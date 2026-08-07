@@ -450,6 +450,60 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to post review: {e}") from e
 
+    async def submit_verdict(self, pr_info: PRInfo, event: str, body: str) -> bool:
+        @_retry_transient
+        def _submit() -> bool:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            pr = gh_repo.get_pull(pr_info.number)
+            try:
+                # No `commit=` — GitHub anchors the verdict to the current head,
+                # which is what we just reviewed. Only the latest review from
+                # each reviewer counts, so an APPROVE here supersedes an earlier
+                # REQUEST_CHANGES without needing the dismissal API.
+                pr.create_review(body=body, event=event)
+                return True
+            except GithubException as exc:
+                if exc.status == 422:
+                    # GitHub refused the verdict — most often "can not approve
+                    # your own pull request". The review itself already landed,
+                    # so this is a downgrade to comment-only, not a failure.
+                    logger.warning("GitHub refused %s on %s: %s", event, pr_info.url, exc.data)
+                    return False
+                raise
+
+        try:
+            return await asyncio.to_thread(_submit)
+        except Exception as e:
+            logger.warning("Failed to submit %s verdict on %s: %s", event, pr_info.url, e)
+            return False
+
+    async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
+        @_retry_transient
+        def _states() -> dict[str, str]:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            pr = gh_repo.get_pull(pr_info.number)
+            latest: dict[str, str] = {}
+            for review in pr.get_reviews():
+                login = getattr(review.user, "login", "") or ""
+                if not login:
+                    continue
+                state = (review.state or "").upper()
+                if state == "DISMISSED":
+                    # A dismissed review no longer counts against the PR.
+                    latest.pop(login, None)
+                    continue
+                if state in {"COMMENTED", "PENDING"}:
+                    # Neither changes a reviewer's standing on GitHub.
+                    continue
+                latest[login] = state
+            return latest
+
+        try:
+            return await asyncio.to_thread(_states)
+        except Exception as e:
+            logger.debug("Could not read review states for %s: %s", pr_info.url, e)
+            return {}
+
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         @_retry_transient
         def _post_comment() -> None:
