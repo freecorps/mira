@@ -72,3 +72,18 @@ review:
   walkthrough: true
   # Include a Mermaid sequence diagram in the walkthrough
   walkthrough_sequence_diagram: true
+
+  # Submit a real review event, not just comments. Off by default: an APPROVE
+  # from a GitHub App counts toward branch-protection approvals, and a
+  # REQUEST_CHANGES blocks the merge until a later review supersedes it.
+  verdict:
+    #   off             — comment only (default)
+    #   approve         — approve clean PRs, stay silent on findings
+    #   request_changes — also request changes on findings above the ceiling
+    mode: "off"
+    # Highest severity tolerated in an approved PR: blocker | warning |
+    # suggestion | nitpick. "suggestion" approves a PR whose only findings are
+    # suggestions and nitpicks.
+    approve_max_severity: "suggestion"
+    # Never approve when files were skipped for exceeding max_diff_size.
+    require_all_files_reviewed: true

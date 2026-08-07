@@ -28,6 +28,7 @@ from mira.core.passes import (
 )
 from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
+from mira.core.verdict import decide_verdict
 from mira.exceptions import ResponseParseError
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
@@ -400,6 +401,37 @@ class ReviewEngine:
         self._index_was_empty = False
         self._agentic_source_fetcher: object | None = None
         self._agentic_repo_tree: list[str] = []
+
+    async def _submit_verdict(self, pr_info: PRInfo, result: ReviewResult) -> None:
+        """Submit an approve / request-changes review event, when opted in."""
+        if self.provider is None or self.config.review.verdict.mode == "off":
+            return
+
+        human_states = await self.provider.get_review_states(pr_info)
+        verdict = decide_verdict(
+            result,
+            self.config,
+            pr_info,
+            self.bot_name,
+            human_states=human_states,
+        )
+        if verdict is None:
+            return
+
+        if self.dry_run:
+            logger.info(
+                "Dry run: would submit %s on %s (%s)", verdict.event, pr_info.url, verdict.reason
+            )
+            return
+
+        submitted = await self.provider.submit_verdict(pr_info, verdict.event, verdict.body)
+        logger.info(
+            "Verdict %s on %s: %s (%s)",
+            verdict.event,
+            pr_info.url,
+            "submitted" if submitted else "refused by platform",
+            verdict.reason,
+        )
 
     async def _post_placeholder_comment(self, pr_info: PRInfo) -> int | None:
         """Post an immediate 'Reviewing this PR...' comment and return its ID.
@@ -824,6 +856,15 @@ class ReviewEngine:
                 )
         else:
             logger.info("No code suggestions for PR %s", pr_info.url)
+
+        # Turn the findings into a review event the merge box can read. Runs on
+        # every pass — including the "nothing left to flag" pass, which posts no
+        # comments at all and was previously silent. Never fatal: a verdict
+        # failure must not discard the review that already landed.
+        try:
+            await self._submit_verdict(pr_info, result)
+        except Exception as exc:
+            logger.warning("Verdict submission failed for %s: %s", pr_info.url, exc)
 
         result.thread_decisions = thread_decisions
 

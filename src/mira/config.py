@@ -153,6 +153,47 @@ class OverlapConfig(BaseModel):
     title_similarity_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
 
 
+class VerdictConfig(BaseModel):
+    """Whether Mira submits a real review event, not just comments.
+
+    Off by default: an APPROVE from a GitHub App counts toward branch-protection
+    approvals, and a REQUEST_CHANGES blocks the merge until it's superseded.
+    Both are opt-in decisions for the deployment, not defaults to inherit.
+
+      "off"             — comment only (historical behaviour)
+      "approve"         — approve clean PRs; stay silent when findings exceed
+                          the ceiling (the inline comments already say it)
+      "request_changes" — also submit REQUEST_CHANGES on findings above it
+    """
+
+    mode: str = "off"
+    # Highest severity tolerated in an approved PR. "suggestion" approves a PR
+    # whose only findings are suggestions and nitpicks; "nitpick" demands a
+    # completely clean pass.
+    approve_max_severity: str = "suggestion"
+    # Never approve when files were skipped because the diff blew past
+    # max_diff_size — approving a partially-read PR is the worst failure mode.
+    require_all_files_reviewed: bool = True
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        allowed = {"off", "approve", "request_changes"}
+        if v not in allowed:
+            raise ValueError(f"review.verdict.mode must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("approve_max_severity")
+    @classmethod
+    def _valid_severity(cls, v: str) -> str:
+        allowed = {"blocker", "warning", "suggestion", "nitpick"}
+        if v not in allowed:
+            raise ValueError(
+                f"review.verdict.approve_max_severity must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+
 class ReviewConfig(BaseModel):
     context_lines: int = Field(default=3, ge=0)
     # Total diff size cap. Above this, the diff is *not* truncated arbitrarily —
@@ -232,6 +273,9 @@ class ReviewConfig(BaseModel):
     # Cross-PR overlap detection — flag other open PRs that step on this one
     # (same files = merge-conflict risk, or same goal = duplicate effort).
     overlap: OverlapConfig = Field(default_factory=OverlapConfig)
+
+    # Submit an approve / request-changes review event alongside the comments.
+    verdict: VerdictConfig = Field(default_factory=VerdictConfig)
 
     # Automatically resolve bot review threads that the LLM verifies as fixed
     # on each review pass. Disable to leave all bot comments open until a human

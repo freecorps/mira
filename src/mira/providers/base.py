@@ -43,6 +43,29 @@ class BaseProvider(abc.ABC):
         link human replies back to the exact comment they answer.
         """
 
+    async def submit_verdict(self, pr_info: PRInfo, event: str, body: str) -> bool:
+        """Submit a standalone review carrying an APPROVE / REQUEST_CHANGES verdict.
+
+        Kept separate from ``post_review`` so the verdict lands the same way
+        whether the inline comments went out as a batch review or through the
+        per-comment 422 fallback — and so a PR with zero findings can still be
+        approved.
+
+        Concrete (not abstract) with a no-op default: providers without review
+        events keep working, they just never emit a verdict. Returns True when
+        the platform actually recorded it.
+        """
+        return False
+
+    async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
+        """Latest review state per reviewer login (e.g. ``{"alice": "CHANGES_REQUESTED"}``).
+
+        Used to keep Mira from approving over a human who asked for changes.
+        Empty dict when the provider can't report it — callers treat that as
+        "no information", not "nobody objected".
+        """
+        return {}
+
     @abc.abstractmethod
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         """Post a top-level comment on a pull request."""
