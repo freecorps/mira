@@ -1,0 +1,12 @@
+[Unit]
+Description=Pull and safely update Mira
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=MIRA_STACK_DIR=/mnt/sda1/mira-stack
+Environment=MIRA_IMAGE=ghcr.io/freecorps/mira:edge
+ExecStart=/usr/local/sbin/mira-update
+TimeoutStartSec=15min

@@ -1,0 +1,41 @@
+name: mira-stack
+
+services:
+  mira:
+    image: ${MIRA_IMAGE:-ghcr.io/freecorps/mira:edge}
+    container_name: mira
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - ./mira/mira.env
+    volumes:
+      - ./mira/mira.yaml:/app/mira.yaml:ro
+      - ./mira/private-key.pem:/etc/mira/private-key.pem:ro
+      - ./data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()
+      interval: 15s
+      timeout: 3s
+      retries: 8
+      start_period: 20s
+    networks:
+      - inference
+    mem_limit: 4g
+    cpus: 3.5
+    pids_limit: 512
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+networks:
+  inference:
+    external: true
+    name: shared-network
