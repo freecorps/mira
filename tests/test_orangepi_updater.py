@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-
 pytestmark = pytest.mark.skipif(
     os.name != "posix" or shutil.which("bash") is None,
     reason="the deployed updater is a Linux/bash systemd service",
