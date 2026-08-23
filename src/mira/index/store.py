@@ -1643,7 +1643,10 @@ def _iter_repo_dbs(index_dir: str) -> list[tuple[str, str, str, str]]:
                     if not fname.endswith(".db"):
                         continue
                     rel = os.path.relpath(os.path.join(root, fname), entry_path)
-                    owner = os.path.dirname(rel)
+                    # Provider repository names are platform-independent and
+                    # always use '/'. Normalize Windows' path separator before
+                    # returning nested GitLab/Forgejo owners.
+                    owner = os.path.dirname(rel).replace(os.sep, "/")
                     out.append((platform, owner, fname[:-3], os.path.join(root, fname)))
             continue
         for fname in sorted(os.listdir(entry_path)):

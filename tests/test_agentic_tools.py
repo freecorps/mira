@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from mira.core.passes import agentic_review_loop
 from mira.llm.agentic_tools import (
     AGENTIC_TOOLS,
     GREP_REPO_TOOL,
@@ -132,3 +133,33 @@ class TestExecutorBudget:
         ex.bytes_used = 1_000_000  # simulate exhaustion
         out = await ex.execute("read_file", {"path": "a.py"})
         assert "budget exhausted" in out
+
+
+class TestAgenticLoopFallback:
+    @pytest.mark.asyncio
+    async def test_malformed_provider_message_falls_back(self):
+        class _MalformedProvider:
+            async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+                return object()
+
+        result = await agentic_review_loop(  # type: ignore[arg-type]
+            _MalformedProvider(),
+            [{"role": "user", "content": "review"}],
+            object(),
+        )
+
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_calls_fall_back(self):
+        class _MalformedProvider:
+            async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+                return {"content": "", "tool_calls": {"not": "a list"}}
+
+        result = await agentic_review_loop(  # type: ignore[arg-type]
+            _MalformedProvider(),
+            [{"role": "user", "content": "review"}],
+            object(),
+        )
+
+        assert result == ""

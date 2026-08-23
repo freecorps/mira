@@ -69,8 +69,23 @@ async def agentic_review_loop(
             logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
             return ""
 
+        # Provider adapters are expected to return a normalized mapping, but a
+        # malformed or partially mocked provider must degrade to the regular
+        # review path instead of crashing the whole PR review.
+        if not isinstance(msg, dict):
+            logger.warning(
+                "Agentic hop %d returned %s instead of a mapping",
+                hop + 1,
+                type(msg).__name__,
+            )
+            return ""
+
         tool_calls = msg.get("tool_calls") or []
         content = msg.get("content") or ""
+
+        if not isinstance(tool_calls, list):
+            logger.warning("Agentic hop %d returned malformed tool_calls", hop + 1)
+            return ""
 
         if not tool_calls:
             logger.debug(
