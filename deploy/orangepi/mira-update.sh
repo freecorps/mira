@@ -39,7 +39,9 @@ for ((attempt = 1; attempt <= health_attempts; attempt++)); do
     echo "Mira is healthy on image $candidate_image"
     exit 0
   fi
-  sleep "$health_interval"
+  if ((attempt < health_attempts)); then
+    sleep "$health_interval"
+  fi
 done
 
 echo "Mira failed its health check after the update" >&2
@@ -59,7 +61,9 @@ for ((attempt = 1; attempt <= health_attempts; attempt++)); do
     echo "Rollback is healthy"
     exit 1
   fi
-  sleep "$health_interval"
+  if ((attempt < health_attempts)); then
+    sleep "$health_interval"
+  fi
 done
 
 echo "Rollback also failed its health check" >&2

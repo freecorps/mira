@@ -58,8 +58,9 @@ cannot reproduce faithfully:
 1. Python 3.11 and 3.12 suites.
 2. Native `amd64` image build and CLI/UI smoke tests.
 3. QEMU `arm64` execution, `/health`, existing SQLite compatibility, and
-   previous-image rollback.
-4. Orange Pi updater rollback contract test.
+   previous-image compatibility.
+4. Orange Pi updater failure-and-restore with real ARM64 images, plus its
+   focused shell contract test.
 
 Do not merge while any blocking job is red. The project-wide `mypy` job is
 advisory until its synchronized-upstream backlog is retired; new code should

@@ -163,3 +163,25 @@ class TestAgenticLoopFallback:
         )
 
         assert result == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {"content": "", "tool_calls": [object()]},
+            {"content": "", "tool_calls": [{"function": object()}]},
+            {"content": object(), "tool_calls": []},
+        ],
+    )
+    async def test_malformed_nested_response_falls_back(self, message):  # type: ignore[no-untyped-def]
+        class _MalformedProvider:
+            async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+                return message
+
+        result = await agentic_review_loop(  # type: ignore[arg-type]
+            _MalformedProvider(),
+            [{"role": "user", "content": "review"}],
+            object(),
+        )
+
+        assert result == ""

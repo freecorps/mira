@@ -80,11 +80,17 @@ async def agentic_review_loop(
             )
             return ""
 
-        tool_calls = msg.get("tool_calls") or []
-        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+        content = msg.get("content")
+        tool_calls = [] if tool_calls is None else tool_calls
+        content = "" if content is None else content
 
-        if not isinstance(tool_calls, list):
-            logger.warning("Agentic hop %d returned malformed tool_calls", hop + 1)
+        malformed_calls = not isinstance(tool_calls, list) or any(
+            not isinstance(call, dict) or not isinstance(call.get("function"), dict)
+            for call in tool_calls
+        )
+        if malformed_calls or not isinstance(content, str):
+            logger.warning("Agentic hop %d returned a malformed response", hop + 1)
             return ""
 
         if not tool_calls:

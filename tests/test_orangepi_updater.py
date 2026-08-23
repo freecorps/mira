@@ -70,6 +70,13 @@ set -Eeuo pipefail
 grep -q '^rollback-started$' "$MIRA_TEST_STATE"
 """,
     )
+    _write_executable(
+        bin_dir / "sleep",
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+echo 'slept-after-final-attempt' >> "$MIRA_TEST_STATE"
+""",
+    )
 
     env = os.environ.copy()
     env.update(
@@ -80,7 +87,7 @@ grep -q '^rollback-started$' "$MIRA_TEST_STATE"
             "MIRA_IMAGE": "ghcr.io/test/mira:edge",
             "MIRA_UPDATE_LOCK_FILE": str(tmp_path / "updater.lock"),
             "MIRA_HEALTH_ATTEMPTS": "1",
-            "MIRA_HEALTH_INTERVAL_SECONDS": "0",
+            "MIRA_HEALTH_INTERVAL_SECONDS": "5",
             "MIRA_TEST_STATE": str(state_file),
         }
     )
