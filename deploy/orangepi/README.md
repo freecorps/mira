@@ -12,7 +12,10 @@ health check fails.
 The update contract is exercised in CI on a real `linux/arm64` image. CI
 creates a SQLite database with the currently deployed `edge` image, starts the
 candidate against it, checks `/health` and the preserved canary row, then
-starts the previous image against the same database to prove app rollback.
+starts the previous image against the same database to prove app rollback. It
+also publishes a deliberately unhealthy candidate to an isolated local
+registry and invokes `mira-update.sh` end to end, verifying that the updater
+restores the healthy image and preserved data.
 
 The host layout is:
 
