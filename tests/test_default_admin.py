@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,11 @@ def test_no_password_generates_random_admin(
     pw_file = tmp_path / "initial_admin_password"
     password = pw_file.read_text().strip()
     assert db.authenticate("admin", password) is not None
-    assert pw_file.stat().st_mode & 0o777 == 0o600
+    # Windows does not expose POSIX mode bits faithfully. The production
+    # deployment is Linux; keep the permission assertion where chmod has the
+    # semantics this security control relies on.
+    if os.name == "posix":
+        assert pw_file.stat().st_mode & 0o777 == 0o600
     assert password not in caplog.text
     assert str(pw_file) in caplog.text
 

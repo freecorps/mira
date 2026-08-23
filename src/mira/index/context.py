@@ -6,7 +6,7 @@ Now async with support for fetching real source code from the PR's head branch.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
 
 from mira.index.extract import extract_symbols, find_symbol_by_name
@@ -97,7 +97,16 @@ async def build_code_context(
 
     # 1. Directory summaries (10% budget)
     dir_parts: list[str] = []
-    parent_dirs = sorted({str(Path(p).parent) for p in changed_paths if str(Path(p).parent) != "."})
+    # Repository paths always use POSIX separators, even when Mira itself runs
+    # on Windows. Path would turn these into backslashes and miss indexed
+    # directory summaries on Windows hosts.
+    parent_dirs = sorted(
+        {
+            str(PurePosixPath(path).parent)
+            for path in changed_paths
+            if str(PurePosixPath(path).parent) != "."
+        }
+    )
     if parent_dirs:
         dir_summaries = store.get_directory_summaries(parent_dirs)
         if dir_summaries:
