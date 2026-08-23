@@ -12,12 +12,17 @@ By contributing, you agree your contributions are licensed under the
 Mira uses [uv](https://github.com/astral-sh/uv) for Python dependency
 management. The lockfile is committed.
 
+The supported Python matrix is 3.11 and 3.12 on Linux. `.python-version`
+selects 3.12 for local development; CI overrides it explicitly to exercise
+both supported versions. Python 3.13+ is not supported until it joins that
+matrix.
+
 ```bash
 git clone https://github.com/miracodeai/mira.git
 cd mira
 
 # Install deps (uv reads pyproject.toml + uv.lock)
-uv sync --extra dev --extra serve
+uv sync --locked --extra dev --extra serve --extra bedrock
 ```
 
 For the dashboard UI:
@@ -46,15 +51,11 @@ ngrok / cloudflared / smee tunnel terminating at port 8100.
 
 ## Quality gates
 
-All four must be green before a PR can merge:
+The blocking local gates are:
 
 ```bash
-# Lint + format
-uv run ruff check src/ tests/
-uv run ruff format --check src/ tests/
-
-# Type check
-uv run mypy src/mira/ --ignore-missing-imports
+# Lint, format, YAML/TOML, and repository hygiene
+uv run pre-commit run --all-files
 
 # Tests
 uv run pytest tests/ --ignore=tests/evals --ignore=tests/test_integration.py
@@ -63,7 +64,19 @@ uv run pytest tests/ --ignore=tests/evals --ignore=tests/test_integration.py
 cd ui/mira && npx tsc --noEmit
 ```
 
-CI runs the same matrix on Python 3.11 and 3.12.
+`mypy` is currently advisory because the synchronized upstream tree has a
+known type-error backlog. Run it before changing typed interfaces, but do not
+interpret its project-wide exit code as a regression until that baseline is
+retired:
+
+```bash
+uv run pre-commit run --all-files --hook-stage manual mypy
+```
+
+CI runs tests on Python 3.11 and 3.12, builds and starts the native `amd64`
+image, and executes the `arm64` image under QEMU against a database produced
+by the currently deployed `edge` image. The ARM job also proves that the
+previous image can reopen the candidate-touched database.
 
 ## PR flow
 
