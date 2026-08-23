@@ -5,8 +5,11 @@ stack_dir="${MIRA_STACK_DIR:-/mnt/sda1/mira-stack}"
 service="${MIRA_SERVICE:-mira}"
 image="${MIRA_IMAGE:-ghcr.io/freecorps/mira:edge}"
 health_url="${MIRA_HEALTH_URL:-http://127.0.0.1:8000/health}"
+lock_file="${MIRA_UPDATE_LOCK_FILE:-/run/lock/mira-update.lock}"
+health_attempts="${MIRA_HEALTH_ATTEMPTS:-24}"
+health_interval="${MIRA_HEALTH_INTERVAL_SECONDS:-5}"
 
-exec 9>/run/lock/mira-update.lock
+exec 9>"$lock_file"
 if ! flock -n 9; then
   echo "Another Mira update is already running"
   exit 0
@@ -31,12 +34,12 @@ fi
 
 docker compose up -d --no-deps "$service"
 
-for _ in {1..24}; do
+for ((attempt = 1; attempt <= health_attempts; attempt++)); do
   if curl --fail --silent --show-error --max-time 3 "$health_url" >/dev/null; then
     echo "Mira is healthy on image $candidate_image"
     exit 0
   fi
-  sleep 5
+  sleep "$health_interval"
 done
 
 echo "Mira failed its health check after the update" >&2
@@ -51,12 +54,12 @@ echo "Rolling back to $previous_image" >&2
 docker image tag "$previous_image" "$image"
 docker compose up -d --no-deps --force-recreate "$service"
 
-for _ in {1..24}; do
+for ((attempt = 1; attempt <= health_attempts; attempt++)); do
   if curl --fail --silent --show-error --max-time 3 "$health_url" >/dev/null; then
     echo "Rollback is healthy"
     exit 1
   fi
-  sleep 5
+  sleep "$health_interval"
 done
 
 echo "Rollback also failed its health check" >&2
