@@ -220,3 +220,21 @@ class TestBuildDependencyReviewPrompt:
         messages = build_dependency_review_prompt(self._manifest(), existing_packages=[])
         system = messages[0]["content"]
         assert "isn't indexed" in system
+
+
+class TestReviewPromptCrossBoundaryTracing:
+    def test_cross_boundary_tracing_section_present(self):
+        files = [
+            FileDiff(
+                path="test.py",
+                change_type=FileChangeType.MODIFIED,
+                hunks=[HunkInfo(1, 5, 1, 5, "content")],
+                language="python",
+                added_lines=1,
+                deleted_lines=1,
+            )
+        ]
+        config = MiraConfig()
+        messages = build_review_prompt(files, config)
+        system = messages[0]["content"]
+        assert "## Cross-Boundary Tracing" in system

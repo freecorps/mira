@@ -30,6 +30,9 @@ class TestShouldIndex:
     def test_typescript_file(self):
         assert _should_index("src/component.tsx") is True
 
+    def test_lua_file(self):
+        assert _should_index("src/main.lua") is True
+
     def test_lock_file(self):
         assert _should_index("package-lock.json") is False
 

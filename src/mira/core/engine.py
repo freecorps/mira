@@ -29,7 +29,7 @@ from mira.core.passes import (
 from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
-from mira.exceptions import ResponseParseError
+from mira.exceptions import MiraError, ResponseParseError
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -131,9 +131,6 @@ def _clamp_confidence_to_findings(
 # Paths excluded from the dedicated security pass — see core/passes.py.
 # Keep conservative: anything that might house auth/crypto/origin/injection logic stays in.
 _SECURITY_PASS_SKIP_PATTERNS = (
-    # DB migrations: schema changes, indexes — no request handling.
-    "db/migrate/",
-    "/migrations/",
     # Tests: assertions about behavior, not the behavior itself.
     "spec/",
     "/__tests__/",
@@ -184,7 +181,7 @@ def _security_relevant_files(files: list) -> list:
     """Return the subset of files plausibly containing security findings.
 
     The dedicated security pass runs as one LLM call across the entire
-    diff. When the diff is dominated by migrations / specs / lockfiles,
+    diff. When the diff is dominated by specs / lockfiles,
     those non-code files dilute attention away from the actual vulnerable
     code. This filter trims the obvious-no-finding cases so the model can
     focus.
@@ -387,10 +384,12 @@ class ReviewEngine:
         bot_name: str = "miracodeai",
         dry_run: bool = False,
         indexing_llm: LLMProviderProtocol | None = None,
+        security_llm: LLMProviderProtocol | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
         self.indexing_llm = indexing_llm or llm
+        self.security_llm = security_llm or llm
         self.provider = provider
         self.bot_name = bot_name
         self.dry_run = dry_run
@@ -449,6 +448,17 @@ class ReviewEngine:
         await self.provider.post_comment(pr_info, placeholder)
         return await self.provider.find_bot_comment(pr_info, WALKTHROUGH_MARKER)
 
+    @staticmethod
+    def _format_failure_notice(exc: BaseException) -> str:
+        """Format a user-safe failure notice without model names or internal errors."""
+        message = exc.safe_message if isinstance(exc, MiraError) else type(exc).__name__
+        return (
+            f"The code review failed to complete due to an unexpected error.\n\n"
+            f"**Stage:** Code review\n"
+            f"**Error type:** `{type(exc).__name__}`\n"
+            f"**Message:** {message}"
+        )
+
     async def _detect_overlaps_safe(
         self,
         pr_info: PRInfo,
@@ -474,7 +484,7 @@ class ReviewEngine:
             if not current_paths:
                 return []
 
-            store = IndexStore.open(pr_info.owner, pr_info.repo)
+            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
             try:
                 symbols: set[str] = set()
                 for path in current_paths:
@@ -578,6 +588,8 @@ class ReviewEngine:
             except Exception as exc:
                 logger.warning("Failed to post walkthrough placeholder: %s", exc)
 
+        _walkthrough_result: list[WalkthroughResult | None] = [None]
+
         async def _on_walkthrough_ready(wt: WalkthroughResult | None) -> None:
             if self.dry_run or wt is None or placeholder_id is None:
                 return
@@ -587,6 +599,7 @@ class ReviewEngine:
                     in_progress=True,
                 )
                 await self.provider.update_comment(pr_info, placeholder_id, markdown)
+                _walkthrough_result[0] = wt
             except Exception as exc:
                 logger.warning("Failed to post in-progress walkthrough: %s", exc)
 
@@ -705,9 +718,50 @@ class ReviewEngine:
                 resolved_threads=resolved_thread_dicts or None,
                 team_conventions=team_conventions,
             )
-        except BaseException:
+        except BaseException as exc:
             if overlap_task is not None:
                 overlap_task.cancel()
+
+            # Await the in-progress walkthrough notification BEFORE updating the
+            # comment. If the walkthrough LLM call resolved but the callback
+            # hasn't run yet, this lets it post the in-progress content and
+            # store the result so we can re-render it below. If it fails or
+            # times out, we suppress and fall back to the bare failure notice.
+            notify_task = getattr(self, "_walkthrough_notify_task", None)
+            if notify_task is not None:
+                with contextlib.suppress(Exception):
+                    await notify_task
+                self._walkthrough_notify_task = None
+
+            # Update placeholder so the user knows the review failed.
+            # If the walkthrough already landed, re-render it without the
+            # in-progress banner and append the failure notice — preserves
+            # walkthrough content while removing the stuck "in progress" state.
+            if placeholder_id is not None:
+                try:
+                    wt = _walkthrough_result[0]
+                    if wt is not None:
+                        failure_body = wt.to_markdown(
+                            bot_name=self.bot_name or "miracodeai",
+                            in_progress=False,
+                            failure_notice=self._format_failure_notice(exc),
+                        )
+                    else:
+                        failure_body = (
+                            f"{WALKTHROUGH_MARKER}\n"
+                            "## Mira PR Walkthrough\n\n"
+                            "---\n\n"
+                            "<details>\n"
+                            "<summary><b>❌ Review failed</b> — click for details</summary>\n\n"
+                            f"{self._format_failure_notice(exc)}\n\n"
+                            "</details>\n"
+                        )
+                    await self.provider.update_comment(pr_info, placeholder_id, failure_body)
+                except Exception as comment_exc:
+                    logger.warning(
+                        "Failed to update placeholder on review failure: %s", comment_exc
+                    )
+
             raise
 
         # The final walkthrough must land after the in-progress one, or it gets
@@ -873,7 +927,7 @@ class ReviewEngine:
 
             from mira.models import Severity
 
-            store = IndexStore.open(pr_info.owner, pr_info.repo)
+            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
             blocker_count = sum(1 for c in result.comments if c.severity == Severity.BLOCKER)
             warning_count = sum(1 for c in result.comments if c.severity == Severity.WARNING)
             suggestion_count = sum(
@@ -1082,7 +1136,7 @@ class ReviewEngine:
             try:
                 pr_info = getattr(self, "_pr_info", None)
                 if pr_info is not None:
-                    store = IndexStore.open(pr_info.owner, pr_info.repo)
+                    store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
                     source_fetcher = None
                     if self.provider and pr_info:
                         from mira.index.context import ProviderSourceFetcher
@@ -1106,28 +1160,29 @@ class ReviewEngine:
                     index_has_data_for_changed = bool(store.get_summaries(changed_paths))
                     self._jit_needed = not index_has_data_for_changed
                     self._index_was_empty = not bool(store.all_paths())
+
+                    # Hoisted: agentic fetcher/tree setup runs whenever a source fetcher exists
+                    # (indexed or not), so the reviewer tools are available on indexed repos too.
+                    tree_paths: set[str] | None = None
+                    if source_fetcher is not None and (
+                        self.config.review.agentic_tools or not index_has_data_for_changed
+                    ):
+                        self._agentic_source_fetcher = source_fetcher
+                        if hasattr(self.provider, "get_repo_tree"):
+                            try:
+                                tree_paths = set(
+                                    await self.provider.get_repo_tree(pr_info, pr_info.head_branch)
+                                )
+                            except Exception as exc:
+                                logger.debug("Repo tree fetch failed: %s", exc)
+                        self._agentic_repo_tree = sorted(tree_paths) if tree_paths else []
+
                     if not index_has_data_for_changed and source_fetcher is not None:
                         try:
                             from mira.index.jit_context import (
                                 build_jit_cross_file_context,
                             )
 
-                            tree_paths: set[str] | None = None
-                            if hasattr(self.provider, "get_repo_tree"):
-                                try:
-                                    tree_paths = set(
-                                        await self.provider.get_repo_tree(
-                                            pr_info,
-                                            pr_info.head_branch,
-                                        )
-                                    )
-                                except Exception as exc:
-                                    logger.debug(
-                                        "JIT: tree fetch failed: %s",
-                                        exc,
-                                    )
-                            self._agentic_source_fetcher = source_fetcher
-                            self._agentic_repo_tree = sorted(tree_paths) if tree_paths else []
                             jit = await build_jit_cross_file_context(
                                 changed_files=filtered,
                                 source_fetcher=source_fetcher,
@@ -1222,7 +1277,9 @@ class ReviewEngine:
         try:
             pr_info = getattr(self, "_pr_info", None)
             if pr_info is not None:
-                _rules_store = IndexStore.open(pr_info.owner, pr_info.repo)
+                _rules_store = IndexStore.open(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                )
 
                 learned_rules = _rules_store.get_learned_rules_text()
 
@@ -1298,7 +1355,6 @@ class ReviewEngine:
                     raw_response = ""
                     use_agentic = (
                         self.config.review.agentic_tools
-                        and getattr(self, "_jit_needed", False)
                         and self._agentic_source_fetcher is not None
                     )
                     if use_agentic:
@@ -1376,7 +1432,7 @@ class ReviewEngine:
                 filtered,
                 _security_relevant_files(filtered),
                 pr_title,
-                indexing_llm=self.indexing_llm,
+                security_llm=self.security_llm,
             )
             if self.config.review.security_pass
             else _asyncio.sleep(0, result=[])
@@ -1388,11 +1444,14 @@ class ReviewEngine:
         # present (empty list on an unindexed repo — pass falls back to the diff).
         manifest_files = manifest_candidates
         existing_packages: list[str] = []
+        pr_source_fetcher = None
         if manifest_files:
             pr_info = getattr(self, "_pr_info", None)
             if pr_info is not None:
                 try:
-                    _pkg_store = IndexStore.open(pr_info.owner, pr_info.repo)
+                    _pkg_store = IndexStore.open(
+                        pr_info.owner, pr_info.repo, platform=pr_info.platform
+                    )
                     try:
                         existing_packages = sorted(
                             {p.name for p in _pkg_store.list_manifest_packages()}
@@ -1401,6 +1460,12 @@ class ReviewEngine:
                         _pkg_store.close()
                 except Exception as exc:
                     logger.debug("Manifest package lookup failed: %s", exc)
+                if self.provider is not None:
+                    from mira.index.context import ProviderSourceFetcher
+
+                    pr_source_fetcher = ProviderSourceFetcher(
+                        self.provider, pr_info, pr_info.head_branch
+                    )
         dependency_task = _asyncio.create_task(
             dependency_review_pass(
                 self.llm,
@@ -1413,8 +1478,16 @@ class ReviewEngine:
             else _asyncio.sleep(0, result=[])
         )
 
-        chunk_results, security_comments, dependency_comments = await _asyncio.gather(
-            review_task, security_task, dependency_task
+        from mira.security.pr_scan import scan_manifest_changes
+
+        osv_task = _asyncio.create_task(
+            scan_manifest_changes(manifest_files, pr_source_fetcher)
+            if manifest_files and self.config.review.osv_scan and pr_source_fetcher is not None
+            else _asyncio.sleep(0, result=[])
+        )
+
+        chunk_results, security_comments, dependency_comments, osv_comments = await _asyncio.gather(
+            review_task, security_task, dependency_task, osv_task
         )
 
         all_comments: list[ReviewComment] = []
@@ -1428,7 +1501,10 @@ class ReviewEngine:
                 summaries.append(summary_text)
         audit.append({"stage": "drafted", "chunk": "security", "count": len(security_comments)})
         all_comments.extend(security_comments)
+        audit.append({"stage": "drafted", "chunk": "dependency", "count": len(dependency_comments)})
         all_comments.extend(dependency_comments)
+        audit.append({"stage": "drafted", "chunk": "osv", "count": len(osv_comments)})
+        all_comments.extend(osv_comments)
 
         all_comments = [classify_severity(c) for c in all_comments]
 

@@ -7,6 +7,7 @@ the heavyweight review model isn't paying for verification work.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 
@@ -49,7 +50,7 @@ async def agentic_review_loop(
     if convo and convo[0].get("role") == "system":
         convo[0]["content"] = (
             convo[0]["content"] + "\n\n## Tools\n\n"
-            "This repo isn't indexed, so you have two helpers for "
+            "You have two helpers for "
             "cross-file checks: `read_file(path)` and "
             "`grep_repo(pattern, path_glob?, path_only?)`. Use them when, "
             "and ONLY when, you need to verify a cross-file claim before "
@@ -120,14 +121,22 @@ def _indexing_llm(fallback: LLMProvider) -> LLMProvider:
         return fallback
 
 
+def _security_llm(fallback: LLMProvider) -> LLMProvider:
+    """Build a security-tier provider, falling back to ``fallback`` on error."""
+    try:
+        return LLMProvider(llm_config_for("security", load_config().llm))
+    except Exception:
+        return fallback
+
+
 async def security_review_pass(
     llm: LLMProvider,
     files: list,
     narrowed: list,
     pr_title: str = "",
-    indexing_llm: LLMProvider | None = None,
+    security_llm: LLMProvider | None = None,
 ) -> list[ReviewComment]:
-    """Dedicated security review on the configured indexing model.
+    """Dedicated security review on the security tier (``security_model`` → review model).
 
     Runs in parallel with the main review. Returns ``[]`` on any failure
     so a transient LLM/API error doesn't kill the main review.
@@ -135,32 +144,67 @@ async def security_review_pass(
     `narrowed` is `files` with migrations/lockfiles/specs stripped (caller
     decides what counts); falls back to `files` if `narrowed` is empty.
 
-    `indexing_llm`, when passed, is the caller's already-built indexing-tier
+    `security_llm`, when passed, is the caller's already-built security-tier
     provider; otherwise one is constructed from ``load_config()``.
     """
     if not files:
         return []
 
     target_files = narrowed or files
+    if not target_files:
+        return []
+    sec_llm = security_llm or _security_llm(llm)
 
-    security_llm = indexing_llm or _indexing_llm(llm)
+    budget = int(load_config().llm.max_context_tokens * 0.75)
+    from mira.core.chunker import chunk_files
 
-    messages = build_security_review_prompt(files=target_files, pr_title=pr_title)
+    chunks = chunk_files(
+        target_files,
+        budget,
+        provider=sec_llm if hasattr(sec_llm, "count_tokens") else None,
+    )
+    if len(chunks) <= 1:
+        return await _security_scan_once(sec_llm, llm, target_files, pr_title)
+
+    logger.info(
+        "Security pass: splitting %d files into %d chunks (single-call budget %d tokens)",
+        len(target_files),
+        len(chunks),
+        budget,
+    )
+    sem = asyncio.Semaphore(load_config().review.max_concurrent_chunks)
+
+    async def _bounded(chunk_files_list: list) -> list[ReviewComment]:
+        async with sem:
+            return await _security_scan_once(sec_llm, llm, chunk_files_list, pr_title)
+
+    results = await asyncio.gather(*[_bounded(c.files) for c in chunks])
+    return [c for chunk_comments in results for c in chunk_comments]
+
+
+async def _security_scan_once(
+    sec_llm: LLMProvider,
+    fallback_llm: LLMProvider,
+    files: list,
+    pr_title: str,
+) -> list[ReviewComment]:
+    """Run the security scan on a single chunk of files."""
+    messages = build_security_review_prompt(files=files, pr_title=pr_title)
     try:
-        raw = await security_llm.complete_with_tools(
+        raw = await sec_llm.complete_with_tools(
             messages=messages,
             tools=[SUBMIT_REVIEW_TOOL],
             temperature=0.0,
         )
     except Exception as exc:
         # Retry on the main LLM rather than drop the security pass entirely.
-        if security_llm is not llm:
-            logger.debug(
-                "Security pass on indexing tier failed (%s); retrying on review LLM",
+        if sec_llm is not fallback_llm:
+            logger.warning(
+                "Security pass on security tier failed (%s); retrying on review LLM",
                 exc,
             )
             try:
-                raw = await llm.complete_with_tools(
+                raw = await fallback_llm.complete_with_tools(
                     messages=messages,
                     tools=[SUBMIT_REVIEW_TOOL],
                     temperature=0.0,
@@ -227,7 +271,7 @@ async def dependency_review_pass(
     except Exception as exc:
         # Retry on the main LLM rather than drop the pass entirely.
         if dep_llm is not llm:
-            logger.debug(
+            logger.warning(
                 "Dependency pass on indexing tier failed (%s); retrying on review LLM",
                 exc,
             )

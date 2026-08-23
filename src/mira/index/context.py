@@ -290,5 +290,6 @@ def _ext_to_language(ext: str) -> str:
         "swift": "swift",
         "kt": "kotlin",
         "scala": "scala",
+        "lua": "lua",
     }
     return mapping.get(ext.lower(), ext.lower())

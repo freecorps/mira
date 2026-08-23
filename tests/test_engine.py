@@ -22,6 +22,7 @@ from mira.core.engine import (
 from mira.core.threads import _extract_sections
 from mira.llm.provider import LLMProvider
 from mira.models import (
+    WALKTHROUGH_MARKER,
     FileChangeType,
     FileDiff,
     KeyIssue,
@@ -61,7 +62,8 @@ class TestSecurityFileFilter:
         keep = [k.path for k in _security_relevant_files(files)]
         assert "app/controllers/embed_controller.rb" in keep
         assert "app/assets/javascripts/embed.js" in keep
-        assert all("/migrate/" not in p for p in keep)
+        # Migrations are no longer stripped — DDL can contain security-relevant logic.
+        assert "db/migrate/20131217174004_create_topic_embeds.rb" in keep
         assert all("spec/" not in p for p in keep)
         assert all(not p.endswith(".scss") for p in keep)
         assert all(not p.endswith(".lock") for p in keep)
@@ -747,6 +749,114 @@ class TestReviewEngine:
                 assert kwargs.get("existing_comments") is None, (
                     f"Chunk {i + 1} should not receive synthetic cross-chunk comments"
                 )
+
+    @pytest.mark.asyncio
+    async def test_review_failure_updates_placeholder_comment(
+        self,
+        mock_provider: AsyncMock,
+        sample_diff_text: str,
+    ):
+        """When _review_diff_internal raises, the placeholder comment is updated
+        with a failure message before the exception propagates."""
+        llm = MagicMock(spec=LLMProvider)
+        llm.count_tokens = MagicMock(return_value=50)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        # Provider returns a valid placeholder ID so the update path can fire
+        # First call returns None (no existing comment), second returns the new ID
+        mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 42])
+        mock_provider.post_comment = AsyncMock(return_value=42)
+        mock_provider.update_comment = AsyncMock()
+
+        pr_info = PRInfo(
+            title="Test PR",
+            description="",
+            base_branch="main",
+            head_branch="feature",
+            url="https://github.com/test/repo/pull/1",
+            number=1,
+            owner="test",
+            repo="repo",
+        )
+        mock_provider.get_pr_info.return_value = pr_info
+        mock_provider.get_pr_diff.return_value = sample_diff_text
+
+        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+
+        # Patch _review_diff_internal to raise directly — bypasses all internal
+        # exception swallowing, tests the outer handler in review_pr.
+        engine._review_diff_internal = AsyncMock(side_effect=ValueError("LLM broke"))
+
+        with pytest.raises(ValueError, match="LLM broke"):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        # The original exception must propagate
+        # But before it did, the placeholder should have been updated
+        mock_provider.update_comment.assert_called_once()
+        call_args = mock_provider.update_comment.call_args
+        assert call_args[0][1] == 42, "must update the placeholder comment by ID"
+        body = call_args[0][2]
+        assert WALKTHROUGH_MARKER in body
+        assert "Code review" in body
+        assert "ValueError" in body
+
+    @pytest.mark.asyncio
+    async def test_review_failure_re_renders_walkthrough_without_in_progress(
+        self,
+        mock_provider: AsyncMock,
+        sample_diff_text: str,
+    ):
+        """When the walkthrough already landed in-progress, a subsequent
+        review failure must re-render it without the in-progress banner and
+        append the failure notice — not wipe it, not leave it stuck."""
+        llm = MagicMock(spec=LLMProvider)
+        llm.count_tokens = MagicMock(return_value=50)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 42])
+        mock_provider.post_comment = AsyncMock(return_value=42)
+        mock_provider.update_comment = AsyncMock()
+
+        pr_info = PRInfo(
+            title="Test PR",
+            description="",
+            base_branch="main",
+            head_branch="feature",
+            url="https://github.com/test/repo/pull/1",
+            number=1,
+            owner="test",
+            repo="repo",
+        )
+        mock_provider.get_pr_info.return_value = pr_info
+        mock_provider.get_pr_diff.return_value = sample_diff_text
+
+        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+
+        async def _raise_after_walkthrough(*args, **kwargs):
+            cb = kwargs.get("on_walkthrough_ready")
+            wt = WalkthroughResult(summary="Walkthrough summary")
+            if cb is not None:
+                await cb(wt)
+            raise ValueError("LLM broke")
+
+        engine._review_diff_internal = AsyncMock(side_effect=_raise_after_walkthrough)
+
+        with pytest.raises(ValueError, match="LLM broke"):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        # update_comment called twice: once for in-progress, once for failure
+        assert mock_provider.update_comment.call_count == 2
+        # First call: in-progress banner present
+        first_body = mock_provider.update_comment.call_args_list[0][0][2]
+        assert "in progress" in first_body.lower()
+        # Second call: no in-progress banner, walkthrough content preserved,
+        # failure notice appended
+        second_body = mock_provider.update_comment.call_args_list[1][0][2]
+        assert "in progress" not in second_body.lower()
+        assert "Walkthrough summary" in second_body
+        assert "<details>" in second_body
+        assert "Review failed" in second_body
+        assert "ValueError" in second_body
 
 
 class TestDryRun:
@@ -1619,6 +1729,93 @@ class TestSecurityReviewPass:
         out = await security_review_pass(llm, files, files, "title")
         assert out == []
 
+    @pytest.mark.asyncio
+    async def test_uses_security_llm_not_main_llm(self, sample_diff_text):
+        """When security_llm is passed, it is called — not the main llm."""
+        from mira.core.diff_parser import parse_diff
+        from mira.core.passes import security_review_pass
+
+        files = parse_diff(sample_diff_text).files
+        cited_line = None
+        for h in files[0].hunks:
+            for raw in h.content.splitlines():
+                if raw.startswith("+") and not raw.startswith("+++"):
+                    cited_line = raw[1:]
+                    break
+            if cited_line:
+                break
+
+        canned = json.dumps(
+            {
+                "comments": [
+                    {
+                        "path": files[0].path,
+                        "line": 1,
+                        "severity": "blocker",
+                        "category": "security",
+                        "title": "XSS",
+                        "body": "Reflected XSS.",
+                        "confidence": 0.9,
+                        "existing_code": cited_line,
+                    }
+                ],
+                "summary": "",
+                "metadata": {"reviewed_files": 1},
+            }
+        )
+
+        security_llm_mock = MagicMock(spec=LLMProvider)
+        security_llm_mock.complete_with_tools = AsyncMock(return_value=canned)
+        security_llm_mock.count_tokens = MagicMock(return_value=100)
+
+        main_llm_mock = MagicMock(spec=LLMProvider)
+        main_llm_mock.complete_with_tools = AsyncMock(
+            side_effect=RuntimeError("should not be called")
+        )
+
+        out = await security_review_pass(
+            main_llm_mock, files, files, "title", security_llm=security_llm_mock
+        )
+        assert len(out) == 1
+        security_llm_mock.complete_with_tools.assert_called_once()
+        main_llm_mock.complete_with_tools.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chunking_splits_large_diff(self):
+        """With small budget, security pass splits files into chunks."""
+        from mira.core.passes import security_review_pass
+
+        # Create enough files to trigger chunking with a tiny budget
+        files = []
+        for i in range(5):
+            hunk_content = f"+{'x' * 500}\n" * 10  # ~125 tokens per file
+            files.append(
+                FileDiff(
+                    path=f"src/file{i}.py",
+                    change_type=FileChangeType.MODIFIED,
+                    language="python",
+                    added_lines=10,
+                    deleted_lines=0,
+                    hunks=[SimpleNamespace(target_start=1, content=hunk_content)],
+                )
+            )
+
+        canned = json.dumps({"comments": [], "summary": "", "metadata": {"reviewed_files": 1}})
+
+        llm = MagicMock(spec=LLMProvider)
+        llm.complete_with_tools = AsyncMock(return_value=canned)
+        llm.count_tokens = MagicMock(return_value=100)
+
+        with patch("mira.core.passes.load_config") as mock_cfg:
+            cfg = MiraConfig()
+            cfg.llm.max_context_tokens = 500  # tiny budget forces chunking
+            mock_cfg.return_value = cfg
+
+            out = await security_review_pass(llm, files, files, "title")
+            assert out == []
+            # Should have been called more than once (multiple chunks)
+            assert llm.complete_with_tools.call_count >= 2
+
 
 class TestDependencyReviewPass:
     """Dependency pass flags duplicate deps and tags them category=dependency."""
@@ -2048,3 +2245,100 @@ class TestRestrictDiffToPaths:
         out = _restrict_diff_to_paths(_TWO_FILE_DIFF, {"src/a.py"})
         patch_set = parse_diff(out)
         assert [f.path for f in patch_set.files] == ["src/a.py"]
+
+
+class TestAgenticToolsOnIndexedRepos:
+    """Agentic tools should be available on indexed repos when enabled."""
+
+    def _make_provider(self) -> MagicMock:
+        from mira.models import PRInfo
+
+        mock_provider = MagicMock()
+        mock_provider.get_pr_info = AsyncMock(
+            return_value=PRInfo(
+                title="t",
+                description="",
+                base_branch="main",
+                head_branch="f",
+                url="https://github.com/test/repo/pull/1",
+                number=1,
+                owner="test",
+                repo="repo",
+            )
+        )
+        mock_provider.get_pr_diff = AsyncMock(return_value=_TWO_FILE_DIFF)
+        mock_provider.get_repo_tree = AsyncMock(return_value=["src/a.py", "src/b.py"])
+        mock_provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+        mock_provider.find_bot_comment = AsyncMock(return_value=None)
+        mock_provider.post_comment = AsyncMock()
+        mock_provider.update_comment = AsyncMock()
+        mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        return mock_provider
+
+    @pytest.mark.asyncio
+    async def test_fetcher_set_on_indexed_repo_with_agentic_tools(self, monkeypatch, tmp_path):
+        """When agentic_tools=True and index has data, _agentic_source_fetcher
+        is set so the reviewer can use read_file/grep_repo."""
+        from unittest.mock import MagicMock
+
+        from mira.config import MiraConfig
+        from mira.core.engine import ReviewEngine
+        from mira.index.store import FileSummary, IndexStore
+
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+
+        store = IndexStore.open("test", "repo")
+        store.upsert_summary(
+            FileSummary(path="src/a.py", language="python", summary="Module a", content_hash="h")
+        )
+        store.close()
+
+        config = MiraConfig()
+        config.review.agentic_tools = True
+        config.review.code_context = True
+        config.review.security_pass = False
+        config.review.self_critique = False
+
+        mock_llm = MagicMock()
+        mock_llm.review = AsyncMock(return_value="{}")
+        mock_llm.count_tokens = MagicMock(return_value=100)
+        mock_llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=self._make_provider())
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert engine._agentic_source_fetcher is not None
+
+    @pytest.mark.asyncio
+    async def test_fetcher_not_set_when_agentic_tools_disabled(self, monkeypatch, tmp_path):
+        """When agentic_tools=False, _agentic_source_fetcher stays None even
+        on indexed repos."""
+        from unittest.mock import MagicMock
+
+        from mira.config import MiraConfig
+        from mira.core.engine import ReviewEngine
+        from mira.index.store import FileSummary, IndexStore
+
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+
+        store = IndexStore.open("test", "repo")
+        store.upsert_summary(
+            FileSummary(path="src/a.py", language="python", summary="Module a", content_hash="h")
+        )
+        store.close()
+
+        config = MiraConfig()
+        config.review.agentic_tools = False
+        config.review.code_context = True
+        config.review.security_pass = False
+        config.review.self_critique = False
+
+        mock_llm = MagicMock()
+        mock_llm.review = AsyncMock(return_value="{}")
+        mock_llm.count_tokens = MagicMock(return_value=100)
+        mock_llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=self._make_provider())
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert engine._agentic_source_fetcher is None

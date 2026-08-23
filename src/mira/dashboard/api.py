@@ -357,23 +357,33 @@ class ModelOption(BaseModel):
 class ModelsResponse(BaseModel):
     indexing_model: str
     review_model: str
+    security_model: str
     backend: str  # "openrouter" | "bedrock" | "openai-compatible"
     indexing_source: str  # "dashboard" (DB override) | "config" (mira.yaml)
     review_source: str
+    security_source: str
     # What each model resolves to with no override — the "inherit" target.
     config_indexing_model: str
     config_review_model: str
+    config_security_model: str
     indexing_options: list[ModelOption]
     review_options: list[ModelOption]
+    security_options: list[ModelOption]
     # Extended-thinking effort for reviews ("off"/"low"/"medium"/"high").
     review_thinking_mode: str
     thinking_options: list[ModelOption]
+    # Protocol dialect for the OpenAI-compatible endpoint ("chat"/"responses"),
+    # resolved DB → config → default. Mirrors review_thinking_mode.
+    api_style: str
+    api_style_options: list[ModelOption]
 
 
 class ModelsUpdate(BaseModel):
     indexing_model: str
     review_model: str
+    security_model: str = ""
     review_thinking_mode: str = "off"
+    api_style: str = "chat"
 
 
 class GlobalSettingsResponse(BaseModel):
@@ -530,12 +540,15 @@ async def _run_initial_indexing(default_mode: str) -> None:
                 llm=llm,
                 full=(repo_record.index_mode == "full"),
             )
+            # `count` is files re-indexed this run, not the store total.
+            # Read the true total before closing to keep the DB in sync.
+            total_files = len(store.all_paths())
             store.close()
             _app_db.set_repo_status(
                 owner,
                 repo,
                 "ready",
-                files_indexed=count,
+                files_indexed=total_files,
                 bump_last_indexed=True,
                 platform=platform,
             )

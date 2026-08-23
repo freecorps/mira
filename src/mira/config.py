@@ -40,6 +40,11 @@ class LLMConfig(BaseModel):
     # Optional per-purpose overrides. Fall back to `model` if not set.
     indexing_model: str | None = None
     review_model: str | None = None
+    # Optional dedicated model for the security review pass. Falls back to
+    # `review_model`, then `model` — deliberately never to `indexing_model`:
+    # the security sweep is the highest-stakes pass and must not silently
+    # downgrade to the indexing tier.
+    security_model: str | None = None
     # Extended-thinking effort for reviews ("low"/"medium"/"high"; None/"off" =
     # no reasoning). `review_reasoning_effort` is the mira.yaml-level override;
     # `reasoning_effort` is the resolved value the provider reads (set by
@@ -52,6 +57,11 @@ class LLMConfig(BaseModel):
     # Provider selection. "openai" uses any OpenAI-compatible endpoint (default).
     # "bedrock" uses AWS Bedrock Converse API directly (requires boto3).
     provider: str = "openai"
+    # Protocol dialect for the OpenAI-compatible endpoint: "chat"
+    # (Chat Completions, default) or "responses" (OpenAI Responses API).
+    # Only meaningful when `provider` is "openai" — bedrock ignores it
+    # (create_llm checks provider first).
+    api_style: str = "chat"
     # Endpoint configuration. Defaults to OpenRouter but any OpenAI-compatible
     # chat-completions endpoint works — vLLM, Ollama, LiteLLM proxy, LocalAI,
     # llama.cpp server, Together, Fireworks, Groq, etc. Set api_key_env to ""
@@ -233,22 +243,26 @@ class ReviewConfig(BaseModel):
     self_critique: bool = True
 
     # Run a dedicated security review pass in parallel with the main review.
-    # Uses the *indexing* tier LLM with a security-focused prompt (XSS,
-    # injection, auth bypass, CSRF, SSRF, origin validation, deserialization,
-    # crypto). The main pass on the review tier still catches deeper
-    # chained-inference security bugs — this pass is the cheap pattern-
-    # matching sweep on top. Set ``llm.indexing_model`` to the same model
-    # as ``llm.review_model`` if you want the heavy model on every pass.
-    # Findings are merged into the main review's comments list and go
-    # through the same noise filter (dedup against overlapping main-pass
-    # findings).
+    # Uses the security tier (`llm.security_model`, falling back to the
+    # review model). The main pass on the review tier still catches deeper
+    # chained-inference security bugs — this pass is the focused pattern
+    # sweep (XSS, injection, auth bypass, CSRF, SSRF, origin validation,
+    # deserialization, crypto) on top. Findings merge into the main review's
+    # comments and go through the same noise filter.
     security_pass: bool = True
 
-    # When the repo is not indexed, give the reviewer LLM tools (`read_file`,
-    # `grep_repo`) it can call to fetch cross-file context on demand. Closes
-    # the gap on Java/Go cross-file findings that JIT pre-fetch can't reach
-    # (those languages need build-system parsing to resolve imports).
-    # No effect when the repo is indexed.
+    # Deterministic CVE check on changed dependency manifests: packages added
+    # or version-bumped by the PR are queried against OSV.dev at review time
+    # (the background poller only re-scans the repo hourly, post-merge). No
+    # LLM involved — one batch HTTP request per PR with manifest changes.
+    osv_scan: bool = True
+
+    # Give the reviewer LLM tools (`read_file`, `grep_repo`) to fetch
+    # cross-file context on demand. On unindexed repos this closes the
+    # Java/Go gaps JIT pre-fetch can't reach; on indexed repos it lets the
+    # reviewer trace callers and dispatch points beyond the pre-fetched
+    # index context. Disable to force single-shot reviews (cheaper, less
+    # thorough).
     agentic_tools: bool = True
 
     # Whether the JIT cross-file resolver should attempt Java + Go imports.

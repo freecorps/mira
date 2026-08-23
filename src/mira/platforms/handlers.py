@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -104,19 +105,24 @@ async def run_pr_review(
 
     llm = create_llm(llm_config_for("review", config.llm))
     indexing_llm = create_llm(llm_config_for("indexing", config.llm))
+    security_llm = create_llm(llm_config_for("security", config.llm))
     engine = ReviewEngine(
         config=config,
         llm=llm,
         provider=provider,
         bot_name=bot_name,
         indexing_llm=indexing_llm,
+        security_llm=security_llm,
     )
 
     from mira.dashboard.api import _app_db
 
     # Keep visibility current — the blast-radius filter relies on it to avoid
     # naming private repos in a public repo's review.
-    _app_db.set_repo_visibility(owner, repo, is_private, platform=platform)
+    try:
+        _app_db.set_repo_visibility(owner, repo, is_private, platform=platform)
+    except sqlite3.OperationalError as exc:
+        logger.debug("set_repo_visibility failed (ignored): %s", exc)
 
     repo_record = _app_db.get_repo(owner, repo, platform=platform)
     is_indexed = bool(repo_record and repo_record.status == "ready")
@@ -179,6 +185,7 @@ async def run_pr_command(
 
     llm = create_llm(llm_config_for("review", config.llm))
     indexing_llm = create_llm(llm_config_for("indexing", config.llm))
+    security_llm = create_llm(llm_config_for("security", config.llm))
 
     normalized = question.lower().strip()
     is_review = normalized in _REVIEW_KEYWORDS
@@ -209,6 +216,7 @@ async def run_pr_command(
             provider=provider,
             bot_name=bot_name,
             indexing_llm=indexing_llm,
+            security_llm=security_llm,
         )
         engine._review_only_paths = set(progress.skipped_paths)  # type: ignore[attr-defined]
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
@@ -230,6 +238,7 @@ async def run_pr_command(
             provider=provider,
             bot_name=bot_name,
             indexing_llm=indexing_llm,
+            security_llm=security_llm,
         )
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
             logger.info("Review already in progress for %s, skipping", pr_url)
