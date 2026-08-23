@@ -23,6 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    env:
+      # .python-version pins local development to 3.12. Override it here so
+      # each matrix entry really exercises the advertised interpreter.
+      UV_PYTHON: ${{ matrix.python-version }}
 
     steps:
       - uses: actions/checkout@v7
@@ -34,21 +38,21 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev --extra serve --extra bedrock
+        run: uv sync --locked --extra dev --extra serve --extra bedrock
 
       # Run the same pre-commit hooks contributors run locally. Single source
       # of truth — if a hook is added/removed/version-bumped in
       # `.pre-commit-config.yaml`, CI picks it up automatically and we don't
       # have to also edit this workflow.
       - name: Pre-commit hooks (lint, format, file hygiene)
-        run: uv run pre-commit run --all-files --show-diff-on-failure
+        run: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
 
       - name: Type check (advisory — manual stage in pre-commit, non-blocking here)
         continue-on-error: true
-        run: uv run pre-commit run --all-files --hook-stage manual mypy
+        run: uv run --no-sync pre-commit run --all-files --hook-stage manual mypy
 
       - name: Test
-        run: uv run pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
+        run: uv run --no-sync pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
 
   ui:
     runs-on: ubuntu-latest
@@ -97,14 +101,57 @@ jobs:
       - name: Smoke test — UI assets bundled
         run: docker run --rm --entrypoint ls mira:ci /app/ui_dist/index.html
 
+  docker-arm64:
+    name: ARM64 runtime and rollback
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build loadable ARM64 candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: mira:ci-arm64
+          provenance: false
+          cache-from: type=gha,scope=arm64-smoke
+          cache-to: type=gha,mode=max,scope=arm64-smoke
+
+      - name: Smoke test ARM64, SQLite migration, and app rollback
+        env:
+          MIRA_CANDIDATE_IMAGE: mira:ci-arm64
+          MIRA_BASELINE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge
+        run: bash scripts/ci/smoke_arm64.sh
+
   publish-edge:
     name: Publish edge image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [python, ui, docker]
+    needs: [python, ui, docker, docker-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
 
@@ -131,6 +178,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push multi-platform image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -138,5 +186,14 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Sign build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
