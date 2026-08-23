@@ -1,7 +1,7 @@
 # Mira: análise competitiva e roadmap de produto
 
-**Status:** proposta  
-**Atualizado em:** 2026-08-23  
+**Status:** proposta
+**Atualizado em:** 2026-08-23
 **Escopo:** experiência de review, aprendizado, automação, governança e operação self-hosted
 
 ## Resumo executivo
