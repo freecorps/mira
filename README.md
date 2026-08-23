@@ -129,22 +129,25 @@ filter:
 ```bash
 git clone https://github.com/miracodeai/mira.git
 cd mira
-pip install -e ".[dev,serve]"
+uv sync --locked --extra dev --extra serve --extra bedrock
 
 # Run tests
-pytest tests/ -v
+uv run pytest tests/ -v
 
 # Run the regression suite (hits real GitHub + LLM, ~$1, ~3 min).
 # Pinned PRs whose findings have flickered across iterations. Run before
 # merging changes that touch prompts, the noise filter, or the engine.
-OPENROUTER_API_KEY=... GITHUB_TOKEN=... pytest -m eval -v
+OPENROUTER_API_KEY=... GITHUB_TOKEN=... uv run pytest -m eval -v
 
-# Lint
-ruff check src/ tests/
+# Lint, format, and repository hygiene
+uv run pre-commit run --all-files
 
-# Type check
-mypy src/mira/ --ignore-missing-imports
+# Advisory type check (the current upstream baseline is not yet clean)
+uv run pre-commit run --all-files --hook-stage manual mypy
 ```
+
+Supported runtimes are Python 3.11 and 3.12 on Linux; local development is
+pinned to 3.12 by `.python-version`.
 
 ## License
 
