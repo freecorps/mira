@@ -184,6 +184,30 @@ async def test_the_gates_own_check_run_does_not_wake_the_gate() -> None:
 
 
 async def test_a_check_suite_from_the_gates_own_app_does_not_wake_it() -> None:
+    """A suite carries only the app that owns it, so it is matched on identity.
+
+    The App slug and the configured display name diverge the moment anyone sets
+    `--bot-name` explicitly, so the real slug from `get_bot_identity()` is what
+    decides — with the configured name kept as a fallback.
+    """
+    auth = _auth()
+    auth.get_bot_identity = AsyncMock(return_value="mira-code-app")
+    tasks = BackgroundTasks()
+    payload = {
+        "action": "completed",
+        "check_suite": {"app": {"slug": "mira-code-app"}, "pull_requests": [{"number": 7}]},
+        "repository": _repository(),
+        "sender": {"login": "mira-bot[bot]"},
+    }
+    result = await dispatch_github_event("check_suite", payload, auth, "some-display-name", tasks)
+    assert result == "ignored"
+    assert tasks.tasks == []
+
+
+async def test_a_check_suite_falls_back_to_the_configured_name() -> None:
+    """An identity that could not be resolved must not disable the filter."""
+    auth = _auth()
+    auth.get_bot_identity = AsyncMock(return_value=None)
     tasks = BackgroundTasks()
     payload = {
         "action": "completed",
@@ -191,8 +215,8 @@ async def test_a_check_suite_from_the_gates_own_app_does_not_wake_it() -> None:
         "repository": _repository(),
         "sender": {"login": "mira-bot[bot]"},
     }
-    result = await dispatch_github_event("check_suite", payload, _auth(), "mira-bot", tasks)
-    assert result != "processing"
+    result = await dispatch_github_event("check_suite", payload, auth, "mira-bot", tasks)
+    assert result == "ignored"
     assert tasks.tasks == []
 
 

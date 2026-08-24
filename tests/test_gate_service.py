@@ -1042,20 +1042,33 @@ async def test_a_channel_that_keeps_refusing_is_eventually_left_alone() -> None:
 
 
 async def test_a_retry_does_not_erase_the_reference_it_already_recorded() -> None:
-    """A comment has no reference to give; that is not a reason to lose one."""
+    """A comment has no reference to give; that is not a reason to lose one.
 
-    class FlakyStatus(FakeProvider):
+    The first pass has to end `partial`, or the row is not retryable and the
+    second pass never reaches the code under test.
+    """
+
+    class MuteComment(FakeProvider):
+        async def post_comment(self, pr_info, body):
+            self.comment_attempts += 1
+            raise ProviderError("the discussion API is down")
+
+    class MuteStatus(FakeProvider):
         async def publish_gate_status(self, pr_info, **kwargs):
-            if self.statuses:
-                raise ProviderError("checks:write went away")
-            return await super().publish_gate_status(pr_info, **kwargs)
+            raise ProviderError("checks:write went away")
 
     config = _config(mode="shadow", comment=True)
-    first = FlakyStatus()
-    await _evaluate(first, config)
-    assert _decisions()[0].delivery_ref == "check-1"
+    # Status through, comment refused: `partial`, with the check-run id stored.
+    await _evaluate(MuteComment(), config)
+    first = _decisions()[0]
+    assert first.delivery_state == "partial"
+    assert first.delivery_ref == "check-1"
 
-    second = FlakyStatus()
-    second.statuses.append({"already": "published"})  # force the failing branch
-    await _evaluate(second, config)
-    assert _decisions()[0].delivery_ref == "check-1"
+    # The retry inverts it. The comment has no reference of its own, and must
+    # not take the recorded one down with it.
+    second_provider = MuteStatus()
+    await _evaluate(second_provider, config)
+    assert second_provider.comments
+    second = _decisions()[0]
+    assert second.delivery_state == "partial"
+    assert second.delivery_ref == "check-1"
