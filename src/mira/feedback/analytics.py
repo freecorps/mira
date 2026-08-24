@@ -211,6 +211,7 @@ def compare_activation_periods(
     rule_id: int,
     window_days: int | None = None,
     config: LearningConfig | None = None,
+    fallback_scope: dict[str, Any] | None = None,
 ) -> dict:
     """Compare the rule's scope before and after the rule went live.
 
@@ -218,6 +219,10 @@ def compare_activation_periods(
     the rule's own exposures: before activation the rule had none, so an
     exposure-based comparison would compare a number against zero and prove
     nothing about whether reviews improved.
+
+    ``fallback_scope`` keeps history readable after a rule row is deleted. The
+    evaluations are the audit record and must stay inspectable, so a missing
+    rule degrades to "not comparable" rather than erasing the drill-down.
     """
     learning = config or load_config().learning
     days = window_days or learning.evaluation_window_days
@@ -228,7 +233,19 @@ def compare_activation_periods(
     with open_analytics_store(owner, repo, platform) as store:
         rule = store.get_learned_rule(rule_id)
         if rule is None:
-            raise LookupError(f"rule {rule_id} not found in {owner}/{repo}")
+            if fallback_scope is None:
+                raise LookupError(f"rule {rule_id} not found in {owner}/{repo}")
+            return {
+                "rule_id": rule_id,
+                "owner": owner,
+                "repo": repo,
+                "window_days": days,
+                "activated_at": None,
+                "comparable": False,
+                "reason": "rule no longer exists; only its recorded evaluations remain",
+                "before": None,
+                "after": None,
+            }
         pivot = float(rule.effective_from or rule.created_at or 0.0)
         if not pivot:
             return {
