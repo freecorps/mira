@@ -1174,17 +1174,26 @@ class ReviewEngine:
         # Phase 4: the merge gate. Runs last, after the review has been posted
         # and recorded, and never raises — a gate failure must not discard a
         # review that already landed, and an unfinished gate never approves.
-        await self._run_merge_gate(pr_info, result, diff_text)
+        # `full_diff_text`, never `diff_text`: round 2+ rebinds the latter to
+        # the incremental diff, and a gate that only saw the newest commits
+        # would stop vetoing a protected path touched two pushes ago.
+        await self._run_merge_gate(pr_info, result, full_diff_text)
 
         return result
 
-    async def _run_merge_gate(self, pr_info: PRInfo, result: ReviewResult, diff_text: str) -> None:
+    async def _run_merge_gate(
+        self, pr_info: PRInfo, result: ReviewResult, full_diff_text: str
+    ) -> None:
         """Evaluate the risk gate for this pull request.
 
         The diff, the finding counts and the coverage are already in hand, so
         they are handed to the gate rather than re-fetched: on the Orange Pi
         profile the gate has to be effectively free next to the review that
         just ran.
+
+        ``full_diff_text`` is the whole pull request, not the incremental diff a
+        later round reviews. The review only needs to look at what changed since
+        last time; the gate has to answer for the entire change.
         """
         from mira.gate import service as gate_service
 
@@ -1208,7 +1217,7 @@ class ReviewEngine:
                     added_lines=file.added_lines,
                     deleted_lines=file.deleted_lines,
                 )
-                for file in parse_diff(diff_text or "").files
+                for file in parse_diff(full_diff_text or "").files
             ] or None
         except Exception as exc:
             logger.info("Merge gate will re-fetch the file list for %s: %s", pr_info.url, exc)

@@ -58,13 +58,23 @@ def _touches_manifest(paths: list[str]) -> list[str]:
     return hits
 
 
-def score(inputs: GateInputs, weights: RiskWeights) -> tuple[int, list[RiskFactor]]:
+def score(
+    inputs: GateInputs,
+    weights: RiskWeights,
+    *,
+    exclude_generated: bool = True,
+) -> tuple[int, list[RiskFactor]]:
     """Score one PR. Returns ``(0..100, factors)``.
 
     Everything it reads is on ``inputs``, which is also what gets persisted, so
     a stored decision can be re-scored and checked. Factors are emitted in a
     fixed order and only when they contribute, so two runs over the same inputs
     produce identical lists — an audit compares them directly.
+
+    ``exclude_generated`` is `size_excludes_generated`, threaded through rather
+    than assumed: the eligibility check consults it, and a scorer that
+    discounted generated output when the policy said not to would put the two
+    halves of the same decision on different arithmetic.
     """
     warnings = inputs.open_warnings
     suggestions = inputs.open_suggestions
@@ -108,7 +118,7 @@ def score(inputs: GateInputs, weights: RiskWeights) -> tuple[int, list[RiskFacto
     # ── Size, discounting machine output ─────────────────────────────────
     counted_files = inputs.changed_files
     generated = len(inputs.generated_paths)
-    if generated and inputs.changed_files:
+    if exclude_generated and generated and inputs.changed_files:
         counted_files = max(0, inputs.changed_files - generated)
     over_files = max(0, counted_files - weights.size_free_files)
     add(
@@ -117,7 +127,9 @@ def score(inputs: GateInputs, weights: RiskWeights) -> tuple[int, list[RiskFacto
         _capped(over_files, weights.size_per_file, weights.size_file_cap),
         f"{counted_files} reviewable file(s) changed",
     )
-    total_lines = max(0, inputs.added_lines + inputs.deleted_lines - inputs.generated_lines)
+    total_lines = inputs.added_lines + inputs.deleted_lines
+    if exclude_generated:
+        total_lines = max(0, total_lines - inputs.generated_lines)
     over_lines = max(0, total_lines - weights.size_free_lines)
     add(
         "size_lines",
