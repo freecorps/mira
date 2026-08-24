@@ -15,6 +15,7 @@ import { LearnedRulesPage } from "@/pages/learned-rules"
 import { RuleAnalyticsPage } from "@/pages/rule-analytics"
 import { LearningFormPage } from "@/pages/learning-form"
 import { LoginPage } from "@/pages/login"
+import { MergeGatePage } from "@/pages/merge-gate"
 import { PackagesPage } from "@/pages/packages"
 import { RepoDetailPage } from "@/pages/repo-detail"
 import { RelationshipsPage } from "@/pages/relationships"
@@ -217,6 +218,7 @@ export function App() {
           <Route path="learnings/analytics" element={<RuleAnalyticsPage />} />
           <Route path="learnings/new" element={<LearningFormPage />} />
           <Route path="learnings/edit" element={<LearningFormPage />} />
+          <Route path="merge-gate" element={<MergeGatePage />} />
           <Route path="vulnerabilities" element={<VulnerabilitiesPage />} />
           <Route path="users" element={<UsersPage />} />
           <Route path="users/new" element={<UserFormPage />} />

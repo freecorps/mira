@@ -632,3 +632,163 @@ export interface LearningAuditEvent {
   owner: string
   repo: string
 }
+
+// ── Phase 4: the risk-oriented merge gate ────────────────────────────────
+//
+// `would_approve` is never rendered as an approval. It means the gate reached
+// the same conclusion it would have acted on, and deliberately did not act:
+// shadow mode, or a platform that cannot record one.
+export type GateState =
+  | "approved"
+  | "would_approve"
+  | "not_approved"
+  | "skipped"
+  | "error"
+
+export type GateMode = "off" | "shadow" | "enforce"
+
+export interface GateReason {
+  code: string
+  message: string
+  // "skip" — out of scope; "block" — disqualifying; "info" — context only.
+  kind: "skip" | "block" | "info"
+}
+
+export interface GateRiskFactor {
+  code: string
+  label: string
+  points: number
+  detail: string
+}
+
+export interface GateCIState {
+  state: string
+  total: number
+  failing: string[]
+  pending: string[]
+}
+
+export interface GateInputs {
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  pr_url: string
+  pr_author: string
+  base_branch: string
+  head_branch: string
+  head_sha: string
+  draft: boolean
+  labels: string[]
+  author_association: string
+  changed_paths: string[]
+  changed_files: number
+  added_lines: number
+  deleted_lines: number
+  generated_paths: string[]
+  protected_matches: string[]
+  codeowner_matches: string[]
+  codeowners_status: string
+  ci: GateCIState
+  open_blockers: number
+  open_findings: number
+  worst_severity: string
+  review_complete: boolean
+  review_skipped_paths: string[]
+  review_failed: string
+  index_ready: boolean
+  human_states: Record<string, string>
+  review_id: number
+}
+
+export interface GateDecisionModel {
+  id: number
+  decision_key: string
+  state: GateState
+  mode: GateMode
+  risk_score: number
+  risk_band: string
+  policy_version: string
+  reasons: GateReason[]
+  factors: GateRiskFactor[]
+  inputs: GateInputs
+  capabilities: Record<string, unknown>
+  request_changes: boolean
+  delivery_state: string
+  delivery_ref: string
+  delivery_attempts: number
+  error: string
+  created_at: number
+  updated_at: number
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  pr_url: string
+  pr_author: string
+  head_sha: string
+  would_have_approved?: boolean
+}
+
+export interface GateDecisionPage {
+  decisions: GateDecisionModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface GateSummaryBucket {
+  state: GateState
+  mode: GateMode
+  count: number
+  approved: number
+  average_risk: number
+}
+
+export interface GateSummary {
+  buckets: GateSummaryBucket[]
+  totals: Record<string, number>
+}
+
+export interface GateOverride {
+  id: number
+  override_key: string
+  decision_id: number
+  decision_key: string
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  head_sha: string
+  actor: string
+  reason: string
+  previous_state: string
+  new_state: string
+  previous_risk: number
+  detail: Record<string, unknown>
+  created_at: number
+}
+
+export interface GateDecisionDetail {
+  decision: GateDecisionModel
+  public_explanation: string
+  admin_explanation: string
+  overrides: GateOverride[]
+  policy: Record<string, unknown>
+}
+
+export interface GateOverrideResult {
+  ok: boolean
+  created: boolean
+  decision: GateDecisionModel
+  override: GateOverride
+}
+
+export interface GateConfigResponse {
+  // The full gate config as the server resolved it (defaults + mira.yaml + DB).
+  config: Record<string, unknown>
+  // Just the admin-editable override blob, which is what the panel writes back.
+  overrides: Record<string, unknown>
+  // What a pull request will actually meet, per repository.
+  effective: Record<string, unknown>
+}
