@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
+from mira.gate.persistence import GateStoreMixin
 from mira.index._store_shared import _StoreSharedMixin
 from mira.models import PRFingerprint
 
@@ -332,6 +333,107 @@ CREATE INDEX IF NOT EXISTS idx_learning_audit_rule
 CREATE INDEX IF NOT EXISTS idx_learning_audit_created
     ON learning_audit_events(created_at);
 
+-- Phase 4 merge gate. One row per distinct evaluation: `decision_key` hashes
+-- the PR, head commit, resolved policy *and* the inputs, so a redelivered
+-- webhook over unchanged facts converges here instead of stacking rows, while
+-- a re-evaluation after CI turned green is recorded as the new decision it is.
+CREATE TABLE IF NOT EXISTS gate_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    review_id INTEGER NOT NULL DEFAULT 0,
+    -- 'off' | 'shadow' | 'enforce'
+    mode TEXT NOT NULL DEFAULT 'off',
+    -- 'approved' | 'would_approve' | 'not_approved' | 'skipped' | 'error'
+    state TEXT NOT NULL DEFAULT 'skipped',
+    risk_score INTEGER NOT NULL DEFAULT 0,
+    risk_band TEXT NOT NULL DEFAULT 'low',
+    policy_version TEXT NOT NULL DEFAULT '',
+    request_changes INTEGER NOT NULL DEFAULT 0,
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    factors_json TEXT NOT NULL DEFAULT '[]',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    delivery_state TEXT NOT NULL DEFAULT 'not_attempted',
+    delivery_ref TEXT NOT NULL DEFAULT '',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    -- Set when an admin moved this decision by hand; the trail is in
+    -- gate_overrides, this column just keeps the list view honest.
+    overridden_by TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_decisions_pr
+    ON gate_decisions(pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_gate_decisions_state
+    ON gate_decisions(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_gate_decisions_created
+    ON gate_decisions(created_at);
+CREATE INDEX IF NOT EXISTS idx_gate_decisions_head
+    ON gate_decisions(pr_number, head_sha);
+
+-- The claim that keeps a retried webhook from approving twice. Scoped to the
+-- pull request and head commit rather than to a decision: two evaluations of
+-- the same commit must still produce at most one approval.
+CREATE TABLE IF NOT EXISTS gate_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_key TEXT NOT NULL UNIQUE,
+    decision_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    -- 'approval' | 'request_changes'
+    kind TEXT NOT NULL DEFAULT '',
+    -- 'pending' | 'in_flight' | 'delivered' | 'failed'
+    state TEXT NOT NULL DEFAULT 'pending',
+    ref TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_deliveries_pr
+    ON gate_deliveries(pr_number, head_sha);
+
+-- Administrative overrides. Append-only: the previous state is part of the
+-- record, so a decision's history reads as a sequence of who changed what and
+-- why, not as a final value with no provenance.
+CREATE TABLE IF NOT EXISTS gate_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    override_key TEXT NOT NULL UNIQUE,
+    decision_id INTEGER NOT NULL DEFAULT 0,
+    decision_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    previous_state TEXT NOT NULL DEFAULT '',
+    new_state TEXT NOT NULL DEFAULT '',
+    previous_risk INTEGER NOT NULL DEFAULT 0,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_overrides_decision
+    ON gate_overrides(decision_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_gate_overrides_created
+    ON gate_overrides(created_at);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -541,7 +643,7 @@ class BlastRadiusEntry:
     depth: int
 
 
-class IndexStore(_StoreSharedMixin):
+class IndexStore(_StoreSharedMixin, GateStoreMixin):
     """SQLite-backed index for a single repository."""
 
     def __init__(
@@ -2512,6 +2614,18 @@ class IndexStore(_StoreSharedMixin):
 
     def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
         return self._conn.execute(sql, params).fetchall()
+
+    # ---------------------------------------------------------------- Phase 4
+    # The two primitives `GateStoreMixin` needs. Everything else about gate
+    # persistence is written once, in that mixin, for both backends.
+
+    def _gate_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def _gate_exec(self, sql: str, params: tuple = ()) -> int:
+        cursor = self._conn.execute(sql, params)
+        self._conn.commit()
+        return int(cursor.rowcount or 0)
 
     def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
         """Persist rule exposures idempotently; return how many were new.

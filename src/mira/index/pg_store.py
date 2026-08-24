@@ -16,6 +16,7 @@ from typing import Any
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
+from mira.gate.persistence import GateStoreMixin
 from mira.index._store_shared import _StoreSharedMixin
 from mira.index.store import (
     BlastRadiusEntry,
@@ -303,6 +304,91 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
+
+-- Phase 4 merge gate. Same columns as the SQLite schema, so the queries in
+-- `mira.gate.persistence` run verbatim on both backends.
+CREATE TABLE IF NOT EXISTS gate_decisions (
+    id BIGSERIAL PRIMARY KEY,
+    decision_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    review_id INTEGER NOT NULL DEFAULT 0,
+    mode TEXT NOT NULL DEFAULT 'off',
+    state TEXT NOT NULL DEFAULT 'skipped',
+    risk_score INTEGER NOT NULL DEFAULT 0,
+    risk_band TEXT NOT NULL DEFAULT 'low',
+    policy_version TEXT NOT NULL DEFAULT '',
+    request_changes INTEGER NOT NULL DEFAULT 0,
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    factors_json TEXT NOT NULL DEFAULT '[]',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    delivery_state TEXT NOT NULL DEFAULT 'not_attempted',
+    delivery_ref TEXT NOT NULL DEFAULT '',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    overridden_by TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_gate_decisions_pr
+    ON gate_decisions(owner, repo, pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_gate_decisions_state
+    ON gate_decisions(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_gate_decisions_created
+    ON gate_decisions(created_at);
+
+CREATE TABLE IF NOT EXISTS gate_deliveries (
+    id BIGSERIAL PRIMARY KEY,
+    delivery_key TEXT NOT NULL UNIQUE,
+    decision_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'pending',
+    ref TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_gate_deliveries_pr
+    ON gate_deliveries(owner, repo, pr_number, head_sha);
+
+CREATE TABLE IF NOT EXISTS gate_overrides (
+    id BIGSERIAL PRIMARY KEY,
+    override_key TEXT NOT NULL UNIQUE,
+    decision_id BIGINT NOT NULL DEFAULT 0,
+    decision_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    previous_state TEXT NOT NULL DEFAULT '',
+    new_state TEXT NOT NULL DEFAULT '',
+    previous_risk INTEGER NOT NULL DEFAULT 0,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_gate_overrides_decision
+    ON gate_overrides(decision_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_gate_overrides_created
+    ON gate_overrides(created_at);
 
 CREATE TABLE IF NOT EXISTS package_manifests (
     id SERIAL PRIMARY KEY,
@@ -703,7 +789,7 @@ def search_packages_org_wide(
     ]
 
 
-class PgIndexStore(_StoreSharedMixin):
+class PgIndexStore(_StoreSharedMixin, GateStoreMixin):
     """PostgreSQL-backed index store with owner/repo scoping.
 
     Implements the same public interface as IndexStore. Shares a single
@@ -2762,6 +2848,46 @@ class PgIndexStore(_StoreSharedMixin):
         if self._repo:
             scoped["repo"] = self._repo
         return scoped
+
+    # ---------------------------------------------------------------- Phase 4
+    # Gate persistence primitives. The queries themselves live in
+    # `GateStoreMixin` and are shared verbatim with the SQLite store.
+
+    _gate_placeholder = "%s"
+    _gate_insert_ignore = "INSERT INTO"
+
+    def _gate_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return list(self._fetchall(sql, params))
+
+    def _gate_exec(self, sql: str, params: tuple = ()) -> int:
+        # `INSERT INTO` alone would raise on a duplicate key. Postgres spells
+        # the SQLite `INSERT OR IGNORE` as a conflict clause, which has to sit
+        # after the VALUES list rather than in the verb, so it is appended here
+        # instead of being baked into every shared statement.
+        if sql.lstrip().upper().startswith("INSERT INTO") and "ON CONFLICT" not in sql.upper():
+            sql = f"{sql} ON CONFLICT DO NOTHING"
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            rowcount = int(cur.rowcount or 0)
+        self._commit()
+        return rowcount
+
+    def _gate_scope(self) -> tuple[str, tuple[Any, ...]]:
+        """Pin gate reads to this store's repository.
+
+        One table holds every repository here, so an unscoped read would return
+        another repo's decisions to a caller that asked about this one. The
+        org-wide handle (empty owner/repo) is the deliberate exception.
+        """
+        clauses = []
+        params: list[Any] = []
+        if self._owner:
+            clauses.append(" AND owner = %s")
+            params.append(self._owner)
+        if self._repo:
+            clauses.append(" AND repo = %s")
+            params.append(self._repo)
+        return "".join(clauses), tuple(params)
 
     def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
         """Persist rule exposures idempotently; return how many were new.

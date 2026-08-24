@@ -399,7 +399,7 @@ class GlobalSettingsUpdate(BaseModel):
 # Only `filter` and `review` are admin-editable from the UI; LLM creds and
 # DB settings stay env-only and would be silently overwritten if exposed
 # here.
-_ALLOWED_OVERRIDE_SECTIONS = {"filter", "review"}
+_ALLOWED_OVERRIDE_SECTIONS = {"filter", "review", "gate"}
 
 
 def _humanize_pydantic_message(err: dict) -> str:
@@ -1329,6 +1329,7 @@ class TimeSeriesPoint(BaseModel):
 import mira.dashboard.routers.admin  # noqa: E402,F401
 import mira.dashboard.routers.analytics  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
+import mira.dashboard.routers.gate  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.repos  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401

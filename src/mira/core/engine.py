@@ -39,6 +39,7 @@ from mira.feedback.exposure import (
 from mira.feedback.models import ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, new_finding_id
 from mira.feedback.retrieval import render_rule
+from mira.gate.policy import resolve_policy
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -464,13 +465,24 @@ class ReviewEngine:
         # evaluations once the review has been posted and has an id.
         self._exposed_rules: list[ExposedRule] = []
         self._review_scope = ReviewScope()
+        # Row id of the review this pass recorded, so the Phase 4 gate decision
+        # can point back at the review it was decided from.
+        self._review_event_id = 0
 
     async def _submit_verdict(self, pr_info: PRInfo, result: ReviewResult) -> None:
         """Submit an approve / request-changes review event, when opted in."""
         if self.provider is None or self.config.review.verdict.mode == "off":
             return
 
-        human_states = await self.provider.get_review_states(pr_info)
+        try:
+            human_states = await self.provider.get_review_states(pr_info)
+        except Exception as exc:
+            # Providers raise rather than reporting "{}" here, because an empty
+            # mapping reads as "nobody objected". Not knowing is a reason to
+            # stay quiet, which is the same thing this method does with every
+            # other doubt.
+            logger.warning("Skipping the verdict on %s — review states: %s", pr_info.url, exc)
+            return
         verdict = decide_verdict(
             result,
             self.config,
@@ -1089,6 +1101,7 @@ class ReviewEngine:
                 [comment.finding_id for comment in result.comments if comment.finding_id],
                 review_event.id,
             )
+            self._review_event_id = review_event.id
             # Phase 3: record which rules were in front of this review and what
             # they decided. Runs last and never raises, so analytics cannot
             # affect a review that has already been published.
@@ -1157,7 +1170,61 @@ class ReviewEngine:
             except Exception as exc:
                 logger.debug("Failed to record last reviewed SHA: %s", exc)
 
+        # Phase 4: the merge gate. Runs last, after the review has been posted
+        # and recorded, and never raises — a gate failure must not discard a
+        # review that already landed, and an unfinished gate never approves.
+        await self._run_merge_gate(pr_info, result, diff_text)
+
         return result
+
+    async def _run_merge_gate(self, pr_info: PRInfo, result: ReviewResult, diff_text: str) -> None:
+        """Evaluate the risk gate for this pull request.
+
+        The diff, the finding counts and the coverage are already in hand, so
+        they are handed to the gate rather than re-fetched: on the Orange Pi
+        profile the gate has to be effectively free next to the review that
+        just ran.
+        """
+        from mira.gate import service as gate_service
+
+        if self.provider is None:
+            return
+        if not resolve_policy(self.config.gate, pr_info.owner, pr_info.repo).active:
+            return
+        try:
+            lines = diff_text.splitlines()
+            added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
+            deleted = sum(
+                1 for line in lines if line.startswith("-") and not line.startswith("---")
+            )
+            signal = gate_service.ReviewSignal(
+                changed_paths=list(result.total_paths) or None,
+                added_lines=added,
+                deleted_lines=deleted,
+                warnings=sum(1 for c in result.comments if c.severity == Severity.WARNING),
+                suggestions=sum(
+                    1
+                    for c in result.comments
+                    if c.severity in (Severity.SUGGESTION, Severity.NITPICK)
+                ),
+                security_findings=sum(1 for c in result.comments if c.category == "security"),
+                review_complete=not result.skipped_paths,
+                skipped_paths=list(result.skipped_paths),
+                review_failed=result.skipped_reason or "",
+                review_id=self._review_event_id,
+            )
+            await gate_service.evaluate(
+                self.provider,
+                pr_info,
+                config=self.config,
+                bot_name=self.bot_name,
+                signal=signal,
+                # A dry-run review must not touch the platform at all, so the
+                # gate still evaluates and records but delivers nothing.
+                deliver_side_effects=not self.dry_run,
+            )
+        except Exception as exc:
+            logger.warning("Merge gate failed for %s: %s", pr_info.url, exc)
 
     async def review_diff(self, diff_text: str) -> ReviewResult:
         """Review a diff from stdin — no provider needed."""

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import abc
 
+from mira.gate.capabilities import NO_CAPABILITIES, GateCapabilities
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -153,4 +155,87 @@ class BaseProvider(abc.ABC):
 
     async def get_discussion_root_body(self, pr_info: PRInfo, discussion_id: str) -> str:
         """The first comment of a thread/discussion (best-effort, "" on failure)."""
+        return ""
+
+    # ── Merge gate (Phase 4) ──
+    #
+    # Every default below reports *ignorance*, never good news. A provider that
+    # does not implement `get_ci_state` returns "unknown", which the gate reads
+    # as "not green"; one that cannot report an author association returns
+    # "unknown", which is never sufficient for an approval. Adding a provider
+    # therefore degrades the gate rather than weakening it.
+
+    def gate_capabilities(self) -> GateCapabilities:
+        """What this provider can do for the merge gate.
+
+        Declared, not probed: a probe costs a round trip per pull request on a
+        device that has none to spare, and a probe that fails transiently would
+        silently downgrade a working install.
+        """
+        return NO_CAPABILITIES
+
+    async def get_ci_state(self, pr_info: PRInfo) -> CIState:
+        """Combined CI outcome for the PR head commit.
+
+        "unknown" is the honest default and the safe one — the gate treats
+        anything that is not `success` as a reason not to approve.
+        """
+        return CIState()
+
+    async def get_pr_labels(self, pr_info: PRInfo) -> list[str]:
+        """Labels currently on the PR. Empty when the provider cannot say."""
+        return []
+
+    async def get_author_association(self, pr_info: PRInfo) -> str:
+        """The author's relationship to the repository.
+
+        Uppercase, GitHub's vocabulary (`OWNER`, `MEMBER`, `COLLABORATOR`,
+        `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `NONE`), which the other
+        providers map onto. `"UNKNOWN"` when it could not be determined.
+        """
+        return "UNKNOWN"
+
+    async def get_pr_change_stats(self, pr_info: PRInfo) -> tuple[list[str], int, int]:
+        """``(changed_paths, added_lines, deleted_lines)`` for the PR.
+
+        Derived from the diff the provider already knows how to fetch, so a new
+        provider gets it for free. Callers that already hold a parsed diff pass
+        their own numbers instead of paying for this.
+        """
+        from mira.core.diff_parser import parse_diff
+
+        # Deliberately not caught: zero changed files would read as a trivially
+        # small pull request and clear every size limit there is.
+        diff_text = await self.get_pr_diff(pr_info)
+        patch_set = parse_diff(diff_text or "")
+        paths = [file.path for file in patch_set.files]
+        added = sum(file.added_lines for file in patch_set.files)
+        deleted = sum(file.deleted_lines for file in patch_set.files)
+        return paths, added, deleted
+
+    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
+        """``(path, contents)`` of the repository CODEOWNERS at the head ref.
+
+        ``("", "")`` when the repository has none. A provider that *cannot look*
+        must raise rather than return this — the gate distinguishes "no owners
+        are declared" from "we could not find out", and only the first is safe.
+        """
+        return "", ""
+
+    async def publish_gate_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        """Publish the gate decision as a check run / commit status.
+
+        Idempotent by ``context``: re-publishing replaces the previous entry
+        rather than adding one, so a retried webhook cannot litter the PR.
+        Returns a provider reference for the audit trail, or "" if unsupported.
+        """
         return ""

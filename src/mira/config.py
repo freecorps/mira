@@ -358,6 +358,247 @@ class LearningConfig(BaseModel):
     evaluation_window_days: int = Field(default=30, ge=1, le=365)
 
 
+class RiskWeights(BaseModel):
+    """Points each observable fact adds to a PR's risk score.
+
+    Integers only, so the same inputs produce a byte-identical score on every
+    replica. Weights at or above 100 are effectively vetoes on their own, which
+    is deliberate for the facts that must never be outweighed by a clean diff.
+    """
+
+    # Findings the review left open.
+    warning_finding: int = Field(default=8, ge=0, le=100)
+    warning_cap: int = Field(default=32, ge=0, le=100)
+    suggestion_finding: int = Field(default=1, ge=0, le=100)
+    suggestion_cap: int = Field(default=6, ge=0, le=100)
+    security_finding: int = Field(default=15, ge=0, le=100)
+
+    # Size. Small diffs cost nothing; the free allowances keep an ordinary
+    # change at zero so the score stays readable.
+    size_free_files: int = Field(default=5, ge=0)
+    size_per_file: int = Field(default=1, ge=0, le=100)
+    size_file_cap: int = Field(default=20, ge=0, le=100)
+    size_free_lines: int = Field(default=100, ge=0)
+    size_per_100_lines: int = Field(default=2, ge=0, le=100)
+    size_line_cap: int = Field(default=20, ge=0, le=100)
+
+    # What Mira could not see.
+    unreviewed_paths: int = Field(default=15, ge=0, le=100)
+    index_not_ready: int = Field(default=10, ge=0, le=100)
+    generated_heavy: int = Field(default=5, ge=0, le=100)
+    dependency_manifest: int = Field(default=8, ge=0, le=100)
+
+    # Who is asking, and whether the platform agrees the change is sound.
+    unknown_association: int = Field(default=25, ge=0, le=100)
+    first_time_contributor: int = Field(default=15, ge=0, le=100)
+    ci_not_success: int = Field(default=30, ge=0, le=100)
+
+    # Facts that must never be outscored by an otherwise clean PR.
+    protected_path: int = Field(default=100, ge=0, le=100)
+    codeowner_path: int = Field(default=40, ge=0, le=100)
+    open_blocker: int = Field(default=100, ge=0, le=100)
+    human_changes_requested: int = Field(default=100, ge=0, le=100)
+
+
+class GateRepoPolicy(BaseModel):
+    """Per-repository overrides, keyed ``owner/repo`` under ``gate.repositories``.
+
+    Set only what differs. ``None`` means "inherit"; a list set to ``[]`` means
+    "explicitly empty", which is how a repository opts out of an inherited
+    requirement rather than accidentally inheriting it forever.
+    """
+
+    enabled: bool | None = None
+    mode: str | None = None
+    protected_paths: list[str] | None = None
+    extra_protected_paths: list[str] = Field(default_factory=list)
+    allowed_base_branches: list[str] | None = None
+    blocked_base_branches: list[str] | None = None
+    required_labels: list[str] | None = None
+    blocked_labels: list[str] | None = None
+    allowed_author_associations: list[str] | None = None
+    max_changed_files: int | None = Field(default=None, ge=1)
+    max_changed_lines: int | None = Field(default=None, ge=1)
+    risk_threshold: int | None = Field(default=None, ge=0, le=100)
+    codeowners: str | None = None
+    request_changes_on_blockers: bool | None = None
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"off", "shadow", "enforce"}:
+            raise ValueError("gate.repositories[].mode must be off, shadow or enforce")
+        return v
+
+    @field_validator("codeowners")
+    @classmethod
+    def _valid_codeowners(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"off", "risk", "block"}:
+            raise ValueError("gate.repositories[].codeowners must be off, risk or block")
+        return v
+
+    @field_validator("protected_paths", "extra_protected_paths")
+    @classmethod
+    def _valid_patterns(cls, v: list[str] | None) -> list[str] | None:
+        if v:
+            _validate_path_patterns(v, "gate.repositories[].protected_paths")
+        return v
+
+
+class GateConfig(BaseModel):
+    """The risk-oriented merge gate (Phase 4).
+
+    Off by default, and never anything else by default. An approval from Mira
+    can satisfy a branch-protection rule, so turning it on is a decision a
+    deployment makes deliberately — and the recommended first step is
+    ``shadow``, which records exactly what it *would* have done without doing
+    any of it.
+
+      "off"      — the gate does not run.
+      "shadow"   — evaluate, explain and record; never approve. Dry run.
+      "enforce"  — the same decision, plus a real approval when it says so.
+
+    Everything in here is deployment configuration. Nothing in a pull request —
+    its title, body, diff, labels or CI logs — can change any of it. Labels and
+    branches are *inputs the operator chose to consult*, and consulting them can
+    only ever make the gate more conservative or take a PR out of scope; no
+    label grants an approval on its own.
+    """
+
+    mode: str = "off"
+    # Hard global disable, independent of `mode` and of every per-repo
+    # override. Exists so an operator can stop the gate everywhere in one edit
+    # during an incident without reconstructing the policy afterwards.
+    kill_switch: bool = False
+    # Recorded with every decision. Bump it when changing policy semantics so
+    # old decisions stay attributable to the policy that produced them.
+    policy_version: str = "gate-v1"
+
+    # ── Eligibility ──────────────────────────────────────────────────────
+    # Empty allowlists mean "any"; blocklists always win over allowlists.
+    allowed_base_branches: list[str] = Field(default_factory=list)
+    blocked_base_branches: list[str] = Field(default_factory=list)
+    required_labels: list[str] = Field(default_factory=list)
+    blocked_labels: list[str] = Field(
+        default_factory=lambda: ["do-not-merge", "wip", "hold", "mira-paused"]
+    )
+    allowed_authors: list[str] = Field(default_factory=list)
+    blocked_authors: list[str] = Field(default_factory=list)
+    # Platform association of the PR author. An association the platform cannot
+    # report is never treated as sufficient.
+    allowed_author_associations: list[str] = Field(
+        default_factory=lambda: ["OWNER", "MEMBER", "COLLABORATOR"]
+    )
+    skip_draft_prs: bool = True
+    max_changed_files: int = Field(default=20, ge=1)
+    max_changed_lines: int = Field(default=500, ge=1)
+    # Generated output is excluded from the size budget (a lockfile bump is not
+    # a change a human has to read) and a diff made only of it is out of scope.
+    generated_paths: list[str] = Field(default_factory=list)
+    size_excludes_generated: bool = True
+
+    # ── Protected paths and CODEOWNERS ───────────────────────────────────
+    # Replaces the built-in list when set; `extra_protected_paths` adds to
+    # whichever list is in effect.
+    protected_paths: list[str] | None = None
+    extra_protected_paths: list[str] = Field(default_factory=list)
+    # "off"   — do not read CODEOWNERS at all (default: it is an integration).
+    # "risk"  — an owned path adds risk but is not on its own disqualifying.
+    # "block" — an owned path is never auto-approved. The conservative reading,
+    #           and what "on" should mean for most deployments.
+    codeowners: str = "off"
+
+    # ── Completeness requirements ────────────────────────────────────────
+    require_ci_success: bool = True
+    require_all_files_reviewed: bool = True
+    require_index_ready: bool = True
+    approve_max_severity: str = "suggestion"
+
+    # ── Risk ─────────────────────────────────────────────────────────────
+    risk_threshold: int = Field(default=25, ge=0, le=100)
+    risk_medium_at: int = Field(default=20, ge=0, le=100)
+    risk_high_at: int = Field(default=50, ge=0, le=100)
+    weights: RiskWeights = Field(default_factory=RiskWeights)
+
+    # ── Actions ──────────────────────────────────────────────────────────
+    # Submit REQUEST_CHANGES when a blocker is open. Off by default: it holds
+    # the merge box until superseded, which is a deployment's decision, not a
+    # default to inherit. Never submitted over an existing human review.
+    request_changes_on_blockers: bool = False
+    # Publish the decision as a check run / commit status when the provider
+    # supports one. Neutral in shadow mode — an explanation, not a verdict.
+    publish_status: bool = True
+    # Also post the public explanation as a PR comment, updated in place.
+    comment: bool = False
+
+    # ── Overrides ────────────────────────────────────────────────────────
+    allow_overrides: bool = True
+    # Forcing an approval by hand is a separate, opt-in capability from
+    # revoking one. Revocation is always available to an authorized admin.
+    allow_approval_override: bool = False
+    # Admin usernames permitted to override a decision. Empty = every admin.
+    # Separates "can administer Mira" from "can move a merge decision".
+    override_admins: list[str] = Field(default_factory=list)
+
+    # ── Budget ───────────────────────────────────────────────────────────
+    # Wall-clock ceiling for gathering inputs from the platform. Exceeding it
+    # is an `error` decision, which never approves.
+    timeout_seconds: float = Field(default=20.0, gt=0, le=300)
+
+    # ── Per-repository policy ────────────────────────────────────────────
+    repositories: dict[str, GateRepoPolicy] = Field(default_factory=dict)
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        allowed = {"off", "shadow", "enforce"}
+        if v not in allowed:
+            raise ValueError(f"gate.mode must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("codeowners")
+    @classmethod
+    def _valid_codeowners(cls, v: str) -> str:
+        allowed = {"off", "risk", "block"}
+        if v not in allowed:
+            raise ValueError(f"gate.codeowners must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("approve_max_severity")
+    @classmethod
+    def _valid_severity(cls, v: str) -> str:
+        allowed = {"blocker", "warning", "suggestion", "nitpick"}
+        if v not in allowed:
+            raise ValueError(
+                f"gate.approve_max_severity must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("protected_paths", "extra_protected_paths", "generated_paths")
+    @classmethod
+    def _valid_patterns(cls, v: list[str] | None) -> list[str] | None:
+        if v:
+            _validate_path_patterns(v, "gate path pattern")
+        return v
+
+
+def _validate_path_patterns(patterns: list[str], label: str) -> None:
+    """Compile gate path patterns at config load, never at decision time.
+
+    A pattern the matcher cannot read has no safe runtime interpretation:
+    ignoring it silently un-protects a path, and vetoing everything takes the
+    install down on a typo. Failing the config load is the only reading that
+    stays honest, so it happens here.
+    """
+    from mira.gate.paths import PatternError, compile_pattern
+
+    for pattern in patterns:
+        try:
+            compile_pattern(pattern)
+        except PatternError as exc:
+            raise ValueError(f"{label}: {exc}") from exc
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -366,6 +607,7 @@ class MiraConfig(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     learning: LearningConfig = Field(default_factory=LearningConfig)
+    gate: GateConfig = Field(default_factory=GateConfig)
 
 
 def find_config_file(start_dir: Path | None = None) -> Path | None:

@@ -15,6 +15,9 @@ from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.exceptions import ProviderError
+from mira.gate.capabilities import GITHUB_CAPABILITIES, GateCapabilities
+from mira.gate.codeowners import CODEOWNERS_LOCATIONS
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -220,6 +223,7 @@ class GitHubProvider(BaseProvider):
                 head_sha=pr.head.sha or "",
                 author=(user.login or "") if user else "",
                 author_avatar_url=(user.avatar_url or "") if user else "",
+                draft=bool(getattr(pr, "draft", False)),
             )
 
         try:
@@ -602,8 +606,12 @@ class GitHubProvider(BaseProvider):
         try:
             return await asyncio.to_thread(_states)
         except Exception as e:
+            # Raised rather than returned as "{}": an empty mapping reads as
+            # "nobody objected", and the merge gate would approve over a human
+            # who did. Callers that only want a best-effort answer (the review
+            # verdict) already treat a failure here as a reason to stay quiet.
             logger.debug("Could not read review states for %s: %s", pr_info.url, e)
-            return {}
+            raise ProviderError(f"Failed to read review states: {e}") from e
 
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         @_retry_transient
@@ -1194,6 +1202,181 @@ class GitHubProvider(BaseProvider):
             return await asyncio.to_thread(_fetch)
         except Exception as e:
             raise ProviderError(f"Failed to fetch human review comments: {e}") from e
+
+    # ── Merge gate (Phase 4) ──
+
+    def gate_capabilities(self) -> GateCapabilities:
+        return GITHUB_CAPABILITIES
+
+    async def get_ci_state(self, pr_info: PRInfo) -> CIState:
+        """Combined check runs *and* legacy commit statuses on the head commit.
+
+        Both surfaces matter: Actions reports check runs while most third-party
+        CI still posts commit statuses, and a repository using only the latter
+        would otherwise look like it has no CI at all.
+
+        A run that has not concluded counts as pending, and anything that is
+        neither success nor neutral/skipped counts as failing. Unrecognized
+        conclusions are treated as failures on purpose: the gate must never
+        approve on a check outcome it does not understand.
+        """
+
+        @_retry_transient
+        def _fetch() -> CIState:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            sha = pr_info.head_sha or gh_repo.get_pull(pr_info.number).head.sha
+            commit = gh_repo.get_commit(sha)
+            failing: list[str] = []
+            pending: list[str] = []
+            total = 0
+            for run in commit.get_check_runs():
+                total += 1
+                name = run.name or "check"
+                if (run.status or "") != "completed":
+                    pending.append(name)
+                    continue
+                conclusion = (run.conclusion or "").lower()
+                if conclusion in {"success", "neutral", "skipped"}:
+                    continue
+                failing.append(name)
+            seen_contexts: set[str] = set()
+            for status in commit.get_statuses():
+                # Chronological, newest first, per context — only the first
+                # entry for a context describes its current state.
+                context = status.context or "status"
+                if context in seen_contexts:
+                    continue
+                seen_contexts.add(context)
+                total += 1
+                state = (status.state or "").lower()
+                if state == "pending":
+                    pending.append(context)
+                elif state != "success":
+                    failing.append(context)
+            if pending:
+                return CIState(state="pending", total=total, failing=failing, pending=pending)
+            if failing:
+                return CIState(state="failure", total=total, failing=failing, pending=pending)
+            if total == 0:
+                return CIState(state="none", total=0)
+            return CIState(state="success", total=total)
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.warning("Could not read CI state for %s: %s", pr_info.url, e)
+            return CIState(state="unknown")
+
+    async def get_pr_labels(self, pr_info: PRInfo) -> list[str]:
+        @_retry_transient
+        def _fetch() -> list[str]:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            issue = gh_repo.get_issue(pr_info.number)
+            return [label.name for label in issue.get_labels() if label.name]
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            # An empty list would read as "no blocking label present".
+            logger.warning("Could not read labels for %s: %s", pr_info.url, e)
+            raise ProviderError(f"Failed to read labels: {e}") from e
+
+    async def get_author_association(self, pr_info: PRInfo) -> str:
+        @_retry_transient
+        def _fetch() -> str:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            pr = gh_repo.get_pull(pr_info.number)
+            association = (getattr(pr, "raw_data", None) or {}).get("author_association", "")
+            return str(association or "").upper() or "UNKNOWN"
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.warning("Could not read author association for %s: %s", pr_info.url, e)
+            return "UNKNOWN"
+
+    async def get_pr_change_stats(self, pr_info: PRInfo) -> tuple[list[str], int, int]:
+        """Per-file counts from the files API — no diff body, no 406 size cliff."""
+
+        @_retry_transient
+        def _fetch() -> tuple[list[str], int, int]:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            pr = gh_repo.get_pull(pr_info.number)
+            paths: list[str] = []
+            added = 0
+            deleted = 0
+            for file in pr.get_files():
+                paths.append(file.filename)
+                added += int(getattr(file, "additions", 0) or 0)
+                deleted += int(getattr(file, "deletions", 0) or 0)
+            return paths, added, deleted
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.warning("Could not read change stats for %s: %s", pr_info.url, e)
+            raise ProviderError(f"Failed to read change stats: {e}") from e
+
+    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
+        """First CODEOWNERS found at the head ref, in GitHub's own order.
+
+        Raises when the lookup itself fails: "we could not check" and "there
+        are no owners" have to reach the gate as different answers, because
+        only the second one is safe to approve past.
+        """
+        ref = pr_info.head_sha or pr_info.head_branch
+        last_error: Exception | None = None
+        for candidate in CODEOWNERS_LOCATIONS["github"]:
+            try:
+                content = await self.get_file_content(pr_info, candidate, ref)
+            except Exception as exc:  # noqa: BLE001 - try the next known path
+                last_error = exc
+                continue
+            if content:
+                return candidate, content
+        if last_error is not None:
+            raise ProviderError(f"Failed to read CODEOWNERS: {last_error}") from last_error
+        return "", ""
+
+    async def publish_gate_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        """Publish the decision as a check run on the head commit.
+
+        Check runs are keyed by name and GitHub surfaces the latest run for a
+        name, so re-publishing after a retry replaces rather than appends.
+        Requires `checks:write`; without it this raises and the caller records
+        a failed delivery instead of pretending the status went out.
+        """
+        conclusion_map = {"success": "success", "failure": "failure", "neutral": "neutral"}
+
+        @_retry_transient
+        def _publish() -> str:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            sha = pr_info.head_sha or gh_repo.get_pull(pr_info.number).head.sha
+            extra = {"details_url": target_url} if target_url else {}
+            run = gh_repo.create_check_run(
+                name=context,
+                head_sha=sha,
+                status="completed",
+                conclusion=conclusion_map.get(conclusion, "neutral"),
+                output={"title": title[:255], "summary": summary[:65535]},
+                **extra,
+            )
+            return str(getattr(run, "id", "") or "")
+
+        try:
+            return await asyncio.to_thread(_publish)
+        except Exception as e:
+            logger.warning("Could not publish gate status on %s: %s", pr_info.url, e)
+            raise ProviderError(f"Failed to publish gate status: {e}") from e
 
     async def get_review_inline_comments(self, pr_info: PRInfo, review_id: int) -> list[str]:
         """Return the bodies of the inline comments that belong to one review
