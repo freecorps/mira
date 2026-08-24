@@ -9,6 +9,8 @@ gate as rule approval itself.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from fastapi import HTTPException, Request, Response
 from pydantic import BaseModel
@@ -16,6 +18,7 @@ from pydantic import BaseModel
 from mira.config import load_config
 from mira.dashboard.api import _require_admin, router
 from mira.feedback import analytics
+from mira.feedback.analytics import PlatformResolutionError
 from mira.feedback.evaluation import DECISIONS, DETAIL_OUTCOMES, ORIGINS
 
 # Page sizes are capped rather than trusted: the Orange Pi profile is the
@@ -97,6 +100,19 @@ def _filters(
     }
 
 
+@contextmanager
+def _resolved_platform() -> Iterator[None]:
+    """Surface an unreachable repo registry as 503, never as an empty result.
+
+    Analytics exists to make evidence auditable, so "we could not look" must
+    never be rendered as "there is nothing".
+    """
+    try:
+        yield
+    except PlatformResolutionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 def _actor(request: Request) -> str:
     user = getattr(request.state, "user", None)
     return str(getattr(user, "username", "") or "")
@@ -124,15 +140,16 @@ def list_rule_analytics(
     if sort not in _SORT_KEYS:
         raise HTTPException(status_code=400, detail=f"sort must be one of {sorted(_SORT_KEYS)}")
     limit, offset = _page(limit, offset)
-    rows, total = analytics.list_rule_analytics(
-        filters=_filters(
-            owner, repo, category, origin, decision, scope_type, pr_author, since, until
-        ),
-        limit=limit,
-        offset=offset,
-        sort=sort,
-        descending=order != "asc",
-    )
+    with _resolved_platform():
+        rows, total = analytics.list_rule_analytics(
+            filters=_filters(
+                owner, repo, category, origin, decision, scope_type, pr_author, since, until
+            ),
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            descending=order != "asc",
+        )
     return RuleAnalyticsPage(
         rules=[row.as_dict() for row in rows], total=total, limit=limit, offset=offset
     )
@@ -142,9 +159,10 @@ def list_rule_analytics(
 def rule_analytics_detail(request: Request, owner: str, repo: str, rule_id: int) -> dict:
     """One rule: where it ran, what came back, and whether it helped."""
     _require_admin(request)
-    rows, _total = analytics.list_rule_analytics(
-        filters={"owner": owner, "repo": repo, "rule_id": rule_id}, limit=1, offset=0
-    )
+    with _resolved_platform():
+        rows, _total = analytics.list_rule_analytics(
+            filters={"owner": owner, "repo": repo, "rule_id": rule_id}, limit=1, offset=0
+        )
     if not rows:
         raise HTTPException(
             status_code=404, detail=f"No recorded evaluations for rule {rule_id} in {owner}/{repo}"
@@ -205,14 +223,17 @@ def list_rule_evaluations(
             status_code=400, detail=f"outcome must be one of {sorted(DETAIL_OUTCOMES)}"
         )
     limit, offset = _page(limit, offset)
-    rows, total = analytics.list_rule_evaluations(
-        owner=owner,
-        repo=repo,
-        filters=_filters("", "", "", "", decision, "", pr_author, since, until, rule_id=rule_id),
-        limit=limit,
-        offset=offset,
-        outcome=outcome,
-    )
+    with _resolved_platform():
+        rows, total = analytics.list_rule_evaluations(
+            owner=owner,
+            repo=repo,
+            filters=_filters(
+                "", "", "", "", decision, "", pr_author, since, until, rule_id=rule_id
+            ),
+            limit=limit,
+            offset=offset,
+            outcome=outcome,
+        )
     return EvaluationPage(evaluations=rows, total=total, limit=limit, offset=offset)
 
 
@@ -235,11 +256,12 @@ def analytics_summary(
         raise HTTPException(
             status_code=400, detail=f"dimension must be one of {sorted(_SUMMARY_DIMENSIONS)}"
         )
-    buckets = analytics.summarize(
-        dimension=dimension,
-        filters=_filters(owner, repo, category, origin, "", "", pr_author, since, until),
-        limit=max(1, min(limit, _MAX_PAGE)),
-    )
+    with _resolved_platform():
+        buckets = analytics.summarize(
+            dimension=dimension,
+            filters=_filters(owner, repo, category, origin, "", "", pr_author, since, until),
+            limit=max(1, min(limit, _MAX_PAGE)),
+        )
     return SummaryResponse(dimension=dimension, buckets=buckets)
 
 
@@ -254,11 +276,12 @@ def list_regressions(
     """
     _require_admin(request)
     learning = load_config().learning
-    suggestions = analytics.regression_suggestions(
-        filters={"owner": owner, "repo": repo},
-        config=learning,
-        limit=max(1, min(limit, _MAX_PAGE)),
-    )
+    with _resolved_platform():
+        suggestions = analytics.regression_suggestions(
+            filters={"owner": owner, "repo": repo},
+            config=learning,
+            limit=max(1, min(limit, _MAX_PAGE)),
+        )
     return RegressionResponse(
         suggestions=[s.as_dict() for s in suggestions],
         min_exposures=learning.min_exposures_for_regression,
@@ -281,7 +304,15 @@ def acknowledge_regression(
     allowed = {"accepted", "dismissed", "deferred"}
     if body.action not in allowed:
         raise HTTPException(status_code=400, detail=f"action must be one of {sorted(allowed)}")
-    event_id = analytics.record_audit_event(
+    with _resolved_platform():
+        event_id = _record_ack(request, owner, repo, rule_id, body)
+    return {"ok": True, "event_id": event_id}
+
+
+def _record_ack(
+    request: Request, owner: str, repo: str, rule_id: int, body: RegressionAckInput
+) -> int:
+    return analytics.record_audit_event(
         owner=owner,
         repo=repo,
         event_type=f"regression_{body.action}",
@@ -290,7 +321,6 @@ def acknowledge_regression(
         summary=f"Regression suggestion {body.action} for rule {rule_id}",
         detail={"note": body.note, "acknowledged_at": time.time()},
     )
-    return {"ok": True, "event_id": event_id}
 
 
 @router.get("/api/analytics/audit", response_model=AuditEventsResponse)
@@ -304,9 +334,10 @@ def list_audit_events(
 ) -> AuditEventsResponse:
     _require_admin(request)
     limit, offset = _page(limit, offset)
-    events = analytics.list_audit_events(
-        owner=owner, repo=repo, rule_id=rule_id, limit=limit, offset=offset
-    )
+    with _resolved_platform():
+        events = analytics.list_audit_events(
+            owner=owner, repo=repo, rule_id=rule_id, limit=limit, offset=offset
+        )
     return AuditEventsResponse(events=events)
 
 
@@ -335,11 +366,12 @@ def export_rule_analytics(
     _require_admin(request)
     if fmt not in {"csv", "json"}:
         raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'json'")
-    body, media_type = analytics.export_rule_analytics(
-        filters=_filters(owner, repo, category, origin, "", "", pr_author, since, until),
-        fmt=fmt,
-        limit=max(1, min(limit, _MAX_EXPORT_RULES)),
-    )
+    with _resolved_platform():
+        body, media_type = analytics.export_rule_analytics(
+            filters=_filters(owner, repo, category, origin, "", "", pr_author, since, until),
+            fmt=fmt,
+            limit=max(1, min(limit, _MAX_EXPORT_RULES)),
+        )
     return _export_response(body, media_type, f"mira-rule-analytics.{fmt}")
 
 
@@ -361,12 +393,13 @@ def export_rule_evaluations(
         raise HTTPException(
             status_code=400, detail=f"outcome must be one of {sorted(DETAIL_OUTCOMES)}"
         )
-    body, media_type = analytics.export_rule_evaluations(
-        owner=owner,
-        repo=repo,
-        filters={"rule_id": rule_id},
-        fmt=fmt,
-        limit=max(1, min(limit, _MAX_EXPORT_EVALUATIONS)),
-        outcome=outcome,
-    )
+    with _resolved_platform():
+        body, media_type = analytics.export_rule_evaluations(
+            owner=owner,
+            repo=repo,
+            filters={"rule_id": rule_id},
+            fmt=fmt,
+            limit=max(1, min(limit, _MAX_EXPORT_EVALUATIONS)),
+            outcome=outcome,
+        )
     return _export_response(body, media_type, f"mira-rule-{rule_id}-evaluations.{fmt}")

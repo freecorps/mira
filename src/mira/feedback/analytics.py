@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from mira.config import LearningConfig, load_config
+from mira.exceptions import MiraError
 from mira.feedback.evaluation import (
     RegressionSuggestion,
     RuleAnalyticsRow,
@@ -26,6 +27,17 @@ from mira.feedback.evaluation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class PlatformResolutionError(MiraError):
+    """The repo registry could not say which platform hosts a repository.
+
+    Raised rather than defaulting, because defaulting to GitHub would query the
+    unnamespaced owner while a Forgejo/GitLab repo's rows live under
+    `_{platform}/{owner}` -- returning an empty result that looks like an
+    answer. An unreachable registry must read as unavailable, not as "no data".
+    """
+
 
 DAY_SECONDS = 86400.0
 
@@ -201,11 +213,21 @@ def _platform_for(owner: str, repo: str) -> str:
             from mira.dashboard.api import _PLATFORM_ORDER, _app_db
 
             records = _app_db.get_repo_any_platform(owner, repo) if _app_db else []
-            if records:
-                best = min(records, key=lambda r: _PLATFORM_ORDER.get(r.platform, 99))
-                return str(best.platform)
-        except Exception:
-            logger.debug("Platform lookup failed for %s/%s; assuming github", owner, repo)
+        except Exception as exc:
+            # A *failed* lookup is not the same as an empty one. Falling back
+            # here would query the wrong owner namespace and hand back a
+            # confident-looking empty history.
+            logger.exception("Platform lookup failed for %s/%s", owner, repo)
+            raise PlatformResolutionError(
+                f"Could not resolve the platform hosting {owner}/{repo}; "
+                "the repository registry is unavailable"
+            ) from exc
+        if records:
+            best = min(records, key=lambda r: _PLATFORM_ORDER.get(r.platform, 99))
+            return str(best.platform)
+        # No record at all: the repo is unregistered, or `owner` is already an
+        # `_{platform}/{owner}` value taken from an aggregate row. Both resolve
+        # correctly through the GitHub path, which passes the owner unchanged.
         return "github"
     for platform, _db_owner, db_repo in _repo_targets(owner, repo):
         if db_repo == repo:

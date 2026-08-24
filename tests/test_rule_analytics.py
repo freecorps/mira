@@ -1187,9 +1187,16 @@ def test_platform_resolution_uses_the_registry_on_postgres(
     assert analytics._platform_for("acme", "app") == "forgejo"
 
 
-def test_platform_resolution_falls_back_when_registry_is_unavailable(
+def test_registry_failure_is_reported_not_defaulted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An unreachable registry must not become an empty analytics result.
+
+    Defaulting to GitHub would query the unnamespaced owner while a
+    GitLab/Forgejo repo's rows live under `_{platform}/{owner}`, handing back a
+    confident-looking empty history. "We could not look" is not "there is
+    nothing" — the same distinction the outcome model makes about silence.
+    """
     monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
 
     class _Broken:
@@ -1197,7 +1204,48 @@ def test_platform_resolution_falls_back_when_registry_is_unavailable(
             raise RuntimeError("registry down")
 
     monkeypatch.setattr("mira.dashboard.api._app_db", _Broken())
-    assert analytics._platform_for("acme", "app") == "github"
+    with pytest.raises(analytics.PlatformResolutionError):
+        analytics._platform_for("acme", "app")
+
+
+def test_unregistered_repo_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty lookup is not a failure.
+
+    It means the repo is unregistered, or `owner` is already an
+    `_{platform}/{owner}` value taken from an aggregate row. Both resolve
+    correctly through the GitHub path, which passes the owner through unchanged.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
+
+    class _Empty:
+        def get_repo_any_platform(self, owner: str, repo: str):
+            return []
+
+    monkeypatch.setattr("mira.dashboard.api._app_db", _Empty())
+    assert analytics._platform_for("_gitlab/acme", "app") == "github"
+
+
+def test_registry_failure_surfaces_as_service_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The API says unavailable rather than returning an empty page."""
+    from fastapi import HTTPException
+
+    import mira.dashboard.routers.analytics as routes
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
+
+    class _Broken:
+        def get_repo_any_platform(self, owner: str, repo: str):
+            raise RuntimeError("registry down")
+
+    monkeypatch.setattr("mira.dashboard.api._app_db", _Broken())
+    admin = SimpleNamespace(
+        state=SimpleNamespace(user=SimpleNamespace(is_admin=True, username="root"))
+    )
+    with pytest.raises(HTTPException) as exc:
+        routes.list_rule_evaluations(admin, "acme", "app", 1)
+    assert exc.value.status_code == 503
 
 
 def test_summary_omits_metrics_it_does_not_compute(store: IndexStore) -> None:
