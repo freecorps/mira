@@ -9,7 +9,7 @@ import {
   ShieldCheck,
   XCircle,
 } from "lucide-react"
-import { useCallback, useMemo, useState } from "react"
+import { Fragment, useCallback, useMemo, useState } from "react"
 import { useSearchParams } from "react-router"
 
 import { Badge } from "@/components/ui/badge"
@@ -570,9 +570,8 @@ function DecisionHistory() {
               </TableHeader>
               <TableBody>
                 {decisions.map((decision) => (
-                  <>
+                  <Fragment key={decision.id}>
                     <TableRow
-                      key={decision.id}
                       className="cursor-pointer"
                       onClick={() =>
                         setExpanded(
@@ -634,7 +633,7 @@ function DecisionHistory() {
                       </TableCell>
                     </TableRow>
                     {expanded === decision.id && (
-                      <TableRow key={`${decision.id}-detail`}>
+                      <TableRow>
                         <TableCell colSpan={6} className="p-0">
                           <DecisionDetail
                             owner={decision.owner}
@@ -644,7 +643,7 @@ function DecisionHistory() {
                         </TableCell>
                       </TableRow>
                     )}
-                  </>
+                  </Fragment>
                 ))}
               </TableBody>
             </Table>

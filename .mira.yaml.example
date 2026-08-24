@@ -125,6 +125,11 @@ gate:
   #   - "infra/**"
   #   - "*.tf"
 
+  # Generated output is excluded from the size budget — files *and* their
+  # lines. `null` (absent) inherits the built-in list; `[]` means nothing here
+  # is generated.
+  # generated_paths: null
+
   # off | risk | block. An owned path is only ever a reason NOT to approve.
   codeowners: "off"
 

@@ -494,7 +494,9 @@ class GateConfig(BaseModel):
     max_changed_lines: int = Field(default=500, ge=1)
     # Generated output is excluded from the size budget (a lockfile bump is not
     # a change a human has to read) and a diff made only of it is out of scope.
-    generated_paths: list[str] = Field(default_factory=list)
+    # `null` inherits the built-in list; `[]` genuinely means "nothing is
+    # generated here", the same sentinel `protected_paths` uses.
+    generated_paths: list[str] | None = None
     size_excludes_generated: bool = True
 
     # ── Protected paths and CODEOWNERS ───────────────────────────────────

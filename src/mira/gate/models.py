@@ -59,6 +59,15 @@ DELIVERY_STATES: tuple[str, ...] = (
 
 RISK_BANDS: tuple[str, ...] = ("low", "medium", "high")
 
+# Name of the check run / commit status the gate publishes. Stable, because
+# re-publishing under a new name would leave the old one on the commit forever.
+#
+# It lives here, next to the vocabulary, because the providers need it too: a
+# gate that counted its own status as CI would read its own `failure` back as a
+# failing build, and would change the check count on every pass — which changes
+# the inputs digest, which manufactures a new decision row each time.
+STATUS_CONTEXT = "mira/merge-gate"
+
 
 class ReasonCode:
     """Stable identifiers for why the gate landed where it did.
@@ -221,6 +230,9 @@ class GateInputs:
     added_lines: int = 0
     deleted_lines: int = 0
     generated_paths: list[str] = field(default_factory=list)
+    # Lines contributed by those generated files, so the size budget can
+    # discount a lockfile bump instead of counting it as 4,000 lines to read.
+    generated_lines: int = 0
     protected_matches: list[str] = field(default_factory=list)
     codeowner_matches: list[str] = field(default_factory=list)
     # ok | unreadable | not_checked | absent

@@ -437,6 +437,21 @@ class PRInfo:
 
 
 @dataclass
+class FileChangeStat:
+    """One file's contribution to a pull request.
+
+    Per-file rather than a diff-wide total because two callers need to slice
+    it: the merge gate discounts generated files from its size budget, and
+    only per-file counts can tell a 4,000-line lockfile bump from a 4,000-line
+    refactor.
+    """
+
+    path: str
+    added_lines: int = 0
+    deleted_lines: int = 0
+
+
+@dataclass
 class OpenPRRef:
     """Lightweight handle on another open PR in the same repo.
 

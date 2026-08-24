@@ -214,6 +214,10 @@ export function GatePolicyPanel() {
 }
 
 function PolicyForm({ config: data }: { config: GateConfigResponse }) {
+  // `data.config` is the fully resolved policy (defaults + mira.yaml + DB) and
+  // is what the form shows; `data.overrides` is only what an admin typed, and
+  // is what gets written back.
+
   const [draft, setDraft] = useState<Draft>(() => draftFrom(data.config))
   const [saving, setSaving] = useState(false)
 
@@ -228,7 +232,11 @@ function PolicyForm({ config: data }: { config: GateConfigResponse }) {
   const save = async () => {
     setSaving(true)
     try {
-      await api.setGateConfig(payloadFrom(draft))
+      // The endpoint replaces the whole `gate` section — wholesale, so that an
+      // empty list is expressible. Keys this form does not render (per-repo
+      // policy, risk weights, a replaced `protected_paths`) are carried over
+      // from what was loaded, or saving would silently delete them.
+      await api.setGateConfig({ ...data.overrides, ...payloadFrom(draft) })
       toast.success("Gate policy saved")
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "The policy was refused")

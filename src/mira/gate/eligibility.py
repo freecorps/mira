@@ -179,6 +179,9 @@ def blocking_reasons(inputs: GateInputs, policy: EffectivePolicy) -> list[Reason
     counted_lines = inputs.added_lines + inputs.deleted_lines
     if policy.size_excludes_generated:
         counted_files = max(0, counted_files - len(inputs.generated_paths))
+        # Discounting the files but not their lines would still trip the line
+        # limit on exactly the diffs this setting exists to forgive.
+        counted_lines = max(0, counted_lines - inputs.generated_lines)
     if counted_files > policy.max_changed_files:
         reasons.append(
             Reason(

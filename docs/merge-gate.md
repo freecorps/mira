@@ -131,8 +131,14 @@ quality and high risk at once, and the gate has to be able to say so.
 
 No LLM is involved. On the Orange Pi profile the gate has to be effectively
 free next to the review, so scoring is arithmetic over facts the review already
-gathered — the engine hands it the parsed diff's counts rather than fetching
-anything a second time.
+gathered — the engine hands it the parsed diff's per-file counts rather than
+fetching anything a second time.
+
+Those counts come from the **unfiltered** diff, not from the list of files Mira
+reviewed. Deletions, binaries and `filter.exclude_patterns` matches are gone
+from the review's list, and whether a file was reviewed has nothing to do with
+whether it is protected — answering the second question from the first is how a
+deleted CI workflow gets approved.
 
 Factors, with their default weights:
 
@@ -152,7 +158,7 @@ Factors, with their default weights:
 | `dependency_manifest` | 8 | The dependency surface moved. |
 | `generated_heavy` | 5 | Most of the diff is machine output. |
 | `size_files` | 1 per file over 5, capped at 20 | Generated files are excluded. |
-| `size_lines` | 2 per 100 lines over 100, capped at 20 | |
+| `size_lines` | 2 per 100 lines over 100, capped at 20 | So are their lines. |
 | `suggestion_findings` | 1 each, capped at 6 | |
 
 Risk is scored for **every in-scope pull request**, including ones already
@@ -306,8 +312,14 @@ artifact (a fixed check name, a comment marker), so re-sending one replaces it.
 
 The gate re-evaluates on `check_suite`/`check_run` completion and on
 label/draft changes, because those are the two things that make a decision
-stale without changing a line of code. Re-evaluation costs no LLM call, and it
-returns before touching the platform when the gate is off for that repository.
+stale without changing a line of code. Re-evaluation costs no LLM call, and the
+policy is resolved *before* an installation token is minted, so an install that
+never turned the gate on pays nothing for every check suite that finishes.
+
+The gate's own status check is excluded from the CI reading. Counting it would
+let the gate read its own verdict back as a failing build, and would change the
+check count on every pass — which changes the inputs digest, which would
+manufacture a fresh decision row each time.
 
 ## Overrides
 
@@ -417,7 +429,7 @@ gate:
   skip_draft_prs: true
   max_changed_files: 20
   max_changed_lines: 500
-  generated_paths: []            # empty = the built-in list
+  generated_paths: null          # null = the built-in list; [] = nothing
   size_excludes_generated: true
 
   # Protected paths and CODEOWNERS.
@@ -464,6 +476,13 @@ that section is written; the review and filter overrides set on the settings
 page are read back and rewritten unchanged, so two panels editing one document
 cannot clobber each other. Policy is validated against the real model before it
 is stored, so a typo fails the request rather than the next pull request.
+
+`PUT /api/gate/config` replaces the whole `gate` section rather than merging
+into it, which is what makes `blocked_labels: []` expressible at all — a merge
+could not tell an empty list from "leave it alone". The caller therefore resends
+what it wants kept, and the panel does that by spreading the loaded overrides
+under its own form values, so per-repository policy and risk weights it does not
+render survive a save.
 
 ## Not in this phase
 

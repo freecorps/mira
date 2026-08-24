@@ -399,3 +399,60 @@ def test_an_unauthenticated_override_is_refused(csrf_app: FastAPI) -> None:
         headers={"Origin": "http://testserver"},
     )
     assert resp.status_code == 401
+
+
+# ───────────────────────────────── regressions from the pre-merge review ──
+
+
+def test_a_policy_edit_preserves_gate_keys_the_caller_resent(monkeypatch) -> None:
+    """The endpoint replaces the `gate` section wholesale, and says so.
+
+    Wholesale is what makes an empty list expressible — a merge would render
+    `blocked_labels: []` indistinguishable from "leave it alone". The contract
+    is therefore that the caller resends what it wants kept, and the dashboard
+    panel does exactly that by spreading the loaded overrides under its form
+    values. This asserts the server half: everything sent is stored, and only
+    the `gate` section is touched.
+    """
+    written: dict = {}
+    registry = SimpleNamespace(
+        get_global_review_overrides=lambda: {
+            "review": {"walkthrough": False},
+            "gate": {"mode": "shadow", "repositories": {"acme/app": {"mode": "off"}}},
+        },
+        set_global_review_overrides=lambda overrides: written.update(overrides),
+    )
+    import mira.dashboard.api as api
+
+    monkeypatch.setattr(api, "_app_db", registry)
+
+    gate_routes.set_gate_config(
+        body=gate_routes.GateConfigUpdate(
+            gate={
+                "mode": "enforce",
+                "repositories": {"acme/app": {"mode": "off"}},
+                "blocked_labels": [],
+            }
+        ),
+        request=_request(),
+    )
+    assert written["gate"]["mode"] == "enforce"
+    assert written["gate"]["repositories"] == {"acme/app": {"mode": "off"}}
+    # An explicitly empty list survives as empty rather than being merged away.
+    assert written["gate"]["blocked_labels"] == []
+    assert written["review"] == {"walkthrough": False}
+
+
+def test_an_empty_gate_edit_clears_the_section(monkeypatch) -> None:
+    written: dict = {}
+    registry = SimpleNamespace(
+        get_global_review_overrides=lambda: {"gate": {"mode": "enforce"}, "filter": {}},
+        set_global_review_overrides=lambda overrides: written.update(overrides),
+    )
+    import mira.dashboard.api as api
+
+    monkeypatch.setattr(api, "_app_db", registry)
+
+    gate_routes.set_gate_config(body=gate_routes.GateConfigUpdate(gate={}), request=_request())
+    assert "gate" not in written
+    assert "filter" in written

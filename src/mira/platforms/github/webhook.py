@@ -622,6 +622,21 @@ async def dispatch_github_event(
 _GATE_RECHECK_ACTIONS = {"labeled", "unlabeled", "ready_for_review", "converted_to_draft"}
 
 
+def _gate_is_active(owner: str, repo: str) -> bool:
+    """Whether the gate runs for this repository at all.
+
+    Consulted before an installation token is minted, so an install that never
+    turned the gate on pays nothing for every check suite that finishes.
+    """
+    from mira.gate.policy import resolve_policy
+
+    try:
+        return resolve_policy(load_config().gate, owner, repo).active
+    except Exception as exc:  # noqa: BLE001 - an unreadable policy is not active
+        logger.warning("Could not resolve the gate policy for %s/%s: %s", owner, repo, exc)
+        return False
+
+
 async def handle_gate_recheck(
     payload: dict[str, Any],
     app_auth: GitHubAppAuth,
@@ -635,7 +650,7 @@ async def handle_gate_recheck(
         return
     owner = payload.get("repository", {}).get("owner", {}).get("login", "")
     repo = payload.get("repository", {}).get("name", "")
-    if not owner or not repo:
+    if not owner or not repo or not _gate_is_active(owner, repo):
         return
     try:
         token = await app_auth.get_installation_token(installation_id)
@@ -670,7 +685,7 @@ async def handle_gate_pr_event(
     owner = payload.get("repository", {}).get("owner", {}).get("login", "")
     repo = payload.get("repository", {}).get("name", "")
     number = int((payload.get("pull_request") or {}).get("number") or 0)
-    if not owner or not repo or not number:
+    if not owner or not repo or not number or not _gate_is_active(owner, repo):
         return
     try:
         token = await app_auth.get_installation_token(installation_id)

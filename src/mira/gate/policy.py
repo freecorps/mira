@@ -194,7 +194,11 @@ def resolve_policy(config: GateConfig, owner: str = "", repo: str = "") -> Effec
         base_protected = list(entry.protected_paths)
     protected = [*base_protected, *config.extra_protected_paths, *entry.extra_protected_paths]
 
-    generated = list(config.generated_paths) or list(DEFAULT_GENERATED_PATTERNS)
+    generated = (
+        list(config.generated_paths)
+        if config.generated_paths is not None
+        else list(DEFAULT_GENERATED_PATTERNS)
+    )
 
     return EffectivePolicy(
         mode=mode,
