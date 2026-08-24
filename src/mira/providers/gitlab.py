@@ -550,8 +550,8 @@ class GitLabProvider(BaseProvider):
                 states[username] = "APPROVED"
         return states
 
-    # GitLab job states that are not a verdict yet.
-    _PENDING_JOB_STATES = frozenset(
+    # Pipeline states that have not reached a verdict yet.
+    _PENDING_PIPELINE_STATES = frozenset(
         {
             "created",
             "waiting_for_resource",
@@ -561,65 +561,69 @@ class GitLabProvider(BaseProvider):
             "scheduled",
         }
     )
-    # States that are a pass: succeeded, deliberately skipped, or waiting on a
-    # human to press the button — which is a gate, not a failure.
-    _PASSING_JOB_STATES = frozenset({"success", "skipped", "manual"})
+
+    async def _commit_status_names(self, pr_info: PRInfo, sha: str) -> list[str]:
+        """Names of the statuses recorded against one commit.
+
+        Only the names: this exists to answer whether anything other than the
+        gate's own status is present, which needs no ordering and no mapping.
+        """
+        if not sha:
+            return []
+        url = f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}/statuses"
+        entries = await self._paginate(url)
+        return [str((entry or {}).get("name") or "status") for entry in entries]
 
     async def get_ci_state(self, pr_info: PRInfo) -> CIState:
-        """Per-job statuses on the head commit, mapped onto the gate vocabulary.
+        """The merge request's head pipeline, mapped onto the gate vocabulary.
 
-        Read per job rather than from `head_pipeline`, because an external
-        commit status posted through the API *joins* that pipeline — including
-        the one the gate itself posts. On a project with no CI, reading the
-        pipeline would mean the gate's own status created a green pipeline that
-        the next evaluation read back as passing CI.
+        The pipeline is authoritative because it is the only view that gets the
+        awkward cases right: a run blocked on a manual gate reports `manual`
+        rather than leaving its downstream jobs looking pending forever, and a
+        merged-results pipeline is found even though it belongs to the
+        merge-ref commit rather than to the head SHA.
 
-        A commit with no statuses reports "none", which is not success: the
-        gate cannot vouch for a commit nothing ever built, and says so the same
-        way it does for a pipeline it could not read.
+        It has one blind spot, and it is the one that matters here. An external
+        commit status posted through the API *joins* the pipeline — including
+        the status the gate itself publishes — so on a project with no CI the
+        gate would create a green pipeline and read it back as passing on the
+        next pass. Hence the second call: if the only thing recorded against
+        this commit is the gate's own status, there is no CI here to speak of.
+
+        A merge request with no pipeline reports "none", which is not success —
+        the gate cannot vouch for a commit that nothing ever built, and says so
+        the same way it does for a pipeline it could not read.
         """
-        sha = pr_info.head_sha
-        if not sha:
-            return CIState(state="unknown")
-        url = f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}/statuses"
         try:
-            statuses = await self._paginate(url)
+            resp = await self._request("GET", self._mr(pr_info))
         except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read MR pipeline for %s: %s", pr_info.url, exc)
+            return CIState(state="unknown")
+        pipeline = (resp.json() or {}).get("head_pipeline") or {}
+        if not pipeline:
+            return CIState(state="none", total=0)
+
+        try:
+            names = await self._commit_status_names(
+                pr_info, str(pipeline.get("sha") or pr_info.head_sha or "")
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown, never assumed green
             logger.warning("Could not read commit statuses for %s: %s", pr_info.url, exc)
             return CIState(state="unknown")
-
-        latest: dict[str, dict[str, Any]] = {}
-        for entry in statuses:
-            name = str((entry or {}).get("name") or "status")
-            if name == STATUS_CONTEXT:
-                # The gate's own status. Counting it would let the gate read its
-                # own verdict back as a build it is waiting on.
-                continue
-            # The endpoint is newest-first per name; the first entry wins.
-            latest.setdefault(name, entry or {})
-
-        failing: list[str] = []
-        pending: list[str] = []
-        for name, entry in latest.items():
-            status = str(entry.get("status") or "").lower()
-            if status in self._PENDING_JOB_STATES:
-                pending.append(name)
-            elif status in self._PASSING_JOB_STATES:
-                continue
-            elif entry.get("allow_failure"):
-                # The project already said this one does not count.
-                continue
-            else:
-                failing.append(f"{name} ({status or 'unknown'})")
-
-        total = len(latest)
-        if pending:
-            return CIState(state="pending", total=total, failing=failing, pending=pending)
-        if failing:
-            return CIState(state="failure", total=total, failing=failing)
-        if total == 0:
+        if names and all(name == STATUS_CONTEXT for name in names):
+            # The pipeline exists because the gate posted into it.
             return CIState(state="none", total=0)
-        return CIState(state="success", total=total)
+
+        status = str(pipeline.get("status") or "").lower()
+        name = f"pipeline #{pipeline.get('id', '?')}"
+        if status in {"success", "manual"}:
+            # `manual` means every automatic job passed and a human gate remains.
+            return CIState(state="success", total=1)
+        if status in self._PENDING_PIPELINE_STATES:
+            return CIState(state="pending", total=1, pending=[name])
+        if status in {"failed", "canceled", "skipped"}:
+            return CIState(state="failure", total=1, failing=[f"{name} ({status})"])
+        return CIState(state="unknown", total=1)
 
     async def get_pr_labels(self, pr_info: PRInfo) -> list[str]:
         try:
