@@ -4,6 +4,17 @@ All notable changes to Mira are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Risk-oriented merge gate.** A conservative approval decision, in its own domain (`mira.gate`) and deliberately apart from the review verdict: the verdict says whether the code is good, the gate says whether Mira may put its name on merging it. It ships `off`, and the recommended first step is `shadow`, which records exactly the decision it would have acted on so you can measure false approvals before letting it act. States are explicit — `approved`, `would_approve`, `not_approved`, `skipped`, `error` — and only a delivery the platform confirmed is ever `approved`: the decision function cannot return it. Eligibility covers base branch, labels, author and platform association, size, generated files, CI status, review completeness and index readiness. Risk is a deterministic integer built from named factors (no LLM, no second diff fetch), scored for every eligible PR including the ones already disqualified, so a threshold can be tuned from all of the data. Protected paths are an absolute veto that no override can force past, and CODEOWNERS is an optional integration read conservatively — an owned path is only ever a reason not to approve. An open blocker never approves whatever the score says. `REQUEST_CHANGES` on blockers is opt-in, enforce-only, and never submitted over an existing human review. Decisions and delivery claims are idempotent, so a redelivered webhook or a second worker cannot approve twice. Per-provider capabilities degrade explicitly instead of reporting an approval nobody received (GitLab has no `REQUEST_CHANGES` event, and says so). Overrides record actor, reason, previous and new decision, and never touch the platform; forcing an approval is a separate opt-in from revoking one. A global kill switch beats every per-repository override. Dashboard panels for the decision history and the policy live at `/merge-gate`. See [docs/merge-gate.md](docs/merge-gate.md).
+
+### Changed
+
+- **Provider reads whose emptiness would read as good news now raise.** `get_pr_labels` and `get_review_states` previously swallowed API failures and returned `[]` / `{}` — which reads as "no blocking label" and "nobody objected". They now raise, the merge gate records an `error` decision, and the review verdict treats the failure as a reason to stay quiet. CI state and author association keep reporting `unknown`, which every caller already treats as not-good-enough.
+- `PRInfo` carries `draft`, and the GitLab and Forgejo providers now populate `author` and `author_avatar_url` from the merge/pull request payload.
+
 ## [0.8.0] — 2026-07-27
 
 ### Added

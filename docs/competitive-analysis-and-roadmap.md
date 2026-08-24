@@ -395,6 +395,9 @@ por padrão, kill switch dedicado e nenhuma desativação automática de regra.
 
 **Objetivo:** evoluir o verdict atual para uma decisão conservadora e auditável.
 
+**Status:** implementada em agosto de 2026, com `gate.mode` em `off` por
+padrão, kill switch global e nenhuma aprovação real habilitada por padrão.
+
 - Criar risk score separado do score de qualidade do review.
 - Eligibility por branch, label, autor, tamanho, arquivos gerados e status de CI.
 - Protected paths e integração opcional com CODEOWNERS.
@@ -405,6 +408,49 @@ por padrão, kill switch dedicado e nenhuma desativação automática de regra.
 - Histórico de decisão e override administrativo.
 
 **Aceite:** caminho protegido nunca recebe auto-approval; falha de componente nunca aprova; o dry-run explica cada decisão e permite calcular falsos approvals antes do rollout.
+
+#### Notas da implementação
+
+- O gate vive em `mira.gate`, separado do verdict. `decide()` é puro — entradas
+  e política resolvida entram, uma decisão sai — o que permite recalcular e
+  conferir uma decisão guardada, e cobrir a matriz nos testes sem plataforma
+  alguma envolvida.
+- `decide()` não consegue devolver `approved`: o melhor que produz é
+  `would_approve`, e só uma entrega confirmada pela plataforma move a decisão.
+  Fail closed é um valor que nunca foi atribuído, não um handler que capturou
+  algo.
+- O risk score é aritmética inteira sobre fatos que o review já reuniu, sem
+  chamada de LLM, e nunca é um número solto: é a lista de fatores nomeados que
+  soma até ele. Toda PR elegível é pontuada, inclusive as já desqualificadas —
+  ajustar o threshold com metade dos dados não é ajustar.
+- Protected path é veto absoluto e nem override administrativo o atravessa. Os
+  padrões são no formato gitignore e um padrão que não compila reprova o load
+  da configuração: ignorá-lo desprotege um caminho em silêncio.
+- CODEOWNERS é opcional e desligado por padrão. Um arquivo que o parser não
+  entende vira `unreadable`, que no modo `block` é veto — adivinhar uma regra
+  de ownership é exatamente como um arquivo protegido é aprovado por acidente.
+- Blocker aberto nunca aprova, em nenhuma pontuação. `outdated` não conta como
+  fechado: ele só diz que o diff andou, que é como um blocker não resolvido se
+  parece depois de um rebase. A mesma leitura da Fase 3.
+- `REQUEST_CHANGES` é opcional, só em `enforce`, só para blocker aberto, e
+  nunca sobre um review humano existente — nas duas direções.
+- Idempotência em dois níveis: a chave da decisão inclui a política e as
+  entradas, então reentrega converge e reavaliação após CI verde vira decisão
+  nova; a claim de entrega é por (PR, head SHA), então duas decisões sobre o
+  mesmo commit ainda produzem no máximo uma aprovação.
+- Capacidades por provedor são declaradas, não sondadas. O que não é suportado
+  degrada explicitamente para `would_approve`/`skipped` com o motivo; GitLab
+  não tem evento `REQUEST_CHANGES` e o gate diz isso em vez de improvisar.
+- Política vem só de configuração de deploy. Nada de dentro da PR a alcança:
+  labels e branches são entradas que o operador escolheu consultar e só
+  conseguem tirar a PR de escopo ou desqualificá-la.
+- Override registra ator, motivo, decisão anterior e nova, e não toca na
+  plataforma. Forçar aprovação é opt-in separado de revogar, e continua
+  recusado diante de qualquer veto duro.
+- `gate_decisions`, `gate_deliveries` e `gate_overrides` existem nos dois
+  bancos com as consultas escritas uma vez em `mira.gate.persistence`. As
+  tabelas são criadas na conexão, então banco existente sobe sem migração.
+- Detalhes em [docs/merge-gate.md](merge-gate.md).
 
 ### Fase 5 — correção assistida segura (8–15 dias)
 
@@ -464,8 +510,8 @@ Esses itens têm valor, mas não devem atrasar o ciclo de aprendizado e o autofi
 | LR-005 | Retrieval e registro de exposição | P0 | LR-003 |
 | AN-001 | Addressed/reaction/repeat-FP metrics | P0 | LR-005 |
 | AN-002 | Avaliação e sugestão de downgrade | P1 | AN-001 |
-| GT-001 | Risk score e eligibility | P1 | Fases 1–3 |
-| GT-002 | Protected paths/CODEOWNERS/dry-run | P1 | GT-001 |
+| GT-001 | Risk score e eligibility | P1 ✅ | Fases 1–3 |
+| GT-002 | Protected paths/CODEOWNERS/dry-run | P1 ✅ | GT-001 |
 | FX-001 | Fix de um finding em branch | P1 | FB-002 |
 | FX-002 | Fix All + testes + CI loop limitado | P1 | FX-001 |
 | CK-001 | Framework de pre-merge checks | P1 | GT-001 |

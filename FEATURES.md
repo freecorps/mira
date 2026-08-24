@@ -55,6 +55,23 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Regression detection that suggests a downgrade but never disables a rule on its own
 - CSV/JSON export and an audit trail for suggestions, overrides, and admin changes
 
+## Merge gate
+
+- A conservative approval decision, in its own domain and kept apart from the review's quality score
+- Deterministic, explainable risk score: never a bare number, always the named factors that add up to it
+- Explicit states — `approved`, `would_approve`, `not_approved`, `skipped`, `error` — where only a platform-confirmed delivery is ever `approved`
+- Shadow mode records exactly the decision it would have acted on, so false approvals are measurable before rollout
+- Eligibility by base branch, labels, author and association, size, generated files, CI status, review completeness and index readiness
+- Protected paths as an absolute veto, with gitignore-shaped patterns and no override that can force one
+- Optional CODEOWNERS integration, read conservatively — an owned path is a reason not to approve, never a reason to approve on the owner's behalf
+- An open blocker finding is never approved, whatever the score says
+- Optional `REQUEST_CHANGES` on blockers, never submitted over an existing human review
+- Off by default, plus a kill switch that beats every per-repository override
+- Idempotent decisions and delivery claims: a redelivered webhook or a second worker cannot approve twice
+- Per-provider capabilities that degrade explicitly instead of reporting an approval nobody received
+- Auditable overrides recording actor, reason, previous and new decision — and never touching the platform
+- Dashboard panel for the decision history and the policy
+
 ## Platform integrations
 
 - GitHub App with webhook support — works against github.com and GitHub Enterprise Server (set `MIRA_GITHUB_API_URL`)
@@ -98,6 +115,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Opt-in ensemble mode (`review.ensemble_runs`): review each chunk N times and keep majority-vote findings
 - Thread auto-resolution toggle (`review.auto_resolve_conversations`)
 - `context_lines`, `max_concurrent_chunks`, and `index.max_file_size` tuning knobs
+- Merge gate policy (`gate`): mode, kill switch, protected paths, eligibility limits, risk threshold, and per-repository overrides
 
 ## Storage and deployment
 
