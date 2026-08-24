@@ -339,6 +339,9 @@ padrão e compatibilidade de migração para regras anteriores.
 
 **Objetivo:** saber se o aprendizado melhora o produto.
 
+**Status:** implementada em agosto de 2026, com registro de exposições ligado
+por padrão, kill switch dedicado e nenhuma desativação automática de regra.
+
 - Registrar exposição e decisão por regra.
 - Medir addressed rate sem confundir merge com aceitação.
 - Métricas de 👍/👎, replies, resolução, fix observado e findings repetidos.
@@ -347,6 +350,42 @@ padrão e compatibilidade de migração para regras anteriores.
 - Export CSV/JSON e eventos de auditoria.
 
 **Aceite:** é possível comparar 30 dias antes/depois de uma regra; toda métrica leva aos findings que compõem o número; regras sem evidência não recebem score positivo.
+
+#### Notas da implementação
+
+- `rule_evaluations` existe em SQLite e PostgreSQL com o mesmo formato. Cada
+  exposição gera uma linha por review — a regra esteve em jogo mesmo sem
+  produzir finding — e uma linha por finding que o escopo da regra cobre.
+- A escrita é idempotente por `evaluation_key`, um hash de plataforma,
+  repositório, PR, head SHA, regra, versão, decisão e finding. Retry de review,
+  reentrega de webhook e workers concorrentes convergem para uma linha. O
+  `review_id` fica fora da chave de propósito: um retry cria outra review, mas
+  continua sendo a mesma exposição.
+- A atribuição é por escopo e declarada como tal. Não dá para saber em qual
+  linha do prompt o modelo se apoiou, então a avaliação registra só o que é
+  verificável: a regra estava presente e o finding está no escopo dela.
+- `unobserved` fica fora do numerador e do denominador do acceptance rate, então
+  silêncio não sobe nem desce o score. Sem sinal decisivo a taxa é nula e o
+  dashboard mostra travessão, nunca `0%`.
+- `addressed` exige evidência concreta: thread resolvida (`fixed`/`resolved`) ou
+  estado equivalente do finding. O estado `outdated` foi deixado de fora de
+  propósito — ele só diz que o diff andou, que é exatamente o que um merge
+  silencioso parece.
+- O agregado e o detalhamento são gerados da mesma expressão de outcome,
+  compartilhada pelos dois bancos. Filtrar a lista por um bucket devolve
+  exatamente a contagem do agregado, por construção.
+- A comparação antes/depois mede findings no escopo da regra, não as exposições
+  dela: antes da ativação não havia exposição alguma. Janela incompleta, regra
+  sem timestamp de ativação ou regra removida retornam `comparable: false` com
+  a razão.
+- A detecção de regressão exige mínimo configurável de exposições (20 por
+  padrão) e maioria negativa entre sinais decisivos. Regras manuais são
+  ignoradas. Nada é desativado automaticamente: aceitar, adiar ou descartar uma
+  sugestão apenas grava auditoria.
+- Endpoints e dashboard são admin-only, paginados e exportáveis em CSV/JSON.
+  `learning.evaluation_analytics` desliga a gravação sem alterar o review, que
+  já foi publicado quando o registro acontece.
+- Detalhes em [docs/rule-evaluation-analytics.md](rule-evaluation-analytics.md).
 
 ### Fase 4 — merge gate orientado a risco (6–10 dias)
 
