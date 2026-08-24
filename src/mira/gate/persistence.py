@@ -444,8 +444,16 @@ class GateStoreMixin:
         approval has told the decision something new, and a stored decision
         whose reasons predate its own delivery cannot explain itself.
         """
-        sets = ["delivery_state = ?", "delivery_ref = ?", "error = ?", "updated_at = ?"]
-        params: list[Any] = [delivery_state, delivery_ref, error, time.time()]
+        # An empty `delivery_ref` means "I have none to give", not "forget the
+        # one you have": a comment never yields a reference, and a retry where
+        # only the comment succeeded must not erase the recorded check-run id.
+        sets = [
+            "delivery_state = ?",
+            "delivery_ref = CASE WHEN ? <> '' THEN ? ELSE delivery_ref END",
+            "error = ?",
+            "updated_at = ?",
+        ]
+        params: list[Any] = [delivery_state, delivery_ref, delivery_ref, error, time.time()]
         if bump_attempts:
             sets.append("delivery_attempts = delivery_attempts + 1")
         if state is not None:

@@ -315,7 +315,14 @@ artifact (a fixed check name, a comment marker), so re-sending one replaces it.
 Because re-sending is free, a delivery that only partly succeeded is recorded
 as `partial` and stays retryable — `delivered` would hide a missing check run
 behind a clean row, and `failed` would claim the decision never surfaced at
-all. The dashboard shows the state and the error beside it.
+all. The dashboard shows the state and the error beside it. Retries stop after
+five attempts: the retry exists for a transient 5xx, not for a missing scope.
+
+Publishing a check run delivers a `check_run.completed` webhook straight back
+to the app, so the gate's own check — and any check suite belonging to its own
+app — is excluded from the events that wake it. Otherwise a retryable delivery
+would republish, the republish would arrive as an event, the inputs would not
+have moved, and it would republish again.
 
 The gate re-evaluates on `check_suite`/`check_run` completion and on
 label/draft changes, because those are the two things that make a decision

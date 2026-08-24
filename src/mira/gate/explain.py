@@ -42,9 +42,12 @@ _STATE_SUMMARY = {
 # explanation landed, and one of the ways it travels did not.
 _DELIVERY_NOTE = {
     "partial": "the explanation reached the pull request, but one channel failed",
-    "failed": "the explanation did not reach the pull request",
     "in_flight": "another worker is delivering this",
 }
+# `failed` deliberately has no note. It covers both an announcement that never
+# landed and a *refused approval* whose announcement landed perfectly well, and
+# a sentence that fits one of those is a lie about the other. The `error` field
+# says which, in the platform's own words.
 
 # Short status-check titles, which most platforms truncate hard.
 _STATE_TITLE = {
