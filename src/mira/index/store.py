@@ -9,6 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.index._store_shared import _StoreSharedMixin
@@ -274,6 +275,62 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     FOREIGN KEY (origin_candidate_id) REFERENCES learning_candidates(id) ON DELETE SET NULL,
     FOREIGN KEY (supersedes_rule_id) REFERENCES learned_rules(id) ON DELETE SET NULL
 );
+
+-- Phase 3 continuous evaluation. One row per (rule, decision, finding-or-review)
+-- exposure. `evaluation_key` is a deterministic hash of the exposure identity,
+-- so a retried review round re-inserts the same key and is ignored instead of
+-- inflating the rule's exposure count.
+CREATE TABLE IF NOT EXISTS rule_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_key TEXT NOT NULL UNIQUE,
+    review_id INTEGER NOT NULL DEFAULT 0,
+    rule_id INTEGER NOT NULL,
+    rule_version INTEGER NOT NULL DEFAULT 1,
+    -- 'manual' | 'learned'. A human-authored rule is never scored or
+    -- suggested for downgrade as if Mira had invented it.
+    rule_origin TEXT NOT NULL DEFAULT 'learned',
+    scope_type TEXT NOT NULL DEFAULT 'repo',
+    scope_value TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    -- 'instruction' | 'suppress' | 'boost'
+    decision TEXT NOT NULL DEFAULT 'instruction',
+    finding_id TEXT,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_author TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT 0,
+    FOREIGN KEY (finding_id) REFERENCES review_findings(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_rule
+    ON rule_evaluations(rule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_finding
+    ON rule_evaluations(finding_id);
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_period
+    ON rule_evaluations(created_at, category);
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_author
+    ON rule_evaluations(pr_author, created_at);
+
+-- Administrative trail for Phase 3: regression suggestions Mira raised, the
+-- overrides an admin applied to them, and every analytics-driven rule change.
+CREATE TABLE IF NOT EXISTS learning_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    rule_id INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_learning_audit_rule
+    ON learning_audit_events(rule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_learning_audit_created
+    ON learning_audit_events(created_at);
 
 CREATE TABLE IF NOT EXISTS package_manifests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2450,6 +2507,119 @@ class IndexStore(_StoreSharedMixin):
     def delete_learned_rule(self, rule_id: int) -> None:
         self._conn.execute("DELETE FROM learned_rules WHERE id = ?", (rule_id,))
         self._conn.commit()
+
+    # ---------------------------------------------------------------- Phase 3
+
+    def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
+        """Persist rule exposures idempotently; return how many were new.
+
+        `INSERT OR IGNORE` against the unique `evaluation_key` makes a retried
+        review round a no-op instead of a double-count, and makes two workers
+        racing on the same review safe without a lock.
+        """
+        if not evaluations:
+            return 0
+        now = time.time()
+        rows = [
+            (
+                evaluation.evaluation_key,
+                evaluation.review_id,
+                evaluation.rule_id,
+                evaluation.rule_version,
+                evaluation.rule_origin,
+                evaluation.scope_type,
+                evaluation.scope_value,
+                evaluation.category,
+                evaluation.decision,
+                evaluation.finding_id,
+                evaluation.platform,
+                evaluation.owner or self._owner,
+                evaluation.repo or self._repo,
+                evaluation.pr_number,
+                evaluation.pr_author,
+                evaluation.head_sha,
+                evaluation.detail_json,
+                evaluation.created_at or now,
+            )
+            for evaluation in evaluations
+        ]
+        cur = self._conn.executemany(
+            "INSERT OR IGNORE INTO rule_evaluations "
+            "(evaluation_key, review_id, rule_id, rule_version, rule_origin, scope_type, "
+            "scope_value, category, decision, finding_id, platform, owner, repo, pr_number, "
+            "pr_author, head_sha, detail_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
+    def link_rule_evaluations(self, evaluation_keys: list[str], review_id: int) -> None:
+        """Attach evaluations to their review once the review row exists.
+
+        Only fills in a missing link; an evaluation already tied to a review is
+        left alone so a retry cannot re-point history at a newer review row.
+        """
+        if not evaluation_keys or not review_id:
+            return
+        self._conn.executemany(
+            "UPDATE rule_evaluations SET review_id = ? WHERE evaluation_key = ? AND review_id = 0",
+            [(review_id, key) for key in evaluation_keys],
+        )
+        self._conn.commit()
+
+    def record_learning_audit_event(
+        self,
+        *,
+        event_type: str,
+        rule_id: int = 0,
+        actor: str = "",
+        summary: str = "",
+        detail: dict | None = None,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO learning_audit_events "
+            "(event_type, rule_id, actor, summary, detail_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                event_type,
+                rule_id,
+                actor,
+                summary,
+                json.dumps(detail or {}, sort_keys=True),
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def list_learning_audit_events(
+        self, *, rule_id: int = 0, limit: int = 100, offset: int = 0
+    ) -> list[dict]:
+        where, params = ("WHERE rule_id = ?", [rule_id]) if rule_id else ("", [])
+        rows = self._conn.execute(
+            "SELECT id, event_type, rule_id, actor, summary, detail_json, created_at "
+            f"FROM learning_audit_events {where} ORDER BY created_at DESC, id DESC "
+            "LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "event_type": r[1],
+                "rule_id": r[2],
+                "actor": r[3],
+                "summary": r[4],
+                "detail_json": r[5],
+                "created_at": r[6],
+                "owner": self._owner,
+                "repo": self._repo,
+            }
+            for r in rows
+        ]
 
     def replace_manifest_packages(
         self,

@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
+from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.index._store_shared import _StoreSharedMixin
@@ -340,6 +341,54 @@ CREATE INDEX IF NOT EXISTS idx_pg_vuln_package
     ON vulnerabilities(owner, repo, package_name, ecosystem, package_version);
 CREATE INDEX IF NOT EXISTS idx_pg_vuln_severity
     ON vulnerabilities(severity);
+
+CREATE TABLE IF NOT EXISTS rule_evaluations (
+    id BIGSERIAL PRIMARY KEY,
+    evaluation_key TEXT NOT NULL UNIQUE,
+    review_id INTEGER NOT NULL DEFAULT 0,
+    rule_id INTEGER NOT NULL,
+    rule_version INTEGER NOT NULL DEFAULT 1,
+    rule_origin TEXT NOT NULL DEFAULT 'learned',
+    scope_type TEXT NOT NULL DEFAULT 'repo',
+    scope_value TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT 'instruction',
+    finding_id TEXT REFERENCES review_findings(id) ON DELETE SET NULL,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_author TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_rule_evaluations_rule
+    ON rule_evaluations(owner, repo, rule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_rule_evaluations_finding
+    ON rule_evaluations(finding_id);
+CREATE INDEX IF NOT EXISTS idx_pg_rule_evaluations_period
+    ON rule_evaluations(created_at, category);
+CREATE INDEX IF NOT EXISTS idx_pg_rule_evaluations_author
+    ON rule_evaluations(pr_author, created_at);
+
+CREATE TABLE IF NOT EXISTS learning_audit_events (
+    id BIGSERIAL PRIMARY KEY,
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL,
+    rule_id INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_learning_audit_rule
+    ON learning_audit_events(owner, repo, rule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_learning_audit_created
+    ON learning_audit_events(created_at);
 """
 
 # Module-level shared connection — initialized lazily
@@ -660,6 +709,10 @@ class PgIndexStore(_StoreSharedMixin):
     Implements the same public interface as IndexStore. Shares a single
     connection across all instances.
     """
+
+    # psycopg uses pyformat placeholders; the shared analytics SQL is rendered
+    # with this so both backends run the same query text.
+    _analytics_placeholder = "%s"
 
     def __init__(self, owner: str, repo: str, url: str) -> None:
         self._owner = owner
@@ -2661,6 +2714,125 @@ class PgIndexStore(_StoreSharedMixin):
                 (rule_id, self._owner, self._repo),
             )
         self._commit()
+
+    # ---------------------------------------------------------------- Phase 3
+
+    def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
+        return self._fetchall(sql, params)
+
+    def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
+        """Persist rule exposures idempotently; return how many were new.
+
+        `ON CONFLICT DO NOTHING` on `evaluation_key` gives the same retry and
+        concurrency guarantee as the SQLite path: the same exposure recorded
+        twice stays one row.
+        """
+        if not evaluations:
+            return 0
+        now = time.time()
+        created = 0
+        with self._cursor() as cur:
+            for evaluation in evaluations:
+                cur.execute(
+                    "INSERT INTO rule_evaluations "
+                    "(evaluation_key, review_id, rule_id, rule_version, rule_origin, "
+                    "scope_type, scope_value, category, decision, finding_id, platform, "
+                    "owner, repo, pr_number, pr_author, head_sha, detail_json, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    "%s, %s, %s) ON CONFLICT(evaluation_key) DO NOTHING RETURNING id",
+                    (
+                        evaluation.evaluation_key,
+                        evaluation.review_id,
+                        evaluation.rule_id,
+                        evaluation.rule_version,
+                        evaluation.rule_origin,
+                        evaluation.scope_type,
+                        evaluation.scope_value,
+                        evaluation.category,
+                        evaluation.decision,
+                        evaluation.finding_id,
+                        evaluation.platform,
+                        evaluation.owner or self._owner,
+                        evaluation.repo or self._repo,
+                        evaluation.pr_number,
+                        evaluation.pr_author,
+                        evaluation.head_sha,
+                        evaluation.detail_json,
+                        evaluation.created_at or now,
+                    ),
+                )
+                if cur.fetchone() is not None:
+                    created += 1
+        self._commit()
+        return created
+
+    def link_rule_evaluations(self, evaluation_keys: list[str], review_id: int) -> None:
+        if not evaluation_keys or not review_id:
+            return
+        with self._cursor() as cur:
+            for key in evaluation_keys:
+                cur.execute(
+                    "UPDATE rule_evaluations SET review_id=%s "
+                    "WHERE evaluation_key=%s AND review_id=0",
+                    (review_id, key),
+                )
+        self._commit()
+
+    def record_learning_audit_event(
+        self,
+        *,
+        event_type: str,
+        rule_id: int = 0,
+        actor: str = "",
+        summary: str = "",
+        detail: dict | None = None,
+    ) -> int:
+        row = self._fetchone(
+            "INSERT INTO learning_audit_events "
+            "(owner, repo, event_type, rule_id, actor, summary, detail_json, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (
+                self._owner,
+                self._repo,
+                event_type,
+                rule_id,
+                actor,
+                summary,
+                json.dumps(detail or {}, sort_keys=True),
+                time.time(),
+            ),
+        )
+        self._commit()
+        return int(row[0]) if row else 0
+
+    def list_learning_audit_events(
+        self, *, rule_id: int = 0, limit: int = 100, offset: int = 0
+    ) -> list[dict]:
+        clause = "WHERE owner=%s AND repo=%s"
+        params: list[Any] = [self._owner, self._repo]
+        if rule_id:
+            clause += " AND rule_id=%s"
+            params.append(rule_id)
+        rows = self._fetchall(
+            "SELECT id, event_type, rule_id, actor, summary, detail_json, created_at, "
+            f"owner, repo FROM learning_audit_events {clause} "
+            "ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+            (*params, limit, offset),
+        )
+        return [
+            {
+                "id": r[0],
+                "event_type": r[1],
+                "rule_id": r[2],
+                "actor": r[3],
+                "summary": r[4],
+                "detail_json": r[5],
+                "created_at": r[6],
+                "owner": r[7],
+                "repo": r[8],
+            }
+            for r in rows
+        ]
 
     def replace_manifest_packages(
         self,
