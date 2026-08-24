@@ -467,3 +467,47 @@ def test_postgres_rule_evaluations_scoped_by_repo(fake_conn):
 
     assert a.count_rule_evaluations({"rule_id": 1}) == 1
     assert b.count_rule_evaluations({"rule_id": 1}) == 0
+
+
+def test_postgres_org_wide_handle_reads_every_repo(fake_conn):
+    """An empty owner/repo is the deliberate org-wide handle.
+
+    Regression guard: the audit listing pinned `owner=''`/`repo=''` literally,
+    so an org-wide request matched only rows with empty scope — i.e. nothing.
+    """
+    a = PgIndexStore("acme", "widgets", "postgresql://fake")
+    b = PgIndexStore("acme", "gadgets", "postgresql://fake")
+    a.record_learning_audit_event(event_type="regression_dismissed", rule_id=1)
+    b.record_learning_audit_event(event_type="regression_accepted", rule_id=2)
+
+    org_wide = PgIndexStore("", "", "postgresql://fake")
+    assert {event["repo"] for event in org_wide.list_learning_audit_events()} == {
+        "widgets",
+        "gadgets",
+    }
+    # An owner-scoped handle still spans that owner's repositories.
+    owner_wide = PgIndexStore("acme", "", "postgresql://fake")
+    assert len(owner_wide.list_learning_audit_events()) == 2
+    # And a repo-scoped handle stays scoped.
+    assert len(a.list_learning_audit_events()) == 1
+
+
+def test_postgres_org_wide_aggregate_keeps_rule_metadata(fake_conn):
+    """Org-wide rows must still carry rule text, status and activation date.
+
+    Regression guard: metadata was fetched with the store's own owner/repo,
+    which is empty on the org-wide handle, so every rule rendered blank.
+    """
+    repo_store = PgIndexStore("acme", "widgets", "postgresql://fake")
+    rule = repo_store.create_learned_rule("Never log credentials.", "security", created_by="admin")
+    _pg_finding(repo_store, "f1")
+    repo_store.record_rule_evaluations([_pg_evaluation(repo_store, "f1", rule_id=rule.id)])
+
+    org_wide = PgIndexStore("", "", "postgresql://fake")
+    rows = org_wide.aggregate_rule_analytics()
+    assert len(rows) == 1
+    assert rows[0].rule_text == "Never log credentials."
+    assert rows[0].status == "approved"
+    assert rows[0].active is True
+    assert rows[0].owner == "acme"
+    assert rows[0].repo == "widgets"

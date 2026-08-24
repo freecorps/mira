@@ -2720,6 +2720,18 @@ class PgIndexStore(_StoreSharedMixin):
     def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
         return self._fetchall(sql, params)
 
+    def _analytics_rule(self, owner: str, repo: str, rule_id: int) -> LearnedRuleRow | None:
+        """Resolve rule metadata by the aggregate row's repo, not the store's.
+
+        The org-wide handle has an empty owner/repo, so `get_learned_rule`
+        would find nothing and every rule would render without its text.
+        """
+        row = self._fetchone(
+            f"SELECT {self._LR_COLS} FROM learned_rules WHERE id=%s AND owner=%s AND repo=%s",
+            (rule_id, owner or self._owner, repo or self._repo),
+        )
+        return self._row_to_learned_rule(row) if row else None
+
     def _scoped_filters(self, filters: dict[str, Any] | None) -> dict[str, Any]:
         """Pin analytics reads to this store's repository.
 
@@ -2823,8 +2835,17 @@ class PgIndexStore(_StoreSharedMixin):
     def list_learning_audit_events(
         self, *, rule_id: int = 0, limit: int = 100, offset: int = 0
     ) -> list[dict]:
-        clause = "WHERE owner=%s AND repo=%s"
-        params: list[Any] = [self._owner, self._repo]
+        # An empty owner/repo is the deliberate org-wide handle, so filter on
+        # each component only when the store is actually scoped to it.
+        clauses: list[str] = []
+        params: list[Any] = []
+        if self._owner:
+            clauses.append("owner=%s")
+            params.append(self._owner)
+        if self._repo:
+            clauses.append("repo=%s")
+            params.append(self._repo)
+        clause = f"WHERE {' AND '.join(clauses)}" if clauses else "WHERE 1=1"
         if rule_id:
             clause += " AND rule_id=%s"
             params.append(rule_id)

@@ -114,6 +114,18 @@ class _StoreSharedMixin:
         """
         return dict(filters or {})
 
+    def _analytics_rule(self, owner: str, repo: str, rule_id: int) -> Any:
+        """Look up a rule's metadata for an aggregate row.
+
+        SQLite has one database per repository, so `rule_id` alone is
+        unambiguous. Postgres shares the table and its `get_learned_rule` is
+        pinned to the store's own owner/repo -- which is empty on the org-wide
+        handle, so it would return None and blank out every rule's text.
+        `PgIndexStore` overrides this to look the rule up by the row's repo.
+        """
+        del owner, repo
+        return self.get_learned_rule(rule_id)  # type: ignore[attr-defined]
+
     def _counts_from_row(self, row: tuple, offset: int) -> RuleOutcomeCounts:
         """Read the shared aggregate column block starting at `offset`."""
         from mira.feedback.evaluation import RuleOutcomeCounts
@@ -174,7 +186,7 @@ class _StoreSharedMixin:
             owner, repo, rule_id = str(row[0]), str(row[1]), int(row[2])
             counts = self._counts_from_row(row, 9)
             counts.repeated_false_positives = repeats.get((owner, repo, rule_id), 0)
-            rule = self.get_learned_rule(rule_id)  # type: ignore[attr-defined]
+            rule = self._analytics_rule(owner, repo, rule_id)
             results.append(
                 RuleAnalyticsRow(
                     rule_id=rule_id,
