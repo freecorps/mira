@@ -30,6 +30,8 @@ from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
 from mira.exceptions import MiraError, ResponseParseError
+from mira.feedback.models import ReviewFinding
+from mira.feedback.provenance import finding_fingerprint, new_finding_id
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -62,6 +64,57 @@ from mira.models import (
 from mira.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _build_review_finding(
+    pr_info: PRInfo,
+    comment: ReviewComment,
+    *,
+    prompt_model: str,
+) -> ReviewFinding:
+    finding_id = comment.finding_id or new_finding_id()
+    comment.finding_id = finding_id
+    detector = comment.source_pass or "main"
+    severity = (
+        comment.severity.name.lower()
+        if isinstance(comment.severity, Severity)
+        else str(comment.severity)
+    )
+    return ReviewFinding(
+        id=finding_id,
+        fingerprint=finding_fingerprint(
+            owner=pr_info.owner,
+            repo=pr_info.repo,
+            pr_number=pr_info.number,
+            base_sha=pr_info.base_sha,
+            head_sha=pr_info.head_sha,
+            path=comment.path,
+            symbol="",
+            category=comment.category,
+            detector=detector,
+            problem=f"{comment.title}\n{comment.body}",
+        ),
+        review_id=0,
+        platform=pr_info.platform,
+        owner=pr_info.owner,
+        repo=pr_info.repo,
+        pr_number=pr_info.number,
+        pr_url=pr_info.url,
+        base_sha=pr_info.base_sha,
+        head_sha=pr_info.head_sha,
+        path=comment.path,
+        start_line=comment.line,
+        end_line=comment.end_line or comment.line,
+        symbol="",
+        category=comment.category,
+        severity=severity,
+        confidence=comment.confidence,
+        title=comment.title,
+        body=comment.body,
+        suggestion=comment.suggestion or "",
+        detector=detector,
+        prompt_model=prompt_model,
+    )
 
 
 def _audit_drop(c: ReviewComment, stage: str, reason: str = "") -> dict:
@@ -905,9 +958,42 @@ class ReviewEngine:
                     pr_info.url,
                 )
             else:
+                # Persist every finding before the network call. This makes a
+                # posted comment impossible to exist without a durable local
+                # identity and lets the hidden marker survive webhook retries.
+                finding_store = IndexStore.open(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                )
+                try:
+                    prompt_model = self.config.llm.review_model or self.config.llm.model
+                    for comment in result.comments:
+                        finding_store.save_review_finding(
+                            _build_review_finding(
+                                pr_info,
+                                comment,
+                                prompt_model=prompt_model,
+                            )
+                        )
+                finally:
+                    finding_store.close()
                 posted_comment_ids = (
                     await self.provider.post_review(pr_info, result, bot_name=self.bot_name) or []
                 )
+                finding_store = IndexStore.open(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                )
+                try:
+                    for index, comment in enumerate(result.comments):
+                        remote_id = (
+                            posted_comment_ids[index] if index < len(posted_comment_ids) else 0
+                        )
+                        finding_store.update_review_finding_posted(
+                            comment.finding_id,
+                            platform_comment_id=remote_id,
+                            platform_thread_id=comment.platform_thread_id,
+                        )
+                finally:
+                    finding_store.close()
         else:
             logger.info("No code suggestions for PR %s", pr_info.url)
 
@@ -976,12 +1062,10 @@ class ReviewEngine:
                     for i, c in enumerate(result.comments)
                 ],
             )
-            try:
-                from mira.analysis.feedback import synthesize_rules
-
-                synthesize_rules(store)
-            except Exception as synth_err:
-                logger.debug("Feedback synthesis failed: %s", synth_err)
+            store.link_review_findings(
+                [comment.finding_id for comment in result.comments if comment.finding_id],
+                review_event.id,
+            )
             store.close()
 
             # Merge with any prior progress for this PR so @miracodeai review-rest

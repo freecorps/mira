@@ -89,11 +89,16 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
           isOutdated
           comments(first: 1) {
             nodes {
+              databaseId
               author { login }
               body
               path
               line
               originalLine
+              reactionGroups {
+                content
+                users(first: 100) { nodes { login } }
+              }
             }
           }
         }
@@ -211,6 +216,7 @@ class GitHubProvider(BaseProvider):
                 number=pr.number,
                 owner=owner,
                 repo=repo,
+                base_sha=pr.base.sha or "",
                 head_sha=pr.head.sha or "",
                 author=(user.login or "") if user else "",
                 author_avatar_url=(user.avatar_url or "") if user else "",
@@ -1058,6 +1064,14 @@ class GitHubProvider(BaseProvider):
                 author = (first.get("author") or {}).get("login", "")
                 if _normalize_login(author) != _normalize_login(effective_login):
                     continue
+                reaction_groups = {
+                    group.get("content", ""): [
+                        user.get("login", "")
+                        for user in (group.get("users") or {}).get("nodes", [])
+                        if user.get("login")
+                    ]
+                    for group in first.get("reactionGroups") or []
+                }
                 threads.append(
                     BotThreadRecord(
                         thread_id=node["id"],
@@ -1066,6 +1080,9 @@ class GitHubProvider(BaseProvider):
                         body=first.get("body", ""),
                         is_resolved=bool(node["isResolved"]),
                         is_outdated=bool(node["isOutdated"]),
+                        platform_comment_id=int(first.get("databaseId") or 0),
+                        positive_reactors=reaction_groups.get("THUMBS_UP", []),
+                        negative_reactors=reaction_groups.get("THUMBS_DOWN", []),
                     )
                 )
 

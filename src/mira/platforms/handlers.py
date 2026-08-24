@@ -16,6 +16,13 @@ from mira.config import load_config
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
 from mira.dashboard.models_config import llm_config_for
+from mira.feedback.models import FeedbackEventV2
+from mira.feedback.service import (
+    DISAGREEMENT_ACK,
+    record_finding_feedback,
+    resolve_finding,
+    set_finding_state,
+)
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
@@ -69,7 +76,7 @@ def _help_message(bot_name: str) -> str:
         f"| `@{bot_name} <anything else>` | Ask a free-form question about the PR. Mira will reply inline using the PR diff as context. |\n\n"
         f"On an inline review comment Mira posted, reply with `@{bot_name} reject` "
         f"(aliases: `dismiss`, `resolve`, `ignore`) to mark the thread resolved and "
-        f"teach Mira not to make similar suggestions in the future.\n\n"
+        f"record the suggestion as a false positive. Direct replies do not require a mention.\n\n"
         f"To skip a PR entirely, include `@{bot_name} ignore` in the PR body.\n\n"
         f"Full docs: https://docs.miracode.ai/commands"
     )
@@ -276,8 +283,12 @@ async def run_thread_reply(
     comment_path: str = "",
     comment_line: int = 0,
     actor: str = "",
+    actor_role: str = "",
     bot_name: str = "miracodeai",
     platform: str = "github",
+    parent_comment_id: str | int = "",
+    source_event_id: str = "",
+    explicit_mention: bool = False,
 ) -> None:
     """Platform-neutral free-form thread reply with intent classification.
 
@@ -294,6 +305,7 @@ async def run_thread_reply(
     )
     # Tool calling forces a schema-valid result — more reliable than parsing
     # free-form JSON. The provider's tenacity decorator retries transient fails.
+    classification_error = ""
     try:
         raw = await llm.complete_with_tools(
             messages=[{"role": "user", "content": prompt}],
@@ -303,12 +315,54 @@ async def run_thread_reply(
         data = json.loads(strip_think_blocks(strip_code_fences(raw))) if raw else {}
     except Exception as exc:
         logger.warning("Free-form thread reply LLM call failed: %s", exc)
-        return
+        data = {"intent": "other", "reply": ""}
+        classification_error = str(exc)
 
     intent = str(data.get("intent", "other")).lower()
     reply_text = str(data.get("reply", "")).strip()
-    if not reply_text:
-        logger.warning("Free-form thread reply: empty reply (intent=%s). Skipping.", intent)
+    kind_by_intent = {
+        "disagreement": "reply_disagree",
+        "agreement": "reply_agree",
+        "question": "reply_question",
+        "other": "reply_other",
+    }
+    source_id = source_event_id or f"review-comment:{comment_id}"
+    finding, _event, created = record_finding_feedback(
+        pr_info,
+        kind=kind_by_intent.get(intent, "reply_other"),
+        source_event_id=source_id,
+        actor=actor,
+        actor_role=actor_role,
+        raw_text=human_reply,
+        rationale=reply_text,
+        original_body=original_suggestion,
+        platform_comment_id=parent_comment_id,
+        platform_thread_id=thread_id or "",
+        path=comment_path,
+        line=comment_line,
+        thread_state="open",
+        platform=platform,
+        audit={"classification_error": classification_error} if classification_error else None,
+    )
+    # A reply outside a Mira finding is not ours to answer unless the caller
+    # explicitly mentioned the bot (legacy integrations pass no parent ID).
+    if not created:
+        logger.info("Ignoring duplicate feedback event %s", source_id)
+        return
+    if finding is None:
+        if not explicit_mention:
+            logger.debug("Ignoring thread reply without Mira finding provenance")
+            return
+        if not reply_text:
+            logger.warning("Mentioned thread reply was recorded but produced no answer")
+            return
+        await provider.reply_to_review_comment(pr_info, comment_id, reply_text)
+        return
+
+    if intent == "disagreement":
+        reply_text = DISAGREEMENT_ACK
+    elif not reply_text:
+        logger.warning("Free-form thread reply: empty reply (intent=%s). Recorded only.", intent)
         return
 
     try:
@@ -327,23 +381,9 @@ async def run_thread_reply(
         except Exception as exc:
             logger.warning("Failed to resolve disagreement thread: %s", exc)
         try:
-            store = _open_store(pr_info.owner, pr_info.repo, platform)
-            try:
-                store.record_feedback(
-                    pr_number=pr_info.number,
-                    pr_url=pr_info.url,
-                    comment_path=comment_path,
-                    comment_line=comment_line,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=actor,
-                )
-            finally:
-                store.close()
+            set_finding_state(pr_info, finding.id, "dismissed", platform)
         except Exception as fb_err:
-            logger.debug("Failed to record disagreement feedback: %s", fb_err)
+            logger.debug("Failed to update disagreement state: %s", fb_err)
 
     logger.info("Thread reply (%s) on %s: %s", intent, pr_info.url, reply_text[:80])
 
@@ -355,112 +395,121 @@ async def run_pr_merged_learning(
     merged_by: str,
     platform: str = "github",
 ) -> None:
-    """Platform-neutral merge-time learning: record accept/reject + human-review
-    signals and synthesize rules. Shared by GitHub and GitLab."""
-    from mira.providers.formatting import parse_bot_comment_metadata
-
+    """Record merge state without treating silence as positive feedback."""
     owner, repo, number, pr_url = pr_info.owner, pr_info.repo, pr_info.number, pr_info.url
     store = _open_store(owner, repo, platform)
-    accepted = 0
-    human_recorded = 0
-    deterministic_rules = 0
-    llm_rules = 0
+    unobserved = 0
+    fixed = 0
     try:
-        existing = store.list_feedback(limit=2000)
-        if any(
-            e.signal in ("accepted", "human_review") and e.pr_number == number for e in existing
-        ):
-            logger.info("PR %s already processed for merge-time learning", pr_url)
-            return
-        rejected_locations = {
-            (e.comment_path, e.comment_line)
-            for e in existing
-            if e.signal == "rejected" and e.pr_number == number
+        legacy_rejected_locations = {
+            (event.comment_path, event.comment_line)
+            for event in store.list_feedback(limit=2000)
+            if event.pr_number == number and event.signal == "rejected"
         }
-
         try:
             bot_threads = await provider.get_all_bot_threads(pr_info)
         except Exception as exc:
             logger.warning("Failed to fetch bot threads for %s: %s", pr_url, exc)
             bot_threads = []
 
-        bot_events: list[dict] = []
         for thread in bot_threads:
-            if (thread.path, thread.line) in rejected_locations:
+            if (thread.path, thread.line) in legacy_rejected_locations:
                 continue
-            meta = parse_bot_comment_metadata(thread.body)
-            if not meta["category"]:
-                continue
-            bot_events.append(
-                {
-                    "pr_number": number,
-                    "pr_url": pr_url,
-                    "comment_path": thread.path,
-                    "comment_line": thread.line,
-                    "comment_category": meta["category"],
-                    "comment_severity": meta["severity"],
-                    "comment_title": meta["title"],
-                    "signal": "accepted",
-                    "actor": merged_by,
-                    "pr_author": pr_info.author,
-                }
+            finding = resolve_finding(
+                store,
+                pr_info,
+                original_body=thread.body,
+                platform_comment_id=thread.platform_comment_id,
+                platform_thread_id=thread.thread_id,
+                path=thread.path,
+                line=thread.line,
+                platform=platform,
             )
-
-        try:
-            human_comments = await provider.get_human_review_comments(pr_info, bot_name)
-        except Exception as exc:
-            logger.warning("Failed to fetch human review comments for %s: %s", pr_url, exc)
-            human_comments = []
-
-        human_events: list[dict] = []
-        for hc in human_comments:
-            body = (hc.body or "").strip()
-            if not body:
+            if finding is None:
                 continue
-            human_events.append(
-                {
-                    "pr_number": number,
-                    "pr_url": pr_url,
-                    "comment_path": hc.path,
-                    "comment_line": hc.line,
-                    "comment_category": "human_review",
-                    "comment_severity": "",
-                    "comment_title": body[:2000],
-                    "signal": "human_review",
-                    "actor": hc.author,
-                    "pr_author": pr_info.author,
-                }
+            for reaction_kind, actors in (
+                ("thumbs_up", thread.positive_reactors),
+                ("thumbs_down", thread.negative_reactors),
+            ):
+                for reaction_actor in actors:
+                    store.record_feedback_v2(
+                        FeedbackEventV2(
+                            id=0,
+                            finding_id=finding.id,
+                            kind=reaction_kind,
+                            actor=reaction_actor,
+                            actor_role="",
+                            raw_text="+1" if reaction_kind == "thumbs_up" else "-1",
+                            rationale="GitHub reaction snapshot",
+                            platform=platform,
+                            source_event_id=(
+                                f"reaction-snapshot:{finding.id}:{reaction_actor}:{reaction_kind}"
+                            ),
+                            head_sha=finding.head_sha,
+                            thread_state="resolved" if thread.is_resolved else "open",
+                            provenance_complete=False,
+                            audit_json=json.dumps(
+                                {"platform_comment_id": thread.platform_comment_id},
+                                sort_keys=True,
+                            ),
+                        )
+                    )
+            prior = store.list_feedback_v2(finding_id=finding.id, limit=100)
+            if any(event.kind in {"thumbs_down", "reply_disagree", "dismissed"} for event in prior):
+                store.update_review_finding_state(finding.id, "dismissed")
+                continue
+            if any(event.kind == "thumbs_up" for event in prior):
+                continue
+            kind = "fixed" if thread.is_resolved else "unobserved"
+            state = "fixed" if thread.is_resolved else "outdated" if thread.is_outdated else "open"
+            _event, created = store.record_feedback_v2(
+                FeedbackEventV2(
+                    id=0,
+                    finding_id=finding.id,
+                    kind=kind,
+                    actor=merged_by,
+                    actor_role="merger",
+                    raw_text="",
+                    rationale=(
+                        "thread was resolved before merge"
+                        if thread.is_resolved
+                        else "PR merged without explicit feedback"
+                    ),
+                    platform=platform,
+                    source_event_id=(
+                        f"merge:{number}:{pr_info.head_sha or 'unknown'}:{finding.id}"
+                    ),
+                    head_sha=finding.head_sha,
+                    thread_state=(
+                        "resolved"
+                        if thread.is_resolved
+                        else "outdated"
+                        if thread.is_outdated
+                        else "open"
+                    ),
+                    provenance_complete=False,
+                    audit_json=json.dumps(
+                        {
+                            "thread_id": thread.thread_id,
+                            "is_resolved": thread.is_resolved,
+                            "is_outdated": thread.is_outdated,
+                        },
+                        sort_keys=True,
+                    ),
+                )
             )
-
-        if bot_events:
-            store.record_bulk_feedback(bot_events)
-            accepted = len(bot_events)
-        if human_events:
-            store.record_bulk_feedback(human_events)
-            human_recorded = len(human_events)
-
-        from mira.analysis.feedback import synthesize_from_human_reviews, synthesize_rules
-
-        deterministic_rules = synthesize_rules(store)
-
-        if human_recorded > 0:
-            try:
-                config = load_config()
-                from mira.dashboard.models_config import llm_config_for
-
-                indexing_llm = create_llm(llm_config_for("indexing", config.llm))
-                llm_rules = await synthesize_from_human_reviews(store, indexing_llm)
-            except Exception as exc:
-                logger.warning("LLM rule synthesis failed for %s: %s", pr_url, exc)
+            if created:
+                if kind == "fixed":
+                    fixed += 1
+                else:
+                    unobserved += 1
+                store.update_review_finding_state(finding.id, state)
     finally:
         store.close()
 
     logger.info(
-        "PR merged %s: recorded %d accepted + %d human review events; "
-        "upserted %d deterministic + %d LLM rules",
+        "PR merged %s: recorded %d unobserved + %d evidence-backed fixed events",
         pr_url,
-        accepted,
-        human_recorded,
-        deterministic_rules,
-        llm_rules,
+        unobserved,
+        fixed,
     )

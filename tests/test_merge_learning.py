@@ -405,7 +405,7 @@ class _StoreProxy:
 
 @pytest.mark.asyncio
 async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
-    """Exercise the whole handler: provider → parser → store → synthesis chain."""
+    """Merge records silence as unobserved and retries remain idempotent."""
     from mira.platforms.github import webhook as handlers
 
     store = IndexStore(str(tmp_path / "test.db"))
@@ -530,8 +530,8 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
             "merged_by": {"login": "alice"},
             "title": "Add auth",
             "body": "",
-            "base": {"ref": "main"},
-            "head": {"ref": "f"},
+            "base": {"ref": "main", "sha": "base123"},
+            "head": {"ref": "f", "sha": "head123"},
             "labels": [],
         },
         "repository": {"owner": {"login": "acme"}, "name": "web"},
@@ -539,40 +539,24 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
 
     await handlers.handle_pr_merged(payload, app_auth, "mira")
 
-    events = store.list_feedback(limit=100)
-    by_signal: dict[str, list] = {"accepted": [], "human_review": [], "rejected": []}
-    for e in events:
-        by_signal.setdefault(e.signal, []).append(e)
+    events = store.list_feedback_v2(pr_number=42, limit=100)
 
-    # Bot threads: t1 (accepted), t2 (skipped — prior reject), t3 (accepted),
-    # t4 (skipped — no parseable metadata).
-    assert len(by_signal["accepted"]) == 2
-    paths = {e.comment_path for e in by_signal["accepted"]}
+    # Bot threads: t1/t3 are unobserved, t2 is skipped due prior legacy reject,
+    # and t4 has no parseable provenance.
+    assert len(events) == 2
+    assert {event.kind for event in events} == {"unobserved"}
+    findings = [store.get_review_finding(event.finding_id or "") for event in events]
+    paths = {finding.path for finding in findings if finding}
     assert paths == {"src/auth.py", "src/utils.py"}
-    cats = {e.comment_category for e in by_signal["accepted"]}
+    cats = {finding.category for finding in findings if finding}
     assert cats == {"bug", "performance"}
-
-    # Titles parsed too.
-    titles = {e.comment_title for e in by_signal["accepted"]}
+    titles = {finding.title for finding in findings if finding}
     assert "Null handling missing" in titles
     assert "Slow loop" in titles
-
-    # Two human-review events (third had empty body).
-    assert len(by_signal["human_review"]) == 2
-    human_paths = {e.comment_path for e in by_signal["human_review"]}
-    assert human_paths == {"src/auth.py", "src/api.py"}
-
-    # Original rejected event still present and not duplicated.
-    assert len(by_signal["rejected"]) == 1
-
-    # LLM was invoked exactly once for this merge.
-    fake_llm.complete.assert_called_once()
-
-    # One human_pattern rule stored.
-    rules = store.list_learned_rules()
-    human_rules = [r for r in rules if r.source_signal == "human_pattern"]
-    assert len(human_rules) == 1
-    assert "raw sql" in human_rules[0].rule_text.lower()
+    assert all(event.provenance_complete for event in events)
+    fake_llm.complete.assert_not_called()
+    mock_provider.get_human_review_comments.assert_not_called()
+    assert store.list_learned_rules() == []
 
     # ── Dedup on retry ──
     fake_llm.complete.reset_mock()
@@ -582,11 +566,12 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
     await handlers.handle_pr_merged(payload, app_auth, "mira")
 
     # No new events should have been recorded.
-    events_after = store.list_feedback(limit=100)
+    events_after = store.list_feedback_v2(pr_number=42, limit=100)
     assert len(events_after) == len(events)
 
-    # Provider fetch methods should not have been called (early return).
-    mock_provider.get_all_bot_threads.assert_not_called()
+    # Threads are fetched again so a partially processed first delivery can
+    # recover, while per-finding source IDs prevent duplicates.
+    mock_provider.get_all_bot_threads.assert_awaited_once()
     mock_provider.get_human_review_comments.assert_not_called()
     fake_llm.complete.assert_not_called()
 

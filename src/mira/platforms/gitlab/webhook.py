@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from mira.config import load_config
+from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback, set_finding_state
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.fetch import _next_link, make_fetcher
@@ -27,6 +28,7 @@ from mira.platforms.mentions import (
     strip_mentions,
 )
 from mira.providers import create_provider
+from mira.providers.formatting import parse_bot_comment_finding_id, parse_bot_comment_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +197,6 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
         _REJECT_KEYWORDS,
         _RESUME_KEYWORDS,
         PAUSE_LABEL,
-        _open_store,
         run_pr_command,
         run_thread_reply,
     )
@@ -236,32 +237,45 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
         discussion_id = attrs.get("discussion_id")
         position = attrs.get("position")
 
-        # Explicit reject on an inline (diff) note → resolve + record feedback.
+        original = ""
+        if discussion_id and position:
+            original = await provider.get_discussion_root_body(pr_info, str(discussion_id))
+            if not isinstance(original, str):
+                original = ""
+            is_mira_finding = bool(parse_bot_comment_finding_id(original)) or bool(
+                parse_bot_comment_metadata(original)["category"]
+            )
+            if not is_mira_finding and not has_mention(note_body, names):
+                logger.debug("Ignoring reply to a non-Mira GitLab discussion")
+                return
+
+        # Explicit reject on an inline (diff) note → record before resolving.
         if first_word in _REJECT_KEYWORDS and discussion_id and position:
+            finding, _event, created = record_finding_feedback(
+                pr_info,
+                kind="dismissed",
+                source_event_id=f"note:{attrs.get('id', '')}",
+                actor=actor,
+                raw_text=note_body,
+                rationale="explicit reject command",
+                original_body=original,
+                platform_thread_id=str(discussion_id),
+                path=position.get("new_path", ""),
+                line=position.get("new_line", 0) or 0,
+                thread_state="open",
+                platform="gitlab",
+            )
+            if not created:
+                return
+            if finding is not None:
+                await provider.reply_to_review_comment(pr_info, attrs.get("id"), DISAGREEMENT_ACK)
             await provider.resolve_threads(pr_info, [str(discussion_id)])
-            try:
-                store = _open_store(owner, repo, "gitlab")
-                store.record_feedback(
-                    pr_number=iid,
-                    pr_url=mr_url,
-                    comment_path=position.get("new_path", ""),
-                    comment_line=position.get("new_line", 0) or 0,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=actor,
-                )
-            except Exception as exc:
-                logger.debug("Failed to record GitLab reject feedback: %s", exc)
-            finally:
-                if "store" in locals():
-                    store.close()
+            if finding is not None:
+                set_finding_state(pr_info, finding.id, "dismissed", "gitlab")
             return
 
         # Free-form @-mention on an inline thread → LLM intent classification.
         if discussion_id and position:
-            original = await provider.get_discussion_root_body(pr_info, str(discussion_id))
             await run_thread_reply(
                 provider,
                 pr_info,
@@ -274,6 +288,8 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
                 actor=actor,
                 bot_name=bot_name,
                 platform="gitlab",
+                source_event_id=f"note:{attrs.get('id', '')}",
+                explicit_mention=has_mention(note_body, names),
             )
             return
 
@@ -283,6 +299,66 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
         )
     except Exception:
         logger.exception("Error handling GitLab note on %s/%s!%s", owner, repo, iid)
+
+
+async def handle_gitlab_emoji(payload: dict[str, Any], auth: PlatformAuth) -> None:
+    """Record GitLab thumbsup/thumbsdown awards on Mira MR notes."""
+    attrs = payload.get("object_attributes", {}) or {}
+    kind = {"thumbsup": "thumbs_up", "thumbsdown": "thumbs_down"}.get(attrs.get("name", ""))
+    note = payload.get("note", {}) or {}
+    if (
+        attrs.get("action") != "award"
+        or attrs.get("awardable_type") != "Note"
+        or note.get("noteable_type") != "MergeRequest"
+        or not kind
+    ):
+        return
+    project = payload.get("project", {}) or {}
+    try:
+        owner, repo = _split_project_path(project.get("path_with_namespace", ""))
+    except ValueError:
+        return
+    merge_request = payload.get("merge_request", {}) or {}
+    iid = merge_request.get("iid")
+    if not iid:
+        awarded_url = attrs.get("awarded_on_url", "") or ""
+        match = re.search(r"/merge_requests/(\d+)", awarded_url)
+        iid = int(match.group(1)) if match else 0
+    if not iid:
+        return
+    mr_url = (
+        merge_request.get("url")
+        or f"{project.get('web_url', '').rstrip('/')}/-/merge_requests/{iid}"
+    )
+    try:
+        token = await auth.get_token()
+        provider = create_provider("gitlab", token)
+        pr_info = await provider.get_pr_info(mr_url)
+        position = note.get("position") or note.get("original_position") or {}
+        actor = (payload.get("user") or {}).get("username", "")
+        finding, _event, created = record_finding_feedback(
+            pr_info,
+            kind=kind,
+            source_event_id=f"emoji:{attrs.get('id', '')}",
+            actor=actor,
+            raw_text=attrs.get("name", ""),
+            original_body=note.get("note") or note.get("description") or "",
+            platform_comment_id=note.get("id", 0) or attrs.get("awardable_id", 0),
+            platform_thread_id=note.get("discussion_id", "") or "",
+            path=position.get("new_path", "") or "",
+            line=position.get("new_line", 0) or 0,
+            thread_state="resolved" if note.get("resolved_at") else "open",
+            platform="gitlab",
+        )
+        if finding is None or not created:
+            return
+        if kind == "thumbs_down":
+            await provider.reply_to_review_comment(
+                pr_info, int(note.get("id", 0) or 0), DISAGREEMENT_ACK
+            )
+            set_finding_state(pr_info, finding.id, "dismissed", "gitlab")
+    except Exception:
+        logger.exception("Error handling GitLab emoji feedback on %s/%s!%s", owner, repo, iid)
 
 
 async def dispatch_gitlab_event(
@@ -328,8 +404,9 @@ async def dispatch_gitlab_event(
     if event == "Note Hook":
         attrs = payload.get("object_attributes", {})
         names = mention_names(bot_name, bot_identity)
-        if attrs.get("noteable_type") == "MergeRequest" and has_mention(
-            attrs.get("note") or "", names
+        is_inline_reply = bool(attrs.get("discussion_id") and attrs.get("position"))
+        if attrs.get("noteable_type") == "MergeRequest" and (
+            has_mention(attrs.get("note") or "", names) or is_inline_reply
         ):
             cmd_word = command_after_mention(attrs.get("note") or "", names)
             if cmd_word != "review":
@@ -340,6 +417,17 @@ async def dispatch_gitlab_event(
                     logger.debug("MR note skipped — author %s filtered", actor)
                     return "ignored"
             background_tasks.add_task(handle_gitlab_note, payload, auth, bot_name)
+            return "processing"
+        return "ignored"
+
+    if event == "Emoji Hook":
+        attrs = payload.get("object_attributes", {}) or {}
+        if (
+            attrs.get("action") == "award"
+            and attrs.get("name") in {"thumbsup", "thumbsdown"}
+            and attrs.get("awardable_type") == "Note"
+        ):
+            background_tasks.add_task(handle_gitlab_emoji, payload, auth)
             return "processing"
         return "ignored"
 

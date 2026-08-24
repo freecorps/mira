@@ -252,6 +252,9 @@ As estimativas abaixo são faixas para uma pessoa familiarizada com o código. C
 
 **Objetivo:** nenhuma discordância volta a ser perdida.
 
+**Status:** implementada em agosto de 2026. O schema legado permanece disponível
+para leitura; toda nova interação de finding usa o modelo v2.
+
 - Adicionar `review_findings` e `feedback_events_v2` em SQLite e PostgreSQL.
 - Persistir finding antes de postar e associar IDs de comentário/thread depois.
 - Incluir `finding_id` oculto em todo comentário do Mira.
@@ -263,6 +266,25 @@ As estimativas abaixo são faixas para uma pessoa familiarizada com o código. C
 - Manter compatibilidade de leitura do schema antigo e criar backfill best-effort.
 
 **Aceite:** reply de discordância sem menção e 👎 geram exatamente um evento ligado ao finding correto; retry de webhook não duplica; nenhum evento com proveniência incompleta vira regra automática.
+
+#### Notas da implementação
+
+- O engine grava cada finding antes do POST e só depois associa o ID remoto. O
+  comentário carrega `<!-- mira:finding:<uuid> -->`, invisível na renderização.
+- `feedback_events_v2` deduplica por plataforma + ID externo do evento. Eventos
+  legados sem path, categoria ou SHA continuam auditáveis, mas recebem
+  `provenance_complete = false` e não participam de síntese.
+- Replies-filhas do GitHub e discussões inline do GitLab não exigem menção. O
+  Forgejo usa o parent ID quando a versão instalada o fornece; sem parent ID,
+  exige menção para não atribuir feedback à conversa errada.
+- GitLab usa o `Emoji Hook` para `thumbsup`/`thumbsdown`. O GitHub não oferece um
+  webhook de reações; o provider lê `reactionGroups` no snapshot GraphQL dos
+  threads e os normaliza ao processar o merge. Forgejo não documenta um webhook
+  equivalente, então reações não são inferidas nessa plataforma.
+- Merge sem interação gera `unobserved`. `fixed` exige thread resolvido e nunca
+  sobrepõe uma discordância ou reação negativa já registrada.
+- A síntese automática no fechamento do PR foi removida desta fase. A criação e
+  governança de candidatos fica exclusivamente para a Fase 2.
 
 ### Fase 2 — Mira Learns Safely (7–12 dias)
 

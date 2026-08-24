@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import BackgroundTasks
 
 from mira.config import load_config
+from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback, set_finding_state
 from mira.index.indexer import _should_index
 from mira.index.store import IndexStore
 from mira.models import PRInfo
@@ -25,7 +26,6 @@ from mira.platforms.handlers import (
     _REJECT_KEYWORDS,
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
-    _open_store,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -40,6 +40,7 @@ from mira.platforms.mentions import (
     strip_mentions,
 )
 from mira.providers import create_provider
+from mira.providers.formatting import parse_bot_comment_finding_id, parse_bot_comment_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +398,8 @@ async def _handle_thread_freeform_reply(
             number=number,
             owner=owner,
             repo=repo,
+            base_sha=(payload.get("pull_request", {}).get("base") or {}).get("sha", ""),
+            head_sha=(payload.get("pull_request", {}).get("head") or {}).get("sha", ""),
         )
 
         # Record the human reply for the activity conversation timeline
@@ -408,6 +411,14 @@ async def _handle_thread_freeform_reply(
         original_suggestion = (
             await provider.get_comment_body(pr_info, in_reply_to_id) if in_reply_to_id else ""
         )
+        if not isinstance(original_suggestion, str):
+            original_suggestion = ""
+        is_mira_finding = bool(parse_bot_comment_finding_id(original_suggestion)) or bool(
+            parse_bot_comment_metadata(original_suggestion)["category"]
+        )
+        if in_reply_to_id and not is_mira_finding and not has_mention(comment["body"], names):
+            logger.debug("Ignoring reply to a non-Mira review comment")
+            return
 
         await run_thread_reply(
             provider,
@@ -419,7 +430,11 @@ async def _handle_thread_freeform_reply(
             comment_path=comment.get("path", ""),
             comment_line=comment.get("original_line", 0) or comment.get("line", 0),
             actor=comment["user"]["login"],
+            actor_role=comment.get("author_association", ""),
             bot_name=bot_name,
+            parent_comment_id=in_reply_to_id or "",
+            source_event_id=f"review-comment:{comment_id}",
+            explicit_mention=has_mention(comment["body"], names),
         )
     except Exception:
         logger.exception("Error handling free-form thread reply")
@@ -548,6 +563,9 @@ async def dispatch_github_event(
             return "ignored"
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         if has_mention(rc_body, names):
+            background_tasks.add_task(handle_thread_reject, payload, app_auth, bot_name)
+            return "processing"
+        if payload.get("comment", {}).get("in_reply_to_id"):
             background_tasks.add_task(handle_thread_reject, payload, app_auth, bot_name)
             return "processing"
 
@@ -689,7 +707,8 @@ async def handle_thread_reject(
 
         owner = payload["repository"]["owner"]["login"]
         repo = payload["repository"]["name"]
-        number = payload["pull_request"]["number"]
+        pr_payload = payload["pull_request"]
+        number = pr_payload["number"]
 
         # Capture the human reply for the activity conversation timeline.
         _record_human_reply(
@@ -701,34 +720,6 @@ async def handle_thread_reject(
         )
 
         provider = create_provider("github", token)
-        from mira.models import PRInfo as _PRInfo
-
-        _pr_info_for_lookup = _PRInfo(
-            title="",
-            description="",
-            base_branch="",
-            head_branch="",
-            url=f"https://github.com/{owner}/{repo}/pull/{number}",
-            number=number,
-            owner=owner,
-            repo=repo,
-        )
-        thread_id = await provider.get_thread_id_for_comment(
-            comment_node_id,
-            _pr_info_for_lookup,
-        )
-        if not thread_id:
-            logger.info(
-                "Thread not found or already resolved for comment %s on PR %s/%s#%d",
-                comment_node_id,
-                owner,
-                repo,
-                number,
-            )
-            return
-
-        from mira.models import PRInfo
-
         pr_info = PRInfo(
             title="",
             description="",
@@ -738,7 +729,67 @@ async def handle_thread_reject(
             number=number,
             owner=owner,
             repo=repo,
+            base_sha=(pr_payload.get("base") or {}).get("sha", ""),
+            head_sha=(pr_payload.get("head") or {}).get("sha", ""),
         )
+        parent_comment_id = payload["comment"].get("in_reply_to_id", 0) or 0
+        original = (
+            await provider.get_comment_body(pr_info, parent_comment_id) if parent_comment_id else ""
+        )
+        external_event_id = payload["comment"].get("id")
+        if external_event_id:
+            finding, _event, created = record_finding_feedback(
+                pr_info,
+                kind="dismissed",
+                source_event_id=f"review-comment:{external_event_id}",
+                actor=payload["comment"]["user"]["login"],
+                actor_role=payload["comment"].get("author_association", ""),
+                raw_text=comment_body,
+                rationale="explicit reject command",
+                original_body=original,
+                platform_comment_id=parent_comment_id,
+                path=payload["comment"].get("path", ""),
+                line=payload["comment"].get("original_line", 0)
+                or payload["comment"].get("line", 0),
+                thread_state="open",
+                platform="github",
+            )
+        else:
+            finding, created = None, True
+        if not created:
+            logger.info("Ignoring duplicate reject feedback webhook")
+            return
+        if finding is not None:
+            try:
+                await provider.reply_to_review_comment(
+                    pr_info, payload["comment"].get("id", 0), DISAGREEMENT_ACK
+                )
+            except Exception as exc:
+                logger.warning("Failed to acknowledge reject feedback: %s", exc)
+
+        thread_id = await provider.get_thread_id_for_comment(
+            comment_node_id,
+            pr_info,
+        )
+        if finding is not None and thread_id:
+            finding_store = IndexStore.open(owner, repo)
+            try:
+                finding_store.update_review_finding_posted(
+                    finding.id,
+                    platform_comment_id=parent_comment_id,
+                    platform_thread_id=thread_id,
+                )
+            finally:
+                finding_store.close()
+        if not thread_id:
+            logger.info(
+                "Thread not found or already resolved for comment %s on PR %s/%s#%d",
+                comment_node_id,
+                owner,
+                repo,
+                number,
+            )
+            return
         try:
             resolved = await provider.resolve_threads(pr_info, [thread_id])
         except Exception as resolve_err:
@@ -770,27 +821,11 @@ async def handle_thread_reject(
             repo,
             number,
         )
-
-        # Record feedback for learning
-        try:
-            store = _open_store(owner, repo)
+        if finding is not None:
             try:
-                store.record_feedback(
-                    pr_number=number,
-                    pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
-                    comment_path=payload["comment"].get("path", ""),
-                    comment_line=payload["comment"].get("original_line", 0)
-                    or payload["comment"].get("line", 0),
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=payload["comment"]["user"]["login"],
-                )
-            finally:
-                store.close()
-        except Exception as fb_err:
-            logger.debug("Failed to record feedback: %s", fb_err)
+                set_finding_state(pr_info, finding.id, "dismissed", "github")
+            except Exception as fb_err:
+                logger.debug("Failed to update finding state: %s", fb_err)
 
     except Exception:
         logger.exception("Error handling thread reject event")
@@ -831,6 +866,7 @@ async def handle_pr_merged(
             number=number,
             owner=owner,
             repo=repo,
+            base_sha=pr["base"].get("sha") or "",
             head_sha=pr["head"].get("sha") or "",
             author=(pr.get("user") or {}).get("login", ""),
         )

@@ -38,9 +38,9 @@ class BaseProvider(abc.ABC):
     ) -> list[int]:
         """Post review comments to a pull request.
 
-        Returns the GitHub comment IDs of the posted inline comments, aligned
-        to ``result.comments`` (0 where the ID couldn't be determined). Used to
-        link human replies back to the exact comment they answer.
+        Returns platform comment IDs aligned to ``result.comments`` (0 where
+        the ID couldn't be determined). Used to link later replies/reactions
+        back to the exact persisted finding.
         """
 
     async def submit_verdict(self, pr_info: PRInfo, event: str, body: str) -> bool:
