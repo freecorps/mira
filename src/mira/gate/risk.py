@@ -58,20 +58,17 @@ def _touches_manifest(paths: list[str]) -> list[str]:
     return hits
 
 
-def score(
-    inputs: GateInputs,
-    weights: RiskWeights,
-    *,
-    warnings: int = 0,
-    suggestions: int = 0,
-    security_findings: int = 0,
-) -> tuple[int, list[RiskFactor]]:
+def score(inputs: GateInputs, weights: RiskWeights) -> tuple[int, list[RiskFactor]]:
     """Score one PR. Returns ``(0..100, factors)``.
 
-    Factors are emitted in a fixed order and only when they contribute, so two
-    runs over the same inputs produce identical lists — an audit compares them
-    directly instead of sorting first.
+    Everything it reads is on ``inputs``, which is also what gets persisted, so
+    a stored decision can be re-scored and checked. Factors are emitted in a
+    fixed order and only when they contribute, so two runs over the same inputs
+    produce identical lists — an audit compares them directly.
     """
+    warnings = inputs.open_warnings
+    suggestions = inputs.open_suggestions
+    security_findings = inputs.open_security
     factors: list[RiskFactor] = []
 
     def add(code: str, label: str, points: int, detail: str = "") -> None:

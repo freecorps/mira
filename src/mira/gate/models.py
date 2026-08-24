@@ -226,7 +226,12 @@ class GateInputs:
     # ok | unreadable | not_checked | absent
     codeowners_status: str = "not_checked"
     ci: CIState = field(default_factory=CIState)
+    # Open findings, bucketed. Recorded on the inputs rather than passed to
+    # `decide()`, so a gate woken by a finished CI run scores the same pull
+    # request the same way a gate woken by the review does.
     open_blockers: int = 0
+    open_warnings: int = 0
+    open_security: int = 0
     open_findings: int = 0
     worst_severity: str = ""
     review_complete: bool = True
@@ -247,6 +252,11 @@ class GateInputs:
         data["labels"] = sorted(data["labels"])[:100]
         data["review_skipped_paths"] = sorted(data["review_skipped_paths"])[:100]
         return data
+
+    @property
+    def open_suggestions(self) -> int:
+        """Everything open that is neither a blocker nor a warning."""
+        return max(0, self.open_findings - self.open_blockers - self.open_warnings)
 
     @property
     def digest(self) -> str:
@@ -287,6 +297,10 @@ class GateDecision:
     delivery_ref: str = ""
     delivery_attempts: int = 0
     error: str = ""
+    # Set when an admin moved this decision by hand. The full trail lives in
+    # `gate_overrides`; this is here so a list view never shows a state without
+    # showing that a person put it there.
+    overridden_by: str = ""
     id: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -321,6 +335,7 @@ class GateDecision:
             "delivery_ref": self.delivery_ref,
             "delivery_attempts": self.delivery_attempts,
             "error": self.error,
+            "overridden_by": self.overridden_by,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "platform": self.inputs.platform,

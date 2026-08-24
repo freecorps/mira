@@ -718,6 +718,7 @@ export interface GateDecisionModel {
   delivery_ref: string
   delivery_attempts: number
   error: string
+  overridden_by: string
   created_at: number
   updated_at: number
   platform: string

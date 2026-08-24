@@ -32,9 +32,6 @@ def decide(
     policy: EffectivePolicy,
     *,
     capabilities: GateCapabilities = NO_CAPABILITIES,
-    warnings: int = 0,
-    suggestions: int = 0,
-    security_findings: int = 0,
 ) -> GateDecision:
     """Evaluate one PR against one policy."""
     key = decision_key(
@@ -67,13 +64,7 @@ def decide(
     # disqualified: a shadow rollout needs the score of the PRs it refused as
     # much as the score of the ones it would have approved, or the threshold
     # can only ever be tuned from half the data.
-    total, factors = score_risk(
-        inputs,
-        policy.weights,
-        warnings=warnings,
-        suggestions=suggestions,
-        security_findings=security_findings,
-    )
+    total, factors = score_risk(inputs, policy.weights)
     base.risk_score = total
     base.factors = factors
     base.risk_band = risk_band(total, medium_at=policy.risk_medium_at, high_at=policy.risk_high_at)

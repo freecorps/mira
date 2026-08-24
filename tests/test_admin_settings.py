@@ -183,7 +183,10 @@ class TestEndpointValidation:
         }
 
     def test_allowed_sections_constant(self):
-        assert {"filter", "review"} == _ALLOWED_OVERRIDE_SECTIONS
+        # `gate` joined the list in Phase 4. The merge-gate panel writes it
+        # through its own endpoint, but the settings blob is one document and
+        # this endpoint has to be able to round-trip the whole of it.
+        assert {"filter", "review", "gate"} == _ALLOWED_OVERRIDE_SECTIONS
 
 
 class TestVersionEndpoint:

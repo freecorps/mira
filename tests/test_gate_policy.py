@@ -215,9 +215,11 @@ def test_a_clean_small_pr_scores_zero() -> None:
 
 
 def test_risk_is_deterministic_and_integral() -> None:
-    inputs = _clean_inputs(changed_files=40, added_lines=900, deleted_lines=300)
-    first = score(inputs, GateConfig().weights, warnings=3)
-    second = score(inputs, GateConfig().weights, warnings=3)
+    inputs = _clean_inputs(
+        changed_files=40, added_lines=900, deleted_lines=300, open_warnings=3, open_findings=3
+    )
+    first = score(inputs, GateConfig().weights)
+    second = score(inputs, GateConfig().weights)
     assert first == second
     assert isinstance(first[0], int)
     assert all(isinstance(factor.points, int) for factor in first[1])
@@ -232,8 +234,11 @@ def test_every_factor_carries_its_own_explanation() -> None:
         author_association="FIRST_TIME_CONTRIBUTOR",
         review_skipped_paths=["src/huge.py"],
         index_ready=False,
+        open_warnings=2,
+        open_security=1,
+        open_findings=3,
     )
-    total, factors = score(inputs, GateConfig().weights, warnings=2, security_findings=1)
+    total, factors = score(inputs, GateConfig().weights)
     assert total == 100  # clamped
     codes = {factor.code for factor in factors}
     assert {
