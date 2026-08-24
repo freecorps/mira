@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from mira.dashboard import api
 from mira.dashboard.db import AppDatabase, User
 from mira.dashboard.routers import rules
+from mira.feedback.models import LearningCandidate
 from mira.index.store import IndexStore
 
 
@@ -100,27 +101,39 @@ def test_admin_crud(patched_db: AppDatabase):
     store.close()
 
     # Update.
-    rules.update_learned_rule(
+    updated = rules.update_learned_rule(
         "acme",
         "web",
         created.id,
         api.LearnedRuleInput(rule_text="Updated", category="style", path_pattern="tests/"),
         _Req(is_admin=True),
     )
-    # Disable → drops out of active set.
+    # Editing an approved rule creates a new version and supersedes the old.
+    replacement_id = updated["rule_id"]
+    assert replacement_id != created.id
+    store = IndexStore.open("acme", "web")
+    prior = store.get_learned_rule(created.id)
+    replacement = store.get_learned_rule(replacement_id)
+    assert prior.status == "superseded" and not prior.active
+    assert replacement.rule_text == "Updated" and replacement.version == 2
+    store.close()
+
+    # Disable → drops the replacement out of the active set.
     rules.set_learned_rule_active(
-        "acme", "web", created.id, api.LearnedRuleActiveInput(active=False), _Req(is_admin=True)
+        "acme",
+        "web",
+        replacement_id,
+        api.LearnedRuleActiveInput(active=False),
+        _Req(is_admin=True),
     )
     store = IndexStore.open("acme", "web")
-    assert all(r.id != created.id for r in store.list_active_learned_rules())
-    got = store.get_learned_rule(created.id)
-    assert got.rule_text == "Updated"
+    assert all(r.id != replacement_id for r in store.list_active_learned_rules())
     store.close()
 
     # Delete.
-    rules.delete_learned_rule("acme", "web", created.id, _Req(is_admin=True))
+    rules.delete_learned_rule("acme", "web", replacement_id, _Req(is_admin=True))
     store = IndexStore.open("acme", "web")
-    assert store.get_learned_rule(created.id) is None
+    assert store.get_learned_rule(replacement_id) is None
     store.close()
 
 
@@ -260,3 +273,62 @@ def test_admin_can_edit_anyones_rule(patched_db: AppDatabase):
     store = IndexStore.open("acme", "web")
     assert store.get_learned_rule(created.id).rule_text == "admin edited"
     store.close()
+
+
+def test_candidate_dashboard_flow_exposes_evidence_and_requires_approval(
+    patched_db: AppDatabase,
+):
+    patched_db.register_repo("acme", "web")
+    store = IndexStore.open("acme", "web")
+    candidate, _ = store.upsert_learning_candidate(
+        LearningCandidate(
+            id=0,
+            semantic_fingerprint="candidate-dashboard",
+            rule_text="Do not flag fake fixture secrets.",
+            rationale="The value only appears in test fixtures.",
+            scope_type="path",
+            scope_value="tests/fixtures/**",
+            category="security",
+            language="python",
+            confidence=0.94,
+            status="pending",
+            synthesizer_version="test",
+            evidence_ids_json="[41]",
+            negative_examples_json=(
+                '[{"feedback_id":41,"finding_id":"finding-1",'
+                '"human_feedback":"this is a fake fixture"}]'
+            ),
+        )
+    )
+    store.close()
+
+    detail = rules.get_learning_candidate("acme", "web", candidate.id)
+    assert detail.evidence_count == 1
+    assert detail.negative_examples[0]["finding_id"] == "finding-1"
+
+    updated = rules.update_learning_candidate(
+        "acme",
+        "web",
+        candidate.id,
+        api.LearningCandidateInput(
+            rule_text="Never flag known fake fixture secrets.",
+            rationale="Maintainers confirmed these values are synthetic.",
+            scope_type="path",
+            scope_value="tests/fixtures/**",
+            category="security",
+            language="python",
+        ),
+        _Req(is_admin=True, username="boss"),
+    )
+    assert updated.rule_text.startswith("Never flag")
+
+    approved = rules.approve_learning_candidate(
+        "acme", "web", candidate.id, _Req(is_admin=True, username="boss")
+    )
+    store = IndexStore.open("acme", "web")
+    try:
+        active = store.get_learned_rule(approved["rule_id"])
+        assert active is not None and active.created_by == "boss"
+        assert active.origin_candidate_id == candidate.id
+    finally:
+        store.close()

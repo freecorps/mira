@@ -23,6 +23,26 @@ PROTECTED = [
     ("/api/repos/sync", "POST", {}),
     ("/api/repos/{owner}/{repo}/index", "POST", {"owner": "o", "repo": "r"}),
     ("/api/repos/{owner}/{repo}/index", "DELETE", {"owner": "o", "repo": "r"}),
+    (
+        "/api/learning-candidates/{owner}/{repo}/{candidate_id}",
+        "PUT",
+        {"owner": "o", "repo": "r", "candidate_id": 1, "body": None},
+    ),
+    (
+        "/api/learning-candidates/{owner}/{repo}/{candidate_id}/approve",
+        "POST",
+        {"owner": "o", "repo": "r", "candidate_id": 1},
+    ),
+    (
+        "/api/learning-candidates/{owner}/{repo}/{candidate_id}/reject",
+        "POST",
+        {"owner": "o", "repo": "r", "candidate_id": 1},
+    ),
+    (
+        "/api/learned-rules/{owner}/{repo}/import.yaml",
+        "POST",
+        {"owner": "o", "repo": "r"},
+    ),
 ]
 
 

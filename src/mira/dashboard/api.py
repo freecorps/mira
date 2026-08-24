@@ -8,6 +8,7 @@ import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -658,6 +659,15 @@ class LearnedRuleModel(BaseModel):
     active: bool = True
     status: str = "approved"  # 'pending' | 'approved' | 'rejected'
     created_by: str = ""  # admin username for manual rules; '' for synthesized
+    version: int = 1
+    scope_type: str = "repo"
+    scope_value: str = ""
+    origin_candidate_id: int | None = None
+    rationale: str = ""
+    evidence_count: int = 0
+    effective_from: float = 0.0
+    disabled_at: float | None = None
+    supersedes_rule_id: int | None = None
     updated_at: float = 0.0
 
 
@@ -670,10 +680,45 @@ class LearnedRuleInput(BaseModel):
     rule_text: str
     category: str = "other"
     path_pattern: str = ""
+    scope_type: str = "repo"
+    scope_value: str = ""
+    rationale: str = ""
 
 
 class LearnedRuleActiveInput(BaseModel):
     active: bool
+
+
+class LearningCandidateModel(BaseModel):
+    id: int
+    owner: str
+    repo: str
+    rule_text: str
+    rationale: str
+    scope_type: str
+    scope_value: str
+    category: str
+    language: str = ""
+    confidence: float
+    status: str
+    synthesizer_version: str
+    evidence_ids: list[Any] = Field(default_factory=list)
+    positive_examples: list[Any] = Field(default_factory=list)
+    negative_examples: list[Any] = Field(default_factory=list)
+    evidence_count: int = 0
+    source_finding_id: str | None = None
+    source_feedback_id: int | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+class LearningCandidateInput(BaseModel):
+    rule_text: str
+    rationale: str = ""
+    scope_type: str
+    scope_value: str
+    category: str = "other"
+    language: str = ""
 
 
 # ── Global rules endpoints ──
