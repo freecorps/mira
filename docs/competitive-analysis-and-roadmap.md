@@ -177,7 +177,7 @@ O ID deve ser embutido de forma invisível no comentário (`<!-- mira:finding:..
 
 #### evolução de `learned_rules`
 
-- `version`, `scope_type` (`repo`, `org`, `path`, `language`, `category`);
+- `version`, `scope_type` (`repo`, `org`, `path`, `language`, `symbol`);
 - `scope_value`, `origin_candidate_id`, `rationale` e `evidence_count`;
 - `effective_from`, `disabled_at`, `supersedes_rule_id`;
 - métricas: exposições, findings suprimidos/gerados, positivos, negativos e última avaliação.

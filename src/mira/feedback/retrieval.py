@@ -9,9 +9,8 @@ _SPECIFICITY = {
     "symbol": 0,
     "path": 1,
     "language": 2,
-    "category": 3,
-    "repo": 4,
-    "org": 5,
+    "repo": 3,
+    "org": 4,
 }
 
 
@@ -46,10 +45,9 @@ def _matches(
         }
     if rule.scope_type == "org":
         return not rule.scope_value or rule.scope_value in {owner, _public_owner(owner)}
-    # Category rules are supplied to the model because finding categories do
-    # not exist until after inference. The instruction itself carries the
-    # category boundary.
-    return True
+    # Unknown/legacy scope types fail closed. In particular, a category cannot
+    # be matched before the model has inferred a finding category.
+    return False
 
 
 def retrieve_rules(

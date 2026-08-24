@@ -67,7 +67,8 @@ const SIGNAL_LABEL: Record<string, string> = {
 
 type SortKey = "repo" | "learning" | "status" | "updated"
 type SortDir = "asc" | "desc"
-type LearningRow = OrgLearnedRuleModel & {
+type LearningRow = Omit<OrgLearnedRuleModel, "status"> & {
+  status: OrgLearnedRuleModel["status"] | LearningCandidateModel["status"]
   entity_type: "rule" | "candidate"
   negative_examples?: LearningCandidateModel["negative_examples"]
   confidence?: number
@@ -95,7 +96,7 @@ function candidateRow(candidate: LearningCandidateModel): LearningRow {
     path_pattern: candidate.scope_type === "path" ? candidate.scope_value : "",
     sample_count: candidate.evidence_count,
     active: false,
-    status: candidate.status === "collecting" ? "pending" : candidate.status,
+    status: candidate.status,
     created_by: "",
     version: 1,
     scope_type: candidate.scope_type,
@@ -221,13 +222,15 @@ export function LearnedRulesPage() {
   const { data, loading, error } = useAsync(async () => {
     const [rules, candidates] = await Promise.all([
       api.listLearnedRules(""),
-      api.listLearningCandidates(""),
+      isAdmin
+        ? api.listLearningCandidates("")
+        : Promise.resolve([] as LearningCandidateModel[]),
     ])
     return {
       rules: rules.map((rule) => ({ ...rule, entity_type: "rule" as const })),
       candidates: candidates.map(candidateRow),
     }
-  }, [refreshKey])
+  }, [refreshKey, isAdmin])
 
   const allRows = useMemo(
     () => [...(data?.rules ?? []), ...(data?.candidates ?? [])],
@@ -242,7 +245,10 @@ export function LearnedRulesPage() {
     [allRows]
   )
   const pending = useMemo(
-    () => allRows.filter((r) => r.status === "pending"),
+    () =>
+      allRows.filter(
+        (r) => r.status === "pending" || r.status === "collecting"
+      ),
     [allRows]
   )
   const rejected = useMemo(
@@ -287,8 +293,13 @@ export function LearnedRulesPage() {
     if (candidate) {
       setSelected(candidate)
       setPanelOpen(true)
+      const next = new URLSearchParams(params)
+      next.delete("candidate")
+      next.delete("owner")
+      next.delete("repo")
+      setParams(next, { replace: true })
     }
-  }, [data, params])
+  }, [data, params, setParams])
 
   const act = (fn: () => Promise<unknown>, successMsg?: string) =>
     fn()
@@ -588,8 +599,8 @@ export function LearnedRulesPage() {
               >
                 <Clock className="h-3 w-3 shrink-0" />
                 <span>
-                  <span className="font-medium">{pending.length}</span> awaiting
-                  approval
+                  <span className="font-medium">{pending.length}</span> in the
+                  learning queue
                 </span>
                 <ChevronRight className="h-3.5 w-3.5 shrink-0" />
               </button>
@@ -666,11 +677,15 @@ export function LearnedRulesPage() {
 
             {(isAdmin || canEdit(selected)) && (
               <div className="flex flex-wrap gap-2 border-b bg-muted/30 p-4">
-                {isAdmin && selected.status === "pending" ? (
+                {isAdmin &&
+                (selected.status === "pending" ||
+                  selected.status === "collecting") ? (
                   <>
-                    <Button onClick={approveSel}>
-                      <Check className="mr-1 h-4 w-4" /> Approve
-                    </Button>
+                    {selected.status === "pending" && (
+                      <Button onClick={approveSel}>
+                        <Check className="mr-1 h-4 w-4" /> Approve
+                      </Button>
+                    )}
                     <Button variant="outline" onClick={rejectSel}>
                       <X className="mr-1 h-4 w-4" /> Reject
                     </Button>
@@ -1035,6 +1050,16 @@ function LearningsTable({
 }
 
 function StatusBadge({ rule }: { rule: LearningRow }) {
+  if (rule.status === "collecting") {
+    return (
+      <Badge
+        variant="outline"
+        className="border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-400"
+      >
+        Collecting
+      </Badge>
+    )
+  }
   if (rule.status === "pending") {
     return (
       <Badge

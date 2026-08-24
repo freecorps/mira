@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from mira.config import LearningConfig
+from mira.feedback.deduplication import find_equivalent_candidate, rule_similarity
 from mira.feedback.lifecycle import (
     approve_candidate,
     update_candidate,
     version_rule,
 )
-from mira.feedback.models import FeedbackEventV2, ReviewFinding
+from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.retrieval import retrieve_rules
 from mira.feedback.serialization import export_rules_yaml, import_rules_yaml
 from mira.feedback.service import create_learning_candidate_for_feedback
@@ -278,6 +281,18 @@ def test_org_rule_is_retrieved_from_sibling_sqlite_repository(
             scope_type="org",
             scope_value="other-org",
         )
+        now = time.time() + 1
+        outsider._conn.executemany(
+            "INSERT INTO learned_rules "
+            "(rule_text, source_signal, category, active, status, scope_type, "
+            "scope_value, created_at, updated_at) "
+            "VALUES (?, 'manual', 'style', 1, 'approved', 'repo', ?, ?, ?)",
+            [
+                (f"Unrelated rule {index}", f"other-org/repo-{index}", now, now)
+                for index in range(2100)
+            ],
+        )
+        outsider._conn.commit()
     finally:
         sibling.close()
         outsider.close()
@@ -289,6 +304,48 @@ def test_org_rule_is_retrieved_from_sibling_sqlite_repository(
     )
     assert org_rule.rule_text in {rule.rule_text for rule in rules}
     assert "Use the other organization's convention." not in {rule.rule_text for rule in rules}
+
+
+def test_opposite_polarity_rules_are_never_deduplicated() -> None:
+    affirmative = LearningCandidate(
+        id=1,
+        semantic_fingerprint="affirmative",
+        rule_text="Report SQL injection issues.",
+        rationale="Security findings should be reported.",
+        scope_type="repo",
+        scope_value="acme/app",
+        category="security",
+        language="",
+        confidence=0.9,
+        status="pending",
+        synthesizer_version="test",
+    )
+    assert rule_similarity(affirmative.rule_text, "Do not report SQL injection issues.") == 0.0
+    assert (
+        find_equivalent_candidate(
+            [affirmative],
+            rule_text="Do not report SQL injection issues.",
+            category="security",
+        )
+        is None
+    )
+
+
+def test_legacy_category_scope_fails_closed(learning_store: IndexStore) -> None:
+    legacy = learning_store.create_learned_rule(
+        "Do not report category-wide style findings.",
+        "style",
+        scope_type="category",
+        scope_value="style",
+    )
+
+    rules = retrieve_rules(
+        learning_store,
+        paths=["src/app.py"],
+        languages=["python"],
+    )
+
+    assert legacy.id not in {rule.id for rule in rules}
 
 
 def test_scopes_and_pending_effective_time_survive_sqlite_reopen(
@@ -456,6 +513,32 @@ def test_synthesis_feature_flag_can_disable_candidates(learning_store: IndexStor
         _feedback(learning_store, finding, "comment:feedback-v2-disabled"),
         config=LearningConfig(feedback_v2=False),
     )
+    assert candidate is None and not created
+
+
+def test_candidate_synthesis_failure_is_best_effort(learning_store: IndexStore) -> None:
+    finding = _finding()
+    learning_store.save_review_finding(finding)
+    event = _feedback(learning_store, finding, "comment:synthesis-failure")
+    pr_info = PRInfo(
+        title="PR",
+        description="",
+        base_branch="main",
+        head_branch="feature",
+        url=finding.pr_url,
+        number=finding.pr_number,
+        owner=finding.owner,
+        repo=finding.repo,
+        base_sha=finding.base_sha,
+        head_sha=finding.head_sha,
+    )
+
+    with patch(
+        "mira.feedback.synthesis.synthesize_candidate",
+        side_effect=RuntimeError("synthesizer unavailable"),
+    ):
+        candidate, created = create_learning_candidate_for_feedback(pr_info, finding, event)
+
     assert candidate is None and not created
 
 

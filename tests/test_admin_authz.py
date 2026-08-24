@@ -12,6 +12,12 @@ from mira.dashboard.api import router
 
 # (path, method, extra kwargs). Bodies are None: _require_admin fires first.
 PROTECTED = [
+    ("/api/learning-candidates", "GET", {}),
+    (
+        "/api/learning-candidates/{owner}/{repo}/{candidate_id}",
+        "GET",
+        {"owner": "o", "repo": "r", "candidate_id": 1},
+    ),
     ("/api/gitlab/sync", "POST", {}),
     ("/api/gitlab/repos", "POST", {"body": None}),
     ("/api/forgejo/sync", "POST", {}),

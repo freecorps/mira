@@ -302,7 +302,9 @@ def test_candidate_dashboard_flow_exposes_evidence_and_requires_approval(
     )
     store.close()
 
-    detail = rules.get_learning_candidate("acme", "web", candidate.id)
+    detail = rules.get_learning_candidate(
+        "acme", "web", candidate.id, _Req(is_admin=True, username="boss")
+    )
     assert detail.evidence_count == 1
     assert detail.negative_examples[0]["finding_id"] == "finding-1"
 

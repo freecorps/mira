@@ -35,10 +35,13 @@ _STOP_WORDS = {
     "to",
     "when",
 }
+_NEGATION_TOKENS = {"avoid", "cannot", "never", "no", "not", "skip", "without"}
 
 
 def normalized_rule(rule_text: str) -> str:
     text = unicodedata.normalize("NFKD", rule_text).encode("ascii", "ignore").decode()
+    text = re.sub(r"\b(?:don't|dont)\b", "do not", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bcan't\b", "cannot", text, flags=re.IGNORECASE)
     return " ".join(token for token in _WORD_RE.findall(text.lower()) if token not in _STOP_WORDS)
 
 
@@ -51,6 +54,11 @@ def rule_similarity(left: str, right: str) -> float:
     left_tokens = set(normalized_rule(left).split())
     right_tokens = set(normalized_rule(right).split())
     if not left_tokens or not right_tokens:
+        return 0.0
+    # Lexical overlap alone must not merge opposite instructions such as
+    # "report X" and "do not report X". False negatives here are safer than
+    # silently combining contradictory governance evidence.
+    if bool(left_tokens & _NEGATION_TOKENS) != bool(right_tokens & _NEGATION_TOKENS):
         return 0.0
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
