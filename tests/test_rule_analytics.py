@@ -1649,3 +1649,45 @@ def test_unregistered_repo_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(HTTPException) as exc:
         routes.rule_analytics_detail(admin, "acme", "app", 1)
     assert exc.value.status_code == 404
+
+
+def test_partial_repo_filters_are_allowed(store: IndexStore, monkeypatch) -> None:
+    """`owner=` alone and `repo=` alone are supported filters, not bad input.
+
+    Regression guard: the traversal check initially required both segments and
+    rejected every owner-only or repo-only query with a 400.
+    """
+    import mira.dashboard.routers.analytics as routes
+
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+
+    class _Registry:
+        def get_repo_any_platform(self, owner: str, repo: str):
+            return [SimpleNamespace(platform="github")]
+
+    monkeypatch.setattr("mira.dashboard.api._app_db", _Registry())
+    admin = SimpleNamespace(
+        state=SimpleNamespace(user=SimpleNamespace(is_admin=True, username="root"))
+    )
+
+    assert routes.list_rule_analytics(admin, owner="acme").total == 1
+    assert routes.list_rule_analytics(admin, repo="app").total == 1
+    assert routes.list_rule_analytics(admin, owner="acme", repo="app").total == 1
+    assert routes.analytics_summary(admin, owner="acme").buckets
+    assert routes.list_regressions(admin, owner="acme").min_exposures > 0
+    assert routes.list_audit_events(admin, owner="acme").events == []
+
+
+def test_partial_repo_filters_still_reject_traversal(monkeypatch) -> None:
+    from fastapi import HTTPException
+
+    import mira.dashboard.routers.analytics as routes
+
+    admin = SimpleNamespace(
+        state=SimpleNamespace(user=SimpleNamespace(is_admin=True, username="root"))
+    )
+    for owner, repo in (("..", ""), ("", ".."), ("a/b", ""), ("", "a/b")):
+        with pytest.raises(HTTPException) as exc:
+            routes.list_rule_analytics(admin, owner=owner, repo=repo)
+        assert exc.value.status_code == 400, (owner, repo)

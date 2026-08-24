@@ -130,6 +130,23 @@ def _safe_segment(value: str) -> bool:
     return bool(value) and value not in {".", ".."} and not _UNSAFE_SEGMENT.search(value)
 
 
+def _validate_repo_filters(owner: str, repo: str) -> None:
+    """Validate optional owner/repo *filters*, which may be given separately.
+
+    `owner=acme` alone (every repo of an owner) and `repo=app` alone are both
+    supported by the analytics layer, so each segment is checked only when
+    present. The registry lookup needs an exact pair, so it runs only when both
+    are supplied.
+    """
+    for value, label in ((owner, "owner"), (repo, "repo")):
+        if value and not (
+            _safe_segment(value) or (label == "owner" and _NAMESPACED_OWNER.match(value))
+        ):
+            raise HTTPException(status_code=400, detail=f"Invalid {label}")
+    if owner and repo:
+        _require_known_repo(owner, repo)
+
+
 def _require_known_repo(owner: str, repo: str) -> None:
     """Reject traversal and unknown repositories before touching a store.
 
@@ -185,8 +202,7 @@ def list_rule_analytics(
     _require_admin(request)
     if sort not in _SORT_KEYS:
         raise HTTPException(status_code=400, detail=f"sort must be one of {sorted(_SORT_KEYS)}")
-    if owner or repo:
-        _require_known_repo(owner, repo)
+    _validate_repo_filters(owner, repo)
     limit, offset = _page(limit, offset)
     with _resolved_platform():
         rows, total = analytics.list_rule_analytics(
@@ -307,8 +323,7 @@ def analytics_summary(
         raise HTTPException(
             status_code=400, detail=f"dimension must be one of {sorted(_SUMMARY_DIMENSIONS)}"
         )
-    if owner or repo:
-        _require_known_repo(owner, repo)
+    _validate_repo_filters(owner, repo)
     with _resolved_platform():
         buckets = analytics.summarize(
             dimension=dimension,
@@ -328,8 +343,7 @@ def list_regressions(
     audited admin action.
     """
     _require_admin(request)
-    if owner or repo:
-        _require_known_repo(owner, repo)
+    _validate_repo_filters(owner, repo)
     learning = load_config().learning
     with _resolved_platform():
         suggestions = analytics.regression_suggestions(
@@ -389,8 +403,7 @@ def list_audit_events(
     offset: int = 0,
 ) -> AuditEventsResponse:
     _require_admin(request)
-    if owner or repo:
-        _require_known_repo(owner, repo)
+    _validate_repo_filters(owner, repo)
     limit, offset = _page(limit, offset)
     with _resolved_platform():
         events = analytics.list_audit_events(
@@ -422,8 +435,7 @@ def export_rule_analytics(
 ) -> Response:
     """Export the rule-level analytics table as CSV or JSON."""
     _require_admin(request)
-    if owner or repo:
-        _require_known_repo(owner, repo)
+    _validate_repo_filters(owner, repo)
     if fmt not in {"csv", "json"}:
         raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'json'")
     with _resolved_platform():
