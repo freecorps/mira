@@ -456,3 +456,173 @@ export interface OpenPr {
   waiting_on: string[]
   reviewers: OpenPrReviewer[]
 }
+
+// ── Phase 3: rule evaluation analytics ──
+// `unobserved` means we recorded that nobody responded. It is never folded
+// into `positive`, and `not_applicable` marks a review-scoped exposure that
+// produced no finding to have an outcome about.
+export type RuleOutcome =
+  "positive" | "negative" | "neutral" | "unobserved" | "not_applicable"
+
+export interface RuleOutcomeCounts {
+  exposures: number
+  review_exposures: number
+  findings: number
+  observed: number
+  positive: number
+  negative: number
+  neutral: number
+  unobserved: number
+  addressed: number
+  thumbs_up: number
+  thumbs_down: number
+  reply_agree: number
+  reply_disagree: number
+  repeated_false_positives: number
+  // Null when nobody has given a decisive signal yet — rendered as "no data",
+  // never as zero, so silence is not shown as a bad score.
+  acceptance_rate: number | null
+  addressed_rate: number | null
+  negative_rate: number | null
+}
+
+export interface RuleAnalyticsModel extends RuleOutcomeCounts {
+  rule_id: number
+  owner: string
+  repo: string
+  platform: string
+  rule_text: string
+  category: string
+  scope_type: string
+  scope_value: string
+  origin: "manual" | "learned"
+  version: number
+  status: string
+  active: boolean
+  effective_from: number
+  disabled_at: number | null
+  first_exposure_at: number
+  last_exposure_at: number
+}
+
+export interface RuleAnalyticsPage {
+  rules: RuleAnalyticsModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface RuleEvaluationModel {
+  id: number
+  evaluation_key: string
+  review_id: number
+  rule_id: number
+  rule_version: number
+  rule_origin: string
+  scope_type: string
+  scope_value: string
+  category: string
+  decision: string
+  finding_id: string | null
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  pr_author: string
+  head_sha: string
+  created_at: number
+  finding_title: string
+  finding_path: string
+  finding_line: number
+  finding_severity: string
+  finding_state: string
+  pr_url: string
+  outcome: RuleOutcome
+  addressed: boolean
+  thumbs_up: number
+  thumbs_down: number
+  reply_agree: number
+  reply_disagree: number
+}
+
+export interface RuleEvaluationPage {
+  evaluations: RuleEvaluationModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface AnalyticsBucket extends RuleOutcomeCounts {
+  bucket: string
+}
+
+export interface AnalyticsSummary {
+  dimension: string
+  buckets: AnalyticsBucket[]
+}
+
+export interface PeriodStats extends RuleOutcomeCounts {
+  start: number
+  end: number
+}
+
+export interface PeriodComparison {
+  rule_id: number
+  owner: string
+  repo: string
+  window_days: number
+  activated_at: number | null
+  // False when the rule has no activation timestamp, the rule row is gone, or
+  // the "after" window has not finished filling. The UI must say so rather
+  // than present a partial window as a verdict.
+  comparable: boolean
+  reason: string
+  before: PeriodStats | null
+  after: PeriodStats | null
+  delta?: {
+    findings: number
+    negative: number
+    positive: number
+    acceptance_rate: number | null
+    addressed_rate: number | null
+    negative_rate: number | null
+  }
+}
+
+export interface RegressionSuggestion {
+  rule_id: number
+  owner: string
+  repo: string
+  action: "downgrade" | "disable"
+  reason: string
+  exposures: number
+  negative_rate: number
+  addressed_rate: number | null
+  min_exposures: number
+}
+
+export interface RegressionResponse {
+  suggestions: RegressionSuggestion[]
+  min_exposures: number
+  negative_rate_threshold: number
+  disable_rate_threshold: number
+}
+
+export interface RuleAnalyticsDetail {
+  rule: RuleAnalyticsModel
+  period_comparison: PeriodComparison
+  regression: RegressionSuggestion | null
+  min_exposures_for_regression: number
+}
+
+export interface LearningAuditEvent {
+  id: number
+  event_type: string
+  rule_id: number
+  actor: string
+  summary: string
+  detail_json: string
+  created_at: number
+  owner: string
+  repo: string
+}
