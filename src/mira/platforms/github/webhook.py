@@ -536,11 +536,9 @@ async def dispatch_github_event(
     # `do-not-merge` label goes on or comes off, a draft is marked ready. Each
     # of those makes the last decision stale, and re-deciding costs no LLM
     # call — so the gate listens for them even though the review does not.
-    if (
-        event in {"check_suite", "check_run"}
-        and action == "completed"
-        and not _is_own_check(payload, bot_name)
-    ):
+    if event in {"check_suite", "check_run"} and action == "completed":
+        if _is_own_check(payload, bot_name, await app_auth.get_bot_identity()):
+            return "ignored"
         background_tasks.add_task(handle_gate_recheck, payload, app_auth, bot_name)
         return "processing"
 
@@ -626,7 +624,7 @@ async def dispatch_github_event(
 _GATE_RECHECK_ACTIONS = {"labeled", "unlabeled", "ready_for_review", "converted_to_draft"}
 
 
-def _is_own_check(payload: dict[str, Any], bot_name: str) -> bool:
+def _is_own_check(payload: dict[str, Any], bot_name: str, bot_slug: str | None = None) -> bool:
     """Whether this check event was produced by the gate's own status.
 
     Publishing a check run delivers a `check_run.completed` webhook straight
@@ -634,6 +632,12 @@ def _is_own_check(payload: dict[str, Any], bot_name: str) -> bool:
     delivery is retryable republishes, the republish arrives as an event, the
     inputs have not moved so the decision key is the same, and it republishes
     again. The pull-request branch already excludes the bot for the same reason.
+
+    Two signals, because neither covers both events. A check *run* is matched by
+    name, which is exact and needs no identity at all. A check *suite* carries
+    only the app that owns it, so it is matched against the App's real slug —
+    `bot_slug`, which `get_bot_identity()` caches — falling back to the
+    configured display name when the identity could not be resolved.
     """
     from mira.gate.models import STATUS_CONTEXT
 
@@ -641,9 +645,12 @@ def _is_own_check(payload: dict[str, Any], bot_name: str) -> bool:
     if str(check_run.get("name") or "") == STATUS_CONTEXT:
         return True
     container = payload.get("check_suite") or check_run.get("check_suite") or {}
-    app = (container.get("app") or check_run.get("app") or {}) if container or check_run else {}
+    app = container.get("app") or check_run.get("app") or {}
     slug = str(app.get("slug") or "").lower()
-    return bool(slug) and slug == (bot_name or "").lower()
+    if not slug:
+        return False
+    ours = {name.lower() for name in (bot_slug, bot_name) if name}
+    return slug in ours
 
 
 def _gate_is_active(owner: str, repo: str) -> bool:
