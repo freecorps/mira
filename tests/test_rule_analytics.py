@@ -1085,3 +1085,63 @@ def test_every_bucket_equals_its_drilldown(store: IndexStore) -> None:
     )
     assert len(not_applicable) == counts.review_exposures
     assert total + len(not_applicable) == counts.exposures
+
+
+def test_previous_release_can_still_read_an_upgraded_database(isolated_index: Path) -> None:
+    """Rollback: the prior release must keep working on an upgraded database.
+
+    Phase 3 only adds tables — it alters no existing column and drops nothing —
+    so the previous release, which has never heard of `rule_evaluations`, must
+    read and write the tables it does know about exactly as before.
+    """
+    store = IndexStore.open("acme", "app")
+    try:
+        _finding(store, "f1")
+        store.record_rule_evaluations([_evaluation("f1")])
+        _feedback(store, "f1", "thumbs_up")
+        rule = store.create_learned_rule("Never log credentials.", "security")
+        db_path = store._db_path
+    finally:
+        store.close()
+
+    # The exact column lists the pre-Phase-3 release selects. A dropped or
+    # renamed column would raise OperationalError here.
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT id, rule_text, source_signal, category, path_pattern, sample_count, "
+            "active, status, created_by, version, scope_type, scope_value, "
+            "origin_candidate_id, rationale, evidence_count, effective_from, disabled_at, "
+            "supersedes_rule_id, semantic_fingerprint, created_at, updated_at "
+            "FROM learned_rules WHERE id = ?",
+            (rule.id,),
+        ).fetchone()
+        assert conn.execute(
+            "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+            "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+            "confidence, title, body, suggestion, detector, prompt_model, "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "FROM review_findings"
+        ).fetchall()
+        assert conn.execute(
+            "SELECT id, finding_id, kind, actor, actor_role, raw_text, rationale, platform, "
+            "source_event_id, head_sha, thread_state, provenance_complete, audit_json, "
+            "created_at FROM feedback_events_v2"
+        ).fetchall()
+        # A prior release still writes through the old paths unchanged.
+        conn.execute(
+            "INSERT INTO learned_rules (rule_text, source_signal, category, sample_count, "
+            "active, created_at, updated_at) VALUES ('Old release rule.', 'manual', "
+            "'style', 1, 1, 0, 0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # And the new release still reads what the old one wrote.
+    reopened = IndexStore.open("acme", "app")
+    try:
+        assert "Old release rule." in {r.rule_text for r in reopened.list_learned_rules()}
+        assert reopened.count_rule_evaluations({"rule_id": 1}) == 1
+    finally:
+        reopened.close()
