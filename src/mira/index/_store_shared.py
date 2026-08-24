@@ -58,6 +58,29 @@ class _StoreSharedMixin:
             parts.append(f"### {entry.title}\n{entry.content}\n")
         return "\n".join(parts)
 
+    def get_learned_rules_for_review(
+        self,
+        paths: list[str] | None = None,
+        languages: list[str] | None = None,
+        symbols: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[Any]:
+        """The rules retrieval selected for this review, as rule rows.
+
+        Phase 3 has to record *which* rules were exposed, not just the text
+        that went into the prompt, so the engine takes the rows and renders
+        them itself.
+        """
+        from mira.feedback.retrieval import retrieve_rules
+
+        return retrieve_rules(
+            self,
+            paths=paths or [],
+            languages=languages or [],
+            symbols=symbols or [],
+            limit=limit,
+        )
+
     def get_learned_rules_text(
         self,
         paths: list[str] | None = None,
@@ -65,14 +88,10 @@ class _StoreSharedMixin:
         symbols: list[str] | None = None,
         limit: int = 10,
     ) -> list[str]:
-        from mira.feedback.retrieval import render_rule, retrieve_rules
+        from mira.feedback.retrieval import render_rule
 
-        rules = retrieve_rules(
-            self,
-            paths=paths or [],
-            languages=languages or [],
-            symbols=symbols or [],
-            limit=limit,
+        rules = self.get_learned_rules_for_review(
+            paths=paths, languages=languages, symbols=symbols, limit=limit
         )
         return [render_rule(rule) for rule in rules]
 

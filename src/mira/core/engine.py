@@ -30,8 +30,10 @@ from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
 from mira.exceptions import MiraError, ResponseParseError
+from mira.feedback.exposure import ExposedRule, exposed_rules_from_rows, record_review_exposures
 from mira.feedback.models import ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, new_finding_id
+from mira.feedback.retrieval import render_rule
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -453,6 +455,9 @@ class ReviewEngine:
         self._index_was_empty = False
         self._agentic_source_fetcher: object | None = None
         self._agentic_repo_tree: list[str] = []
+        # Rules retrieval put in front of this review. Recorded as Phase 3
+        # evaluations once the review has been posted and has an id.
+        self._exposed_rules: list[ExposedRule] = []
 
     async def _submit_verdict(self, pr_info: PRInfo, result: ReviewResult) -> None:
         """Submit an approve / request-changes review event, when opted in."""
@@ -1066,6 +1071,22 @@ class ReviewEngine:
                 [comment.finding_id for comment in result.comments if comment.finding_id],
                 review_event.id,
             )
+            # Phase 3: record which rules were in front of this review and what
+            # they decided. Runs last and never raises, so analytics cannot
+            # affect a review that has already been published.
+            if self.config.learning.evaluation_analytics and self._exposed_rules:
+                record_review_exposures(
+                    store,
+                    self._exposed_rules,
+                    platform=pr_info.platform,
+                    owner=pr_info.owner,
+                    repo=pr_info.repo,
+                    pr_number=pr_info.number,
+                    pr_author=pr_info.author,
+                    head_sha=pr_info.head_sha,
+                    findings=result.comments,
+                    review_id=review_event.id,
+                )
             store.close()
 
             # Merge with any prior progress for this PR so @miracodeai review-rest
@@ -1371,12 +1392,18 @@ class ReviewEngine:
                     if summary:
                         changed_symbols.update(symbol.name for symbol in summary.symbols)
 
-                learned_rules = _rules_store.get_learned_rules_text(
+                rule_rows = _rules_store.get_learned_rules_for_review(
                     paths=[file.path for file in filtered],
                     languages=[file.language for file in filtered if file.language],
                     symbols=sorted(changed_symbols),
                     limit=self.config.learning.max_rules_per_review,
                 )
+                learned_rules = [render_rule(rule) for rule in rule_rows]
+                # Snapshot what was exposed so Phase 3 can record it after the
+                # review is posted. Held on the engine because retrieval and
+                # persistence happen in different methods of the same run.
+                if self.config.learning.evaluation_analytics:
+                    self._exposed_rules = exposed_rules_from_rows(rule_rows)
 
                 for ctx in _rules_store.list_review_context():
                     custom_rules.append({"title": ctx.title, "content": ctx.content})
