@@ -88,7 +88,9 @@ def build_rule_evaluations(
     for rule in exposed:
         if not rule.rule_id:
             continue
-        common = {
+        # Annotated so the heterogeneous values survive the ** expansion;
+        # mypy would otherwise widen them all to `object`.
+        common: dict[str, Any] = {
             "review_id": review_id,
             "rule_id": rule.rule_id,
             "rule_version": rule.version,
