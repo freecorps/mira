@@ -363,7 +363,11 @@ por padrão, kill switch dedicado e nenhuma desativação automática de regra.
   continua sendo a mesma exposição.
 - A atribuição é por escopo e declarada como tal. Não dá para saber em qual
   linha do prompt o modelo se apoiou, então a avaliação registra só o que é
-  verificável: a regra estava presente e o finding está no escopo dela.
+  verificável: a regra estava presente e o finding está no escopo dela. O
+  casamento de escopo na atribuição é mais estrito que no retrieval: regra de
+  linguagem ou símbolo só liga findings do arquivo que de fato carrega aquela
+  linguagem ou símbolo, e falha fechada sem metadado — perder um vínculo é
+  recuperável, um vínculo errado corrompe o score em silêncio.
 - `unobserved` fica fora do numerador e do denominador do acceptance rate, então
   silêncio não sobe nem desce o score. Sem sinal decisivo a taxa é nula e o
   dashboard mostra travessão, nunca `0%`.
