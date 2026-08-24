@@ -6,6 +6,7 @@ import {
   ChevronRight,
   ChevronsUpDown,
   Database,
+  Gavel,
   GitFork,
   KeyRound,
   LayoutDashboard,
@@ -86,6 +87,7 @@ const navItems = [
     label: "Rule analytics",
     adminOnly: true,
   },
+  { to: "/merge-gate", icon: Gavel, label: "Merge gate", adminOnly: true },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
 
@@ -106,6 +108,7 @@ const PAGE_LABELS: Record<string, string> = {
   relationships: "Relationships",
   rules: "Rules",
   learnings: "Learnings",
+  "merge-gate": "Merge gate",
   analytics: "Rule analytics",
   settings: "Settings",
   users: "Users",
