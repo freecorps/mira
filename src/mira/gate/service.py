@@ -421,28 +421,39 @@ async def deliver(
     reclaimable so a transient error still gets a second chance.
     """
     inputs = decision.inputs
+    capability = caps.for_provider(provider)
     store = _open_store(inputs.owner, inputs.repo, inputs.platform)
     try:
         # Whether a review event — the delivery that actually matters — was
-        # attempted. If one was, its outcome owns `delivery_state`: a status
-        # check that published fine must not overwrite a failed approval with
-        # "delivered", which would read as an approval that never happened.
+        # attempted. If one was, its outcome owns `delivery_state`: an
+        # announcement that went out fine must not overwrite a failed approval
+        # with "delivered", which would read as an approval that never happened.
         attempted_review_event = False
         if decision.request_changes:
             attempted_review_event = True
             await _deliver_review_event(provider, pr_info, decision, store, "REQUEST_CHANGES")
-        elif decision.state == "would_approve" and policy.enforcing:
-            capability = caps.for_provider(provider)
-            if capability.can_approve:
-                attempted_review_event = True
-                await _deliver_review_event(provider, pr_info, decision, store, "APPROVE")
+        elif decision.state == "would_approve" and policy.enforcing and capability.can_approve:
+            attempted_review_event = True
+            await _deliver_review_event(provider, pr_info, decision, store, "APPROVE")
 
-        if policy.publish_status:
-            await _publish_status(
-                provider, pr_info, decision, store, owns_delivery_state=not attempted_review_event
-            )
+        # The announcement channels only report whether they got through; this
+        # function decides what the row says, so that adding or removing one
+        # cannot leave the bookkeeping to whichever happens to run last.
+        outcomes: list[tuple[bool, str, str]] = []
+        if policy.publish_status and capability.can_publish_status:
+            outcomes.append(await _publish_status(provider, pr_info, decision))
         if policy.comment:
-            await _publish_comment(provider, pr_info, decision)
+            outcomes.append(await _publish_comment(provider, pr_info, decision))
+
+        if outcomes and not attempted_review_event:
+            delivered = all(ok for ok, _ref, _error in outcomes)
+            store.update_gate_decision_delivery(
+                decision.decision_key,
+                delivery_state="delivered" if delivered else "failed",
+                delivery_ref=next((ref for ok, ref, _e in outcomes if ok and ref), ""),
+                error="; ".join(error for ok, _ref, error in outcomes if not ok),
+            )
+            decision.delivery_state = "delivered" if delivered else "failed"
 
         refreshed = store.get_gate_decision(decision.decision_key)
         return refreshed or decision
@@ -559,27 +570,14 @@ async def _deliver_review_event(
 
 
 async def _publish_status(
-    provider: Any,
-    pr_info: Any,
-    decision: GateDecision,
-    store: Any,
-    *,
-    owns_delivery_state: bool,
-) -> None:
+    provider: Any, pr_info: Any, decision: GateDecision
+) -> tuple[bool, str, str]:
     """Publish the explanation as a check run / commit status.
 
-    Not claimed: a status is an update to a named artifact, so re-sending one
-    replaces it. A failure here never changes what the decision *is* — it is
-    how the decision is announced.
-
-    ``owns_delivery_state`` is False whenever a review event was attempted for
-    this decision. The approval's outcome is then the one that gets recorded: a
-    status check that published cleanly must never turn a failed approval into
-    a row that reads ``delivered``.
+    Returns ``(published, reference, error)``. Not claimed: a status is an
+    update to a named artifact, so re-sending one replaces it. A failure here
+    never changes what the decision *is* — it is how the decision is announced.
     """
-    capability = caps.for_provider(provider)
-    if not capability.can_publish_status:
-        return
     try:
         ref = await provider.publish_gate_status(
             pr_info,
@@ -590,30 +588,30 @@ async def _publish_status(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Merge gate could not publish its status on %s: %s", pr_info.url, exc)
-        if owns_delivery_state and decision.delivery_state != "delivered":
-            store.update_gate_decision_delivery(
-                decision.decision_key, delivery_state="failed", error=str(exc)
-            )
-            decision.delivery_state = "failed"
-        return
-    if owns_delivery_state and decision.delivery_state != "delivered":
-        store.update_gate_decision_delivery(
-            decision.decision_key, delivery_state="delivered", delivery_ref=str(ref or "")
-        )
-        decision.delivery_state = "delivered"
+        return False, "", str(exc)
+    return True, str(ref or ""), ""
 
 
-async def _publish_comment(provider: Any, pr_info: Any, decision: GateDecision) -> None:
-    """Post or update the gate's PR comment. Best-effort by design."""
+async def _publish_comment(
+    provider: Any, pr_info: Any, decision: GateDecision
+) -> tuple[bool, str, str]:
+    """Post or update the gate's PR comment, in place.
+
+    Returns ``(posted, reference, error)``. On a provider with no status check
+    this is the only place the explanation reaches the pull request, so whether
+    it got through is worth recording.
+    """
     body = f"{COMMENT_MARKER}\n{public_explanation(decision)}"
     try:
         existing = await provider.find_bot_comment(pr_info, COMMENT_MARKER)
         if existing is not None:
             await provider.update_comment(pr_info, existing, body)
-        else:
-            await provider.post_comment(pr_info, body)
+            return True, str(existing), ""
+        await provider.post_comment(pr_info, body)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Merge gate could not post its comment on %s: %s", pr_info.url, exc)
+        return False, "", str(exc)
+    return True, "", ""
 
 
 # ─────────────────────────────────────────────────────────────── overrides ──

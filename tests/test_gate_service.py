@@ -933,3 +933,56 @@ async def test_turning_the_generated_discount_off_applies_to_the_score_too() -> 
     assert discounted.risk_score < counted.risk_score
     assert any(factor.code == "size_lines" for factor in counted.factors)
     assert not any(factor.code == "size_lines" for factor in discounted.factors)
+
+
+async def test_a_comment_only_delivery_is_recorded_as_delivered() -> None:
+    """On a provider with no status check, the comment is the only channel.
+
+    Leaving the row at `pending` would make a delivery that went out
+    indistinguishable, on the dashboard, from one nobody ever attempted.
+    """
+    provider = FakeProvider(
+        capabilities=GateCapabilities(
+            provider="github",
+            can_read_labels=True,
+            can_read_ci=True,
+            can_read_association=True,
+            can_read_review_states=True,
+            can_publish_status=False,
+        )
+    )
+    decision = await _evaluate(provider, _config(mode="shadow", comment=True))
+    assert decision.state == "would_approve"
+    assert len(provider.comments) == 1
+    assert provider.statuses == []
+    assert decision.delivery_state == "delivered"
+    assert _decisions()[0].delivery_state == "delivered"
+
+
+async def test_a_comment_that_could_not_be_posted_is_recorded_as_failed() -> None:
+    class MuteProvider(FakeProvider):
+        async def post_comment(self, pr_info, body):
+            raise ProviderError("the discussion API is down")
+
+    provider = MuteProvider(
+        capabilities=GateCapabilities(
+            provider="github",
+            can_read_labels=True,
+            can_read_ci=True,
+            can_read_association=True,
+            can_read_review_states=True,
+            can_publish_status=False,
+        )
+    )
+    decision = await _evaluate(provider, _config(mode="shadow", comment=True))
+    assert decision.delivery_state == "failed"
+    assert _decisions()[0].delivery_state == "failed"
+
+
+async def test_an_announcement_never_overwrites_a_failed_approval() -> None:
+    """The approval's outcome owns the row, whatever the channels achieved."""
+    provider = FakeProvider(verdict_result=False)
+    decision = await _evaluate(provider, _config(mode="enforce", comment=True))
+    assert decision.state == "would_approve"
+    assert provider.comments  # the explanation still went out
+    assert decision.delivery_state == "failed"
