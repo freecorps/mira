@@ -30,6 +30,15 @@ than guess, an evaluation records only what is verifiable: the rule was present
 in this review, and this finding falls inside its declared scope. The drill-down
 shows exactly those rows, so nobody has to trust an inference they can't check.
 
+Scope matching for attribution is stricter than for retrieval. Retrieval selects
+a language- or symbol-scoped rule when *any* changed file matches; attribution
+links only the findings in a file that actually carries that language or symbol.
+Path scopes match the finding's path; repo and org scopes cover the review, since
+they genuinely do. When the per-file metadata is missing, language and symbol
+scopes **fail closed** — losing a link is recoverable, because the review-scoped
+exposure still records that the rule ran, whereas a wrong link silently corrupts
+the score.
+
 ### Idempotency
 
 `evaluation_key` is a SHA-256 of
@@ -104,6 +113,12 @@ reports `comparable: false`, with a reason, when the rule has no activation
 timestamp, when the rule row has been deleted, or when the "after" window has
 not finished filling — a partial window is never presented as a verdict.
 
+The in-scope set is narrowed by the rule's category, plus its path pattern for
+path scopes. Language and symbol scopes fall back to category alone, because
+`review_findings` stores neither a language nor a reliable symbol; the applied
+scope is returned in the response's `scope` field so the comparison's basis is
+never implicit.
+
 ## Regression suggestions
 
 A rule is flagged when **all** of the following hold:
@@ -133,6 +148,13 @@ rows.
 `rule_evaluations` is indexed on `(rule_id, created_at)`, `finding_id`,
 `(created_at, category)` and `(pr_author, created_at)`. Page sizes are capped
 server-side. No Redis, no pgvector, no extra service.
+
+When the repository registry is unreachable, analytics returns **503**
+rather than defaulting to a platform guess. Guessing GitHub would query the
+unnamespaced owner while a GitLab or Forgejo repo's rows live under
+`_{platform}/{owner}`, producing an empty result that looks like an answer —
+the same conversion of "we could not look" into "there is nothing" that the
+outcome model refuses elsewhere.
 
 On Postgres the store pins analytics reads to its own repository. An empty
 owner/repo is the explicit org-wide handle the analytics service opens on
