@@ -247,11 +247,13 @@ def _gitlab() -> GitLabProvider:
     return provider
 
 
-def _gitlab_ci(pipeline: dict | None, *status_names: str):
-    """Serve the MR (with its head pipeline) and the commit's status names."""
+def _gitlab_ci(pipeline: dict | None, *status_names: str, statuses_status: int = 200):
+    """Serve the MR (with its head pipeline) and the head commit's statuses."""
 
     def handler(method, url, **kw):
         if "/statuses" in url:
+            if statuses_status != 200:
+                return _FakeResp(status=statuses_status, json_data=[])
             return _FakeResp(json_data=[{"name": name} for name in status_names])
         return _FakeResp(json_data={"head_pipeline": pipeline} if pipeline else {})
 
@@ -272,7 +274,9 @@ def _gitlab_ci(pipeline: dict | None, *status_names: str):
         ("waiting_for_resource", "pending"),
         ("failed", "failure"),
         ("canceled", "failure"),
-        ("skipped", "failure"),
+        # `[ci skip]`, or every job excluded by `rules`. Nothing failed and
+        # nothing ran — the same standing as a commit with no pipeline.
+        ("skipped", "none"),
         ("weird", "unknown"),
     ],
 )
@@ -397,7 +401,14 @@ async def test_gitlab_labels_raise_rather_than_read_as_absent() -> None:
         await _gitlab().get_pr_labels(_pr("gitlab"))
 
 
-async def test_gitlab_publishes_a_commit_status() -> None:
+@pytest.mark.parametrize("conclusion", ["success", "neutral", "failure"])
+async def test_gitlab_never_publishes_a_red_commit_status(conclusion: str) -> None:
+    """The status is an explanation here, not a verdict.
+
+    GitLab has no blocking review event, so a red status would claim a power
+    this provider does not have — and because an external status joins the head
+    pipeline, it would corrupt the very signal `get_ci_state` reads back.
+    """
     captured: dict = {}
 
     def handler(method, url, **kw):
@@ -407,12 +418,18 @@ async def test_gitlab_publishes_a_commit_status() -> None:
 
     with _patch_gitlab(handler):
         ref = await _gitlab().publish_gate_status(
-            _pr("gitlab"), context="mira/merge-gate", conclusion="failure", title="No", summary="s"
+            _pr("gitlab"),
+            context="mira/merge-gate",
+            conclusion=conclusion,
+            title="Not approved",
+            summary="s",
         )
     assert ref == "5"
     assert "/statuses/head123" in captured["url"]
-    assert captured["params"]["state"] == "failed"
+    assert captured["params"]["state"] == "success"
     assert captured["params"]["name"] == "mira/merge-gate"
+    # The verdict travels where it cannot break anything.
+    assert captured["params"]["description"] == "Not approved"
 
 
 # ───────────────────────────────────────────────────────────────── Forgejo ──
@@ -634,3 +651,34 @@ async def test_forgejo_codeowners_decodes_the_contents_api() -> None:
         path, content = await _forgejo().get_codeowners(_pr("forgejo"))
     assert path in CODEOWNERS_LOCATIONS["forgejo"]
     assert "@backend" in content
+
+
+async def test_gitlab_an_unaddressable_commit_falls_through_to_the_pipeline() -> None:
+    """A 404 on the statuses endpoint means "nothing recorded", not "unknown".
+
+    Merged-results pipelines belong to the merge-ref commit, and the guard has
+    no business blocking a project just because the head commit carries no
+    statuses of its own.
+    """
+    handler = _gitlab_ci({"id": 3, "status": "success"}, statuses_status=404)
+    with _patch_gitlab(handler):
+        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "success"
+
+
+async def test_gitlab_reads_the_guard_from_the_head_commit() -> None:
+    """The gate posts against the head SHA, so that is where it must look."""
+    seen: list[str] = []
+
+    def handler(method, url, **kw):
+        if "/statuses" in url:
+            seen.append(url)
+            return _FakeResp(json_data=[{"name": STATUS_CONTEXT}])
+        return _FakeResp(
+            json_data={"head_pipeline": {"id": 1, "status": "success", "sha": "mergeref"}}
+        )
+
+    with _patch_gitlab(handler):
+        state = await _gitlab().get_ci_state(_pr("gitlab"))
+    assert state.state == "none"
+    assert all("head123" in url for url in seen)
+    assert not any("mergeref" in url for url in seen)

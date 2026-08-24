@@ -562,17 +562,33 @@ class GitLabProvider(BaseProvider):
         }
     )
 
-    async def _commit_status_names(self, pr_info: PRInfo, sha: str) -> list[str]:
-        """Names of the statuses recorded against one commit.
+    async def _foreign_commit_status(self, pr_info: PRInfo) -> bool | None:
+        """Is anything other than the gate recorded against the head commit?
 
-        Only the names: this exists to answer whether anything other than the
-        gate's own status is present, which needs no ordering and no mapping.
+        ``True`` — yes, so the pipeline describes real work.
+        ``False`` — only the gate's own status is here, so there is no CI.
+        ``None`` — nothing at all is recorded, which is what a merged-results
+        pipeline looks like from the head commit: it belongs to the merge-ref
+        commit instead. The caller then trusts the pipeline.
+
+        Deliberately one page and one question. Answering a boolean by walking
+        every retried job of a large pipeline would cost several sequential
+        requests on every gate evaluation.
         """
+        sha = pr_info.head_sha
         if not sha:
-            return []
-        url = f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}/statuses"
-        entries = await self._paginate(url)
-        return [str((entry or {}).get("name") or "status") for entry in entries]
+            return None
+        url = (
+            f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}"
+            "/statuses?per_page=100"
+        )
+        resp = await self._request("GET", url, ok=(200, 404))
+        if resp.status_code == 404:
+            return None
+        entries = resp.json() or []
+        if not entries:
+            return None
+        return any(str((entry or {}).get("name") or "") != STATUS_CONTEXT for entry in entries)
 
     async def get_ci_state(self, pr_info: PRInfo) -> CIState:
         """The merge request's head pipeline, mapped onto the gate vocabulary.
@@ -587,8 +603,8 @@ class GitLabProvider(BaseProvider):
         commit status posted through the API *joins* the pipeline — including
         the status the gate itself publishes — so on a project with no CI the
         gate would create a green pipeline and read it back as passing on the
-        next pass. Hence the second call: if the only thing recorded against
-        this commit is the gate's own status, there is no CI here to speak of.
+        next pass. Hence the second call, which asks only whether anything
+        other than the gate is recorded against this commit.
 
         A merge request with no pipeline reports "none", which is not success —
         the gate cannot vouch for a commit that nothing ever built, and says so
@@ -604,13 +620,11 @@ class GitLabProvider(BaseProvider):
             return CIState(state="none", total=0)
 
         try:
-            names = await self._commit_status_names(
-                pr_info, str(pipeline.get("sha") or pr_info.head_sha or "")
-            )
+            foreign = await self._foreign_commit_status(pr_info)
         except Exception as exc:  # noqa: BLE001 - unknown, never assumed green
             logger.warning("Could not read commit statuses for %s: %s", pr_info.url, exc)
             return CIState(state="unknown")
-        if names and all(name == STATUS_CONTEXT for name in names):
+        if foreign is False:
             # The pipeline exists because the gate posted into it.
             return CIState(state="none", total=0)
 
@@ -621,8 +635,13 @@ class GitLabProvider(BaseProvider):
             return CIState(state="success", total=1)
         if status in self._PENDING_PIPELINE_STATES:
             return CIState(state="pending", total=1, pending=[name])
-        if status in {"failed", "canceled", "skipped"}:
+        if status in {"failed", "canceled"}:
             return CIState(state="failure", total=1, failing=[f"{name} ({status})"])
+        if status == "skipped":
+            # `[ci skip]`, or every job excluded by `rules`. Nothing failed and
+            # nothing ran, which is the same standing as a commit with no
+            # pipeline: not green, and not a failure to report as one.
+            return CIState(state="none", total=0)
         return CIState(state="unknown", total=1)
 
     async def get_pr_labels(self, pr_info: PRInfo) -> list[str]:
@@ -700,17 +719,24 @@ class GitLabProvider(BaseProvider):
 
         GitLab has no check runs; a commit status is the closest equivalent and
         is keyed by `name`, so re-publishing after a retry updates in place.
-        `neutral` has no GitLab spelling, so a dry run posts `success` with an
-        explicit "would approve" description rather than a green tick that
-        claims more than it should — the description is the payload, and the
-        status is deliberately non-blocking unless the decision blocks.
+        The state is always `success` and the verdict travels in the
+        description. GitLab has no blocking review event, so a red status would
+        claim a power this provider does not have; and because an external
+        status joins the head pipeline, posting one would corrupt the very
+        signal `get_ci_state` reads back. The status is an explanation here, not
+        a verdict — which is also why a dry run is not a lie: it says "would
+        approve" in the words next to the tick.
         """
         sha = pr_info.head_sha
         if not sha:
             return ""
-        state = {"success": "success", "failure": "failed", "neutral": "success"}.get(
-            conclusion, "success"
-        )
+        # Always `success`. GitLab has no blocking review event, so a red status
+        # would claim a power this provider does not have — and an external
+        # status *joins* the head pipeline, so posting `failed` would turn the
+        # pipeline red and the gate would read its own verdict back as a failing
+        # build on the next pass, forever, on that commit. The verdict travels
+        # in the description, where it cannot break anything.
+        state = "success"
         params: dict[str, Any] = {
             "state": state,
             "name": context or STATUS_CONTEXT,
