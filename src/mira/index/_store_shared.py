@@ -7,9 +7,10 @@ they don't touch SQL themselves, so they live in one place.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from mira.feedback.evaluation import RuleAnalyticsRow, RuleOutcomeCounts
     from mira.index.store import (
         DirectorySummary,
         ExternalRef,
@@ -18,6 +19,10 @@ if TYPE_CHECKING:
 
 
 class _StoreSharedMixin:
+    # Parameter placeholder for the analytics SQL, which is written once and
+    # run on both backends. SQLite keeps `?`; PgIndexStore overrides with `%s`.
+    _analytics_placeholder = "?"
+
     def get_summaries(self, paths: list[str]) -> dict[str, FileSummary]:
         result: dict[str, FileSummary] = {}
         for path in paths:
@@ -70,3 +75,231 @@ class _StoreSharedMixin:
             limit=limit,
         )
         return [render_rule(rule) for rule in rules]
+
+    # ---------------------------------------------------------------- Phase 3
+    # Evaluation analytics. The SQL comes from `feedback.evaluation_sql` and is
+    # identical for both backends; only `_analytics_fetchall` differs, which is
+    # what keeps SQLite and Postgres from drifting apart.
+
+    def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
+        raise NotImplementedError  # pragma: no cover - backends implement this
+
+    def _counts_from_row(self, row: tuple, offset: int) -> RuleOutcomeCounts:
+        """Read the shared aggregate column block starting at `offset`."""
+        from mira.feedback.evaluation import RuleOutcomeCounts
+
+        return RuleOutcomeCounts(
+            exposures=int(row[offset] or 0),
+            review_exposures=int(row[offset + 1] or 0),
+            findings=int(row[offset + 2] or 0),
+            positive=int(row[offset + 3] or 0),
+            negative=int(row[offset + 4] or 0),
+            neutral=int(row[offset + 5] or 0),
+            unobserved=int(row[offset + 6] or 0),
+            addressed=int(row[offset + 7] or 0),
+            thumbs_up=int(row[offset + 8] or 0),
+            thumbs_down=int(row[offset + 9] or 0),
+            reply_agree=int(row[offset + 10] or 0),
+            reply_disagree=int(row[offset + 11] or 0),
+        )
+
+    def aggregate_rule_analytics(
+        self,
+        filters: dict[str, Any] | None = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        sort: str = "exposures",
+        descending: bool = True,
+    ) -> list[RuleAnalyticsRow]:
+        """Per-rule outcome aggregation for one repository, paginated.
+
+        Rule metadata (text, status, activation date) is looked up per row
+        rather than joined, so the page size bounds the extra reads. That keeps
+        the query cheap enough for the Orange Pi profile.
+        """
+        from mira.feedback.evaluation import RuleAnalyticsRow, origin_for_rule
+        from mira.feedback.evaluation_sql import aggregate_rules_sql, repeated_false_positives_sql
+
+        active_filters = dict(filters or {})
+        sql, params = aggregate_rules_sql(
+            self._analytics_placeholder,
+            active_filters,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            descending=descending,
+        )
+        rows = self._analytics_fetchall(sql, params)
+        repeat_sql, repeat_params = repeated_false_positives_sql(
+            self._analytics_placeholder, active_filters
+        )
+        repeats = {
+            (str(r[0]), str(r[1]), int(r[2])): int(r[3] or 0)
+            for r in self._analytics_fetchall(repeat_sql, repeat_params)
+        }
+
+        results: list[RuleAnalyticsRow] = []
+        for row in rows:
+            owner, repo, rule_id = str(row[0]), str(row[1]), int(row[2])
+            counts = self._counts_from_row(row, 9)
+            counts.repeated_false_positives = repeats.get((owner, repo, rule_id), 0)
+            rule = self.get_learned_rule(rule_id)  # type: ignore[attr-defined]
+            results.append(
+                RuleAnalyticsRow(
+                    rule_id=rule_id,
+                    owner=owner,
+                    repo=repo,
+                    platform=str(row[3] or "github"),
+                    rule_text=getattr(rule, "rule_text", ""),
+                    category=str(row[8] or ""),
+                    scope_type=str(row[6] or "repo"),
+                    scope_value=str(row[7] or ""),
+                    # Prefer the recorded origin: it captures what the rule was
+                    # when it ran, even if the rule has been edited since.
+                    origin=str(row[5] or (origin_for_rule(rule) if rule else "learned")),
+                    version=int(row[4] or 1),
+                    status=getattr(rule, "status", "approved"),
+                    active=bool(getattr(rule, "active", True)),
+                    effective_from=float(getattr(rule, "effective_from", 0.0) or 0.0),
+                    disabled_at=getattr(rule, "disabled_at", None),
+                    counts=counts,
+                    first_exposure_at=float(row[21] or 0.0),
+                    last_exposure_at=float(row[22] or 0.0),
+                )
+            )
+        return results
+
+    def count_rule_analytics(self, filters: dict[str, Any] | None = None) -> int:
+        from mira.feedback.evaluation_sql import count_rules_sql
+
+        sql, params = count_rules_sql(self._analytics_placeholder, dict(filters or {}))
+        rows = self._analytics_fetchall(sql, params)
+        return int(rows[0][0]) if rows else 0
+
+    def list_rule_evaluations(
+        self,
+        filters: dict[str, Any] | None = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        outcome: str = "",
+    ) -> list[dict]:
+        """The auditable drill-down: the individual evaluations behind a number."""
+        from mira.feedback.evaluation_sql import evaluation_details_sql
+
+        sql, params = evaluation_details_sql(
+            self._analytics_placeholder,
+            dict(filters or {}),
+            limit=limit,
+            offset=offset,
+            outcome_filter=outcome,
+        )
+        columns = (
+            "id",
+            "evaluation_key",
+            "review_id",
+            "rule_id",
+            "rule_version",
+            "rule_origin",
+            "scope_type",
+            "scope_value",
+            "category",
+            "decision",
+            "finding_id",
+            "platform",
+            "owner",
+            "repo",
+            "pr_number",
+            "pr_author",
+            "head_sha",
+            "created_at",
+            "finding_title",
+            "finding_path",
+            "finding_line",
+            "finding_severity",
+            "finding_state",
+            "pr_url",
+            "outcome",
+            "addressed",
+            "thumbs_up",
+            "thumbs_down",
+            "reply_agree",
+            "reply_disagree",
+        )
+        results = []
+        for row in self._analytics_fetchall(sql, params):
+            record = dict(zip(columns, row, strict=False))
+            record["addressed"] = bool(record.get("addressed"))
+            results.append(record)
+        return results
+
+    def count_rule_evaluations(
+        self, filters: dict[str, Any] | None = None, *, outcome: str = ""
+    ) -> int:
+        from mira.feedback.evaluation_sql import count_evaluations_sql
+
+        sql, params = count_evaluations_sql(
+            self._analytics_placeholder, dict(filters or {}), outcome_filter=outcome
+        )
+        rows = self._analytics_fetchall(sql, params)
+        return int(rows[0][0]) if rows else 0
+
+    def rule_analytics_summary(
+        self,
+        filters: dict[str, Any] | None = None,
+        *,
+        dimension: str = "category",
+        limit: int = 50,
+    ) -> list[dict]:
+        """Outcome mix grouped by category, repo, author, scope or origin."""
+        from mira.feedback.evaluation_sql import summary_sql
+
+        sql, params = summary_sql(
+            self._analytics_placeholder,
+            dict(filters or {}),
+            dimension=dimension,
+            limit=limit,
+        )
+        buckets = []
+        for row in self._analytics_fetchall(sql, params):
+            counts = self._counts_from_row(row, 1)
+            buckets.append({"bucket": str(row[0] or ""), **counts.as_dict()})
+        return buckets
+
+    def rule_period_stats(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        category: str,
+        scope_type: str,
+        scope_value: str,
+        start: float,
+        end: float,
+    ) -> dict:
+        """Outcome mix of in-scope findings inside one time window."""
+        from mira.feedback.evaluation import RuleOutcomeCounts
+        from mira.feedback.evaluation_sql import glob_to_like, period_findings_sql
+
+        path_like = glob_to_like(scope_value) if scope_type == "path" and scope_value else ""
+        sql, params = period_findings_sql(
+            self._analytics_placeholder,
+            owner=owner,
+            repo=repo,
+            category=category,
+            path_like=path_like,
+            start=start,
+            end=end,
+        )
+        rows = self._analytics_fetchall(sql, params)
+        row = rows[0] if rows else (0, 0, 0, 0, 0, 0)
+        counts = RuleOutcomeCounts(
+            findings=int(row[0] or 0),
+            positive=int(row[1] or 0),
+            negative=int(row[2] or 0),
+            neutral=int(row[3] or 0),
+            unobserved=int(row[4] or 0),
+            addressed=int(row[5] or 0),
+        )
+        return {"start": start, "end": end, **counts.as_dict()}
