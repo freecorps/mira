@@ -117,13 +117,13 @@ def score(inputs: GateInputs, weights: RiskWeights) -> tuple[int, list[RiskFacto
         _capped(over_files, weights.size_per_file, weights.size_file_cap),
         f"{counted_files} reviewable file(s) changed",
     )
-    total_lines = inputs.added_lines + inputs.deleted_lines
+    total_lines = max(0, inputs.added_lines + inputs.deleted_lines - inputs.generated_lines)
     over_lines = max(0, total_lines - weights.size_free_lines)
     add(
         "size_lines",
         "Lines changed",
         _capped(over_lines // 100, weights.size_per_100_lines, weights.size_line_cap),
-        f"{total_lines} line(s) added or removed",
+        f"{total_lines} hand-written line(s) added or removed",
     )
     if inputs.changed_files and generated / max(inputs.changed_files, 1) >= _GENERATED_HEAVY_RATIO:
         add(

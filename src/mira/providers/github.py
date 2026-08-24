@@ -17,9 +17,10 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITHUB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
-from mira.gate.models import CIState
+from mira.gate.models import STATUS_CONTEXT, CIState
 from mira.models import (
     BotThreadRecord,
+    FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     OpenPRRef,
@@ -1230,8 +1231,12 @@ class GitHubProvider(BaseProvider):
             pending: list[str] = []
             total = 0
             for run in commit.get_check_runs():
-                total += 1
                 name = run.name or "check"
+                if name == STATUS_CONTEXT:
+                    # The gate's own check. Counting it would let the gate read
+                    # its own verdict back as a failing build.
+                    continue
+                total += 1
                 if (run.status or "") != "completed":
                     pending.append(name)
                     continue
@@ -1244,7 +1249,7 @@ class GitHubProvider(BaseProvider):
                 # Chronological, newest first, per context — only the first
                 # entry for a context describes its current state.
                 context = status.context or "status"
-                if context in seen_contexts:
+                if context in seen_contexts or context == STATUS_CONTEXT:
                     continue
                 seen_contexts.add(context)
                 total += 1
@@ -1295,21 +1300,26 @@ class GitHubProvider(BaseProvider):
             logger.warning("Could not read author association for %s: %s", pr_info.url, e)
             return "UNKNOWN"
 
-    async def get_pr_change_stats(self, pr_info: PRInfo) -> tuple[list[str], int, int]:
-        """Per-file counts from the files API — no diff body, no 406 size cliff."""
+    async def get_pr_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
+        """Per-file counts from the files API — no diff body, no 406 size cliff.
+
+        Lists every file the PR touches, deletions and binaries included: the
+        merge gate asks this to find protected paths, not to decide what to
+        review.
+        """
 
         @_retry_transient
-        def _fetch() -> tuple[list[str], int, int]:
+        def _fetch() -> list[FileChangeStat]:
             gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             pr = gh_repo.get_pull(pr_info.number)
-            paths: list[str] = []
-            added = 0
-            deleted = 0
-            for file in pr.get_files():
-                paths.append(file.filename)
-                added += int(getattr(file, "additions", 0) or 0)
-                deleted += int(getattr(file, "deletions", 0) or 0)
-            return paths, added, deleted
+            return [
+                FileChangeStat(
+                    path=file.filename,
+                    added_lines=int(getattr(file, "additions", 0) or 0),
+                    deleted_lines=int(getattr(file, "deletions", 0) or 0),
+                )
+                for file in pr.get_files()
+            ]
 
         try:
             return await asyncio.to_thread(_fetch)

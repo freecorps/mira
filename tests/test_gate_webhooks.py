@@ -17,6 +17,7 @@ from fastapi import BackgroundTasks
 
 from mira.config import GateConfig, MiraConfig
 from mira.platforms import handlers
+from mira.platforms.github import webhook
 from mira.platforms.github.webhook import (
     dispatch_github_event,
     handle_gate_pr_event,
@@ -110,3 +111,53 @@ async def test_a_check_suite_with_no_pull_requests_does_nothing() -> None:
         {"check_suite": {"pull_requests": []}, "repository": _repository()}, auth, "mira-bot"
     )
     auth.get_installation_token.assert_not_called()
+
+
+# ───────────────────────────────── regressions from the pre-merge review ──
+
+
+async def test_a_check_suite_recheck_costs_no_token_when_the_gate_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The policy is resolved before an installation token is minted.
+
+    An install that never turned the gate on would otherwise pay an API call
+    for every check suite that finishes anywhere it is installed.
+    """
+    monkeypatch.setattr(webhook, "load_config", lambda: MiraConfig())
+    auth = _auth()
+    await handle_gate_recheck(
+        {
+            "check_suite": {"pull_requests": [{"number": 7}]},
+            "repository": _repository(),
+            "installation": {"id": 1},
+        },
+        auth,
+        "mira-bot",
+    )
+    auth.get_installation_token.assert_not_called()
+
+
+async def test_a_label_recheck_costs_no_token_when_the_gate_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(webhook, "load_config", lambda: MiraConfig())
+    auth = _auth()
+    await handle_gate_pr_event(
+        {
+            "pull_request": {"number": 7},
+            "repository": _repository(),
+            "installation": {"id": 1},
+        },
+        auth,
+        "mira-bot",
+    )
+    auth.get_installation_token.assert_not_called()
+
+
+async def test_an_unreadable_policy_is_not_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _explode() -> MiraConfig:
+        raise RuntimeError("the settings store is unreachable")
+
+    monkeypatch.setattr(webhook, "load_config", _explode)
+    assert webhook._gate_is_active("acme", "app") is False

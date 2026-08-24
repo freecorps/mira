@@ -42,6 +42,7 @@ from mira.gate.explain import (
     status_title,
 )
 from mira.gate.models import (
+    STATUS_CONTEXT,
     CIState,
     GateDecision,
     GateInputs,
@@ -52,12 +53,9 @@ from mira.gate.models import (
     override_key,
 )
 from mira.gate.policy import EffectivePolicy, resolve_policy
+from mira.models import FileChangeStat
 
 logger = logging.getLogger(__name__)
-
-# Name of the check run / commit status the gate publishes. Stable, because
-# re-publishing under a new name would leave the old one on the commit forever.
-STATUS_CONTEXT = "mira/merge-gate"
 
 # Marker for the gate's PR comment, so updates land in place instead of
 # stacking a new comment on every push.
@@ -81,9 +79,9 @@ class ReviewSignal:
     Re-deriving that would cost a second diff fetch per PR for nothing.
     """
 
-    changed_paths: list[str] | None = None
-    added_lines: int = 0
-    deleted_lines: int = 0
+    # Every file the PR touches, with its own line counts — not the review's
+    # filtered list. A file Mira chose not to review can still be protected.
+    changes: list[FileChangeStat] | None = None
     # Finding counts the caller already has. The store is consulted regardless
     # and the larger of the two wins — a dry-run review never persists its
     # findings, and taking the max can only make the gate stricter.
@@ -199,13 +197,22 @@ async def gather_inputs(
         raise GateUnavailable(f"{capability.provider} cannot report human review states")
     human_states = dict(await provider.get_review_states(pr_info) or {})
 
-    if signal.changed_paths is None:
-        changed_paths, added, deleted = await provider.get_pr_change_stats(pr_info)
-    else:
-        changed_paths = list(signal.changed_paths)
-        added, deleted = signal.added_lines, signal.deleted_lines
+    changes = (
+        list(signal.changes)
+        if signal.changes is not None
+        else list(await provider.get_pr_change_stats(pr_info))
+    )
+    changed_paths = [change.path for change in changes]
+    added = sum(change.added_lines for change in changes)
+    deleted = sum(change.deleted_lines for change in changes)
 
     generated, protected = classify_paths(changed_paths, policy)
+    generated_set = set(generated)
+    generated_lines = sum(
+        change.added_lines + change.deleted_lines
+        for change in changes
+        if change.path in generated_set
+    )
 
     codeowners = await _codeowners_for(provider, pr_info, policy)
     owned = codeowners.owned_paths(changed_paths) if codeowners.status == "ok" else []
@@ -244,6 +251,7 @@ async def gather_inputs(
         added_lines=int(added),
         deleted_lines=int(deleted),
         generated_paths=generated,
+        generated_lines=generated_lines,
         protected_matches=protected,
         codeowner_matches=owned,
         codeowners_status=codeowners.status,
@@ -470,23 +478,29 @@ async def _deliver_review_event(
         head_sha=inputs.head_sha,
         kind=kind,
     ):
+        # Someone else owns this side effect. Adopt whatever they achieved with
+        # it, so this decision settles instead of looking un-attempted and
+        # re-entering `deliver()` on every later webhook.
         existing = store.get_gate_delivery(key) or {}
+        existing_state = str(existing.get("state") or "in_flight")
         logger.info(
             "Merge gate skipping a duplicate %s on %s (delivery already %s)",
             event,
             inputs.pr_url,
-            existing.get("state", "claimed"),
+            existing_state,
         )
-        if event == "APPROVE" and existing.get("state") == "delivered":
-            # Another worker already approved this exact commit. Reflecting
-            # that here keeps the two decision rows consistent instead of
-            # leaving this one saying `would_approve` about an approved PR.
-            store.update_gate_decision_delivery(
-                decision.decision_key,
-                delivery_state="delivered",
-                delivery_ref=str(existing.get("ref", "")),
-                state="approved",
-            )
+        approved = event == "APPROVE" and existing_state == "delivered"
+        store.update_gate_decision_delivery(
+            decision.decision_key,
+            delivery_state=existing_state,
+            delivery_ref=str(existing.get("ref", "")),
+            error=str(existing.get("error", "")),
+            state="approved" if approved else None,
+        )
+        decision.delivery_state = existing_state
+        if approved:
+            # Another worker already approved this exact commit. Saying so here
+            # keeps the two decision rows from disagreeing about the same PR.
             decision.state = "approved"
         return
 

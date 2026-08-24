@@ -20,7 +20,7 @@ import httpx
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITLAB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
-from mira.gate.models import CIState
+from mira.gate.models import STATUS_CONTEXT, CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -624,11 +624,25 @@ class GitLabProvider(BaseProvider):
         return "NONE"
 
     async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
+        """First CODEOWNERS found at the head ref, or ``("", "")`` if none.
+
+        Deliberately not routed through `get_file_content`, which logs a failed
+        fetch and returns "". "There are no owners" and "we could not check"
+        have to reach the gate as different answers — the first is safe to
+        approve past and the second is not — so a real failure raises.
+        """
         ref = pr_info.head_sha or pr_info.head_branch
         for candidate in CODEOWNERS_LOCATIONS["gitlab"]:
-            content = await self.get_file_content(pr_info, candidate, ref)
-            if content:
-                return candidate, content
+            url = (
+                f"{self._project(pr_info)}/repository/files/"
+                f"{quote(candidate, safe='')}/raw?ref={quote(ref, safe='')}"
+            )
+            try:
+                resp = await self._request("GET", url, ok=(200, 404))
+            except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
+                raise ProviderError(f"Failed to read CODEOWNERS: {exc}") from exc
+            if resp.status_code == 200 and resp.text:
+                return candidate, resp.text
         return "", ""
 
     async def publish_gate_status(
@@ -658,7 +672,7 @@ class GitLabProvider(BaseProvider):
         )
         params: dict[str, Any] = {
             "state": state,
-            "name": context,
+            "name": context or STATUS_CONTEXT,
             "description": title[:255],
         }
         if target_url:

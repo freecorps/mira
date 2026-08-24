@@ -610,3 +610,42 @@ def test_a_retried_review_does_not_look_like_a_new_world() -> None:
     first = decide(_clean_inputs(review_id=1), _policy(), capabilities=GITHUB_CAPABILITIES)
     retry = decide(_clean_inputs(review_id=2), _policy(), capabilities=GITHUB_CAPABILITIES)
     assert first.decision_key == retry.decision_key
+
+
+# ───────────────────────────────── regressions from the pre-merge review ──
+
+
+def test_an_empty_generated_list_means_empty() -> None:
+    """`[]` is a statement, not a request to fall back to the built-ins.
+
+    The same sentinel `protected_paths` uses: `null` inherits, `[]` is empty.
+    A repository that declares nothing generated must not have `uv.lock`
+    silently discounted from its size budget.
+    """
+    inherited = resolve_policy(GateConfig(mode="shadow"), "acme", "app")
+    assert "uv.lock" in inherited.generated_paths
+
+    explicit = resolve_policy(GateConfig(mode="shadow", generated_paths=[]), "acme", "app")
+    assert explicit.generated_paths == ()
+
+    custom = resolve_policy(GateConfig(mode="shadow", generated_paths=["vendor/**"]), "acme", "app")
+    assert custom.generated_paths == ("vendor/**",)
+
+
+def test_generated_lines_are_discounted_from_the_size_score() -> None:
+    weights = GateConfig().weights
+    lockfile = _clean_inputs(
+        changed_files=2,
+        changed_paths=["src/a.py", "uv.lock"],
+        generated_paths=["uv.lock"],
+        added_lines=4000,
+        deleted_lines=3800,
+        generated_lines=7794,
+    )
+    hand_written = _clean_inputs(
+        changed_files=2,
+        changed_paths=["src/a.py", "src/b.py"],
+        added_lines=4000,
+        deleted_lines=3800,
+    )
+    assert score(lockfile, weights)[0] < score(hand_written, weights)[0]

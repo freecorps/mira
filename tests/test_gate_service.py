@@ -31,6 +31,7 @@ from mira.gate.capabilities import (
 from mira.gate.models import CIState, ReasonCode, delivery_key
 from mira.gate.service import OverrideDenied, apply_override
 from mira.index.store import IndexStore
+from mira.models import FileChangeStat
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +81,12 @@ class FakeProvider:
         verdict_result: bool = True,
         raise_on: str = "",
         status_raises: bool = False,
+        changes: list[FileChangeStat] | None = None,
     ) -> None:
+        self._changes = changes or [
+            FileChangeStat(path="src/a.py", added_lines=12, deleted_lines=3),
+            FileChangeStat(path="src/b.py", added_lines=8, deleted_lines=1),
+        ]
         self._capabilities = capabilities
         self._labels = labels or []
         self._association = association
@@ -119,7 +125,7 @@ class FakeProvider:
 
     async def get_pr_change_stats(self, pr_info):
         self._maybe_raise("change_stats")
-        return ["src/a.py", "src/b.py"], 20, 4
+        return list(self._changes)
 
     async def get_codeowners(self, pr_info):
         self._maybe_raise("codeowners")
@@ -393,7 +399,7 @@ async def test_an_llm_or_review_failure_never_approves() -> None:
         config=_config(mode="enforce"),
         bot_name="miracodeai",
         signal=gate_service.ReviewSignal(
-            changed_paths=["src/a.py"],
+            changes=[FileChangeStat(path="src/a.py", added_lines=3)],
             review_failed="the review model returned no parseable response",
         ),
     )
@@ -632,14 +638,34 @@ async def test_the_engine_hands_the_gate_what_the_review_already_knows(
         total_paths=["src/a.py", "src/b.py"],
         skipped_paths=["src/huge.py"],
     )
-    diff = "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1,2 @@\n+added\n-removed\n"
+    # A real diff, with a deleted CI workflow in it. That file is in neither
+    # `total_paths` nor `skipped_paths` — the review filters deletions out — and
+    # it is exactly the kind of file the protected-path veto exists for.
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " context\n"
+        "-removed\n"
+        "+added\n"
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "deleted file mode 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-name: CI\n"
+    )
 
     monkeypatch.setattr(gate_service, "evaluate", _fake_evaluate)
     await engine._run_merge_gate(_pr(), result, diff)
 
     signal = captured["signal"]
-    assert signal.changed_paths == ["src/a.py", "src/b.py"]
-    assert (signal.added_lines, signal.deleted_lines) == (1, 1)
+    assert [change.path for change in signal.changes] == [
+        "src/a.py",
+        ".github/workflows/ci.yml",
+    ]
+    assert (signal.changes[0].added_lines, signal.changes[0].deleted_lines) == (1, 1)
     assert signal.open_warnings == 1
     assert signal.open_security == 1
     assert signal.open_findings == 1
@@ -709,9 +735,10 @@ async def test_both_entry_paths_score_the_same_pull_request_alike() -> None:
         config=_config(mode="shadow"),
         bot_name="miracodeai",
         signal=gate_service.ReviewSignal(
-            changed_paths=["src/a.py", "src/b.py"],
-            added_lines=20,
-            deleted_lines=4,
+            changes=[
+                FileChangeStat(path="src/a.py", added_lines=12, deleted_lines=3),
+                FileChangeStat(path="src/b.py", added_lines=8, deleted_lines=1),
+            ],
             open_warnings=1,
             open_security=1,
             open_findings=1,
@@ -737,7 +764,7 @@ async def test_a_dry_run_review_is_still_scored_on_its_own_findings() -> None:
         config=_config(mode="shadow"),
         bot_name="miracodeai",
         signal=gate_service.ReviewSignal(
-            changed_paths=["src/a.py"],
+            changes=[FileChangeStat(path="src/a.py", added_lines=3)],
             open_blockers=1,
             open_findings=1,
             worst_severity="blocker",
@@ -763,3 +790,81 @@ async def test_a_provider_that_cannot_report_review_states_is_an_error() -> None
     decision = await _evaluate(provider, _config(mode="enforce"))
     assert decision.state == "error"
     assert provider.verdicts == []
+
+
+# ───────────────────────────────── regressions from the pre-merge review ──
+
+
+async def test_a_protected_file_the_review_never_saw_still_vetoes() -> None:
+    """The gate classifies the whole diff, not the review's filtered list.
+
+    Deletions, binaries and `filter.exclude_patterns` matches never reach
+    `result.total_paths`. Whether Mira reviewed a file and whether that file is
+    protected are different questions, and answering the second from the first
+    is how a deleted CI workflow gets approved.
+    """
+    provider = FakeProvider(
+        changes=[
+            FileChangeStat(path="src/a.py", added_lines=4, deleted_lines=1),
+            # Deleted, so the review filtered it out entirely.
+            FileChangeStat(path=".github/workflows/ci.yml", added_lines=0, deleted_lines=30),
+        ]
+    )
+    decision = await _evaluate(provider, _config(mode="enforce"))
+    assert decision.state == "not_approved"
+    assert ReasonCode.PROTECTED_PATH in decision.reason_codes()
+    assert ".github/workflows/ci.yml" in decision.inputs.protected_matches
+    assert provider.verdicts == []
+
+
+async def test_generated_lines_are_discounted_from_the_size_budget() -> None:
+    """Discounting the files but not their lines forgives nothing."""
+    lockfile_bump = FakeProvider(
+        changes=[
+            FileChangeStat(path="src/a.py", added_lines=6, deleted_lines=2),
+            FileChangeStat(path="uv.lock", added_lines=4000, deleted_lines=3800),
+        ]
+    )
+    decision = await _evaluate(lockfile_bump, _config(mode="enforce", max_changed_lines=500))
+    assert decision.state == "approved"
+    assert decision.inputs.generated_lines == 7800
+
+    hand_written = FakeProvider(
+        changes=[FileChangeStat(path="src/a.py", added_lines=4000, deleted_lines=3800)]
+    )
+    refused = await _evaluate(hand_written, _config(mode="enforce", max_changed_lines=500))
+    assert refused.state == "not_approved"
+    assert ReasonCode.PR_TOO_MANY_LINES in refused.reason_codes()
+
+
+async def test_a_codeowners_fetch_failure_is_never_read_as_no_owners() -> None:
+    provider = FakeProvider(raise_on="codeowners")
+    decision = await _evaluate(provider, _config(mode="enforce", codeowners="block"))
+    assert decision.state == "not_approved"
+    assert ReasonCode.CODEOWNERS_UNREADABLE in decision.reason_codes()
+    assert provider.verdicts == []
+
+
+async def test_a_lost_request_changes_claim_settles_the_decision() -> None:
+    """Otherwise `deliver()` re-runs on every later webhook, forever."""
+    provider = FakeProvider()
+    config = _config(mode="enforce", request_changes_on_blockers=True)
+    signal = gate_service.ReviewSignal(
+        changes=[FileChangeStat(path="src/a.py", added_lines=3)],
+        open_blockers=1,
+        open_findings=1,
+        worst_severity="blocker",
+    )
+    first = await gate_service.evaluate(
+        provider, _pr(), config=config, bot_name="miracodeai", signal=signal
+    )
+    assert first.request_changes is True
+    assert [event for event, _ in provider.verdicts] == ["REQUEST_CHANGES"]
+
+    # A redelivered webhook over the same facts finds the claim already taken.
+    second_provider = FakeProvider()
+    second = await gate_service.evaluate(
+        second_provider, _pr(), config=config, bot_name="miracodeai", signal=signal
+    )
+    assert second_provider.verdicts == []
+    assert second.delivery_state == "delivered"

@@ -14,6 +14,7 @@ report it (CI, association). Reads whose emptiness would read as good news
 
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,8 @@ import pytest
 
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import for_provider
+from mira.gate.codeowners import CODEOWNERS_LOCATIONS
+from mira.gate.models import STATUS_CONTEXT
 from mira.models import PRInfo
 from mira.providers.forgejo import ForgejoProvider
 from mira.providers.github import GitHubProvider
@@ -228,9 +231,9 @@ async def test_github_change_stats_come_from_the_files_api() -> None:
         SimpleNamespace(filename="src/b.py", additions=5, deletions=0),
     ]
     provider, _ = _github_provider(pull=pull)
-    paths, added, deleted = await provider.get_pr_change_stats(_pr())
-    assert paths == ["src/a.py", "src/b.py"]
-    assert (added, deleted) == (15, 2)
+    changes = await provider.get_pr_change_stats(_pr())
+    assert [change.path for change in changes] == ["src/a.py", "src/b.py"]
+    assert [(c.added_lines, c.deleted_lines) for c in changes] == [(10, 2), (5, 0)]
 
 
 # ────────────────────────────────────────────────────────────────── GitLab ──
@@ -468,3 +471,103 @@ async def test_forgejo_publishes_a_commit_status() -> None:
     # it is a dry run — never a failure for a PR the gate would have approved.
     assert captured["json"]["state"] == "success"
     assert "dry run" in captured["json"]["description"].lower()
+
+
+# ───────────────────────────────── regressions from the pre-merge review ──
+
+
+async def test_github_ci_ignores_the_gates_own_check_run() -> None:
+    """Counting it would let the gate read its own verdict back as a build.
+
+    It would also change the check count on every pass, which changes the
+    inputs digest, which manufactures a fresh decision row each time.
+    """
+    commit = MagicMock()
+    commit.get_check_runs.return_value = [
+        _check_run("build", "completed", "success"),
+        _check_run(STATUS_CONTEXT, "completed", "failure"),
+    ]
+    commit.get_statuses.return_value = [_status(STATUS_CONTEXT, "failure")]
+    provider, _ = _github_provider(commit=commit)
+    state = await provider.get_ci_state(_pr())
+    assert state.state == "success"
+    assert state.total == 1
+
+
+async def test_forgejo_ci_ignores_the_gates_own_status() -> None:
+    def handler(method, url, **kw):
+        return _FakeResp(
+            json_data=[
+                {"context": "ci", "status": "success"},
+                {"context": STATUS_CONTEXT, "status": "failure"},
+            ]
+        )
+
+    with _patch_forgejo(handler):
+        state = await _forgejo().get_ci_state(_pr("forgejo"))
+    assert state.state == "success"
+    assert state.total == 1
+
+
+@pytest.mark.parametrize("status", [500, 502])
+async def test_gitlab_codeowners_failure_raises_rather_than_reading_as_absent(
+    status: int,
+) -> None:
+    """ "No owners" and "we could not check" are different answers."""
+
+    def handler(method, url, **kw):
+        return _FakeResp(status=status, text="upstream is down")
+
+    with _patch_gitlab(handler), pytest.raises(ProviderError, match="CODEOWNERS"):
+        await _gitlab().get_codeowners(_pr("gitlab"))
+
+
+async def test_gitlab_codeowners_absent_is_reported_as_absent() -> None:
+    def handler(method, url, **kw):
+        return _FakeResp(status=404, text="")
+
+    with _patch_gitlab(handler):
+        assert await _gitlab().get_codeowners(_pr("gitlab")) == ("", "")
+
+
+async def test_gitlab_codeowners_is_read_from_the_head_ref() -> None:
+    def handler(method, url, **kw):
+        if "CODEOWNERS" in url:
+            return _FakeResp(status=200, text="src/**  @backend\n")
+        return _FakeResp(status=404, text="")
+
+    with _patch_gitlab(handler):
+        path, content = await _gitlab().get_codeowners(_pr("gitlab"))
+    assert path == "CODEOWNERS"
+    assert "@backend" in content
+
+
+@pytest.mark.parametrize("status", [500, 502])
+async def test_forgejo_codeowners_failure_raises_rather_than_reading_as_absent(
+    status: int,
+) -> None:
+    def handler(method, url, **kw):
+        return _FakeResp(status=status, text="upstream is down")
+
+    with _patch_forgejo(handler), pytest.raises(ProviderError, match="CODEOWNERS"):
+        await _forgejo().get_codeowners(_pr("forgejo"))
+
+
+async def test_forgejo_codeowners_absent_is_reported_as_absent() -> None:
+    def handler(method, url, **kw):
+        return _FakeResp(status=404, json_data={})
+
+    with _patch_forgejo(handler):
+        assert await _forgejo().get_codeowners(_pr("forgejo")) == ("", "")
+
+
+async def test_forgejo_codeowners_decodes_the_contents_api() -> None:
+    encoded = base64.b64encode(b"src/**  @backend\n").decode()
+
+    def handler(method, url, **kw):
+        return _FakeResp(status=200, json_data={"content": encoded})
+
+    with _patch_forgejo(handler):
+        path, content = await _forgejo().get_codeowners(_pr("forgejo"))
+    assert path in CODEOWNERS_LOCATIONS["forgejo"]
+    assert "@backend" in content

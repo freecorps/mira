@@ -55,6 +55,7 @@ from mira.llm.response_parser import (
 )
 from mira.models import (
     WALKTHROUGH_MARKER,
+    FileChangeStat,
     FileChangeType,
     KeyIssue,
     OverlapFinding,
@@ -1191,16 +1192,30 @@ class ReviewEngine:
             return
         if not resolve_policy(self.config.gate, pr_info.owner, pr_info.repo).active:
             return
+        # The *unfiltered* diff, not `result.total_paths`. That list is what
+        # Mira chose to review — deletions, binaries and excluded paths are
+        # already gone from it — and whether a file was reviewed has nothing to
+        # do with whether it is protected.
+        #
+        # `None` falls through to the provider, which is the right answer when
+        # the diff is empty or unparseable: the gate then asks the platform
+        # directly rather than deciding from a file list it knows is short.
+        changes: list[FileChangeStat] | None = None
         try:
-            lines = diff_text.splitlines()
-            added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
-            deleted = sum(
-                1 for line in lines if line.startswith("-") and not line.startswith("---")
-            )
+            changes = [
+                FileChangeStat(
+                    path=file.path,
+                    added_lines=file.added_lines,
+                    deleted_lines=file.deleted_lines,
+                )
+                for file in parse_diff(diff_text or "").files
+            ] or None
+        except Exception as exc:
+            logger.info("Merge gate will re-fetch the file list for %s: %s", pr_info.url, exc)
+
+        try:
             signal = gate_service.ReviewSignal(
-                changed_paths=list(result.total_paths) or None,
-                added_lines=added,
-                deleted_lines=deleted,
+                changes=changes,
                 # A dry run never persists its findings, so the gate would
                 # otherwise score this pass as though it had found nothing.
                 open_blockers=sum(1 for c in result.comments if c.severity == Severity.BLOCKER),

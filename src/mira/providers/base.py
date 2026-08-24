@@ -8,6 +8,7 @@ from mira.gate.capabilities import NO_CAPABILITIES, GateCapabilities
 from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
+    FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     PRInfo,
@@ -195,12 +196,16 @@ class BaseProvider(abc.ABC):
         """
         return "UNKNOWN"
 
-    async def get_pr_change_stats(self, pr_info: PRInfo) -> tuple[list[str], int, int]:
-        """``(changed_paths, added_lines, deleted_lines)`` for the PR.
+    async def get_pr_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
+        """Every file the PR touches, with its own line counts.
+
+        *Every* file — including deletions, binaries, and anything the review
+        filters out. Whether Mira reviewed a file and whether that file is
+        protected are different questions, and answering the second from the
+        first is how a deleted CI workflow gets approved.
 
         Derived from the diff the provider already knows how to fetch, so a new
-        provider gets it for free. Callers that already hold a parsed diff pass
-        their own numbers instead of paying for this.
+        provider gets it for free.
         """
         from mira.core.diff_parser import parse_diff
 
@@ -208,10 +213,14 @@ class BaseProvider(abc.ABC):
         # small pull request and clear every size limit there is.
         diff_text = await self.get_pr_diff(pr_info)
         patch_set = parse_diff(diff_text or "")
-        paths = [file.path for file in patch_set.files]
-        added = sum(file.added_lines for file in patch_set.files)
-        deleted = sum(file.deleted_lines for file in patch_set.files)
-        return paths, added, deleted
+        return [
+            FileChangeStat(
+                path=file.path,
+                added_lines=file.added_lines,
+                deleted_lines=file.deleted_lines,
+            )
+            for file in patch_set.files
+        ]
 
     async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
         """``(path, contents)`` of the repository CODEOWNERS at the head ref.

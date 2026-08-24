@@ -24,7 +24,7 @@ import httpx
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import FORGEJO_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
-from mira.gate.models import CIState
+from mira.gate.models import STATUS_CONTEXT, CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -594,7 +594,9 @@ class ForgejoProvider(BaseProvider):
         total = 0
         for status in statuses:
             context = str((status or {}).get("context") or "status")
-            if context in seen:
+            if context in seen or context == STATUS_CONTEXT:
+                # The gate's own status. Counting it would let the gate read
+                # its own verdict back as a failing build.
                 continue
             seen.add(context)
             total += 1
@@ -646,9 +648,28 @@ class ForgejoProvider(BaseProvider):
         return "NONE"
 
     async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
+        """First CODEOWNERS found at the head ref, or ``("", "")`` if none.
+
+        Deliberately not routed through `get_file_content`, which logs a failed
+        fetch and returns "". "There are no owners" and "we could not check"
+        have to reach the gate as different answers — the first is safe to
+        approve past and the second is not — so a real failure raises.
+        """
         ref = pr_info.head_sha or pr_info.head_branch
         for candidate in CODEOWNERS_LOCATIONS["forgejo"]:
-            content = await self.get_file_content(pr_info, candidate, ref)
+            url = (
+                f"{self._repo(pr_info)}/contents/{quote(candidate, safe='')}"
+                f"?ref={quote(ref, safe='')}"
+            )
+            try:
+                resp = await self._request("GET", url, ok=(200, 404))
+            except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
+                raise ProviderError(f"Failed to read CODEOWNERS: {exc}") from exc
+            if resp.status_code == 404:
+                continue
+            content = base64.b64decode((resp.json() or {}).get("content", "")).decode(
+                "utf-8", errors="replace"
+            )
             if content:
                 return candidate, content
         return "", ""
