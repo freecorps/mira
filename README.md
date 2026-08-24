@@ -125,11 +125,18 @@ learning:
   feedback_v2: true
   learning_synthesis: true
   learning_auto_apply: false  # keep human approval in the loop
+  evaluation_analytics: true  # record which rules ran and what came of it
+  min_exposures_for_regression: 20  # evidence needed before flagging a rule
 ```
 
 Set `MIRA_DASHBOARD_URL` to the externally reachable dashboard base URL (for
 example, `https://mira.example.com`) so feedback acknowledgements can link
 directly to their candidate and evidence.
+
+Rule analytics live at `/learnings/analytics` (admin only). Setting
+`learning.evaluation_analytics: false` stops the recording entirely; reviews
+behave identically either way, since exposures are written only after the
+review has already been posted.
 
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 

@@ -62,3 +62,9 @@ Git. The dashboard and webhook should be published through a TLS reverse proxy;
 the container port remains bound to loopback. Add the public base URL as
 `MIRA_DASHBOARD_URL=https://mira.example.com` in `mira.env` to make feedback
 candidate links clickable from pull-request comments.
+
+Rule evaluation analytics adds a few small rows per review and aggregates
+entirely in SQL, one page at a time — it never loads the review history into
+memory. If you would rather not pay even that on constrained hardware, set
+`learning.evaluation_analytics: false`; reviews behave identically, since the
+recording happens only after comments have been posted.

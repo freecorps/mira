@@ -49,6 +49,11 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Rule comparison, editing, rejection, versioning, disabling, and YAML import/export in the dashboard
 - Scope-aware retrieval with manual and specific rules taking precedence
 - Feature flags for feedback capture, synthesis, and opt-in auto-application
+- Rule evaluation analytics: exposures, decisions, and outcomes recorded per rule and finding
+- 👍/👎, agree/disagree replies, addressed rate, and repeated false positives, all traceable to the events behind them
+- Before/after activation comparison so you can see whether a rule improved reviews
+- Regression detection that suggests a downgrade but never disables a rule on its own
+- CSV/JSON export and an audit trail for suggestions, overrides, and admin changes
 
 ## Platform integrations
 
