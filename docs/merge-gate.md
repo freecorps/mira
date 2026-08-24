@@ -319,10 +319,10 @@ stale without changing a line of code. Re-evaluation costs no LLM call, and the
 policy is resolved *before* an installation token is minted, so an install that
 never turned the gate on pays nothing for every check suite that finishes.
 
-The gate's own status check is excluded from the CI reading on all three
-platforms. Counting it would let the gate read its own verdict back as a
-failing build, and would change the check count on every pass — which changes
-the inputs digest, which would manufacture a fresh decision row each time.
+On GitHub and Forgejo the gate's own status check is excluded from the CI
+reading. Counting it would let the gate read its own verdict back as a failing
+build, and would change the check count on every pass — which changes the
+inputs digest, which would manufacture a fresh decision row each time.
 
 **GitLab gets no status check at all**, and that is the interesting case.
 
