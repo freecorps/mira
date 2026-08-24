@@ -134,11 +134,13 @@ free next to the review, so scoring is arithmetic over facts the review already
 gathered — the engine hands it the parsed diff's per-file counts rather than
 fetching anything a second time.
 
-Those counts come from the **unfiltered** diff, not from the list of files Mira
-reviewed. Deletions, binaries and `filter.exclude_patterns` matches are gone
-from the review's list, and whether a file was reviewed has nothing to do with
-whether it is protected — answering the second question from the first is how a
-deleted CI workflow gets approved.
+Those counts come from the **whole, unfiltered** diff — not from the list of
+files Mira reviewed, and not from the incremental diff a second review round
+looks at. Deletions, binaries and `filter.exclude_patterns` matches are gone
+from the review's list, and a round-2 review only looks at the newest commits.
+Whether a file was reviewed has nothing to do with whether it is protected, and
+answering the second question from the first is how a deleted CI workflow gets
+approved.
 
 Factors, with their default weights:
 
@@ -257,7 +259,7 @@ would silently downgrade a working install.
 | Approve | ✅ | ✅ (tier-dependent) | ✅ |
 | Request changes | ✅ | ❌ | ✅ |
 | Status check | ✅ check run | ✅ commit status | ✅ commit status |
-| Read CI | ✅ check runs + statuses | ✅ head pipeline | ✅ commit statuses |
+| Read CI | ✅ check runs + statuses | ✅ per-job statuses | ✅ commit statuses |
 | Read association | ✅ | ✅ access levels | ✅ permissions |
 | Read review states | ✅ | ✅ approvals only | ✅ |
 | Read labels | ✅ | ✅ | ✅ |
@@ -316,10 +318,14 @@ stale without changing a line of code. Re-evaluation costs no LLM call, and the
 policy is resolved *before* an installation token is minted, so an install that
 never turned the gate on pays nothing for every check suite that finishes.
 
-The gate's own status check is excluded from the CI reading. Counting it would
-let the gate read its own verdict back as a failing build, and would change the
-check count on every pass — which changes the inputs digest, which would
-manufacture a fresh decision row each time.
+The gate's own status check is excluded from the CI reading on all three
+platforms. Counting it would let the gate read its own verdict back as a
+failing build, and would change the check count on every pass — which changes
+the inputs digest, which would manufacture a fresh decision row each time. On
+GitLab it would be worse than that: an external commit status *joins* the head
+pipeline, so on a project with no CI the gate's own status would have created a
+green pipeline for the next evaluation to read back as passing. That is why
+GitLab is read per job rather than from `head_pipeline`.
 
 ## Overrides
 

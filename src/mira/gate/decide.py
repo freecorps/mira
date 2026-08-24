@@ -64,7 +64,9 @@ def decide(
     # disqualified: a shadow rollout needs the score of the PRs it refused as
     # much as the score of the ones it would have approved, or the threshold
     # can only ever be tuned from half the data.
-    total, factors = score_risk(inputs, policy.weights)
+    total, factors = score_risk(
+        inputs, policy.weights, exclude_generated=policy.size_excludes_generated
+    )
     base.risk_score = total
     base.factors = factors
     base.risk_band = risk_band(total, medium_at=policy.risk_medium_at, high_at=policy.risk_high_at)

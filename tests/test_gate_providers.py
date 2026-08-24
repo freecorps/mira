@@ -247,29 +247,89 @@ def _gitlab() -> GitLabProvider:
     return provider
 
 
+def _gitlab_jobs(*jobs):
+    """A handler serving `/repository/commits/{sha}/statuses`."""
+
+    def handler(method, url, **kw):
+        return _FakeResp(json_data=list(jobs))
+
+    return handler
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
         ("success", "success"),
+        # A manual job is a human gate, not a failure.
         ("manual", "success"),
+        ("skipped", "success"),
         ("running", "pending"),
         ("pending", "pending"),
+        ("created", "pending"),
         ("failed", "failure"),
         ("canceled", "failure"),
-        ("weird", "unknown"),
+        # An outcome we do not recognise is a failure, never a pass.
+        ("weird", "failure"),
     ],
 )
-async def test_gitlab_pipeline_mapping(status: str, expected: str) -> None:
-    def handler(method, url, **kw):
-        return _FakeResp(json_data={"head_pipeline": {"id": 1, "status": status}})
-
-    with _patch_gitlab(handler):
+async def test_gitlab_job_status_mapping(status: str, expected: str) -> None:
+    with _patch_gitlab(_gitlab_jobs({"name": "build", "status": status})):
         assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == expected
 
 
-async def test_gitlab_no_pipeline_is_none_not_success() -> None:
-    with _patch_gitlab(lambda *a, **kw: _FakeResp(json_data={})):
+async def test_gitlab_allowed_failures_do_not_fail_the_gate() -> None:
+    handler = _gitlab_jobs(
+        {"name": "build", "status": "success"},
+        {"name": "lint", "status": "failed", "allow_failure": True},
+    )
+    with _patch_gitlab(handler):
+        state = await _gitlab().get_ci_state(_pr("gitlab"))
+    assert state.state == "success"
+    assert state.total == 2
+
+
+async def test_gitlab_takes_the_newest_entry_per_job() -> None:
+    # Newest first: a retried job that now passes must not stay failed.
+    handler = _gitlab_jobs(
+        {"name": "build", "status": "success"},
+        {"name": "build", "status": "failed"},
+    )
+    with _patch_gitlab(handler):
+        state = await _gitlab().get_ci_state(_pr("gitlab"))
+    assert state.state == "success"
+    assert state.total == 1
+
+
+async def test_gitlab_ci_ignores_the_gates_own_status() -> None:
+    """An external status joins the pipeline — including the gate's own.
+
+    On a project with no CI at all, counting it would mean the gate's status
+    created a green pipeline that the next evaluation read back as passing.
+    """
+    with _patch_gitlab(_gitlab_jobs({"name": STATUS_CONTEXT, "status": "success"})):
         assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "none"
+
+    handler = _gitlab_jobs(
+        {"name": "build", "status": "success"},
+        {"name": STATUS_CONTEXT, "status": "failed"},
+    )
+    with _patch_gitlab(handler):
+        state = await _gitlab().get_ci_state(_pr("gitlab"))
+    assert state.state == "success"
+    assert state.total == 1
+
+
+async def test_gitlab_no_statuses_is_none_not_success() -> None:
+    with _patch_gitlab(_gitlab_jobs()):
+        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "none"
+
+
+async def test_gitlab_unreadable_statuses_are_unknown() -> None:
+    def handler(method, url, **kw):
+        raise RuntimeError("upstream is down")
+
+    with _patch_gitlab(handler):
+        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "unknown"
 
 
 @pytest.mark.parametrize(

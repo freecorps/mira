@@ -868,3 +868,68 @@ async def test_a_lost_request_changes_claim_settles_the_decision() -> None:
     )
     assert second_provider.verdicts == []
     assert second.delivery_state == "delivered"
+
+
+async def test_the_gate_sees_the_whole_pr_not_the_incremental_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2+ reviews an incremental diff; the gate answers for all of it.
+
+    A protected path touched two pushes ago is not in the newest commits, and a
+    gate handed only those would stop vetoing it — which is the same
+    deleted-CI-workflow failure by another route.
+    """
+    from mira.core.engine import ReviewEngine
+    from mira.models import ReviewResult
+
+    captured: dict = {}
+
+    async def _fake_evaluate(provider, pr_info, *, config, bot_name, signal, deliver_side_effects):
+        captured["signal"] = signal
+        return SimpleNamespace(state="skipped")
+
+    engine = ReviewEngine(
+        config=_config(mode="shadow"),
+        llm=SimpleNamespace(),
+        provider=FakeProvider(),
+        bot_name="miracodeai",
+    )
+    full_diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -1 +1 @@\n"
+        "-name: CI\n"
+        "+name: Build\n"
+        "diff --git a/src/late.py b/src/late.py\n"
+        "--- a/src/late.py\n"
+        "+++ b/src/late.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    monkeypatch.setattr(gate_service, "evaluate", _fake_evaluate)
+    await engine._run_merge_gate(_pr(), ReviewResult(), full_diff)
+
+    assert [change.path for change in captured["signal"].changes] == [
+        ".github/workflows/ci.yml",
+        "src/late.py",
+    ]
+
+
+async def test_turning_the_generated_discount_off_applies_to_the_score_too() -> None:
+    """The eligibility check and the scorer must agree on the arithmetic."""
+    changes = [
+        FileChangeStat(path="src/a.py", added_lines=6, deleted_lines=2),
+        FileChangeStat(path="uv.lock", added_lines=4000, deleted_lines=3800),
+    ]
+    discounted = await _evaluate(
+        FakeProvider(changes=changes), _config(mode="shadow", max_changed_lines=100000)
+    )
+    counted = await _evaluate(
+        FakeProvider(changes=changes),
+        _config(mode="shadow", max_changed_lines=100000, size_excludes_generated=False),
+    )
+    assert discounted.risk_score < counted.risk_score
+    assert any(factor.code == "size_lines" for factor in counted.factors)
+    assert not any(factor.code == "size_lines" for factor in discounted.factors)
