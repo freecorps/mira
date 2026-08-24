@@ -259,7 +259,7 @@ would silently downgrade a working install.
 | Approve | ✅ | ✅ (tier-dependent) | ✅ |
 | Request changes | ✅ | ❌ | ✅ |
 | Status check | ✅ check run | ✅ commit status | ✅ commit status |
-| Read CI | ✅ check runs + statuses | ✅ per-job statuses | ✅ commit statuses |
+| Read CI | ✅ check runs + statuses | ✅ head pipeline | ✅ commit statuses |
 | Read association | ✅ | ✅ access levels | ✅ permissions |
 | Read review states | ✅ | ✅ approvals only | ✅ |
 | Read labels | ✅ | ✅ | ✅ |
@@ -321,11 +321,16 @@ never turned the gate on pays nothing for every check suite that finishes.
 The gate's own status check is excluded from the CI reading on all three
 platforms. Counting it would let the gate read its own verdict back as a
 failing build, and would change the check count on every pass — which changes
-the inputs digest, which would manufacture a fresh decision row each time. On
-GitLab it would be worse than that: an external commit status *joins* the head
-pipeline, so on a project with no CI the gate's own status would have created a
-green pipeline for the next evaluation to read back as passing. That is why
-GitLab is read per job rather than from `head_pipeline`.
+the inputs digest, which would manufacture a fresh decision row each time.
+
+GitLab needs one extra step. An external commit status posted through the API
+*joins* the head pipeline, so on a project with no CI the gate's own status
+creates a green pipeline for the next evaluation to read back as passing. The
+pipeline stays authoritative — it is the only view that reports a run blocked
+on a manual gate as green rather than pending forever, and the only one that
+finds a merged-results pipeline, which belongs to the merge-ref commit rather
+than the head SHA — and a second, cheap call asks the one question the pipeline
+cannot answer: is there anything recorded against this commit other than us?
 
 ## Overrides
 
