@@ -302,6 +302,65 @@ async def test_disagreement_reply_records_once_and_uses_safe_ack(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_synthesis_failure_still_acknowledges_and_resolves_thread(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    pr_info = PRInfo(
+        title="PR",
+        description="",
+        base_branch="main",
+        head_branch="feature",
+        url="https://github.com/acme/app/pull/7",
+        number=7,
+        owner="acme",
+        repo="app",
+        base_sha="base123",
+        head_sha="head123",
+    )
+    finding = _finding(finding_id="00000000-0000-4000-8000-000000000010")
+    store = IndexStore.open("acme", "app")
+    store.save_review_finding(finding)
+    store.update_review_finding_posted(finding.id, 123, "thread-1")
+    store.close()
+
+    llm = AsyncMock()
+    llm.complete_with_tools = AsyncMock(
+        return_value=json.dumps({"intent": "disagreement", "reply": "Understood."})
+    )
+    provider = AsyncMock()
+    provider.get_pr_diff = AsyncMock(return_value="")
+    provider.reply_to_review_comment = AsyncMock()
+    provider.resolve_threads = AsyncMock(return_value=1)
+
+    with (
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
+        patch(
+            "mira.feedback.synthesis.synthesize_candidate",
+            side_effect=RuntimeError("synthesizer unavailable"),
+        ),
+    ):
+        await run_thread_reply(
+            provider,
+            pr_info,
+            "This is a false positive",
+            456,
+            original_suggestion=finding_marker(finding.id),
+            thread_id="thread-1",
+            comment_path=finding.path,
+            comment_line=finding.start_line,
+            actor="alice",
+            parent_comment_id=123,
+            source_event_id="review-comment:456",
+        )
+
+    provider.reply_to_review_comment.assert_awaited_once_with(pr_info, 456, DISAGREEMENT_ACK)
+    provider.resolve_threads.assert_awaited_once_with(pr_info, ["thread-1"])
+
+
+@pytest.mark.asyncio
 async def test_gitlab_thumbsdown_award_is_recorded(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
     finding = _finding(finding_id="00000000-0000-4000-8000-000000000011")

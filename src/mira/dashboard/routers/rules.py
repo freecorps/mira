@@ -207,7 +207,10 @@ def list_org_learned_rules(limit: int = 500, status: str = "") -> list[OrgLearne
 
 
 @router.get("/api/learning-candidates", response_model=list[LearningCandidateModel])
-def list_learning_candidates(limit: int = 500, status: str = "") -> list[LearningCandidateModel]:
+def list_learning_candidates(
+    request: Request, limit: int = 500, status: str = ""
+) -> list[LearningCandidateModel]:
+    _require_admin(request)
     db_url = os.environ.get("DATABASE_URL", "")
     capped = max(1, min(limit, 2000))
     status_filter = status or None
@@ -226,7 +229,10 @@ def list_learning_candidates(limit: int = 500, status: str = "") -> list[Learnin
     "/api/learning-candidates/{owner}/{repo}/{candidate_id}",
     response_model=LearningCandidateModel,
 )
-def get_learning_candidate(owner: str, repo: str, candidate_id: int) -> LearningCandidateModel:
+def get_learning_candidate(
+    owner: str, repo: str, candidate_id: int, request: Request
+) -> LearningCandidateModel:
+    _require_admin(request)
     with _open_store(owner, repo) as store:
         candidate = store.get_learning_candidate(candidate_id)
     if candidate is None:

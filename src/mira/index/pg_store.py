@@ -346,6 +346,7 @@ CREATE INDEX IF NOT EXISTS idx_pg_vuln_severity
 _pg_conn = None
 _schema_initialized = False
 _lock = threading.Lock()
+_learning_lock = threading.RLock()
 
 
 def _drop_pg_conn() -> None:
@@ -401,6 +402,16 @@ def _get_conn(url: str) -> Any:
                     cur.execute(
                         f"ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS {column} {ddl}"
                     )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pg_learned_rules_candidate_once "
+                    "ON learned_rules(origin_candidate_id) "
+                    "WHERE origin_candidate_id IS NOT NULL AND status = 'approved'"
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pg_learned_rules_successor_once "
+                    "ON learned_rules(supersedes_rule_id) "
+                    "WHERE supersedes_rule_id IS NOT NULL AND status = 'approved'"
+                )
                 cur.execute(
                     "UPDATE learned_rules SET scope_type = CASE WHEN path_pattern <> '' "
                     "AND scope_type = 'repo' AND scope_value = '' THEN 'path' "
@@ -665,11 +676,22 @@ class PgIndexStore(_StoreSharedMixin):
         ) as cur:
             yield cur
 
+    @contextmanager
+    def _transaction_cursor(self) -> Iterator[Any]:
+        """Cursor bound to one explicit transaction on the autocommit connection."""
+        conn = _get_conn(self._url)
+        with conn.transaction(), conn.cursor() as cur:
+            yield cur
+
     def _commit(self) -> None:
         # Always commit the current shared connection — a reconnect (from this
         # or any other store instance) closes the old handle, so caching one
         # per instance would commit on a dead connection.
         _get_conn(self._url).commit()
+
+    def _rollback(self) -> None:
+        with suppress(Exception):
+            _get_conn(self._url).rollback()
 
     def _exec(self, sql: str, params: tuple = ()):
         """Execute a query and return the cursor."""
@@ -1958,92 +1980,108 @@ class PgIndexStore(_StoreSharedMixin):
         self, candidate: LearningCandidate
     ) -> tuple[LearningCandidate, bool]:
         now = time.time()
-        existing = self._fetchone(
-            f"SELECT {self._LC_COLS} FROM learning_candidates "
-            "WHERE owner=%s AND repo=%s AND semantic_fingerprint=%s "
-            "AND scope_type=%s AND scope_value=%s",
-            (
-                self._owner,
-                self._repo,
-                candidate.semantic_fingerprint,
-                candidate.scope_type,
-                candidate.scope_value,
-            ),
-        )
-        if existing:
-            current = self._row_to_learning_candidate(existing)
-            evidence_json = IndexStore._merge_json_lists(
-                current.evidence_ids_json, candidate.evidence_ids_json
-            )
-            positives_json = IndexStore._merge_json_lists(
-                current.positive_examples_json, candidate.positive_examples_json
-            )
-            negatives_json = IndexStore._merge_json_lists(
-                current.negative_examples_json, candidate.negative_examples_json
-            )
-            with self._cursor() as cur:
-                cur.execute(
-                    "UPDATE learning_candidates SET rule_text=%s, rationale=%s, category=%s, "
-                    "language=%s, confidence=%s, evidence_ids_json=%s, "
-                    "positive_examples_json=%s, negative_examples_json=%s, cost_tokens=%s, "
-                    "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
-                    (
-                        candidate.rule_text or current.rule_text,
-                        candidate.rationale or current.rationale,
-                        candidate.category or current.category,
-                        candidate.language or current.language,
-                        max(current.confidence, candidate.confidence),
-                        evidence_json,
-                        positives_json,
-                        negatives_json,
-                        current.cost_tokens + candidate.cost_tokens,
-                        now,
-                        current.id,
-                        self._owner,
-                        self._repo,
-                    ),
-                )
-            self._commit()
-            return self.get_learning_candidate(current.id), False  # type: ignore[return-value]
-
         candidate.created_at = candidate.created_at or now
         candidate.updated_at = now
-        with self._cursor() as cur:
-            cur.execute(
-                "INSERT INTO learning_candidates "
-                "(owner, repo, semantic_fingerprint, rule_text, rationale, scope_type, "
-                "scope_value, category, language, confidence, status, synthesizer_version, "
-                "evidence_ids_json, positive_examples_json, negative_examples_json, "
-                "source_finding_id, source_feedback_id, superseded_by_id, cost_tokens, "
-                "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                (
-                    self._owner,
-                    self._repo,
-                    candidate.semantic_fingerprint,
-                    candidate.rule_text,
-                    candidate.rationale,
-                    candidate.scope_type,
-                    candidate.scope_value,
-                    candidate.category,
-                    candidate.language,
-                    candidate.confidence,
-                    candidate.status,
-                    candidate.synthesizer_version,
-                    candidate.evidence_ids_json,
-                    candidate.positive_examples_json,
-                    candidate.negative_examples_json,
-                    candidate.source_finding_id,
-                    candidate.source_feedback_id,
-                    candidate.superseded_by_id,
-                    candidate.cost_tokens,
-                    candidate.created_at,
-                    candidate.updated_at,
-                ),
-            )
-            row_id = cur.fetchone()[0]
-        self._commit()
-        return self.get_learning_candidate(row_id), True  # type: ignore[return-value]
+        with _learning_lock:
+            try:
+                with self._transaction_cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO learning_candidates "
+                        "(owner, repo, semantic_fingerprint, rule_text, rationale, scope_type, "
+                        "scope_value, category, language, confidence, status, "
+                        "synthesizer_version, evidence_ids_json, positive_examples_json, "
+                        "negative_examples_json, source_finding_id, source_feedback_id, "
+                        "superseded_by_id, cost_tokens, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                        "%s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (owner, repo, semantic_fingerprint, scope_type, "
+                        "scope_value) DO NOTHING RETURNING id",
+                        (
+                            self._owner,
+                            self._repo,
+                            candidate.semantic_fingerprint,
+                            candidate.rule_text,
+                            candidate.rationale,
+                            candidate.scope_type,
+                            candidate.scope_value,
+                            candidate.category,
+                            candidate.language,
+                            candidate.confidence,
+                            candidate.status,
+                            candidate.synthesizer_version,
+                            candidate.evidence_ids_json,
+                            candidate.positive_examples_json,
+                            candidate.negative_examples_json,
+                            candidate.source_finding_id,
+                            candidate.source_feedback_id,
+                            candidate.superseded_by_id,
+                            candidate.cost_tokens,
+                            candidate.created_at,
+                            candidate.updated_at,
+                        ),
+                    )
+                    inserted = cur.fetchone()
+                    if inserted is not None:
+                        row_id = inserted[0]
+                        created = self.get_learning_candidate(row_id)
+                        if created is None:
+                            raise RuntimeError("Inserted learning candidate could not be reloaded")
+                        return created, True
+
+                    cur.execute(
+                        f"SELECT {self._LC_COLS} FROM learning_candidates "
+                        "WHERE owner=%s AND repo=%s AND semantic_fingerprint=%s "
+                        "AND scope_type=%s AND scope_value=%s FOR UPDATE",
+                        (
+                            self._owner,
+                            self._repo,
+                            candidate.semantic_fingerprint,
+                            candidate.scope_type,
+                            candidate.scope_value,
+                        ),
+                    )
+                    existing = cur.fetchone()
+                    if existing is None:
+                        raise RuntimeError("Candidate conflict did not return the existing row")
+                    current = self._row_to_learning_candidate(existing)
+                    evidence_json = IndexStore._merge_json_lists(
+                        current.evidence_ids_json, candidate.evidence_ids_json
+                    )
+                    positives_json = IndexStore._merge_json_lists(
+                        current.positive_examples_json, candidate.positive_examples_json
+                    )
+                    negatives_json = IndexStore._merge_json_lists(
+                        current.negative_examples_json, candidate.negative_examples_json
+                    )
+                    cur.execute(
+                        "UPDATE learning_candidates SET rule_text=%s, rationale=%s, "
+                        "category=%s, language=%s, confidence=%s, evidence_ids_json=%s, "
+                        "positive_examples_json=%s, negative_examples_json=%s, "
+                        "cost_tokens=%s, updated_at=%s "
+                        "WHERE id=%s AND owner=%s AND repo=%s",
+                        (
+                            candidate.rule_text or current.rule_text,
+                            candidate.rationale or current.rationale,
+                            candidate.category or current.category,
+                            candidate.language or current.language,
+                            max(current.confidence, candidate.confidence),
+                            evidence_json,
+                            positives_json,
+                            negatives_json,
+                            current.cost_tokens + candidate.cost_tokens,
+                            now,
+                            current.id,
+                            self._owner,
+                            self._repo,
+                        ),
+                    )
+            except Exception:
+                self._rollback()
+                raise
+        merged = self.get_learning_candidate(current.id)
+        if merged is None:
+            raise RuntimeError("Merged learning candidate could not be reloaded")
+        return merged, False
 
     def get_learning_candidate(self, candidate_id: int) -> LearningCandidate | None:
         row = self._fetchone(
@@ -2112,6 +2150,108 @@ class PgIndexStore(_StoreSharedMixin):
                 (status, superseded_by_id, time.time(), candidate_id, self._owner, self._repo),
             )
         self._commit()
+
+    def approve_learning_candidate_atomic(
+        self, candidate_id: int, *, actor: str, min_evidence: int
+    ) -> LearnedRuleRow:
+        """Approve a candidate and create its rule in one transaction."""
+        now = time.time()
+        with _learning_lock:
+            try:
+                with self._transaction_cursor() as cur:
+                    cur.execute(
+                        f"SELECT {self._LC_COLS} FROM learning_candidates "
+                        "WHERE id=%s AND owner=%s AND repo=%s FOR UPDATE",
+                        (candidate_id, self._owner, self._repo),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise LookupError("Learning candidate not found")
+                    candidate = self._row_to_learning_candidate(row)
+                    cur.execute(
+                        f"SELECT {self._LR_COLS} FROM learned_rules "
+                        "WHERE owner=%s AND repo=%s AND origin_candidate_id=%s "
+                        "AND status='approved' ORDER BY id LIMIT 1",
+                        (self._owner, self._repo, candidate_id),
+                    )
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        cur.execute(
+                            "UPDATE learning_candidates SET status='approved', updated_at=%s "
+                            "WHERE id=%s AND owner=%s AND repo=%s",
+                            (now, candidate_id, self._owner, self._repo),
+                        )
+                        return self._row_to_learned_rule(existing)
+                    if candidate.status == "approved":
+                        raise ValueError("Approved candidate has no active rule")
+                    if candidate.status not in {"collecting", "pending"}:
+                        raise ValueError(f"Cannot approve candidate in state '{candidate.status}'")
+                    if not candidate.rule_text.strip():
+                        raise ValueError("rule_text is required")
+                    if not candidate.scope_value.strip():
+                        raise ValueError("scope_value is required")
+                    if candidate.evidence_count < min_evidence:
+                        raise ValueError(
+                            f"Scope '{candidate.scope_type}' requires at least "
+                            f"{min_evidence} evidence events"
+                        )
+                    cur.execute(
+                        "INSERT INTO learned_rules "
+                        "(owner, repo, rule_text, source_signal, category, path_pattern, "
+                        "sample_count, active, status, created_by, version, scope_type, "
+                        "scope_value, origin_candidate_id, rationale, evidence_count, "
+                        "effective_from, disabled_at, supersedes_rule_id, "
+                        "semantic_fingerprint, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, 'feedback_v2', %s, %s, %s, 1, 'approved', "
+                        "%s, 1, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s, %s) "
+                        "ON CONFLICT DO NOTHING RETURNING id",
+                        (
+                            self._owner,
+                            self._repo,
+                            candidate.rule_text,
+                            candidate.category,
+                            candidate.scope_value if candidate.scope_type == "path" else "",
+                            candidate.evidence_count,
+                            actor,
+                            candidate.scope_type,
+                            candidate.scope_value,
+                            candidate.id,
+                            candidate.rationale,
+                            candidate.evidence_count,
+                            now,
+                            candidate.semantic_fingerprint,
+                            now,
+                            now,
+                        ),
+                    )
+                    inserted = cur.fetchone()
+                    if inserted is None:
+                        cur.execute(
+                            "SELECT id FROM learned_rules WHERE owner=%s AND repo=%s "
+                            "AND origin_candidate_id=%s AND status='approved' "
+                            "ORDER BY id LIMIT 1",
+                            (self._owner, self._repo, candidate_id),
+                        )
+                        conflict = cur.fetchone()
+                        if conflict is None:
+                            raise RuntimeError(
+                                "Candidate approval conflicted without an approved rule"
+                            )
+                        rule_id = conflict[0]
+                    else:
+                        rule_id = inserted[0]
+                    cur.execute(
+                        "UPDATE learning_candidates SET status='approved', updated_at=%s "
+                        "WHERE id=%s AND owner=%s AND repo=%s",
+                        (now, candidate_id, self._owner, self._repo),
+                    )
+            except Exception:
+                self._rollback()
+                raise
+        approved = self.get_learned_rule(rule_id)
+        if approved is None:
+            raise RuntimeError("Approved learning rule could not be reloaded")
+        return approved
 
     # ── Learned rules ──
 
@@ -2318,6 +2458,119 @@ class PgIndexStore(_StoreSharedMixin):
             row_id = cur.fetchone()[0]
         self._commit()
         return self.get_learned_rule(row_id)  # type: ignore[return-value]
+
+    def version_learned_rule_atomic(
+        self,
+        rule_id: int,
+        *,
+        rule_text: str,
+        category: str,
+        scope_type: str,
+        scope_value: str,
+        rationale: str,
+        actor: str,
+        semantic_fingerprint: str,
+    ) -> LearnedRuleRow:
+        """Create one successor and supersede its prior version atomically."""
+        now = time.time()
+        with _learning_lock:
+            try:
+                with self._transaction_cursor() as cur:
+                    cur.execute(
+                        f"SELECT {self._LR_COLS} FROM learned_rules "
+                        "WHERE id=%s AND owner=%s AND repo=%s FOR UPDATE",
+                        (rule_id, self._owner, self._repo),
+                    )
+                    previous_row = cur.fetchone()
+                    if previous_row is None:
+                        raise LookupError("Learning not found")
+                    previous = self._row_to_learned_rule(previous_row)
+                    cur.execute(
+                        f"SELECT {self._LR_COLS} FROM learned_rules "
+                        "WHERE owner=%s AND repo=%s AND supersedes_rule_id=%s "
+                        "AND status='approved' ORDER BY id LIMIT 1",
+                        (self._owner, self._repo, rule_id),
+                    )
+                    existing_row = cur.fetchone()
+                    if existing_row is not None:
+                        existing = self._row_to_learned_rule(existing_row)
+                        if existing.semantic_fingerprint != semantic_fingerprint:
+                            raise ValueError(
+                                "Learning was already versioned with different content"
+                            )
+                        cur.execute(
+                            "UPDATE learned_rules SET active=0, status='superseded', "
+                            "disabled_at=COALESCE(disabled_at, %s), updated_at=%s "
+                            "WHERE id=%s AND owner=%s AND repo=%s",
+                            (now, now, rule_id, self._owner, self._repo),
+                        )
+                        return existing
+                    if previous.status != "approved":
+                        raise ValueError("Only approved rules can be versioned")
+
+                    cur.execute(
+                        "INSERT INTO learned_rules "
+                        "(owner, repo, rule_text, source_signal, category, path_pattern, "
+                        "sample_count, active, status, created_by, version, scope_type, "
+                        "scope_value, origin_candidate_id, rationale, evidence_count, "
+                        "effective_from, disabled_at, supersedes_rule_id, "
+                        "semantic_fingerprint, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, 1, 'approved', %s, %s, %s, "
+                        "%s, %s, %s, %s, %s, NULL, %s, %s, %s, %s) "
+                        "ON CONFLICT DO NOTHING RETURNING id",
+                        (
+                            self._owner,
+                            self._repo,
+                            rule_text,
+                            previous.source_signal,
+                            category,
+                            scope_value if scope_type == "path" else "",
+                            previous.evidence_count,
+                            actor or previous.created_by,
+                            previous.version + 1,
+                            scope_type,
+                            scope_value,
+                            previous.origin_candidate_id,
+                            rationale or previous.rationale,
+                            previous.evidence_count,
+                            now,
+                            previous.id,
+                            semantic_fingerprint,
+                            now,
+                            now,
+                        ),
+                    )
+                    inserted = cur.fetchone()
+                    if inserted is None:
+                        cur.execute(
+                            "SELECT id, semantic_fingerprint FROM learned_rules "
+                            "WHERE owner=%s AND repo=%s AND supersedes_rule_id=%s "
+                            "AND status='approved' ORDER BY id LIMIT 1",
+                            (self._owner, self._repo, rule_id),
+                        )
+                        conflict = cur.fetchone()
+                        if conflict is None:
+                            raise RuntimeError("Rule version conflicted without a successor")
+                        if conflict[1] != semantic_fingerprint:
+                            raise ValueError(
+                                "Learning was already versioned with different content"
+                            )
+                        replacement_id = conflict[0]
+                    else:
+                        replacement_id = inserted[0]
+                    cur.execute(
+                        "UPDATE learned_rules SET active=0, status='superseded', "
+                        "disabled_at=%s, updated_at=%s "
+                        "WHERE id=%s AND owner=%s AND repo=%s",
+                        (now, now, rule_id, self._owner, self._repo),
+                    )
+            except Exception:
+                self._rollback()
+                raise
+        replacement = self.get_learned_rule(replacement_id)
+        if replacement is None:
+            raise RuntimeError("Versioned learning rule could not be reloaded")
+        return replacement
 
     def update_learned_rule(
         self,

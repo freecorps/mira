@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 from urllib.parse import urlencode
@@ -18,6 +19,7 @@ from mira.index.store import IndexStore
 from mira.providers.formatting import parse_bot_comment_metadata
 
 DISAGREEMENT_ACK = "Entendi o feedback; registrei como falso positivo."
+logger = logging.getLogger(__name__)
 
 
 def resolve_finding(
@@ -184,27 +186,38 @@ def create_learning_candidate_for_feedback(
     learning_config = config if isinstance(config, LearningConfig) else load_config().learning
     store = IndexStore.open(pr_info.owner, pr_info.repo, platform=platform)
     try:
-        candidate, created = synthesize_candidate(
-            store,
-            finding,
-            event,
-            proposal=proposal,
-            config=learning_config,
-        )
-        if (
-            candidate is not None
-            and learning_config.learning_auto_apply
-            and candidate.confidence >= 0.95
-            and candidate.evidence_count >= evidence_required(candidate.scope_type, learning_config)
-        ):
-            approve_candidate(
+        try:
+            candidate, created = synthesize_candidate(
                 store,
-                candidate.id,
-                actor="mira-auto-apply",
+                finding,
+                event,
+                proposal=proposal,
                 config=learning_config,
             )
-            candidate = store.get_learning_candidate(candidate.id)
-        return candidate, created
+            if (
+                candidate is not None
+                and learning_config.learning_auto_apply
+                and candidate.confidence >= 0.95
+                and candidate.evidence_count
+                >= evidence_required(candidate.scope_type, learning_config)
+            ):
+                approve_candidate(
+                    store,
+                    candidate.id,
+                    actor="mira-auto-apply",
+                    config=learning_config,
+                )
+                candidate = store.get_learning_candidate(candidate.id)
+            return candidate, created
+        except Exception:
+            # Feedback is already durable. Candidate synthesis is best-effort
+            # and must never suppress the acknowledgement or thread cleanup.
+            logger.exception(
+                "Failed to synthesize learning candidate for %s/%s",
+                pr_info.owner,
+                pr_info.repo,
+            )
+            return None, False
     finally:
         store.close()
 

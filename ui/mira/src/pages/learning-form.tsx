@@ -167,7 +167,6 @@ function LearningDetailsCard({
                 <SelectItem value="symbol">Symbol</SelectItem>
                 <SelectItem value="path">Path</SelectItem>
                 <SelectItem value="language">Language</SelectItem>
-                <SelectItem value="category">Category</SelectItem>
                 <SelectItem value="repo">Repository</SelectItem>
                 <SelectItem value="org">Organization</SelectItem>
               </SelectContent>

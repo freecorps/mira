@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -26,7 +27,8 @@ class _FakeCursor:
         self._cur = conn.cursor()
 
     def execute(self, sql, params=()):
-        self._cur.execute(sql.replace("%s", "?"), params)
+        sqlite_sql = sql.replace("%s", "?").replace(" FOR UPDATE", "")
+        self._cur.execute(sqlite_sql, params)
         return self
 
     def executemany(self, sql, seq_of_params):
@@ -42,6 +44,12 @@ class _FakeCursor:
     def close(self):
         self._cur.close()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
 
 class _FakeConn:
     def __init__(self):
@@ -50,12 +58,34 @@ class _FakeConn:
         sqlite_schema = _PG_SCHEMA.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY")
         sqlite_schema = sqlite_schema.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY")
         self._conn.executescript(sqlite_schema)
+        self._conn.executescript(
+            "CREATE UNIQUE INDEX idx_pg_learned_rules_candidate_once "
+            "ON learned_rules(origin_candidate_id) "
+            "WHERE origin_candidate_id IS NOT NULL AND status = 'approved';"
+            "CREATE UNIQUE INDEX idx_pg_learned_rules_successor_once "
+            "ON learned_rules(supersedes_rule_id) "
+            "WHERE supersedes_rule_id IS NOT NULL AND status = 'approved';"
+        )
 
     def cursor(self):
         return _FakeCursor(self._conn)
 
+    @contextmanager
+    def transaction(self):
+        self._conn.execute("BEGIN")
+        try:
+            yield self
+        except Exception:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
 
 @pytest.fixture

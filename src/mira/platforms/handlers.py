@@ -445,8 +445,8 @@ async def run_pr_merged_learning(
 ) -> None:
     """Record merge state without treating silence as positive feedback."""
     owner, repo, number, pr_url = pr_info.owner, pr_info.repo, pr_info.number, pr_info.url
-    store = _open_store(owner, repo, platform)
     learning_config = load_config().learning
+    store = _open_store(owner, repo, platform)
     unobserved = 0
     fixed = 0
     try:
@@ -504,12 +504,18 @@ async def run_pr_merged_learning(
                         )
                     )
                     if reaction_kind == "thumbs_down" and reaction_created:
-                        synthesize_candidate(
-                            store,
-                            finding,
-                            reaction_event,
-                            config=learning_config,
-                        )
+                        try:
+                            synthesize_candidate(
+                                store,
+                                finding,
+                                reaction_event,
+                                config=learning_config,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to synthesize merge-time learning for finding %s",
+                                finding.id,
+                            )
             prior = store.list_feedback_v2(finding_id=finding.id, limit=100)
             if any(event.kind in {"thumbs_down", "reply_disagree", "dismissed"} for event in prior):
                 store.update_review_finding_state(finding.id, "dismissed")

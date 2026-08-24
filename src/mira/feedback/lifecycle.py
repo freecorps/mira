@@ -8,7 +8,7 @@ from mira.config import LearningConfig
 from mira.feedback.deduplication import semantic_fingerprint
 from mira.feedback.models import LearningCandidate
 
-_SCOPES = {"symbol", "path", "language", "category", "repo", "org"}
+_SCOPES = {"symbol", "path", "language", "repo", "org"}
 
 
 def evidence_required(scope_type: str, config: LearningConfig | None = None) -> int:
@@ -17,7 +17,6 @@ def evidence_required(scope_type: str, config: LearningConfig | None = None) -> 
         "symbol": config.min_evidence_path,
         "path": config.min_evidence_path,
         "language": config.min_evidence_language,
-        "category": config.min_evidence_language,
         "repo": config.min_evidence_repo,
         "org": config.min_evidence_org,
     }.get(scope_type, config.min_evidence_repo)
@@ -99,21 +98,6 @@ def approve_candidate(
     candidate = store.get_learning_candidate(candidate_id)
     if candidate is None:
         raise LookupError("Learning candidate not found")
-    rules = [
-        rule
-        for rule in store.list_learned_rules()
-        if rule.origin_candidate_id == candidate.id and rule.status == "approved"
-    ]
-    if rules:
-        # This also repairs an interrupted approval where rule creation
-        # committed but the candidate status update did not.
-        if candidate.status != "approved":
-            store.set_learning_candidate_status(candidate.id, "approved")
-        return rules[0]
-    if candidate.status == "approved":
-        raise ValueError("Approved candidate has no active rule")
-    if candidate.status not in {"collecting", "pending"}:
-        raise ValueError(f"Cannot approve candidate in state '{candidate.status}'")
     validate_rule_text(candidate.rule_text)
     validate_rule_scope(candidate.scope_type, candidate.scope_value)
     required = evidence_required(candidate.scope_type, config)
@@ -121,24 +105,11 @@ def approve_candidate(
         raise ValueError(
             f"Scope '{candidate.scope_type}' requires at least {required} evidence events"
         )
-    rule = store.create_learned_rule(
-        rule_text=candidate.rule_text,
-        category=candidate.category,
-        path_pattern=candidate.scope_value if candidate.scope_type == "path" else "",
-        source_signal="feedback_v2",
-        status="approved",
-        active=True,
-        created_by=actor,
-        version=1,
-        scope_type=candidate.scope_type,
-        scope_value=candidate.scope_value,
-        origin_candidate_id=candidate.id,
-        rationale=candidate.rationale,
-        evidence_count=candidate.evidence_count,
-        semantic_fingerprint=candidate.semantic_fingerprint,
+    return store.approve_learning_candidate_atomic(
+        candidate_id,
+        actor=actor,
+        min_evidence=required,
     )
-    store.set_learning_candidate_status(candidate.id, "approved")
-    return rule
 
 
 def reject_candidate(store: Any, candidate_id: int) -> None:
@@ -165,8 +136,6 @@ def version_rule(
     previous = store.get_learned_rule(rule_id)
     if previous is None:
         raise LookupError("Learning not found")
-    if previous.status != "approved":
-        raise ValueError("Only approved rules can be versioned")
     validate_rule_text(rule_text)
     validate_rule_scope(scope_type, scope_value)
     if previous.source_signal != "manual" and previous.evidence_count < evidence_required(
@@ -176,33 +145,13 @@ def version_rule(
             f"Scope '{scope_type}' requires at least "
             f"{evidence_required(scope_type, config)} evidence events"
         )
-    interrupted = next(
-        (
-            rule
-            for rule in store.list_learned_rules()
-            if rule.supersedes_rule_id == previous.id and rule.status == "approved"
-        ),
-        None,
-    )
-    if interrupted is not None:
-        store.supersede_learned_rule(previous.id, interrupted.id)
-        return interrupted
-    replacement = store.create_learned_rule(
+    return store.version_learned_rule_atomic(
+        rule_id,
         rule_text=rule_text,
         category=category,
-        path_pattern=scope_value if scope_type == "path" else "",
-        source_signal=previous.source_signal,
-        status="approved",
-        active=True,
-        created_by=actor or previous.created_by,
-        version=previous.version + 1,
         scope_type=scope_type,
         scope_value=scope_value,
-        origin_candidate_id=previous.origin_candidate_id,
-        rationale=rationale or previous.rationale,
-        evidence_count=previous.evidence_count,
-        supersedes_rule_id=previous.id,
+        rationale=rationale,
+        actor=actor,
         semantic_fingerprint=semantic_fingerprint(rule_text, category),
     )
-    store.supersede_learned_rule(previous.id, replacement.id)
-    return replacement

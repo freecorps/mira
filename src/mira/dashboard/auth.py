@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
@@ -20,6 +22,34 @@ SESSION_COOKIE = "mira_session"
 _PUBLIC_PATHS = {"/api/auth/login", "/docs", "/openapi.json", "/redoc"}
 # The badge SVG must be public so GitHub can embed it as an image
 _PUBLIC_SVG = re.compile(r"/api/repos/[^/]+/[^/]+/blast-radius\.svg")
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _normalize_origin(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _trusted_origins(request: Request) -> set[str]:
+    origins = {_normalize_origin(str(request.base_url))}
+    host = (
+        (request.headers.get("x-forwarded-host") or request.headers.get("host") or "")
+        .split(",", 1)[0]
+        .strip()
+    )
+    scheme = (
+        (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",", 1)[0].strip()
+    )
+    if host:
+        origins.add(_normalize_origin(f"{scheme}://{host}"))
+    configured = [os.environ.get("MIRA_DASHBOARD_URL", "")]
+    configured.extend(os.environ.get("MIRA_TRUSTED_ORIGINS", "").split(","))
+    origins.update(_normalize_origin(value) for value in configured if value.strip())
+    if request.url.hostname in {"localhost", "127.0.0.1", "testserver"}:
+        origins.update({"http://localhost:3000", "http://localhost:5173"})
+    return {origin for origin in origins if origin}
 
 
 class LoginRequest(BaseModel):
@@ -206,6 +236,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
         user = self.db.validate_session(token)
         if not user:
             return JSONResponse(status_code=401, content={"error": "Session expired"})
+
+        # Cookie-authenticated mutations must originate from this dashboard.
+        # Browsers send Origin for fetch/XHR and form POSTs; requests without
+        # Origin remain available to non-browser API clients using a session.
+        if request.method in _MUTATING_METHODS:
+            origin = request.headers.get("origin")
+            if origin and _normalize_origin(origin) not in _trusted_origins(request):
+                return JSONResponse(status_code=403, content={"error": "Invalid request origin"})
 
         request.state.user = user
         return await call_next(request)
