@@ -19,6 +19,7 @@ import pytest
 
 from mira.config import GateConfig, GateRepoPolicy, MiraConfig
 from mira.exceptions import ProviderError
+from mira.feedback.models import ReviewFinding
 from mira.gate import service as gate_service
 from mira.gate.capabilities import (
     FORGEJO_CAPABILITIES,
@@ -395,15 +396,15 @@ async def test_an_llm_or_review_failure_never_approves() -> None:
     assert provider.verdicts == []
 
 
-async def test_an_unindexed_repository_never_approves() -> None:
+async def test_an_unindexed_repository_never_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gate_service, "_index_ready", lambda owner, repo, platform: False)
     provider = FakeProvider()
-    gate_service._index_ready = lambda owner, repo, platform: False  # noqa: SLF001
-    try:
-        decision = await _evaluate(provider, _config(mode="enforce"))
-    finally:
-        gate_service._index_ready = lambda owner, repo, platform: True  # noqa: SLF001
+    decision = await _evaluate(provider, _config(mode="enforce"))
     assert decision.state == "not_approved"
     assert ReasonCode.INDEX_NOT_READY in decision.reason_codes()
+    assert provider.verdicts == []
 
 
 async def test_a_failed_status_publish_does_not_undo_an_approval() -> None:
@@ -535,13 +536,8 @@ async def test_forcing_an_approval_is_its_own_opt_in() -> None:
 
 
 async def test_no_override_can_approve_past_a_hard_veto() -> None:
-    decision = await _one_decision(mode="shadow", ci=CIState(state="failure", failing=["build"]))
-    store = IndexStore.open("acme", "app")
-    try:
-        # Give it a veto that policy cannot wave off.
-        pass
-    finally:
-        store.close()
+    # A human asking for changes is not an opinion the gate formed and an
+    # admin can wave off — it is one of the reasons this phase exists.
     blocked = await _one_decision(mode="shadow", review_states={"carol": "CHANGES_REQUESTED"})
     with pytest.raises(OverrideDenied, match="cannot be overridden"):
         apply_override(
@@ -638,8 +634,10 @@ async def test_the_engine_hands_the_gate_what_the_review_already_knows(
     signal = captured["signal"]
     assert signal.changed_paths == ["src/a.py", "src/b.py"]
     assert (signal.added_lines, signal.deleted_lines) == (1, 1)
-    assert signal.warnings == 1
-    assert signal.security_findings == 1
+    assert signal.open_warnings == 1
+    assert signal.open_security == 1
+    assert signal.open_findings == 1
+    assert signal.worst_severity == "warning"
     assert signal.review_complete is False
     assert signal.skipped_paths == ["src/huge.py"]
     assert signal.review_id == 42
@@ -658,3 +656,87 @@ async def test_a_gate_failure_never_discards_a_published_review() -> None:
     )
     # Must not raise: the review has already been posted by this point.
     await engine._run_merge_gate(_pr(), ReviewResult(), "")
+
+
+async def test_both_entry_paths_score_the_same_pull_request_alike() -> None:
+    """A gate woken by a finished CI run must not score a PR as spotless.
+
+    The review path hands its own finding counts over; the CI-recheck path has
+    only the store. Both have to land on the same score, or the same PR gets
+    two different answers depending on what woke the gate up.
+    """
+    store = IndexStore.open("acme", "app")
+    try:
+        store.save_review_finding(
+            ReviewFinding(
+                id="f1",
+                fingerprint="fp-f1",
+                review_id=0,
+                platform="github",
+                owner="acme",
+                repo="app",
+                pr_number=7,
+                pr_url="https://github.com/acme/app/pull/7",
+                base_sha="base",
+                head_sha="head123",
+                path="src/a.py",
+                start_line=1,
+                end_line=1,
+                symbol="",
+                category="security",
+                severity="warning",
+                confidence=0.9,
+                title="Unsafe call",
+                body="",
+                suggestion="",
+                detector="llm",
+                prompt_model="test",
+                state="open",
+            )
+        )
+    finally:
+        store.close()
+
+    from_review = await gate_service.evaluate(
+        FakeProvider(),
+        _pr(),
+        config=_config(mode="shadow"),
+        bot_name="miracodeai",
+        signal=gate_service.ReviewSignal(
+            changed_paths=["src/a.py", "src/b.py"],
+            added_lines=20,
+            deleted_lines=4,
+            open_warnings=1,
+            open_security=1,
+            open_findings=1,
+            worst_severity="warning",
+        ),
+    )
+    # The recheck path passes no signal at all.
+    from_recheck = await _evaluate(FakeProvider(), _config(mode="shadow"))
+
+    assert from_review.risk_score == from_recheck.risk_score
+    assert from_review.decision_key == from_recheck.decision_key
+    assert {factor.code for factor in from_recheck.factors} >= {
+        "warning_findings",
+        "security_findings",
+    }
+
+
+async def test_a_dry_run_review_is_still_scored_on_its_own_findings() -> None:
+    """A dry run never persists findings, so the store would say "clean"."""
+    decision = await gate_service.evaluate(
+        FakeProvider(),
+        _pr(),
+        config=_config(mode="shadow"),
+        bot_name="miracodeai",
+        signal=gate_service.ReviewSignal(
+            changed_paths=["src/a.py"],
+            open_blockers=1,
+            open_findings=1,
+            worst_severity="blocker",
+        ),
+        deliver_side_effects=False,
+    )
+    assert decision.state == "not_approved"
+    assert ReasonCode.OPEN_BLOCKER in decision.reason_codes()

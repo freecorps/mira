@@ -84,16 +84,35 @@ class ReviewSignal:
     changed_paths: list[str] | None = None
     added_lines: int = 0
     deleted_lines: int = 0
-    open_blockers: int | None = None
-    open_findings: int | None = None
-    warnings: int = 0
-    suggestions: int = 0
-    security_findings: int = 0
+    # Finding counts the caller already has. The store is consulted regardless
+    # and the larger of the two wins — a dry-run review never persists its
+    # findings, and taking the max can only make the gate stricter.
+    open_blockers: int = 0
+    open_warnings: int = 0
+    open_security: int = 0
+    open_findings: int = 0
     worst_severity: str = ""
     review_complete: bool = True
     skipped_paths: list[str] | None = None
     review_failed: str = ""
     review_id: int = 0
+
+
+# Severity ordering, for reconciling the store's worst finding with the
+# caller's. Not `Severity.from_str`, which resolves an unknown value to
+# `suggestion` — here an unrecognised severity must not silently outrank or
+# understate a real one, so it is simply ranked lowest and ignored.
+_SEVERITY_RANK = {"blocker": 4, "warning": 3, "suggestion": 2, "nitpick": 1}
+
+
+def _worst_severity(*candidates: str) -> str:
+    """The most severe of several reported worst-severities."""
+    best, best_rank = "", 0
+    for candidate in candidates:
+        rank = _SEVERITY_RANK.get((candidate or "").lower(), 0)
+        if rank > best_rank:
+            best, best_rank = candidate, rank
+    return best
 
 
 def _open_store(owner: str, repo: str, platform: str) -> Any:
@@ -194,22 +213,16 @@ async def gather_inputs(
     repo = pr_info.repo
     platform = getattr(pr_info, "platform", "github")
 
-    blockers = signal.open_blockers
-    open_findings = signal.open_findings
-    worst = signal.worst_severity
-    warnings = signal.warnings
-    security = signal.security_findings
-    if blockers is None or open_findings is None:
-        store = _open_store(owner, repo, platform)
-        try:
-            counts = store.gate_finding_counts(pr_info.number)
-        finally:
-            store.close()
-        blockers = counts["blockers"] if blockers is None else blockers
-        open_findings = counts["open"] if open_findings is None else open_findings
-        warnings = warnings or counts["warnings"]
-        security = security or counts["security"]
-        worst = worst or counts["worst"]
+    store = _open_store(owner, repo, platform)
+    try:
+        counts = store.gate_finding_counts(pr_info.number)
+    finally:
+        store.close()
+    blockers = max(counts["blockers"], signal.open_blockers)
+    warnings = max(counts["warnings"], signal.open_warnings)
+    security = max(counts["security"], signal.open_security)
+    open_findings = max(counts["open"], signal.open_findings)
+    worst = _worst_severity(counts["worst"], signal.worst_severity)
 
     return GateInputs(
         platform=platform,
@@ -234,8 +247,10 @@ async def gather_inputs(
         codeowner_matches=owned,
         codeowners_status=codeowners.status,
         ci=ci,
-        open_blockers=int(blockers or 0),
-        open_findings=int(open_findings or 0),
+        open_blockers=int(blockers),
+        open_warnings=int(warnings),
+        open_security=int(security),
+        open_findings=int(open_findings),
         worst_severity=worst,
         review_complete=signal.review_complete,
         review_skipped_paths=list(signal.skipped_paths or []),
@@ -348,15 +363,7 @@ async def evaluate(
         logger.warning("Merge gate could not evaluate %s: %s", pr_info.url, exc)
         return decision
 
-    signal = signal or ReviewSignal()
-    decision = decide(
-        inputs,
-        policy,
-        capabilities=capability,
-        warnings=signal.warnings,
-        suggestions=signal.suggestions,
-        security_findings=signal.security_findings,
-    )
+    decision = decide(inputs, policy, capabilities=capability)
     stored, created = _persist(decision)
     logger.info("Merge gate on %s: %s", pr_info.url, one_line(stored))
 

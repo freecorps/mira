@@ -369,7 +369,10 @@ def test_an_override_records_actor_reason_and_both_states(store) -> None:
     assert override["new_state"] == "not_approved"
     assert override["previous_risk"] == 12
     assert override["detail"]["ticket"] == "OPS-1"
-    assert store.get_gate_decision(stored.decision_key).state == "not_approved"
+    moved = store.get_gate_decision(stored.decision_key)
+    assert moved.state == "not_approved"
+    # A state without an actor beside it is a state nobody can account for.
+    assert moved.overridden_by == "admin"
 
 
 def test_a_retried_override_request_records_one_override(store) -> None:

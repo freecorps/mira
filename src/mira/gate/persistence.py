@@ -118,6 +118,7 @@ def decision_from_row(row: tuple) -> GateDecision:
         delivery_ref=str(data.get("delivery_ref") or ""),
         delivery_attempts=int(data.get("delivery_attempts") or 0),
         error=str(data.get("error") or ""),
+        overridden_by=str(data.get("overridden_by") or ""),
         created_at=float(data.get("created_at") or 0.0),
         updated_at=float(data.get("updated_at") or 0.0),
     )
@@ -153,9 +154,6 @@ def decision_from_row(row: tuple) -> GateDecision:
     ]
     capabilities = loads(str(data.get("capabilities_json") or "{}"), {})
     decision.capabilities = capabilities if isinstance(capabilities, dict) else {}
-    overridden_by = str(data.get("overridden_by") or "")
-    if overridden_by:
-        decision.capabilities.setdefault("overridden_by", overridden_by)
     return decision
 
 

@@ -1201,13 +1201,15 @@ class ReviewEngine:
                 changed_paths=list(result.total_paths) or None,
                 added_lines=added,
                 deleted_lines=deleted,
-                warnings=sum(1 for c in result.comments if c.severity == Severity.WARNING),
-                suggestions=sum(
-                    1
-                    for c in result.comments
-                    if c.severity in (Severity.SUGGESTION, Severity.NITPICK)
+                # A dry run never persists its findings, so the gate would
+                # otherwise score this pass as though it had found nothing.
+                open_blockers=sum(1 for c in result.comments if c.severity == Severity.BLOCKER),
+                open_warnings=sum(1 for c in result.comments if c.severity == Severity.WARNING),
+                open_security=sum(1 for c in result.comments if c.category == "security"),
+                open_findings=len(result.comments),
+                worst_severity=(
+                    max(c.severity for c in result.comments).name.lower() if result.comments else ""
                 ),
-                security_findings=sum(1 for c in result.comments if c.category == "security"),
                 review_complete=not result.skipped_paths,
                 skipped_paths=list(result.skipped_paths),
                 review_failed=result.skipped_reason or "",
@@ -1430,11 +1432,15 @@ class ReviewEngine:
         # after the final one on fast PRs (see review_pr).
         self._walkthrough_notify_task = None
         if on_walkthrough_ready is not None:
+            # Bound to a local before the closure captures it: a narrowing on
+            # the parameter does not survive into a nested function, since
+            # nothing stops the name being rebound before the task runs.
+            notify_ready = on_walkthrough_ready
 
             async def _notify_caller() -> None:
                 try:
                     wt = await walkthrough_task
-                    await on_walkthrough_ready(wt)
+                    await notify_ready(wt)
                 except Exception as exc:
                     logger.warning("on_walkthrough_ready callback failed: %s", exc)
 
