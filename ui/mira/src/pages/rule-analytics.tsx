@@ -651,9 +651,11 @@ export function RuleAnalyticsPage() {
   )
   const { data: regressions } = useAsync(() => api.listRegressions(), [reload])
 
-  // Text search narrows the page in the browser. The server-side filters
-  // (origin, sort, paging) do the heavy lifting; this is a refinement on what
-  // is already on screen, not a substitute for them.
+  // Text search narrows the *current page* in the browser, because rule text
+  // lives in `learned_rules` and the aggregate groups `rule_evaluations`.
+  // The empty state below says so explicitly rather than implying the search
+  // covered every rule -- an honest "nothing on this page" beats a confident
+  // "no matches" that never looked at pages 2..n.
   const visible = useMemo(() => {
     const rules = data?.rules ?? []
     const needle = search.trim().toLowerCase()
@@ -717,7 +719,7 @@ export function RuleAnalyticsPage() {
           <Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             className={cn("pl-8", search && ACTIVE_FILTER)}
-            placeholder="Filter by rule, repository or category"
+            placeholder="Filter this page by rule, repository or category"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
             aria-label="Filter rules"
@@ -794,12 +796,14 @@ export function RuleAnalyticsPage() {
                 <EmptyState
                   title={
                     search
-                      ? "No rules match that filter"
+                      ? "No matches on this page"
                       : "No rule exposures recorded yet"
                   }
                   hint={
                     search
-                      ? "Try a shorter search, or clear the origin filter."
+                      ? total > PAGE_SIZE
+                        ? `The filter searches only the ${PAGE_SIZE} rules on this page. ${total} rules match the current filters in total — try the next page, or narrow with Origin and Sort first.`
+                        : "Try a shorter search, or clear the origin filter."
                       : "Rules start appearing here after they run in a review. If analytics is turned off in your config, nothing is recorded."
                   }
                 />

@@ -33,6 +33,7 @@ from mira.feedback.evaluation import (
 )
 from mira.feedback.exposure import (
     ExposedRule,
+    ReviewScope,
     build_rule_evaluations,
     exposed_rules_from_rows,
     record_review_exposures,
@@ -1369,3 +1370,82 @@ def test_audit_listing_spans_repositories(isolated_index: Path) -> None:
     org_wide = analytics.list_audit_events()
     assert {event["repo"] for event in org_wide} == {"one", "two"}
     assert len(analytics.list_audit_events(owner="acme", repo="one")) == 1
+
+
+# ------------------------------------------------------- scope attribution
+
+
+def _exposed(scope_type: str, scope_value: str, *, category: str = "") -> ExposedRule:
+    return ExposedRule(
+        rule_id=1,
+        version=1,
+        origin="learned",
+        scope_type=scope_type,
+        scope_value=scope_value,
+        category=category,
+        rule_text="Rule text.",
+    )
+
+
+def _build(exposed, findings, scope=None):
+    return build_rule_evaluations(
+        [exposed],
+        platform="github",
+        owner="acme",
+        repo="app",
+        pr_number=7,
+        pr_author="alice",
+        head_sha="head",
+        findings=findings,
+        scope=scope,
+    )
+
+
+def test_symbol_scope_only_attributes_files_carrying_the_symbol(store: IndexStore) -> None:
+    """Retrieval matches if *any* file has the symbol; attribution must not.
+
+    Otherwise a symbol-scoped rule collects feedback from every unrelated
+    finding in the review and its score stops meaning anything.
+    """
+    findings = [
+        SimpleNamespace(finding_id="here", path="src/auth.py", category="security"),
+        SimpleNamespace(finding_id="elsewhere", path="src/views.py", category="security"),
+    ]
+    scope = ReviewScope(symbols={"src/auth.py": {"validate_token"}, "src/views.py": {"render"}})
+
+    linked = {e.finding_id for e in _build(_exposed("symbol", "validate_token"), findings, scope)}
+    assert linked == {None, "here"}
+
+
+def test_language_scope_only_attributes_files_in_that_language() -> None:
+    findings = [
+        SimpleNamespace(finding_id="py", path="a.py", category="style"),
+        SimpleNamespace(finding_id="ts", path="a.ts", category="style"),
+    ]
+    scope = ReviewScope(languages={"a.py": "Python", "a.ts": "TypeScript"})
+
+    linked = {e.finding_id for e in _build(_exposed("language", "python"), findings, scope)}
+    assert linked == {None, "py"}
+
+
+def test_language_and_symbol_scopes_fail_closed_without_metadata() -> None:
+    """A missing lookup must not become a link.
+
+    The review-scoped row still records that the rule ran, so failing closed
+    loses an attribution but never the exposure; failing open would silently
+    corrupt the score.
+    """
+    findings = [SimpleNamespace(finding_id="a", path="a.py", category="style")]
+
+    for scope_type, value in (("symbol", "validate_token"), ("language", "python")):
+        linked = {e.finding_id for e in _build(_exposed(scope_type, value), findings, None)}
+        assert linked == {None}, scope_type
+
+
+def test_repo_scope_still_covers_the_whole_review() -> None:
+    findings = [
+        SimpleNamespace(finding_id="a", path="a.py", category="style"),
+        SimpleNamespace(finding_id="b", path="b.ts", category="style"),
+    ]
+    linked = {e.finding_id for e in _build(_exposed("repo", ""), findings, ReviewScope())}
+    assert linked == {None, "a", "b"}
