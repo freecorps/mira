@@ -22,6 +22,12 @@ from mira.models import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def isolate_index_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep tests from writing Mira's durable state to the host data directory."""
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "indexes"))
+
+
 @pytest.fixture
 def sample_diff_text() -> str:
     return (FIXTURES_DIR / "sample.diff").read_text()
