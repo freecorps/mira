@@ -97,8 +97,10 @@ def list_rule_analytics(
 
     if _postgres_url():
         # A single shared database: the store's filters already span every
-        # repository, so ask it for exactly the page requested.
-        with open_analytics_store(owner or "", repo or "") as store:
+        # repository, so ask it for exactly the page requested. An empty
+        # owner/repo opens the deliberate org-wide handle.
+        platform = _platform_for(owner, repo) if owner and repo else "github"
+        with open_analytics_store(owner or "", repo or "", platform) as store:
             rows = store.aggregate_rule_analytics(
                 active, limit=limit, offset=offset, sort=sort, descending=descending
             )
@@ -109,11 +111,19 @@ def list_rule_analytics(
     for platform, db_owner, db_repo in _repo_targets(owner, repo):
         try:
             with open_analytics_store(db_owner, db_repo, platform) as store:
-                merged.extend(
-                    store.aggregate_rule_analytics(
-                        active, limit=_PER_REPO_RULE_CAP, offset=0, sort=sort, descending=descending
-                    )
+                rows = store.aggregate_rule_analytics(
+                    active, limit=_PER_REPO_RULE_CAP, offset=0, sort=sort, descending=descending
                 )
+            if len(rows) == _PER_REPO_RULE_CAP:
+                # Never truncate silently: a capped page would read as
+                # "that's all of them".
+                logger.warning(
+                    "%s/%s hit the %d-rule analytics cap; totals exclude the remainder",
+                    db_owner,
+                    db_repo,
+                    _PER_REPO_RULE_CAP,
+                )
+            merged.extend(rows)
         except Exception:
             logger.exception("Rule analytics failed for %s/%s", db_owner, db_repo)
     merged.sort(key=lambda row: (_merged_sort_key(row, sort), row.rule_id), reverse=descending)
@@ -141,12 +151,29 @@ def list_rule_evaluations(
 
 
 def _platform_for(owner: str, repo: str) -> str:
+    """Resolve which platform hosts a repo, so the store keys line up.
+
+    `IndexStore.open` namespaces non-GitHub owners as `_{platform}/{owner}`,
+    and on Postgres that namespaced value is what lands in the `owner` column.
+    Guessing "github" here would scope an analytics read to an owner that has
+    no rows. The dashboard resolves this from the repo registry
+    (see `dashboard.api._open_store`); do the same, preferring GitHub when a
+    name exists on more than one platform, exactly as the routers do.
+    """
     if _postgres_url():
+        try:
+            from mira.dashboard.api import _PLATFORM_ORDER, _app_db
+
+            records = _app_db.get_repo_any_platform(owner, repo) if _app_db else []
+            if records:
+                best = min(records, key=lambda r: _PLATFORM_ORDER.get(r.platform, 99))
+                return str(best.platform)
+        except Exception:
+            logger.debug("Platform lookup failed for %s/%s; assuming github", owner, repo)
         return "github"
-    for platform, db_owner, db_repo in _repo_targets(owner, repo):
+    for platform, _db_owner, db_repo in _repo_targets(owner, repo):
         if db_repo == repo:
             return platform
-        _ = db_owner
     return "github"
 
 
@@ -162,7 +189,8 @@ def summarize(
     repo = str(active.get("repo") or "")
 
     if _postgres_url():
-        with open_analytics_store(owner or "", repo or "") as store:
+        platform = _platform_for(owner, repo) if owner and repo else "github"
+        with open_analytics_store(owner or "", repo or "", platform) as store:
             return store.rule_analytics_summary(active, dimension=dimension, limit=limit)
 
     accumulator: dict[str, dict] = {}
@@ -369,7 +397,8 @@ def list_audit_events(
     offset: int = 0,
 ) -> list[dict]:
     if _postgres_url():
-        with open_analytics_store(owner or "", repo or "") as store:
+        platform = _platform_for(owner, repo) if owner and repo else "github"
+        with open_analytics_store(owner or "", repo or "", platform) as store:
             return store.list_learning_audit_events(rule_id=rule_id, limit=limit, offset=offset)
 
     events: list[dict] = []
