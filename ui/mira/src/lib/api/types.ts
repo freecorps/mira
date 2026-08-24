@@ -115,14 +115,56 @@ export interface LearnedRuleModel {
   path_pattern: string
   sample_count: number
   active: boolean
-  status: "pending" | "approved" | "rejected"
+  status: "pending" | "approved" | "rejected" | "superseded"
   created_by: string
+  version: number
+  scope_type: string
+  scope_value: string
+  origin_candidate_id: number | null
+  rationale: string
+  evidence_count: number
+  effective_from: number
+  disabled_at: number | null
+  supersedes_rule_id: number | null
   updated_at: number
 }
 
 export interface OrgLearnedRuleModel extends LearnedRuleModel {
   owner: string
   repo: string
+}
+
+export interface LearningEvidence {
+  feedback_id?: number
+  finding_id?: string
+  path?: string
+  line?: number
+  head_sha?: string
+  finding?: string
+  human_feedback?: string
+}
+
+export interface LearningCandidateModel {
+  id: number
+  owner: string
+  repo: string
+  rule_text: string
+  rationale: string
+  scope_type: string
+  scope_value: string
+  category: string
+  language: string
+  confidence: number
+  status: "collecting" | "pending" | "approved" | "rejected" | "superseded"
+  synthesizer_version: string
+  evidence_ids: Array<number | string>
+  positive_examples: LearningEvidence[]
+  negative_examples: LearningEvidence[]
+  evidence_count: number
+  source_finding_id: string | null
+  source_feedback_id: number | null
+  created_at: number
+  updated_at: number
 }
 
 export interface RepoEdgeModel {
@@ -343,7 +385,8 @@ export interface ContributorSummary {
   previous: ContributionWindow
 }
 
-export type ContributorSort = "commits" | "prs" | "reviews" | "recent" | "additions"
+export type ContributorSort =
+  "commits" | "prs" | "reviews" | "recent" | "additions"
 export type StatsPeriod = "day" | "week" | "month"
 
 // ── Review insights ──

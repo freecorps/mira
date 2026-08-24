@@ -14,12 +14,29 @@ export async function fetchJson<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+export async function fetchText(path: string): Promise<string> {
+  const res = await fetch(`${API_BASE}${path}`, { credentials: "include" })
+  if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`)
+  return res.text()
+}
+
 export async function postJson<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`)
+  return res.json() as Promise<T>
+}
+
+export async function postText<T>(path: string, body: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/yaml" },
+    credentials: "include",
+    body,
   })
   if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`)
   return res.json() as Promise<T>

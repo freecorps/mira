@@ -7,15 +7,17 @@ import {
   ChevronsUpDown,
   ChevronUp,
   Clock,
+  Download,
   Lock,
   Pencil,
   Plus,
   Power,
   RefreshCw,
   Search,
+  Upload,
   X,
 } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate, useSearchParams } from "react-router"
 
 import { Badge } from "@/components/ui/badge"
@@ -40,14 +42,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { toast } from "@/components/ui/sonner"
-import { api, type OrgLearnedRuleModel } from "@/lib/api"
+import {
+  api,
+  type LearningCandidateModel,
+  type OrgLearnedRuleModel,
+} from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
@@ -66,9 +67,51 @@ const SIGNAL_LABEL: Record<string, string> = {
 
 type SortKey = "repo" | "learning" | "status" | "updated"
 type SortDir = "asc" | "desc"
+type LearningRow = OrgLearnedRuleModel & {
+  entity_type: "rule" | "candidate"
+  negative_examples?: LearningCandidateModel["negative_examples"]
+  confidence?: number
+  synthesizer_version?: string
+}
 
-function ruleKey(r: OrgLearnedRuleModel) {
-  return `${r.owner}/${r.repo}#${r.id}`
+function ruleKey(r: LearningRow) {
+  return `${r.entity_type}:${r.owner}/${r.repo}#${r.id}`
+}
+
+function editHref(r: LearningRow) {
+  return `/learnings/edit?owner=${r.owner}&repo=${r.repo}&${
+    r.entity_type === "candidate" ? "candidate" : "id"
+  }=${r.id}`
+}
+
+function candidateRow(candidate: LearningCandidateModel): LearningRow {
+  return {
+    id: candidate.id,
+    owner: candidate.owner,
+    repo: candidate.repo,
+    rule_text: candidate.rule_text,
+    source_signal: "feedback_v2",
+    category: candidate.category,
+    path_pattern: candidate.scope_type === "path" ? candidate.scope_value : "",
+    sample_count: candidate.evidence_count,
+    active: false,
+    status: candidate.status === "collecting" ? "pending" : candidate.status,
+    created_by: "",
+    version: 1,
+    scope_type: candidate.scope_type,
+    scope_value: candidate.scope_value,
+    origin_candidate_id: candidate.id,
+    rationale: candidate.rationale,
+    evidence_count: candidate.evidence_count,
+    effective_from: 0,
+    disabled_at: null,
+    supersedes_rule_id: null,
+    updated_at: candidate.updated_at,
+    entity_type: "candidate",
+    negative_examples: candidate.negative_examples,
+    confidence: candidate.confidence,
+    synthesizer_version: candidate.synthesizer_version,
+  }
 }
 
 // Who added a learning: the admin's avatar for manual rules, a Mira mark for
@@ -77,14 +120,19 @@ function AddedBy({
   rule,
   withName = false,
 }: {
-  rule: OrgLearnedRuleModel
+  rule: LearningRow
   withName?: boolean
 }) {
   if (rule.created_by) {
     return (
-      <span className="flex items-center gap-1.5" title={`Added by ${rule.created_by}`}>
+      <span
+        className="flex items-center gap-1.5"
+        title={`Added by ${rule.created_by}`}
+      >
         <UserAvatar seed={rule.created_by} className="h-5 w-5" />
-        {withName && <span className="truncate text-xs">{rule.created_by}</span>}
+        {withName && (
+          <span className="truncate text-xs">{rule.created_by}</span>
+        )}
       </span>
     )
   }
@@ -94,7 +142,9 @@ function AddedBy({
         <img src="/logo.png" alt="Mira" className="hidden h-3 w-3 dark:block" />
         <img src="/logo-light.png" alt="Mira" className="h-3 w-3 dark:hidden" />
       </span>
-      {withName && <span className="truncate text-xs text-muted-foreground">Mira</span>}
+      {withName && (
+        <span className="truncate text-xs text-muted-foreground">Mira</span>
+      )}
     </span>
   )
 }
@@ -123,17 +173,23 @@ export function LearnedRulesPage() {
   const isAdmin = !!user?.is_admin
   const username = user?.username ?? ""
   // Admins can edit any rule; a creator can edit their own while it's pending.
-  const canEdit = (r: OrgLearnedRuleModel) =>
-    isAdmin || (!!username && r.created_by === username && r.status === "pending")
+  const canEdit = (r: LearningRow) =>
+    r.entity_type === "candidate"
+      ? isAdmin && r.status === "pending"
+      : isAdmin ||
+        (!!username && r.created_by === username && r.status === "pending")
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
 
   const [refreshKey, setRefreshKey] = useState(0)
   const refresh = () => setRefreshKey((k) => k + 1)
   // Tab lives in the URL (?tab=) so the browser back button moves between tabs.
-  const tab: "approved" | "pending" =
-    params.get("tab") === "pending" ? "pending" : "approved"
-  const setTab = (t: "approved" | "pending") => {
+  const requestedTab = params.get("tab")
+  const tab: "approved" | "pending" | "rejected" =
+    requestedTab === "pending" || requestedTab === "rejected"
+      ? requestedTab
+      : "approved"
+  const setTab = (t: "approved" | "pending" | "rejected") => {
     setPanelOpen(false) // switching tabs closes any open detail panel
     const next = new URLSearchParams(params)
     next.set("tab", t)
@@ -141,16 +197,15 @@ export function LearnedRulesPage() {
   }
   const [query, setQuery] = useState("")
   const [repoFilter, setRepoFilter] = useState(ALL_REPOS)
-  const [enabledFilter, setEnabledFilter] = useState<"all" | "enabled" | "disabled">(
-    "all",
-  )
-  const [selected, setSelected] = useState<OrgLearnedRuleModel | null>(null)
+  const [enabledFilter, setEnabledFilter] = useState<
+    "all" | "enabled" | "disabled"
+  >("all")
+  const [selected, setSelected] = useState<LearningRow | null>(null)
+  const importInput = useRef<HTMLInputElement>(null)
 
-  const editHref = (r: OrgLearnedRuleModel) =>
-    `/learnings/edit?owner=${r.owner}&repo=${r.repo}&id=${r.id}`
   const [panelOpen, setPanelOpen] = useState(false)
 
-  const openDetail = (r: OrgLearnedRuleModel) => {
+  const openDetail = (r: LearningRow) => {
     setSelected(r)
     setPanelOpen(true)
   }
@@ -163,27 +218,48 @@ export function LearnedRulesPage() {
     return () => window.removeEventListener("keydown", onKey)
   }, [panelOpen])
 
-  const { data: rules, loading, error } = useAsync(
-    () => api.listLearnedRules(""),
-    [refreshKey],
+  const { data, loading, error } = useAsync(async () => {
+    const [rules, candidates] = await Promise.all([
+      api.listLearnedRules(""),
+      api.listLearningCandidates(""),
+    ])
+    return {
+      rules: rules.map((rule) => ({ ...rule, entity_type: "rule" as const })),
+      candidates: candidates.map(candidateRow),
+    }
+  }, [refreshKey])
+
+  const allRows = useMemo(
+    () => [...(data?.rules ?? []), ...(data?.candidates ?? [])],
+    [data]
   )
 
   const approved = useMemo(
-    () => (rules ?? []).filter((r) => r.status === "approved"),
-    [rules],
+    () =>
+      allRows.filter(
+        (r) => r.status === "approved" && r.entity_type === "rule"
+      ),
+    [allRows]
   )
   const pending = useMemo(
-    () => (rules ?? []).filter((r) => r.status === "pending"),
-    [rules],
+    () => allRows.filter((r) => r.status === "pending"),
+    [allRows]
+  )
+  const rejected = useMemo(
+    () =>
+      allRows.filter(
+        (r) => r.status === "rejected" || r.status === "superseded"
+      ),
+    [allRows]
   )
 
   const repoOptions = useMemo(() => {
     const set = new Set<string>()
-    for (const r of rules ?? []) set.add(`${r.owner}/${r.repo}`)
+    for (const r of allRows) set.add(`${r.owner}/${r.repo}`)
     return [...set].sort()
-  }, [rules])
+  }, [allRows])
 
-  const applyFilter = (list: OrgLearnedRuleModel[]) => {
+  const applyFilter = (list: LearningRow[]) => {
     const q = query.trim().toLowerCase()
     return list.filter((r) => {
       const slug = `${r.owner}/${r.repo}`
@@ -199,17 +275,34 @@ export function LearnedRulesPage() {
     })
   }
 
+  useEffect(() => {
+    const candidateId = Number(params.get("candidate"))
+    const owner = params.get("owner")
+    const repo = params.get("repo")
+    if (!candidateId || !owner || !repo || !data) return
+    const candidate = data.candidates.find(
+      (row) =>
+        row.id === candidateId && row.owner === owner && row.repo === repo
+    )
+    if (candidate) {
+      setSelected(candidate)
+      setPanelOpen(true)
+    }
+  }, [data, params])
+
   const act = (fn: () => Promise<unknown>, successMsg?: string) =>
     fn()
       .then(() => {
         refresh()
         if (successMsg) toast.success(successMsg)
+        return true
       })
-      .catch((e) =>
+      .catch((e) => {
         toast.error("Action failed", {
           description: e instanceof Error ? e.message : String(e),
-        }),
-      )
+        })
+        return false
+      })
 
   // After approving/rejecting in the queue, advance to the next pending rule
   // so the admin can clear the queue without reopening the panel — close only
@@ -220,7 +313,9 @@ export function LearnedRulesPage() {
     const list = applyFilter(pending)
     const idx = list.findIndex((r) => ruleKey(r) === ruleKey(selected))
     const remaining = list.filter((r) => ruleKey(r) !== ruleKey(selected))
-    const next = remaining.length ? remaining[Math.min(idx, remaining.length - 1)] : null
+    const next = remaining.length
+      ? remaining[Math.min(idx, remaining.length - 1)]
+      : null
     return () => {
       if (next) setSelected(next)
       else closeDetail()
@@ -231,30 +326,112 @@ export function LearnedRulesPage() {
   const approveSel = () => {
     if (!selected) return
     const advance = computeNextPending()
-    act(() => api.approveLearnedRule(selected.owner, selected.repo, selected.id), "Approved")
-      .then(advance)
+    const action =
+      selected.entity_type === "candidate"
+        ? () =>
+            api.approveLearningCandidate(
+              selected.owner,
+              selected.repo,
+              selected.id
+            )
+        : () =>
+            api.approveLearnedRule(selected.owner, selected.repo, selected.id)
+    void act(action, "Approved").then((succeeded) => {
+      if (succeeded) advance()
+    })
   }
   const rejectSel = () => {
     if (!selected) return
     const advance = computeNextPending()
-    act(() => api.rejectLearnedRule(selected.owner, selected.repo, selected.id), "Rejected")
-      .then(advance)
+    const action =
+      selected.entity_type === "candidate"
+        ? () =>
+            api.rejectLearningCandidate(
+              selected.owner,
+              selected.repo,
+              selected.id
+            )
+        : () =>
+            api.rejectLearnedRule(selected.owner, selected.repo, selected.id)
+    void act(action, "Rejected").then((succeeded) => {
+      if (succeeded) advance()
+    })
   }
   const toggleSel = (active: boolean) => {
     if (!selected) return
-    act(
-      () => api.setLearnedRuleActive(selected.owner, selected.repo, selected.id, active),
-      active ? "Enabled" : "Disabled",
-    )
-    setSelected({ ...selected, active })
+    const toggledKey = ruleKey(selected)
+    void act(
+      () =>
+        api.setLearnedRuleActive(
+          selected.owner,
+          selected.repo,
+          selected.id,
+          active
+        ),
+      active ? "Enabled" : "Disabled"
+    ).then((succeeded) => {
+      if (succeeded) {
+        setSelected((current) =>
+          current && ruleKey(current) === toggledKey
+            ? { ...current, active }
+            : current
+        )
+      }
+    })
+  }
+  const selectedRepo = () => {
+    const split = repoFilter.lastIndexOf("/")
+    return split > 0
+      ? ([repoFilter.slice(0, split), repoFilter.slice(split + 1)] as const)
+      : null
+  }
+  const exportYaml = async () => {
+    const repo = selectedRepo()
+    if (!repo) return
+    try {
+      const yaml = await api.exportLearnedRules(repo[0], repo[1])
+      const url = URL.createObjectURL(
+        new Blob([yaml], { type: "application/yaml" })
+      )
+      const anchor = document.createElement("a")
+      anchor.href = url
+      anchor.download = `${repo[0].replaceAll("/", "-")}-${repo[1]}-mira-rules.yaml`
+      anchor.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      toast.error("Couldn't export learnings", {
+        description: e instanceof Error ? e.message : String(e),
+      })
+    }
+  }
+  const importYaml = async (file: File | undefined) => {
+    const repo = selectedRepo()
+    if (!repo || !file) return
+    try {
+      const result = await api.importLearnedRules(
+        repo[0],
+        repo[1],
+        await file.text()
+      )
+      toast.success(
+        `Imported ${result.imported} learning${result.imported === 1 ? "" : "s"}`
+      )
+      refresh()
+    } catch (e) {
+      toast.error("Couldn't import learnings", {
+        description: e instanceof Error ? e.message : String(e),
+      })
+    } finally {
+      if (importInput.current) importInput.current.value = ""
+    }
   }
   // Enabled/disabled only applies to approved rules, so only offer it there.
-  const showEnabledFilter = !isAdmin || tab === "approved"
+  const showEnabledFilter = tab === "approved"
 
   const filters = (
     <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
       <div className="relative flex-1">
-        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Search className="pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           aria-label="Filter learnings"
           placeholder="Filter learnings…"
@@ -266,9 +443,13 @@ export function LearnedRulesPage() {
       {showEnabledFilter && (
         <Select
           value={enabledFilter}
-          onValueChange={(v) => setEnabledFilter(v as "all" | "enabled" | "disabled")}
+          onValueChange={(v) =>
+            setEnabledFilter(v as "all" | "enabled" | "disabled")
+          }
         >
-          <SelectTrigger className={cn("sm:w-40", enabledFilter !== "all" && ACTIVE_FILTER)}>
+          <SelectTrigger
+            className={cn("sm:w-40", enabledFilter !== "all" && ACTIVE_FILTER)}
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -279,7 +460,9 @@ export function LearnedRulesPage() {
         </Select>
       )}
       <Select value={repoFilter} onValueChange={setRepoFilter}>
-        <SelectTrigger className={cn("sm:w-64", repoFilter !== ALL_REPOS && ACTIVE_FILTER)}>
+        <SelectTrigger
+          className={cn("sm:w-64", repoFilter !== ALL_REPOS && ACTIVE_FILTER)}
+        >
           <SelectValue placeholder="All repos" />
         </SelectTrigger>
         <SelectContent>
@@ -294,6 +477,33 @@ export function LearnedRulesPage() {
           ))}
         </SelectContent>
       </Select>
+      {isAdmin && (
+        <>
+          <input
+            ref={importInput}
+            type="file"
+            accept=".yaml,.yml,application/yaml,text/yaml"
+            className="hidden"
+            onChange={(event) => void importYaml(event.target.files?.[0])}
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={repoFilter === ALL_REPOS}
+            onClick={() => importInput.current?.click()}
+          >
+            <Upload className="h-4 w-4" /> Import
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={repoFilter === ALL_REPOS}
+            onClick={() => void exportYaml()}
+          >
+            <Download className="h-4 w-4" /> Export
+          </Button>
+        </>
+      )}
       <Button
         variant="outline"
         size="sm"
@@ -308,7 +518,7 @@ export function LearnedRulesPage() {
     </div>
   )
 
-  const firstLoad = loading && !rules
+  const firstLoad = loading && !data
   const selectedKey = selected ? ruleKey(selected) : null
 
   return (
@@ -318,8 +528,8 @@ export function LearnedRulesPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Learnings</h1>
           <p className="text-sm text-muted-foreground">
-            What Mira has learned from your team's PR feedback. Approved learnings
-            inject into every review automatically.
+            What Mira has learned from your team's PR feedback. Approved
+            learnings are added to future reviews that match their scope.
           </p>
         </div>
         <Button size="sm" onClick={() => navigate("/learnings/new")}>
@@ -336,7 +546,9 @@ export function LearnedRulesPage() {
       ) : (
         <Tabs
           value={tab}
-          onValueChange={(v) => setTab(v as "approved" | "pending")}
+          onValueChange={(v) =>
+            setTab(v as "approved" | "pending" | "rejected")
+          }
           className="flex min-h-0 flex-1 flex-col"
         >
           <TabsList className="shrink-0">
@@ -353,6 +565,12 @@ export function LearnedRulesPage() {
                 className="ml-2 tabular-nums"
               >
                 {pending.length}
+              </Badge>
+            </TabsTrigger>
+            <TabsTrigger value="rejected">
+              Rejected
+              <Badge variant="secondary" className="ml-2 tabular-nums">
+                {rejected.length}
               </Badge>
             </TabsTrigger>
           </TabsList>
@@ -401,6 +619,18 @@ export function LearnedRulesPage() {
               resetKey={`pending|${query}|${repoFilter}|${enabledFilter}`}
             />
           </TabsContent>
+
+          <TabsContent
+            value="rejected"
+            className="mt-3 flex min-h-0 flex-1 flex-col gap-2"
+          >
+            <LearningsTable
+              rows={applyFilter(rejected)}
+              onSelect={openDetail}
+              selectedKey={panelOpen ? selectedKey : null}
+              resetKey={`rejected|${query}|${repoFilter}|${enabledFilter}`}
+            />
+          </TabsContent>
         </Tabs>
       )}
 
@@ -408,8 +638,8 @@ export function LearnedRulesPage() {
       <div
         aria-hidden={!panelOpen}
         className={cn(
-          "fixed right-0 top-12 bottom-0 z-30 flex w-full max-w-[560px] flex-col border-l bg-background shadow-2xl transition-transform duration-300 ease-in-out",
-          panelOpen ? "translate-x-0" : "pointer-events-none translate-x-full",
+          "fixed top-12 right-0 bottom-0 z-30 flex w-full max-w-[560px] flex-col border-l bg-background shadow-2xl transition-transform duration-300 ease-in-out",
+          panelOpen ? "translate-x-0" : "pointer-events-none translate-x-full"
         )}
       >
         {selected && (
@@ -423,7 +653,12 @@ export function LearnedRulesPage() {
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <StatusBadge rule={selected} />
-                <Button variant="ghost" size="icon-sm" onClick={closeDetail} aria-label="Close">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={closeDetail}
+                  aria-label="Close"
+                >
                   <X />
                 </Button>
               </div>
@@ -440,12 +675,14 @@ export function LearnedRulesPage() {
                       <X className="mr-1 h-4 w-4" /> Reject
                     </Button>
                   </>
-                ) : isAdmin && selected.status === "approved" ? (
+                ) : isAdmin &&
+                  selected.entity_type === "rule" &&
+                  selected.status === "approved" ? (
                   selected.active ? (
                     <ConfirmButton
                       variant="destructive"
                       destructive
-                      className="ring-1 ring-inset ring-destructive/30"
+                      className="ring-1 ring-destructive/30 ring-inset"
                       dialogTitle="Disable learning?"
                       dialogDescription="It will stop influencing reviews until you re-enable it."
                       confirmLabel="Disable"
@@ -460,7 +697,10 @@ export function LearnedRulesPage() {
                   )
                 ) : null}
                 {canEdit(selected) && (
-                  <Button variant="outline" onClick={() => navigate(editHref(selected))}>
+                  <Button
+                    variant="outline"
+                    onClick={() => navigate(editHref(selected))}
+                  >
                     <Pencil className="mr-1 h-4 w-4" /> Edit
                   </Button>
                 )}
@@ -469,20 +709,51 @@ export function LearnedRulesPage() {
 
             <div className="flex-1 space-y-6 overflow-y-auto p-6">
               <div>
-                <h3 className="mb-2 text-xs font-medium uppercase text-muted-foreground">
+                <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase">
                   Learning
                 </h3>
-                <p className="whitespace-pre-wrap text-sm">{selected.rule_text}</p>
+                <p className="text-sm whitespace-pre-wrap">
+                  {selected.rule_text}
+                </p>
               </div>
+              {selected.rationale && (
+                <div>
+                  <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                    Rationale
+                  </h3>
+                  <p className="text-sm whitespace-pre-wrap text-muted-foreground">
+                    {selected.rationale}
+                  </p>
+                </div>
+              )}
               <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
-                <Meta label="Repo" value={`${selected.owner}/${selected.repo}`} />
+                <Meta
+                  label="Repo"
+                  value={`${selected.owner}/${selected.repo}`}
+                />
                 <Meta label="Category" value={selected.category || "—"} />
-                <Meta label="Path pattern" value={selected.path_pattern || "Any"} />
+                <Meta
+                  label="Scope"
+                  value={`${selected.scope_type}: ${selected.scope_value || "Any"}`}
+                />
                 <Meta
                   label="Source"
-                  value={SIGNAL_LABEL[selected.source_signal] ?? selected.source_signal}
+                  value={
+                    SIGNAL_LABEL[selected.source_signal] ??
+                    selected.source_signal
+                  }
                 />
-                <Meta label="Samples" value={String(selected.sample_count)} />
+                <Meta
+                  label="Evidence"
+                  value={String(selected.evidence_count)}
+                />
+                <Meta label="Version" value={`v${selected.version}`} />
+                {selected.confidence !== undefined && (
+                  <Meta
+                    label="Confidence"
+                    value={`${Math.round(selected.confidence * 100)}%`}
+                  />
+                )}
                 <Meta label="Updated" value={formatDate(selected.updated_at)} />
                 <div>
                   <dt className="text-xs text-muted-foreground">Added by</dt>
@@ -491,8 +762,41 @@ export function LearnedRulesPage() {
                   </dd>
                 </div>
               </dl>
+              {selected.negative_examples &&
+                selected.negative_examples.length > 0 && (
+                  <div>
+                    <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase">
+                      Evidence
+                    </h3>
+                    <div className="space-y-3">
+                      {selected.negative_examples.map((example) => (
+                        <div
+                          key={
+                            example.feedback_id ??
+                            `${example.finding_id}:${example.head_sha}:${example.path}:${example.line}`
+                          }
+                          className="rounded-md border p-3"
+                        >
+                          <div className="font-mono text-xs text-muted-foreground">
+                            {example.path ?? "Unknown path"}
+                            {example.line ? `:${example.line}` : ""}
+                          </div>
+                          {example.human_feedback && (
+                            <p className="mt-2 text-sm">
+                              “{example.human_feedback}”
+                            </p>
+                          )}
+                          {example.finding && (
+                            <p className="mt-2 text-xs text-muted-foreground">
+                              Original: {example.finding}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
             </div>
-
           </>
         )}
       </div>
@@ -509,14 +813,18 @@ function Meta({ label, value }: { label: string; value: string }) {
   )
 }
 
-function sortValue(r: OrgLearnedRuleModel, key: SortKey): string | number {
+function sortValue(r: LearningRow, key: SortKey): string | number {
   switch (key) {
     case "repo":
       return `${r.owner}/${r.repo}`.toLowerCase()
     case "learning":
       return r.rule_text.toLowerCase()
     case "status":
-      return r.status === "approved" ? (r.active ? "enabled" : "disabled") : r.status
+      return r.status === "approved"
+        ? r.active
+          ? "enabled"
+          : "disabled"
+        : r.status
     case "updated":
       return r.updated_at
   }
@@ -528,8 +836,8 @@ function LearningsTable({
   selectedKey,
   resetKey,
 }: {
-  rows: OrgLearnedRuleModel[]
-  onSelect: (r: OrgLearnedRuleModel) => void
+  rows: LearningRow[]
+  onSelect: (r: LearningRow) => void
   selectedKey: string | null
   resetKey: string
 }) {
@@ -548,7 +856,7 @@ function LearningsTable({
     setSort((s) =>
       s.key === key
         ? { key, dir: s.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: "asc" },
+        : { key, dir: "asc" }
     )
 
   const sorted = useMemo(() => {
@@ -564,7 +872,10 @@ function LearningsTable({
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize))
   const safePage = Math.min(page, totalPages - 1)
-  const paged = sorted.slice(safePage * pageSize, safePage * pageSize + pageSize)
+  const paged = sorted.slice(
+    safePage * pageSize,
+    safePage * pageSize + pageSize
+  )
   const rangeStart = sorted.length === 0 ? 0 : safePage * pageSize + 1
   const rangeEnd = Math.min(sorted.length, safePage * pageSize + pageSize)
 
@@ -588,62 +899,85 @@ function LearningsTable({
         >
           <TableHeader className="sticky top-0 z-10 bg-background shadow-[0_1px_0_0_var(--border)]">
             <TableRow>
-            <SortHead label="Repo" sortKey="repo" sort={sort} onSort={toggleSort} className="w-56" />
-            <SortHead label="Learning" sortKey="learning" sort={sort} onSort={toggleSort} />
-            <SortHead label="Status" sortKey="status" sort={sort} onSort={toggleSort} className="w-28" />
-            <TableHead className="w-40">Created by</TableHead>
-            <SortHead label="Updated" sortKey="updated" sort={sort} onSort={toggleSort} className="w-28" />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {paged.map((r) => {
-            const disabled = r.status === "approved" && !r.active
-            return (
-              <TableRow
-                key={ruleKey(r)}
-                data-active={selectedKey === ruleKey(r)}
-                className="cursor-pointer data-[active=true]:bg-muted/60"
-                onClick={() => onSelect(r)}
-              >
-                <TableCell className="whitespace-nowrap align-top font-mono text-xs text-muted-foreground">
-                  <span className="flex items-center gap-1.5">
-                    <GitHubIcon className="h-3.5 w-3.5 shrink-0" />
-                    {r.owner}/{r.repo}
-                  </span>
-                </TableCell>
-                <TableCell className="align-top">
-                  {/* table-fixed gives this column the leftover width; the text
-                      truncates to it (with an ellipsis) and adapts on resize. */}
-                  <div
-                    className={cn(
-                      "line-clamp-2 break-words text-sm",
-                      disabled && "opacity-50",
-                    )}
-                  >
-                    {r.rule_text}
-                  </div>
-                  {(r.category || r.path_pattern) && (
-                    <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                      {r.category}
-                      {r.path_pattern ? ` · ${r.path_pattern}` : ""}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell className="align-top">
-                  <StatusBadge rule={r} />
-                </TableCell>
-                <TableCell className="align-top">
-                  <AddedBy rule={r} withName />
-                </TableCell>
-                <TableCell
-                  className="align-top whitespace-nowrap text-xs text-muted-foreground"
-                  title={formatDate(r.updated_at)}
+              <SortHead
+                label="Repo"
+                sortKey="repo"
+                sort={sort}
+                onSort={toggleSort}
+                className="w-56"
+              />
+              <SortHead
+                label="Learning"
+                sortKey="learning"
+                sort={sort}
+                onSort={toggleSort}
+              />
+              <SortHead
+                label="Status"
+                sortKey="status"
+                sort={sort}
+                onSort={toggleSort}
+                className="w-28"
+              />
+              <TableHead className="w-40">Created by</TableHead>
+              <SortHead
+                label="Updated"
+                sortKey="updated"
+                sort={sort}
+                onSort={toggleSort}
+                className="w-28"
+              />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {paged.map((r) => {
+              const disabled = r.status === "approved" && !r.active
+              return (
+                <TableRow
+                  key={ruleKey(r)}
+                  data-active={selectedKey === ruleKey(r)}
+                  className="cursor-pointer data-[active=true]:bg-muted/60"
+                  onClick={() => onSelect(r)}
                 >
-                  {relativeTime(r.updated_at)}
-                </TableCell>
-              </TableRow>
-            )
-          })}
+                  <TableCell className="align-top font-mono text-xs whitespace-nowrap text-muted-foreground">
+                    <span className="flex items-center gap-1.5">
+                      <GitHubIcon className="h-3.5 w-3.5 shrink-0" />
+                      {r.owner}/{r.repo}
+                    </span>
+                  </TableCell>
+                  <TableCell className="align-top">
+                    {/* table-fixed gives this column the leftover width; the text
+                      truncates to it (with an ellipsis) and adapts on resize. */}
+                    <div
+                      className={cn(
+                        "line-clamp-2 text-sm break-words",
+                        disabled && "opacity-50"
+                      )}
+                    >
+                      {r.rule_text}
+                    </div>
+                    {(r.category || r.path_pattern) && (
+                      <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                        {r.category}
+                        {r.path_pattern ? ` · ${r.path_pattern}` : ""}
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell className="align-top">
+                    <StatusBadge rule={r} />
+                  </TableCell>
+                  <TableCell className="align-top">
+                    <AddedBy rule={r} withName />
+                  </TableCell>
+                  <TableCell
+                    className="align-top text-xs whitespace-nowrap text-muted-foreground"
+                    title={formatDate(r.updated_at)}
+                  >
+                    {relativeTime(r.updated_at)}
+                  </TableCell>
+                </TableRow>
+              )
+            })}
           </TableBody>
         </Table>
       </div>
@@ -655,7 +989,10 @@ function LearningsTable({
           </span>
           <div className="flex items-center gap-1.5">
             <span>Rows:</span>
-            <Select value={String(pageSize)} onValueChange={(v) => setPageSize(Number(v))}>
+            <Select
+              value={String(pageSize)}
+              onValueChange={(v) => setPageSize(Number(v))}
+            >
               <SelectTrigger className="h-7 w-[4.25rem] text-xs">
                 <SelectValue />
               </SelectTrigger>
@@ -697,7 +1034,7 @@ function LearningsTable({
   )
 }
 
-function StatusBadge({ rule }: { rule: OrgLearnedRuleModel }) {
+function StatusBadge({ rule }: { rule: LearningRow }) {
   if (rule.status === "pending") {
     return (
       <Badge
@@ -712,6 +1049,13 @@ function StatusBadge({ rule }: { rule: OrgLearnedRuleModel }) {
     return (
       <Badge variant="outline" className="text-muted-foreground">
         Rejected
+      </Badge>
+    )
+  }
+  if (rule.status === "superseded") {
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        Superseded
       </Badge>
     )
   }
@@ -743,7 +1087,11 @@ function SortHead({
   className?: string
 }) {
   const active = sort.key === sortKey
-  const Icon = active ? (sort.dir === "asc" ? ChevronUp : ChevronDown) : ChevronsUpDown
+  const Icon = active
+    ? sort.dir === "asc"
+      ? ChevronUp
+      : ChevronDown
+    : ChevronsUpDown
   return (
     <TableHead className={className}>
       <button
@@ -752,14 +1100,14 @@ function SortHead({
         aria-label={`Sort by ${label}`}
         className={cn(
           "inline-flex items-center gap-1 transition-colors hover:text-foreground",
-          active ? "text-foreground" : "text-muted-foreground",
+          active ? "text-foreground" : "text-muted-foreground"
         )}
       >
         {label}
         <Icon
           className={cn(
             "h-3.5 w-3.5",
-            active ? "text-foreground" : "text-muted-foreground/50",
+            active ? "text-foreground" : "text-muted-foreground/50"
           )}
         />
       </button>
