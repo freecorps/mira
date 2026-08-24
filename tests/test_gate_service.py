@@ -99,6 +99,7 @@ class FakeProvider:
         self.verdicts: list[tuple[str, str]] = []
         self.statuses: list[dict] = []
         self.comments: list[str] = []
+        self.comment_attempts = 0
 
     def _maybe_raise(self, name: str) -> None:
         if self._raise_on == name:
@@ -146,6 +147,7 @@ class FakeProvider:
         return None
 
     async def post_comment(self, pr_info, body):
+        self.comment_attempts += 1
         self.comments.append(body)
 
     async def update_comment(self, pr_info, comment_id, body):
@@ -998,6 +1000,7 @@ async def test_a_partly_delivered_explanation_says_so_and_stays_retryable() -> N
 
     class MuteProvider(FakeProvider):
         async def post_comment(self, pr_info, body):
+            self.comment_attempts += 1
             raise ProviderError("the discussion API is down")
 
     provider = MuteProvider()
@@ -1006,7 +1009,53 @@ async def test_a_partly_delivered_explanation_says_so_and_stays_retryable() -> N
     assert decision.delivery_state == "partial"
     assert "discussion API" in _decisions()[0].error
 
-    # And the next webhook tries the broken channel again.
+    # And the next webhook tries the channel that failed, rather than treating
+    # a partly delivered explanation as finished.
     retry = MuteProvider()
-    await _evaluate(retry, _config(mode="shadow", comment=True))
-    assert retry.statuses
+    second = await _evaluate(retry, _config(mode="shadow", comment=True))
+    assert retry.comment_attempts == 1
+    assert second.delivery_state == "partial"
+    assert second.delivery_attempts == 2
+
+
+async def test_a_channel_that_keeps_refusing_is_eventually_left_alone() -> None:
+    """The retry is for a transient 5xx, not for a missing scope.
+
+    An unbounded retry is also one self-triggering event away from a loop, so
+    the ceiling is a backstop as much as it is politeness.
+    """
+
+    class MuteProvider(FakeProvider):
+        async def post_comment(self, pr_info, body):
+            self.comment_attempts += 1
+            raise ProviderError("the discussion API is down")
+
+    config = _config(mode="shadow", comment=True)
+    attempts = []
+    for _ in range(8):
+        provider = MuteProvider()
+        await _evaluate(provider, config)
+        attempts.append(provider.comment_attempts)
+
+    assert sum(attempts) == gate_service._MAX_DELIVERY_ATTEMPTS
+    assert _decisions()[0].delivery_state == "partial"
+
+
+async def test_a_retry_does_not_erase_the_reference_it_already_recorded() -> None:
+    """A comment has no reference to give; that is not a reason to lose one."""
+
+    class FlakyStatus(FakeProvider):
+        async def publish_gate_status(self, pr_info, **kwargs):
+            if self.statuses:
+                raise ProviderError("checks:write went away")
+            return await super().publish_gate_status(pr_info, **kwargs)
+
+    config = _config(mode="shadow", comment=True)
+    first = FlakyStatus()
+    await _evaluate(first, config)
+    assert _decisions()[0].delivery_ref == "check-1"
+
+    second = FlakyStatus()
+    second.statuses.append({"already": "published"})  # force the failing branch
+    await _evaluate(second, config)
+    assert _decisions()[0].delivery_ref == "check-1"

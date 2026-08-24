@@ -16,6 +16,7 @@ import pytest
 from fastapi import BackgroundTasks
 
 from mira.config import GateConfig, MiraConfig
+from mira.gate.models import STATUS_CONTEXT
 from mira.platforms import handlers
 from mira.platforms.github import webhook
 from mira.platforms.github.webhook import (
@@ -161,3 +162,52 @@ async def test_an_unreadable_policy_is_not_active(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(webhook, "load_config", _explode)
     assert webhook._gate_is_active("acme", "app") is False
+
+
+async def test_the_gates_own_check_run_does_not_wake_the_gate() -> None:
+    """Publishing a check run delivers a webhook straight back to the app.
+
+    Without this filter the gate wakes itself: a retryable delivery
+    republishes, the republish arrives as an event, the inputs have not moved
+    so the decision key is the same, and it republishes again.
+    """
+    tasks = BackgroundTasks()
+    payload = {
+        "action": "completed",
+        "check_run": {"name": STATUS_CONTEXT, "pull_requests": [{"number": 7}]},
+        "repository": _repository(),
+        "sender": {"login": "mira-bot[bot]"},
+    }
+    result = await dispatch_github_event("check_run", payload, _auth(), "mira-bot", tasks)
+    assert result != "processing"
+    assert tasks.tasks == []
+
+
+async def test_a_check_suite_from_the_gates_own_app_does_not_wake_it() -> None:
+    tasks = BackgroundTasks()
+    payload = {
+        "action": "completed",
+        "check_suite": {"app": {"slug": "mira-bot"}, "pull_requests": [{"number": 7}]},
+        "repository": _repository(),
+        "sender": {"login": "mira-bot[bot]"},
+    }
+    result = await dispatch_github_event("check_suite", payload, _auth(), "mira-bot", tasks)
+    assert result != "processing"
+    assert tasks.tasks == []
+
+
+async def test_a_real_check_run_still_wakes_the_gate() -> None:
+    tasks = BackgroundTasks()
+    payload = {
+        "action": "completed",
+        "check_run": {
+            "name": "build",
+            "app": {"slug": "github-actions"},
+            "pull_requests": [{"number": 7}],
+        },
+        "repository": _repository(),
+        "sender": {"login": "github-actions[bot]"},
+    }
+    result = await dispatch_github_event("check_run", payload, _auth(), "mira-bot", tasks)
+    assert result == "processing"
+    assert len(tasks.tasks) == 1

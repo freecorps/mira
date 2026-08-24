@@ -377,9 +377,30 @@ async def evaluate(
     stored, created = _persist(decision)
     logger.info("Merge gate on %s: %s", pr_info.url, one_line(stored))
 
-    if deliver_side_effects and stored.delivery_state in RETRYABLE_DELIVERY_STATES:
+    if deliver_side_effects and _worth_retrying(stored):
         stored = await deliver(provider, pr_info, stored, policy)
     return stored
+
+
+# A channel that has refused this many times is not going to be talked round by
+# another webhook. The retry exists for a transient 5xx, not for a missing
+# scope — and an unbounded retry is one self-triggering event away from a loop.
+_MAX_DELIVERY_ATTEMPTS = 5
+
+
+def _worth_retrying(decision: GateDecision) -> bool:
+    """Whether there is still something to send, and still a point in trying."""
+    if decision.delivery_state not in RETRYABLE_DELIVERY_STATES:
+        return False
+    if decision.delivery_attempts >= _MAX_DELIVERY_ATTEMPTS:
+        logger.info(
+            "Merge gate giving up on delivery for %s after %d attempts (%s)",
+            decision.inputs.pr_url,
+            decision.delivery_attempts,
+            decision.error or decision.delivery_state,
+        )
+        return False
+    return True
 
 
 def _persist(decision: GateDecision) -> tuple[GateDecision, bool]:
@@ -461,8 +482,12 @@ async def deliver(
             store.update_gate_decision_delivery(
                 decision.decision_key,
                 delivery_state=state,
+                # An empty reference leaves the stored one alone: a comment has
+                # none to give, so a retry where only the comment succeeds must
+                # not erase the check-run id the status channel recorded.
                 delivery_ref=next((ref for ok, ref, _e in outcomes if ok and ref), ""),
                 error="; ".join(error for ok, _ref, error in outcomes if not ok),
+                bump_attempts=True,
             )
             decision.delivery_state = state
 
