@@ -78,7 +78,9 @@ def test_same_origin_authenticated_mutation_is_allowed(
     )
 
 
-def test_non_browser_authenticated_mutation_without_origin_is_allowed(
+def test_authenticated_mutation_without_origin_is_rejected(
     authenticated_client: TestClient,
 ) -> None:
-    assert authenticated_client.post("/api/events").status_code == 200
+    response = authenticated_client.post("/api/events")
+    assert response.status_code == 403
+    assert response.json() == {"error": "Invalid request origin"}

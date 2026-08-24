@@ -242,7 +242,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Origin remain available to non-browser API clients using a session.
         if request.method in _MUTATING_METHODS:
             origin = request.headers.get("origin")
-            if origin and _normalize_origin(origin) not in _trusted_origins(request):
+            if not origin or _normalize_origin(origin) not in _trusted_origins(request):
                 return JSONResponse(status_code=403, content={"error": "Invalid request origin"})
 
         request.state.user = user

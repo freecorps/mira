@@ -430,6 +430,13 @@ def _get_conn(url: str) -> Any:
         return _pg_conn
 
 
+def _new_pg_conn(url: str) -> Any:
+    """Open a connection owned by one atomic transition."""
+    from mira.db.postgres import connect
+
+    return connect(url)
+
+
 @contextmanager
 def _pg_cursor(url: str) -> Iterator[Any]:
     """Yield a cursor that reconnects once on stale-connection errors."""
@@ -678,20 +685,19 @@ class PgIndexStore(_StoreSharedMixin):
 
     @contextmanager
     def _transaction_cursor(self) -> Iterator[Any]:
-        """Cursor bound to one explicit transaction on the autocommit connection."""
-        conn = _get_conn(self._url)
-        with conn.transaction(), conn.cursor() as cur:
-            yield cur
+        """Cursor bound to a dedicated connection and explicit transaction."""
+        conn = _new_pg_conn(self._url)
+        try:
+            with conn.transaction(), conn.cursor() as cur:
+                yield cur
+        finally:
+            conn.close()
 
     def _commit(self) -> None:
         # Always commit the current shared connection — a reconnect (from this
         # or any other store instance) closes the old handle, so caching one
         # per instance would commit on a dead connection.
         _get_conn(self._url).commit()
-
-    def _rollback(self) -> None:
-        with suppress(Exception):
-            _get_conn(self._url).rollback()
 
     def _exec(self, sql: str, params: tuple = ()):
         """Execute a query and return the cursor."""
@@ -2076,7 +2082,7 @@ class PgIndexStore(_StoreSharedMixin):
                         ),
                     )
             except Exception:
-                self._rollback()
+                logger.debug("Atomic candidate upsert rolled back", exc_info=True)
                 raise
         merged = self.get_learning_candidate(current.id)
         if merged is None:
@@ -2246,7 +2252,7 @@ class PgIndexStore(_StoreSharedMixin):
                         (now, candidate_id, self._owner, self._repo),
                     )
             except Exception:
-                self._rollback()
+                logger.debug("Atomic candidate approval rolled back", exc_info=True)
                 raise
         approved = self.get_learned_rule(rule_id)
         if approved is None:
@@ -2565,7 +2571,7 @@ class PgIndexStore(_StoreSharedMixin):
                         (now, now, rule_id, self._owner, self._repo),
                     )
             except Exception:
-                self._rollback()
+                logger.debug("Atomic rule versioning rolled back", exc_info=True)
                 raise
         replacement = self.get_learned_rule(replacement_id)
         if replacement is None:
