@@ -1145,3 +1145,66 @@ def test_previous_release_can_still_read_an_upgraded_database(isolated_index: Pa
         assert reopened.count_rule_evaluations({"rule_id": 1}) == 1
     finally:
         reopened.close()
+
+
+# ------------------------------------------------------- platform resolution
+
+
+def test_platform_resolution_finds_non_github_repos(isolated_index: Path) -> None:
+    """A GitLab repo must resolve to its own store, not a GitHub-shaped guess.
+
+    `IndexStore.open` namespaces non-GitHub owners, so guessing "github" would
+    point analytics at a store that has no rows.
+    """
+    store = IndexStore.open("acme", "app", platform="gitlab")
+    try:
+        _finding(store, "f1")
+        store.record_rule_evaluations([_evaluation("f1")])
+    finally:
+        store.close()
+
+    assert analytics._platform_for("acme", "app") == "gitlab"
+    rows, total = analytics.list_rule_analytics()
+    assert total == 1
+    evaluations, count = analytics.list_rule_evaluations(owner="acme", repo="app")
+    assert count == 1
+    assert evaluations[0]["finding_id"] == "f1"
+    assert rows[0].counts.exposures == 1
+
+
+def test_platform_resolution_uses_the_registry_on_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Postgres the owner column is namespaced, so the platform must be
+    resolved from the repo registry rather than assumed."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
+
+    class _Db:
+        def get_repo_any_platform(self, owner: str, repo: str):
+            return [SimpleNamespace(platform="forgejo")]
+
+    monkeypatch.setattr("mira.dashboard.api._app_db", _Db())
+    assert analytics._platform_for("acme", "app") == "forgejo"
+
+
+def test_platform_resolution_falls_back_when_registry_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
+
+    class _Broken:
+        def get_repo_any_platform(self, owner: str, repo: str):
+            raise RuntimeError("registry down")
+
+    monkeypatch.setattr("mira.dashboard.api._app_db", _Broken())
+    assert analytics._platform_for("acme", "app") == "github"
+
+
+def test_summary_omits_metrics_it_does_not_compute(store: IndexStore) -> None:
+    """Repeat detection needs per-rule grouping a bucket doesn't have."""
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+
+    bucket = store.rule_analytics_summary(dimension="category")[0]
+    assert "repeated_false_positives" not in bucket
+    assert bucket["exposures"] == 1

@@ -293,8 +293,11 @@ class _StoreSharedMixin:
         )
         buckets = []
         for row in self._analytics_fetchall(sql, params):
-            counts = self._counts_from_row(row, 1)
-            buckets.append({"bucket": str(row[0] or ""), **counts.as_dict()})
+            values = self._counts_from_row(row, 1).as_dict()
+            # Repeat detection needs per-rule grouping, which a bucket does not
+            # have. Drop the key rather than report a zero we never computed.
+            values.pop("repeated_false_positives", None)
+            buckets.append({"bucket": str(row[0] or ""), **values})
         return buckets
 
     def rule_period_stats(
