@@ -9,6 +9,8 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from mira.feedback.models import FeedbackEventV2, ReviewFinding
+from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.index._store_shared import _StoreSharedMixin
 from mira.models import PRFingerprint
 
@@ -155,6 +157,65 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     pr_author TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0
 );
+
+-- Phase 1 feedback model. Findings are written before their platform comment,
+-- then enriched with the remote comment/thread IDs after the API responds.
+CREATE TABLE IF NOT EXISTS review_findings (
+    id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    review_id INTEGER NOT NULL DEFAULT 0,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    start_line INTEGER NOT NULL DEFAULT 0,
+    end_line INTEGER NOT NULL DEFAULT 0,
+    symbol TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    suggestion TEXT NOT NULL DEFAULT '',
+    detector TEXT NOT NULL DEFAULT '',
+    prompt_model TEXT NOT NULL DEFAULT '',
+    platform_comment_id TEXT NOT NULL DEFAULT '',
+    platform_thread_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_findings_comment
+    ON review_findings(platform, platform_comment_id);
+CREATE INDEX IF NOT EXISTS idx_review_findings_pr
+    ON review_findings(pr_number, path, start_line);
+
+CREATE TABLE IF NOT EXISTS feedback_events_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id TEXT,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
+    actor_role TEXT NOT NULL DEFAULT '',
+    raw_text TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    head_sha TEXT NOT NULL DEFAULT '',
+    thread_state TEXT NOT NULL DEFAULT '',
+    provenance_complete INTEGER NOT NULL DEFAULT 0,
+    audit_json TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    FOREIGN KEY (finding_id) REFERENCES review_findings(id) ON DELETE SET NULL,
+    UNIQUE(platform, source_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_v2_finding
+    ON feedback_events_v2(finding_id, created_at);
 
 CREATE TABLE IF NOT EXISTS learned_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,8 +436,17 @@ class BlastRadiusEntry:
 class IndexStore(_StoreSharedMixin):
     """SQLite-backed index for a single repository."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        owner: str = "",
+        repo: str = "",
+        platform: str = "github",
+    ) -> None:
         self._db_path = db_path
+        self._owner = owner
+        self._repo = repo
+        self._platform = platform
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -411,6 +481,7 @@ class IndexStore(_StoreSharedMixin):
                 "ALTER TABLE learned_rules ADD COLUMN created_by TEXT NOT NULL DEFAULT ''"
             )
         self._conn.commit()
+        self._backfill_feedback_v2()
 
     @classmethod
     def open(cls, owner: str, repo: str, platform: str = "github"):  # type: ignore[no-untyped-def]
@@ -435,7 +506,7 @@ class IndexStore(_StoreSharedMixin):
         repo_dir = os.path.join(index_dir, key_owner)
         os.makedirs(repo_dir, exist_ok=True)
         db_path = os.path.join(repo_dir, f"{repo}.db")
-        return cls(db_path)
+        return cls(db_path, owner=owner, repo=repo, platform=platform)
 
     def get_summary(self, path: str) -> FileSummary | None:
         """Get the summary for a single file."""
@@ -1139,6 +1210,361 @@ class IndexStore(_StoreSharedMixin):
             (path,),
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
+
+    # ── Provenance-complete findings and feedback ──
+
+    def save_review_finding(self, finding: ReviewFinding) -> ReviewFinding:
+        """Persist a finding before its platform comment is posted."""
+        now = time.time()
+        if not finding.created_at:
+            finding.created_at = now
+        finding.updated_at = now
+        self._conn.execute(
+            "INSERT INTO review_findings "
+            "(id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+            "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+            "confidence, title, body, suggestion, detector, prompt_model, "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, "
+            "review_id=excluded.review_id, platform_comment_id=excluded.platform_comment_id, "
+            "platform_thread_id=excluded.platform_thread_id, state=excluded.state, "
+            "updated_at=excluded.updated_at",
+            (
+                finding.id,
+                finding.fingerprint,
+                finding.review_id,
+                finding.platform,
+                finding.owner,
+                finding.repo,
+                finding.pr_number,
+                finding.pr_url,
+                finding.base_sha,
+                finding.head_sha,
+                finding.path,
+                finding.start_line,
+                finding.end_line,
+                finding.symbol,
+                finding.category,
+                finding.severity,
+                finding.confidence,
+                finding.title,
+                finding.body,
+                finding.suggestion,
+                finding.detector,
+                finding.prompt_model,
+                finding.platform_comment_id,
+                finding.platform_thread_id,
+                finding.state,
+                finding.created_at,
+                finding.updated_at,
+            ),
+        )
+        self._conn.commit()
+        return finding
+
+    def update_review_finding_posted(
+        self,
+        finding_id: str,
+        platform_comment_id: str | int = "",
+        platform_thread_id: str = "",
+    ) -> None:
+        """Attach IDs returned by the hosting platform to a persisted finding."""
+        self._conn.execute(
+            "UPDATE review_findings SET platform_comment_id = CASE WHEN ? <> '' THEN ? "
+            "ELSE platform_comment_id END, platform_thread_id = CASE WHEN ? <> '' THEN ? "
+            "ELSE platform_thread_id END, updated_at = ? WHERE id = ?",
+            (
+                str(platform_comment_id or ""),
+                str(platform_comment_id or ""),
+                platform_thread_id,
+                platform_thread_id,
+                time.time(),
+                finding_id,
+            ),
+        )
+        self._conn.commit()
+
+    def link_review_findings(self, finding_ids: list[str], review_id: int) -> None:
+        if not finding_ids:
+            return
+        self._conn.executemany(
+            "UPDATE review_findings SET review_id = ?, updated_at = ? WHERE id = ?",
+            [(review_id, time.time(), finding_id) for finding_id in finding_ids],
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _finding_from_row(row: tuple) -> ReviewFinding:
+        return ReviewFinding(
+            id=row[0],
+            fingerprint=row[1],
+            review_id=row[2],
+            platform=row[3],
+            owner=row[4],
+            repo=row[5],
+            pr_number=row[6],
+            pr_url=row[7],
+            base_sha=row[8],
+            head_sha=row[9],
+            path=row[10],
+            start_line=row[11],
+            end_line=row[12],
+            symbol=row[13],
+            category=row[14],
+            severity=row[15],
+            confidence=row[16],
+            title=row[17],
+            body=row[18],
+            suggestion=row[19],
+            detector=row[20],
+            prompt_model=row[21],
+            platform_comment_id=row[22],
+            platform_thread_id=row[23],
+            state=row[24],
+            created_at=row[25],
+            updated_at=row[26],
+        )
+
+    def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
+        row = self._conn.execute(
+            "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+            "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+            "confidence, title, body, suggestion, detector, prompt_model, "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "FROM review_findings WHERE id = ?",
+            (finding_id,),
+        ).fetchone()
+        return self._finding_from_row(row) if row else None
+
+    def find_review_finding(
+        self,
+        *,
+        platform_comment_id: str | int = "",
+        platform_thread_id: str = "",
+        pr_number: int = 0,
+        path: str = "",
+        line: int = 0,
+    ) -> ReviewFinding | None:
+        clauses: list[str] = []
+        params: list[object] = []
+        if platform_comment_id:
+            clauses.append("platform_comment_id = ?")
+            params.append(str(platform_comment_id))
+        if platform_thread_id:
+            clauses.append("platform_thread_id = ?")
+            params.append(platform_thread_id)
+        if not clauses and pr_number and path:
+            clauses.extend(("pr_number = ?", "path = ?"))
+            params.extend((pr_number, path))
+            if line:
+                clauses.append("start_line = ?")
+                params.append(line)
+        if not clauses:
+            return None
+        row = self._conn.execute(
+            "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+            "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+            "confidence, title, body, suggestion, detector, prompt_model, "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            f"FROM review_findings WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        return self._finding_from_row(row) if row else None
+
+    def update_review_finding_state(self, finding_id: str, state: str) -> None:
+        self._conn.execute(
+            "UPDATE review_findings SET state = ?, updated_at = ? WHERE id = ?",
+            (state, time.time(), finding_id),
+        )
+        self._conn.commit()
+
+    def record_feedback_v2(self, event: FeedbackEventV2) -> tuple[FeedbackEventV2, bool]:
+        """Insert once per platform webhook event and report whether it was new."""
+        if not event.source_event_id:
+            raise ValueError("source_event_id is required for idempotent feedback")
+        now = event.created_at or time.time()
+        finding = self.get_review_finding(event.finding_id) if event.finding_id else None
+        finding_exists = finding is not None
+        event.provenance_complete = bool(
+            finding and finding.path and finding.category and finding.head_sha
+        )
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO feedback_events_v2 "
+            "(finding_id, kind, actor, actor_role, raw_text, rationale, platform, "
+            "source_event_id, head_sha, thread_state, provenance_complete, audit_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.finding_id if finding_exists else None,
+                event.kind,
+                event.actor,
+                event.actor_role,
+                event.raw_text,
+                event.rationale,
+                event.platform,
+                event.source_event_id,
+                event.head_sha,
+                event.thread_state,
+                int(event.provenance_complete),
+                event.audit_json,
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT id, finding_id, kind, actor, actor_role, raw_text, rationale, platform, "
+            "source_event_id, head_sha, thread_state, provenance_complete, audit_json, created_at "
+            "FROM feedback_events_v2 WHERE platform = ? AND source_event_id = ?",
+            (event.platform, event.source_event_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("feedback event insert did not return a row")
+        stored = FeedbackEventV2(
+            id=row[0],
+            finding_id=row[1],
+            kind=row[2],
+            actor=row[3],
+            actor_role=row[4],
+            raw_text=row[5],
+            rationale=row[6],
+            platform=row[7],
+            source_event_id=row[8],
+            head_sha=row[9],
+            thread_state=row[10],
+            provenance_complete=bool(row[11]),
+            audit_json=row[12],
+            created_at=row[13],
+        )
+        return stored, cur.rowcount == 1
+
+    def list_feedback_v2(
+        self, *, finding_id: str = "", pr_number: int = 0, limit: int = 500
+    ) -> list[FeedbackEventV2]:
+        where: list[str] = []
+        params: list[object] = []
+        if finding_id:
+            where.append("e.finding_id = ?")
+            params.append(finding_id)
+        if pr_number:
+            where.append("f.pr_number = ?")
+            params.append(pr_number)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            "SELECT e.id, e.finding_id, e.kind, e.actor, e.actor_role, e.raw_text, "
+            "e.rationale, e.platform, e.source_event_id, e.head_sha, e.thread_state, "
+            "e.provenance_complete, e.audit_json, e.created_at FROM feedback_events_v2 e "
+            "LEFT JOIN review_findings f ON f.id = e.finding_id "
+            f"{clause} ORDER BY e.created_at DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+        return [
+            FeedbackEventV2(
+                id=r[0],
+                finding_id=r[1],
+                kind=r[2],
+                actor=r[3],
+                actor_role=r[4],
+                raw_text=r[5],
+                rationale=r[6],
+                platform=r[7],
+                source_event_id=r[8],
+                head_sha=r[9],
+                thread_state=r[10],
+                provenance_complete=bool(r[11]),
+                audit_json=r[12],
+                created_at=r[13],
+            )
+            for r in rows
+        ]
+
+    def _backfill_feedback_v2(self) -> None:
+        """Best-effort migration of legacy review comments and feedback rows."""
+        try:
+            comments = self._conn.execute(
+                "SELECT id, review_id, pr_number, pr_url, path, line, severity, category, "
+                "title, body, github_comment_id, created_at FROM review_comments"
+            ).fetchall()
+            for row in comments:
+                finding_id = legacy_finding_id(self._db_path, "review_comment", row[0])
+                fingerprint = finding_fingerprint(
+                    owner=self._owner,
+                    repo=self._repo,
+                    pr_number=row[2],
+                    base_sha="",
+                    head_sha="",
+                    path=row[4],
+                    symbol="",
+                    category=row[7],
+                    detector="legacy",
+                    problem=f"{row[8]} {row[9]}",
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO review_findings "
+                    "(id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+                    "path, start_line, end_line, category, severity, title, body, detector, "
+                    "platform_comment_id, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy', ?, "
+                    "'open', ?, ?)",
+                    (
+                        finding_id,
+                        fingerprint,
+                        row[1],
+                        self._platform,
+                        self._owner,
+                        self._repo,
+                        row[2],
+                        row[3],
+                        row[4],
+                        row[5],
+                        row[5],
+                        row[7],
+                        row[6],
+                        row[8],
+                        row[9],
+                        str(row[10] or ""),
+                        row[11],
+                        row[11],
+                    ),
+                )
+
+            old_events = self._conn.execute(
+                "SELECT id, pr_number, comment_path, comment_line, signal, actor, created_at "
+                "FROM feedback_events"
+            ).fetchall()
+            kind_map = {"accepted": "unobserved", "rejected": "reply_disagree"}
+            for row in old_events:
+                kind = kind_map.get(row[4], row[4])
+                matched_finding_id: str | None = None
+                if row[4] in kind_map:
+                    match = self._conn.execute(
+                        "SELECT id FROM review_findings WHERE pr_number = ? AND path = ? "
+                        "AND start_line = ? ORDER BY created_at DESC LIMIT 1",
+                        (row[1], row[2], row[3]),
+                    ).fetchone()
+                    matched_finding_id = match[0] if match else None
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO feedback_events_v2 "
+                    "(finding_id, kind, actor, platform, source_event_id, "
+                    "provenance_complete, audit_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        matched_finding_id,
+                        kind,
+                        row[5],
+                        self._platform,
+                        f"legacy-feedback:{row[0]}",
+                        0,
+                        '{"backfilled":true}',
+                        row[6],
+                    ),
+                )
+            self._conn.commit()
+        except Exception as exc:
+            self._conn.rollback()
+            logger.warning("Feedback v2 backfill skipped: %s", exc)
 
     def record_feedback(
         self,

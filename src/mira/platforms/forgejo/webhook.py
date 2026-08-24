@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from mira.config import load_config
+from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.fetch import make_fetcher
@@ -29,6 +30,7 @@ from mira.platforms.mentions import (
     strip_mentions,
 )
 from mira.providers import create_provider
+from mira.providers.formatting import parse_bot_comment_finding_id, parse_bot_comment_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +240,6 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
         _REJECT_KEYWORDS,
         _RESUME_KEYWORDS,
         PAUSE_LABEL,
-        _open_store,
         run_pr_command,
         run_thread_reply,
     )
@@ -298,34 +299,49 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
         comment_path = comment.get("path", "")
         comment_line = comment.get("line", 0) or 0
 
-        # Forgejo has no discussion threading, so thread_id is the comment id
-        thread_id = str(comment.get("id", ""))
+        # Some Forgejo versions include the parent ID even though replies are
+        # rendered flat. Without it, only explicit @mentions are actionable.
+        parent_comment_id = comment.get("in_reply_to_id", 0) or 0
+        thread_id = str(parent_comment_id or comment.get("id", ""))
+        original = (
+            await provider.get_comment_body(pr_info, int(parent_comment_id))
+            if parent_comment_id
+            else ""
+        )
+        if not isinstance(original, str):
+            original = ""
+        if parent_comment_id:
+            is_mira_finding = bool(parse_bot_comment_finding_id(original)) or bool(
+                parse_bot_comment_metadata(original)["category"]
+            )
+            if not is_mira_finding and not has_mention(comment_body, names):
+                return
 
         # Explicit reject on an inline (diff) comment → record feedback.
-        if first_word in _REJECT_KEYWORDS and comment_path:
-            try:
-                store = _open_store(owner, repo_name, "forgejo")
-                store.record_feedback(
-                    pr_number=number,
-                    pr_url=pr_url,
-                    comment_path=comment_path,
-                    comment_line=comment_line,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=actor,
+        if first_word in _REJECT_KEYWORDS and (comment_path or parent_comment_id):
+            finding, _event, created = record_finding_feedback(
+                pr_info,
+                kind="dismissed",
+                source_event_id=f"comment:{comment.get('id', '')}",
+                actor=actor,
+                raw_text=comment_body,
+                rationale="explicit reject command",
+                original_body=original,
+                platform_comment_id=parent_comment_id,
+                platform_thread_id=thread_id,
+                path=comment_path,
+                line=comment_line,
+                thread_state="open",
+                platform="forgejo",
+            )
+            if finding is not None and created:
+                await provider.reply_to_review_comment(
+                    pr_info, comment.get("id", 0), DISAGREEMENT_ACK
                 )
-            except Exception as exc:
-                logger.debug("Failed to record Forgejo reject feedback: %s", exc)
-            finally:
-                if "store" in locals():
-                    store.close()
             return
 
         # Free-form @-mention on an inline comment → LLM intent classification.
-        if comment_path:
-            original = await provider.get_comment_body(pr_info, int(thread_id))
+        if comment_path or parent_comment_id:
             await run_thread_reply(
                 provider,
                 pr_info,
@@ -338,6 +354,9 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
                 actor=actor,
                 bot_name=bot_name,
                 platform="forgejo",
+                parent_comment_id=parent_comment_id,
+                source_event_id=f"comment:{comment.get('id', '')}",
+                explicit_mention=has_mention(comment_body, names),
             )
             return
 
@@ -413,7 +432,8 @@ async def dispatch_forgejo_event(
             return "ignored"
         names = mention_names(bot_name, bot_identity)
         comment_body = payload.get("comment", {}).get("body", "") or ""
-        if has_mention(comment_body, names):
+        is_inline_reply = bool(payload.get("comment", {}).get("in_reply_to_id"))
+        if has_mention(comment_body, names) or is_inline_reply:
             cmd_word = command_after_mention(comment_body, names)
             if cmd_word == "review":
                 pass  # review command bypasses author filter

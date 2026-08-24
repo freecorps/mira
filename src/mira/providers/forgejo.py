@@ -131,6 +131,7 @@ class ForgejoProvider(BaseProvider):
             number=pr.get("number") or number,
             owner=owner,
             repo=repo,
+            base_sha=(pr.get("base") or {}).get("sha") or "",
             head_sha=(pr.get("head") or {}).get("sha") or "",
             platform="forgejo",
         )
@@ -266,9 +267,9 @@ class ForgejoProvider(BaseProvider):
 
     async def post_review(
         self, pr_info: PRInfo, result: ReviewResult, bot_name: str = "miracodeai"
-    ) -> None:
+    ) -> list[int]:
         if not result.comments:
-            return
+            return []
 
         summary_text = ""
         if result.summary:
@@ -291,7 +292,15 @@ class ForgejoProvider(BaseProvider):
         }
 
         try:
-            await self._request("POST", f"{self._pr(pr_info)}/reviews", json=review_body)
+            response = await self._request("POST", f"{self._pr(pr_info)}/reviews", json=review_body)
+            posted_review = response.json() or {}
+            review_thread_id = str(posted_review.get("id") or "")
+            posted_comments = posted_review.get("comments") or []
+            if review_thread_id:
+                for comment in result.comments:
+                    comment.platform_thread_id = review_thread_id
+            ids = [int(comment.get("id") or 0) for comment in posted_comments]
+            return ids + [0] * (len(result.comments) - len(ids))
         except ProviderError as exc:
             if getattr(exc, "status_code", None) == 422:
                 logger.warning("Inline review failed (%s); posting as individual comments", exc)
@@ -313,6 +322,7 @@ class ForgejoProvider(BaseProvider):
                         )
             else:
                 raise
+        return [0] * len(result.comments)
 
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         await self._request(

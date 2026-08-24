@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import re
 
+from mira.feedback.provenance import finding_marker, parse_finding_id
 from mira.models import KeyIssue, ReviewComment, Severity
 
 _CATEGORY_DISPLAY: dict[str, tuple[str, str]] = {
@@ -110,6 +111,11 @@ def parse_bot_comment_metadata(body: str) -> dict[str, str]:
     return {"category": category, "severity": severity, "title": title}
 
 
+def parse_bot_comment_finding_id(body: str) -> str | None:
+    """Return the hidden durable finding ID from a Mira inline comment."""
+    return parse_finding_id(body)
+
+
 def format_key_issues(key_issues: list[KeyIssue]) -> str:
     """Format key issues as a markdown table for the review body."""
     lines = [
@@ -164,7 +170,10 @@ def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") ->
     # Two trailing spaces = a Markdown hard break. GitHub renders a bare
     # newline as a break but GitLab doesn't, so the category and severity
     # would otherwise run together on one line on GitLab.
-    parts = [f"**{label}**" + ("  " if badge else "")]
+    parts = []
+    if comment.finding_id:
+        parts.append(finding_marker(comment.finding_id))
+    parts.append(f"**{label}**" + ("  " if badge else ""))
     if badge:
         parts.append(badge)
     parts.append("")
@@ -211,6 +220,7 @@ def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") ->
         )
 
     parts.append("")
+    parts.append("> Reply directly with context; no bot mention is required in this thread.")
     parts.append(f"> Not useful? Reply `@{bot_name} reject` to dismiss this suggestion.")
 
     return "\n".join(parts)

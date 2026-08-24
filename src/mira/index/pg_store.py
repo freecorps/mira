@@ -13,6 +13,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
+from mira.feedback.models import FeedbackEventV2, ReviewFinding
+from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.index._store_shared import _StoreSharedMixin
 from mira.index.store import (
     BlastRadiusEntry,
@@ -188,6 +190,64 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS review_findings (
+    id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    review_id INTEGER NOT NULL DEFAULT 0,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    start_line INTEGER NOT NULL DEFAULT 0,
+    end_line INTEGER NOT NULL DEFAULT 0,
+    symbol TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    suggestion TEXT NOT NULL DEFAULT '',
+    detector TEXT NOT NULL DEFAULT '',
+    prompt_model TEXT NOT NULL DEFAULT '',
+    platform_comment_id TEXT NOT NULL DEFAULT '',
+    platform_thread_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_review_findings_comment
+    ON review_findings(owner, repo, platform, platform_comment_id);
+CREATE INDEX IF NOT EXISTS idx_pg_review_findings_pr
+    ON review_findings(owner, repo, pr_number, path, start_line);
+
+CREATE TABLE IF NOT EXISTS feedback_events_v2 (
+    id BIGSERIAL PRIMARY KEY,
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    finding_id TEXT REFERENCES review_findings(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
+    actor_role TEXT NOT NULL DEFAULT '',
+    raw_text TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    head_sha TEXT NOT NULL DEFAULT '',
+    thread_state TEXT NOT NULL DEFAULT '',
+    provenance_complete INTEGER NOT NULL DEFAULT 0,
+    audit_json TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE(owner, repo, platform, source_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_feedback_v2_finding
+    ON feedback_events_v2(owner, repo, finding_id, created_at);
+
 CREATE TABLE IF NOT EXISTS learned_rules (
     id SERIAL PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -285,6 +345,10 @@ def _get_conn(url: str) -> Any:
                 )
                 cur.execute(
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS created_by "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS pr_author "
                     "TEXT NOT NULL DEFAULT ''"
                 )
             _schema_initialized = True
@@ -478,6 +542,7 @@ class PgIndexStore(_StoreSharedMixin):
         self._repo = repo
         self._url = url
         _get_conn(url)  # eager connect + schema init
+        self._backfill_feedback_v2()
 
     def _refresh_conn(self) -> Any:
         """Drop the shared module connection and bind a fresh handle."""
@@ -1229,7 +1294,392 @@ class PgIndexStore(_StoreSharedMixin):
         )
         return [(r[0], r[1], r[2]) for r in rows]
 
-    # ── Feedback events ──
+    # ── Provenance-complete findings and feedback ──
+
+    def save_review_finding(self, finding: ReviewFinding) -> ReviewFinding:
+        now = time.time()
+        if not finding.created_at:
+            finding.created_at = now
+        finding.updated_at = now
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO review_findings "
+                "(id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+                "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+                "confidence, title, body, suggestion, detector, prompt_model, "
+                "platform_comment_id, platform_thread_id, state, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT(id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, "
+                "review_id=EXCLUDED.review_id, platform_comment_id=EXCLUDED.platform_comment_id, "
+                "platform_thread_id=EXCLUDED.platform_thread_id, state=EXCLUDED.state, "
+                "updated_at=EXCLUDED.updated_at",
+                (
+                    finding.id,
+                    finding.fingerprint,
+                    finding.review_id,
+                    finding.platform,
+                    self._owner,
+                    self._repo,
+                    finding.pr_number,
+                    finding.pr_url,
+                    finding.base_sha,
+                    finding.head_sha,
+                    finding.path,
+                    finding.start_line,
+                    finding.end_line,
+                    finding.symbol,
+                    finding.category,
+                    finding.severity,
+                    finding.confidence,
+                    finding.title,
+                    finding.body,
+                    finding.suggestion,
+                    finding.detector,
+                    finding.prompt_model,
+                    finding.platform_comment_id,
+                    finding.platform_thread_id,
+                    finding.state,
+                    finding.created_at,
+                    finding.updated_at,
+                ),
+            )
+        self._commit()
+        return finding
+
+    def update_review_finding_posted(
+        self,
+        finding_id: str,
+        platform_comment_id: str | int = "",
+        platform_thread_id: str = "",
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE review_findings SET platform_comment_id = CASE WHEN %s <> '' THEN %s "
+                "ELSE platform_comment_id END, platform_thread_id = CASE WHEN %s <> '' THEN %s "
+                "ELSE platform_thread_id END, updated_at = %s "
+                "WHERE owner=%s AND repo=%s AND id=%s",
+                (
+                    str(platform_comment_id or ""),
+                    str(platform_comment_id or ""),
+                    platform_thread_id,
+                    platform_thread_id,
+                    time.time(),
+                    self._owner,
+                    self._repo,
+                    finding_id,
+                ),
+            )
+        self._commit()
+
+    def link_review_findings(self, finding_ids: list[str], review_id: int) -> None:
+        if not finding_ids:
+            return
+        with self._cursor() as cur:
+            cur.executemany(
+                "UPDATE review_findings SET review_id=%s, updated_at=%s "
+                "WHERE owner=%s AND repo=%s AND id=%s",
+                [
+                    (review_id, time.time(), self._owner, self._repo, finding_id)
+                    for finding_id in finding_ids
+                ],
+            )
+        self._commit()
+
+    @staticmethod
+    def _finding_from_row(row: tuple) -> ReviewFinding:
+        return ReviewFinding(
+            id=row[0],
+            fingerprint=row[1],
+            review_id=row[2],
+            platform=row[3],
+            owner=row[4],
+            repo=row[5],
+            pr_number=row[6],
+            pr_url=row[7],
+            base_sha=row[8],
+            head_sha=row[9],
+            path=row[10],
+            start_line=row[11],
+            end_line=row[12],
+            symbol=row[13],
+            category=row[14],
+            severity=row[15],
+            confidence=row[16],
+            title=row[17],
+            body=row[18],
+            suggestion=row[19],
+            detector=row[20],
+            prompt_model=row[21],
+            platform_comment_id=row[22],
+            platform_thread_id=row[23],
+            state=row[24],
+            created_at=row[25],
+            updated_at=row[26],
+        )
+
+    def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
+        row = self._fetchone(
+            "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+            "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+            "confidence, title, body, suggestion, detector, prompt_model, "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "FROM review_findings WHERE owner=%s AND repo=%s AND id=%s",
+            (self._owner, self._repo, finding_id),
+        )
+        return self._finding_from_row(row) if row else None
+
+    def find_review_finding(
+        self,
+        *,
+        platform_comment_id: str | int = "",
+        platform_thread_id: str = "",
+        pr_number: int = 0,
+        path: str = "",
+        line: int = 0,
+    ) -> ReviewFinding | None:
+        clauses = ["owner=%s", "repo=%s"]
+        params: list[object] = [self._owner, self._repo]
+        if platform_comment_id:
+            clauses.append("platform_comment_id=%s")
+            params.append(str(platform_comment_id))
+        if platform_thread_id:
+            clauses.append("platform_thread_id=%s")
+            params.append(platform_thread_id)
+        if len(clauses) == 2 and pr_number and path:
+            clauses.extend(("pr_number=%s", "path=%s"))
+            params.extend((pr_number, path))
+            if line:
+                clauses.append("start_line=%s")
+                params.append(line)
+        if len(clauses) == 2:
+            return None
+        row = self._fetchone(
+            "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+            "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
+            "confidence, title, body, suggestion, detector, prompt_model, "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            f"FROM review_findings WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC LIMIT 1",
+            tuple(params),
+        )
+        return self._finding_from_row(row) if row else None
+
+    def update_review_finding_state(self, finding_id: str, state: str) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE review_findings SET state=%s, updated_at=%s "
+                "WHERE owner=%s AND repo=%s AND id=%s",
+                (state, time.time(), self._owner, self._repo, finding_id),
+            )
+        self._commit()
+
+    def record_feedback_v2(self, event: FeedbackEventV2) -> tuple[FeedbackEventV2, bool]:
+        if not event.source_event_id:
+            raise ValueError("source_event_id is required for idempotent feedback")
+        now = event.created_at or time.time()
+        finding = self.get_review_finding(event.finding_id) if event.finding_id else None
+        finding_exists = finding is not None
+        event.provenance_complete = bool(
+            finding and finding.path and finding.category and finding.head_sha
+        )
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO feedback_events_v2 "
+                "(owner, repo, finding_id, kind, actor, actor_role, raw_text, rationale, "
+                "platform, source_event_id, head_sha, thread_state, provenance_complete, "
+                "audit_json, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT(owner, repo, platform, source_event_id) DO NOTHING RETURNING id",
+                (
+                    self._owner,
+                    self._repo,
+                    event.finding_id if finding_exists else None,
+                    event.kind,
+                    event.actor,
+                    event.actor_role,
+                    event.raw_text,
+                    event.rationale,
+                    event.platform,
+                    event.source_event_id,
+                    event.head_sha,
+                    event.thread_state,
+                    int(event.provenance_complete),
+                    event.audit_json,
+                    now,
+                ),
+            )
+            inserted = cur.fetchone()
+        self._commit()
+        row = self._fetchone(
+            "SELECT id, finding_id, kind, actor, actor_role, raw_text, rationale, platform, "
+            "source_event_id, head_sha, thread_state, provenance_complete, audit_json, created_at "
+            "FROM feedback_events_v2 WHERE owner=%s AND repo=%s AND platform=%s "
+            "AND source_event_id=%s",
+            (self._owner, self._repo, event.platform, event.source_event_id),
+        )
+        if row is None:
+            raise RuntimeError("feedback event insert did not return a row")
+        return (
+            FeedbackEventV2(
+                id=row[0],
+                finding_id=row[1],
+                kind=row[2],
+                actor=row[3],
+                actor_role=row[4],
+                raw_text=row[5],
+                rationale=row[6],
+                platform=row[7],
+                source_event_id=row[8],
+                head_sha=row[9],
+                thread_state=row[10],
+                provenance_complete=bool(row[11]),
+                audit_json=row[12],
+                created_at=row[13],
+            ),
+            inserted is not None,
+        )
+
+    def list_feedback_v2(
+        self, *, finding_id: str = "", pr_number: int = 0, limit: int = 500
+    ) -> list[FeedbackEventV2]:
+        clauses = ["e.owner=%s", "e.repo=%s"]
+        params: list[object] = [self._owner, self._repo]
+        if finding_id:
+            clauses.append("e.finding_id=%s")
+            params.append(finding_id)
+        if pr_number:
+            clauses.append("f.pr_number=%s")
+            params.append(pr_number)
+        params.append(limit)
+        rows = self._fetchall(
+            "SELECT e.id, e.finding_id, e.kind, e.actor, e.actor_role, e.raw_text, "
+            "e.rationale, e.platform, e.source_event_id, e.head_sha, e.thread_state, "
+            "e.provenance_complete, e.audit_json, e.created_at FROM feedback_events_v2 e "
+            "LEFT JOIN review_findings f ON f.id=e.finding_id "
+            f"WHERE {' AND '.join(clauses)} ORDER BY e.created_at DESC LIMIT %s",
+            tuple(params),
+        )
+        return [
+            FeedbackEventV2(
+                id=r[0],
+                finding_id=r[1],
+                kind=r[2],
+                actor=r[3],
+                actor_role=r[4],
+                raw_text=r[5],
+                rationale=r[6],
+                platform=r[7],
+                source_event_id=r[8],
+                head_sha=r[9],
+                thread_state=r[10],
+                provenance_complete=bool(r[11]),
+                audit_json=r[12],
+                created_at=r[13],
+            )
+            for r in rows
+        ]
+
+    def _backfill_feedback_v2(self) -> None:
+        """Best-effort, idempotent migration of this repository's legacy rows."""
+        platform = "github"
+        if self._owner.startswith("_") and "/" in self._owner:
+            platform = self._owner[1:].split("/", 1)[0]
+        try:
+            rows = self._fetchall(
+                "SELECT id, review_id, pr_number, pr_url, path, line, severity, category, "
+                "title, body, github_comment_id, created_at FROM review_comments "
+                "WHERE owner=%s AND repo=%s",
+                (self._owner, self._repo),
+            )
+            with self._cursor() as cur:
+                for row in rows:
+                    finding_id = legacy_finding_id(
+                        self._owner, self._repo, "review_comment", row[0]
+                    )
+                    fingerprint = finding_fingerprint(
+                        owner=self._owner,
+                        repo=self._repo,
+                        pr_number=row[2],
+                        base_sha="",
+                        head_sha="",
+                        path=row[4],
+                        symbol="",
+                        category=row[7],
+                        detector="legacy",
+                        problem=f"{row[8]} {row[9]}",
+                    )
+                    cur.execute(
+                        "INSERT INTO review_findings "
+                        "(id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
+                        "path, start_line, end_line, category, severity, title, body, detector, "
+                        "platform_comment_id, state, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                        "%s, %s, 'legacy', %s, 'open', %s, %s) ON CONFLICT(id) DO NOTHING",
+                        (
+                            finding_id,
+                            fingerprint,
+                            row[1],
+                            platform,
+                            self._owner,
+                            self._repo,
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                            row[5],
+                            row[7],
+                            row[6],
+                            row[8],
+                            row[9],
+                            str(row[10] or ""),
+                            row[11],
+                            row[11],
+                        ),
+                    )
+            self._commit()
+
+            old_events = self._fetchall(
+                "SELECT id, pr_number, comment_path, comment_line, signal, actor, created_at "
+                "FROM feedback_events WHERE owner=%s AND repo=%s",
+                (self._owner, self._repo),
+            )
+            kind_map = {"accepted": "unobserved", "rejected": "reply_disagree"}
+            with self._cursor() as cur:
+                for row in old_events:
+                    matched_finding_id: str | None = None
+                    if row[4] in kind_map:
+                        match = self._fetchone(
+                            "SELECT id FROM review_findings WHERE owner=%s AND repo=%s "
+                            "AND pr_number=%s AND path=%s AND start_line=%s "
+                            "ORDER BY created_at DESC LIMIT 1",
+                            (self._owner, self._repo, row[1], row[2], row[3]),
+                        )
+                        matched_finding_id = match[0] if match else None
+                    cur.execute(
+                        "INSERT INTO feedback_events_v2 "
+                        "(owner, repo, finding_id, kind, actor, platform, source_event_id, "
+                        "provenance_complete, audit_json, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT(owner, repo, platform, source_event_id) DO NOTHING",
+                        (
+                            self._owner,
+                            self._repo,
+                            matched_finding_id,
+                            kind_map.get(row[4], row[4]),
+                            row[5],
+                            platform,
+                            f"legacy-feedback:{row[0]}",
+                            0,
+                            '{"backfilled":true}',
+                            row[6],
+                        ),
+                    )
+            self._commit()
+        except Exception as exc:
+            logger.warning("Postgres feedback v2 backfill skipped: %s", exc)
+
+    # ── Legacy feedback events ──
 
     def record_feedback(
         self,
@@ -1242,14 +1692,16 @@ class PgIndexStore(_StoreSharedMixin):
         comment_title: str,
         signal: str,
         actor: str,
+        pr_author: str = "",
     ) -> FeedbackEventRow:
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO feedback_events "
                 "(owner, repo, pr_number, pr_url, comment_path, comment_line, "
-                "comment_category, comment_severity, comment_title, signal, actor, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
+                "created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
                 (
                     self._owner,
                     self._repo,
@@ -1262,6 +1714,7 @@ class PgIndexStore(_StoreSharedMixin):
                     comment_title,
                     signal,
                     actor,
+                    pr_author,
                     now,
                 ),
             )
@@ -1278,6 +1731,7 @@ class PgIndexStore(_StoreSharedMixin):
             comment_title=comment_title,
             signal=signal,
             actor=actor,
+            pr_author=pr_author,
             created_at=now,
         )
 
@@ -1303,6 +1757,7 @@ class PgIndexStore(_StoreSharedMixin):
                 e["comment_title"],
                 e["signal"],
                 e["actor"],
+                e.get("pr_author", ""),
                 now,
             )
             for e in events
@@ -1311,8 +1766,8 @@ class PgIndexStore(_StoreSharedMixin):
             cur.executemany(
                 "INSERT INTO feedback_events "
                 "(owner, repo, pr_number, pr_url, comment_path, comment_line, "
-                "comment_category, comment_severity, comment_title, signal, actor, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
+                "created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 rows,
             )
         self._commit()
@@ -1321,7 +1776,7 @@ class PgIndexStore(_StoreSharedMixin):
     def list_feedback(self, limit: int = 500) -> list[FeedbackEventRow]:
         rows = self._fetchall(
             "SELECT id, pr_number, pr_url, comment_path, comment_line, "
-            "comment_category, comment_severity, comment_title, signal, actor, created_at "
+            "comment_category, comment_severity, comment_title, signal, actor, pr_author, created_at "
             "FROM feedback_events WHERE owner=%s AND repo=%s "
             "ORDER BY created_at DESC LIMIT %s",
             (self._owner, self._repo, limit),
@@ -1338,7 +1793,8 @@ class PgIndexStore(_StoreSharedMixin):
                 comment_title=r[7],
                 signal=r[8],
                 actor=r[9],
-                created_at=r[10],
+                pr_author=r[10],
+                created_at=r[11],
             )
             for r in rows
         ]

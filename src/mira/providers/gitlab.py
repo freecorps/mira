@@ -160,6 +160,7 @@ class GitLabProvider(BaseProvider):
             number=iid,
             owner=owner,
             repo=repo,
+            base_sha=(mr.get("diff_refs") or {}).get("base_sha") or "",
             head_sha=mr.get("sha") or "",
             platform="gitlab",
         )
@@ -267,9 +268,9 @@ class GitLabProvider(BaseProvider):
 
     async def post_review(
         self, pr_info: PRInfo, result: ReviewResult, bot_name: str = "miracodeai"
-    ) -> None:
+    ) -> list[int]:
         if not result.comments:
-            return
+            return []
         try:
             data = await self._changes(pr_info)
         except Exception as e:
@@ -277,7 +278,8 @@ class GitLabProvider(BaseProvider):
         diff_refs = data.get("diff_refs") or {}
 
         posted = 0
-        for comment in result.comments:
+        posted_ids = [0] * len(result.comments)
+        for index, comment in enumerate(result.comments):
             body = format_comment_body(comment, bot_name=bot_name)
             line = (
                 comment.end_line
@@ -294,11 +296,16 @@ class GitLabProvider(BaseProvider):
                 "position[new_line]": str(line),
             }
             try:
-                await self._request(
+                response = await self._request(
                     "POST",
                     f"{self._mr(pr_info)}/discussions",
                     data={"body": body, **position},
                 )
+                discussion = response.json() or {}
+                comment.platform_thread_id = str(discussion.get("id") or "")
+                notes = discussion.get("notes") or []
+                if notes:
+                    posted_ids[index] = int(notes[0].get("id") or 0)
                 posted += 1
             except ProviderError as exc:
                 # GitLab 400s when a position lands on an unchanged/context line.
@@ -325,6 +332,7 @@ class GitLabProvider(BaseProvider):
                 logger.warning("Failed to post MR summary note: %s", exc)
 
         logger.info("GitLab: posted %d/%d review notes", posted, len(result.comments))
+        return posted_ids
 
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         await self._request("POST", f"{self._mr(pr_info)}/notes", data={"body": body})

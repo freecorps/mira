@@ -139,6 +139,11 @@ class ReviewComment:
     # Which pipeline pass produced this ("main", "security", or "osv") — lets eval
     # artifacts attribute FP share per pass. Not posted anywhere.
     source_pass: str = "main"
+    # Stable ID persisted before the inline comment is posted. Providers embed
+    # this as a hidden marker so later replies/reactions retain provenance.
+    finding_id: str = ""
+    # Provider-populated thread/discussion ID when the post response exposes it.
+    platform_thread_id: str = ""
 
 
 def _format_stats_breakdown(stats: dict[Severity, int]) -> str:
@@ -413,6 +418,9 @@ class PRInfo:
     number: int
     owner: str
     repo: str
+    # Immutable commit at the base of this review. Providers may leave it empty
+    # when their API does not expose it; head_sha still anchors the event.
+    base_sha: str = ""
     # Round 2+ reviews diff against last_reviewed_sha → head_sha; empty falls back to full diff.
     head_sha: str = ""
     # Hosting platform ("github" / "gitlab") — scopes per-PR review progress.
@@ -497,6 +505,9 @@ class BotThreadRecord:
     body: str
     is_resolved: bool
     is_outdated: bool = False
+    platform_comment_id: int = 0
+    positive_reactors: list[str] = field(default_factory=list)
+    negative_reactors: list[str] = field(default_factory=list)
 
 
 @dataclass
