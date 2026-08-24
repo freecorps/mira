@@ -683,6 +683,14 @@ export function RuleAnalyticsPage() {
 
   const total = data?.total ?? 0
 
+  function openRule(rule: RuleAnalyticsModel) {
+    setSearchParams({
+      owner: rule.owner,
+      repo: rule.repo,
+      rule: String(rule.rule_id),
+    })
+  }
+
   return (
     <div className="space-y-4 p-4 md:p-6">
       <div>
@@ -828,14 +836,22 @@ export function RuleAnalyticsPage() {
                       {visible.map((rule) => (
                         <TableRow
                           key={`${rule.owner}/${rule.repo}#${rule.rule_id}`}
-                          className="cursor-pointer"
-                          onClick={() =>
-                            setSearchParams({
-                              owner: rule.owner,
-                              repo: rule.repo,
-                              rule: String(rule.rule_id),
-                            })
-                          }
+                          className="cursor-pointer focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                          // A <tr> is not focusable and never fires a click
+                          // from Enter or Space. Opening a rule is this
+                          // table's primary action, so it gets a role, a tab
+                          // stop and key handling rather than mouse-only
+                          // access.
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`Open analytics for rule ${rule.rule_id} in ${rule.owner}/${rule.repo}`}
+                          onClick={() => openRule(rule)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault()
+                              openRule(rule)
+                            }
+                          }}
                         >
                           <TableCell className="max-w-96">
                             <p className="truncate font-medium">

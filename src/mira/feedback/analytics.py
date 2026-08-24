@@ -50,10 +50,11 @@ _MERGE_PAGE_SIZE = 500
 # index cannot spin forever. Crossing it is logged, never silent.
 _MERGE_MAX_ROWS = 20_000
 
-# Buckets read per repository before merging a summary. The grouping
-# dimensions are all low-cardinality (category, scope, origin, repo, author),
-# so this covers the real domain; hitting it is logged.
-_SUMMARY_DOMAIN_CAP = 5_000
+# Buckets fetched per round trip while walking a repository's summary domain.
+# A batch size, not a ceiling: `author` is not low-cardinality, so the walk
+# pages until the repository is exhausted rather than trusting one query to
+# have covered it.
+_SUMMARY_PAGE_SIZE = 1_000
 
 
 def _postgres_url() -> str:
@@ -252,25 +253,14 @@ def summarize(
             return store.rule_analytics_summary(active, dimension=dimension, limit=limit)
 
     # The caller's `limit` is a *global* top-N and cannot be pushed down into
-    # each repository: a category ranked second everywhere can still have the
+    # each repository: a bucket ranked second everywhere can still have the
     # largest combined total, and per-repo limiting would drop it from every
-    # result set. Take each repository's full bucket domain, merge, then slice.
+    # result set. Walk each repository's whole bucket domain, merge, then slice.
     accumulator: dict[str, dict] = {}
     numeric_keys: set[str] = set()
     for platform, db_owner, db_repo in _repo_targets(owner, repo):
         try:
-            with open_analytics_store(db_owner, db_repo, platform) as store:
-                buckets = store.rule_analytics_summary(
-                    active, dimension=dimension, limit=_SUMMARY_DOMAIN_CAP
-                )
-            if len(buckets) == _SUMMARY_DOMAIN_CAP:
-                logger.warning(
-                    "%s/%s produced %d '%s' buckets, the cap; the merged view may omit some",
-                    db_owner,
-                    db_repo,
-                    _SUMMARY_DOMAIN_CAP,
-                    dimension,
-                )
+            buckets = _walk_repo_buckets(db_owner, db_repo, platform, active, dimension)
         except Exception:
             logger.exception("Analytics summary failed for %s/%s", db_owner, db_repo)
             continue
@@ -290,6 +280,41 @@ def summarize(
             bucket.setdefault(key, 0)
     merged.sort(key=lambda b: b.get("exposures", 0), reverse=True)
     return merged[:limit]
+
+
+def _walk_repo_buckets(
+    db_owner: str,
+    db_repo: str,
+    platform: str,
+    filters: dict[str, Any],
+    dimension: str,
+) -> list[dict]:
+    """Every summary bucket for one repository, fetched in bounded pages.
+
+    A fixed ceiling would be wrong here: `author` has no small domain, and
+    silently keeping only a repository's local top buckets is exactly the bug
+    global merging exists to avoid.
+    """
+    collected: list[dict] = []
+    with open_analytics_store(db_owner, db_repo, platform) as store:
+        while len(collected) < _MERGE_MAX_ROWS:
+            page = store.rule_analytics_summary(
+                filters,
+                dimension=dimension,
+                limit=_SUMMARY_PAGE_SIZE,
+                offset=len(collected),
+            )
+            collected.extend(page)
+            if len(page) < _SUMMARY_PAGE_SIZE:
+                return collected
+    logger.warning(
+        "%s/%s exceeded the %d-bucket '%s' backstop; the merged view omits the remainder",
+        db_owner,
+        db_repo,
+        _MERGE_MAX_ROWS,
+        dimension,
+    )
+    return collected
 
 
 def _recompute_rates(bucket: dict) -> None:

@@ -552,7 +552,13 @@ export interface RuleEvaluationPage {
   offset: number
 }
 
-export interface AnalyticsBucket extends RuleOutcomeCounts {
+// Repeat detection needs per-rule grouping a bucket does not have, so the
+// server drops the key from summary rows. Omit it here too, rather than let a
+// read type-check and come back undefined.
+export interface AnalyticsBucket extends Omit<
+  RuleOutcomeCounts,
+  "repeated_false_positives"
+> {
   bucket: string
 }
 
