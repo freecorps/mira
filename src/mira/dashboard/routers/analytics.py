@@ -8,6 +8,7 @@ gate as rule approval itself.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -26,6 +27,12 @@ from mira.feedback.evaluation import DECISIONS, DETAIL_OUTCOMES, ORIGINS
 _MAX_PAGE = 200
 _MAX_EXPORT_RULES = 5000
 _MAX_EXPORT_EVALUATIONS = 20000
+
+# Owner/repo arrive from the URL and end up in a filesystem path, so they
+# are validated as single safe segments. The one exception is the
+# `_{platform}/{owner}` form the stores themselves emit.
+_UNSAFE_SEGMENT = re.compile(r"[/\x00]")
+_NAMESPACED_OWNER = re.compile(r"^_(?:github|gitlab|forgejo)/(?P<owner>[^/\x00]+)$")
 
 _SORT_KEYS = {"exposures", "negative", "positive", "findings", "last_exposure_at", "rule_id"}
 _SUMMARY_DIMENSIONS = {"category", "repo", "owner", "author", "scope_type", "origin", "decision"}
@@ -113,6 +120,45 @@ def _resolved_platform() -> Iterator[None]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _public_owner(owner: str) -> str:
+    """Strip the `_{platform}/` prefix stores use for non-GitHub owners."""
+    match = _NAMESPACED_OWNER.match(owner)
+    return match.group("owner") if match else owner
+
+
+def _safe_segment(value: str) -> bool:
+    return bool(value) and value not in {".", ".."} and not _UNSAFE_SEGMENT.search(value)
+
+
+def _require_known_repo(owner: str, repo: str) -> None:
+    """Reject traversal and unknown repositories before touching a store.
+
+    `IndexStore.open` builds a SQLite path from owner/repo and creates it, so
+    an unchecked `owner=".."` writes outside `MIRA_INDEX_DIR`. Admin-only is
+    not enough: these values arrive from a URL, and an admin session should not
+    be a filesystem primitive.
+
+    A `_{platform}/{owner}` owner is accepted because the stores produce it
+    themselves and it reaches the client on Postgres aggregate rows; the
+    registry is then checked against the public owner.
+    """
+    if not _safe_segment(repo) or not (_safe_segment(owner) or _NAMESPACED_OWNER.match(owner)):
+        raise HTTPException(status_code=400, detail="Invalid repository identifier")
+
+    from mira.dashboard.api import _app_db
+
+    if _app_db is None:  # pragma: no cover - only unconfigured installs
+        return
+    try:
+        records = _app_db.get_repo_any_platform(_public_owner(owner), repo)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="The repository registry is unavailable"
+        ) from exc
+    if not records:
+        raise HTTPException(status_code=404, detail=f"Repo {owner}/{repo} not found")
+
+
 def _actor(request: Request) -> str:
     user = getattr(request.state, "user", None)
     return str(getattr(user, "username", "") or "")
@@ -139,6 +185,8 @@ def list_rule_analytics(
     _require_admin(request)
     if sort not in _SORT_KEYS:
         raise HTTPException(status_code=400, detail=f"sort must be one of {sorted(_SORT_KEYS)}")
+    if owner or repo:
+        _require_known_repo(owner, repo)
     limit, offset = _page(limit, offset)
     with _resolved_platform():
         rows, total = analytics.list_rule_analytics(
@@ -159,6 +207,7 @@ def list_rule_analytics(
 def rule_analytics_detail(request: Request, owner: str, repo: str, rule_id: int) -> dict:
     """One rule: where it ran, what came back, and whether it helped."""
     _require_admin(request)
+    _require_known_repo(owner, repo)
     with _resolved_platform():
         rows, _total = analytics.list_rule_analytics(
             filters={"owner": owner, "repo": repo, "rule_id": rule_id}, limit=1, offset=0
@@ -191,6 +240,7 @@ def rule_analytics_detail(request: Request, owner: str, repo: str, rule_id: int)
             min_exposures=learning.min_exposures_for_regression,
             negative_rate_threshold=learning.regression_negative_rate,
             disable_rate_threshold=learning.regression_disable_rate,
+            min_decisive=learning.min_decisive_for_regression,
         )
     return {
         "rule": row.as_dict(),
@@ -218,6 +268,7 @@ def list_rule_evaluations(
 ) -> EvaluationPage:
     """The individual evaluations behind a rule's aggregate numbers."""
     _require_admin(request)
+    _require_known_repo(owner, repo)
     if outcome and outcome not in DETAIL_OUTCOMES:
         raise HTTPException(
             status_code=400, detail=f"outcome must be one of {sorted(DETAIL_OUTCOMES)}"
@@ -256,6 +307,8 @@ def analytics_summary(
         raise HTTPException(
             status_code=400, detail=f"dimension must be one of {sorted(_SUMMARY_DIMENSIONS)}"
         )
+    if owner or repo:
+        _require_known_repo(owner, repo)
     with _resolved_platform():
         buckets = analytics.summarize(
             dimension=dimension,
@@ -275,6 +328,8 @@ def list_regressions(
     audited admin action.
     """
     _require_admin(request)
+    if owner or repo:
+        _require_known_repo(owner, repo)
     learning = load_config().learning
     with _resolved_platform():
         suggestions = analytics.regression_suggestions(
@@ -301,6 +356,7 @@ def acknowledge_regression(
     trail always shows a human made it.
     """
     _require_admin(request)
+    _require_known_repo(owner, repo)
     allowed = {"accepted", "dismissed", "deferred"}
     if body.action not in allowed:
         raise HTTPException(status_code=400, detail=f"action must be one of {sorted(allowed)}")
@@ -333,6 +389,8 @@ def list_audit_events(
     offset: int = 0,
 ) -> AuditEventsResponse:
     _require_admin(request)
+    if owner or repo:
+        _require_known_repo(owner, repo)
     limit, offset = _page(limit, offset)
     with _resolved_platform():
         events = analytics.list_audit_events(
@@ -364,6 +422,8 @@ def export_rule_analytics(
 ) -> Response:
     """Export the rule-level analytics table as CSV or JSON."""
     _require_admin(request)
+    if owner or repo:
+        _require_known_repo(owner, repo)
     if fmt not in {"csv", "json"}:
         raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'json'")
     with _resolved_platform():
@@ -387,6 +447,7 @@ def export_rule_evaluations(
 ) -> Response:
     """Export the evidence rows behind one rule, so a number can be checked."""
     _require_admin(request)
+    _require_known_repo(owner, repo)
     if fmt not in {"csv", "json"}:
         raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'json'")
     if outcome and outcome not in DETAIL_OUTCOMES:

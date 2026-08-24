@@ -11,8 +11,8 @@ cannot become a compliment.
 
 ## What gets recorded
 
-Rules retrieval selects for a review are recorded after the review has been
-posted, in `rule_evaluations`. Each exposure produces:
+The rules that retrieval selected for a review are recorded after the review
+has been posted, in `rule_evaluations`. Each exposure produces:
 
 - one **review-scoped** row per rule — the rule was in front of the model, even
   if it surfaced nothing. This matters: a suppression-style rule doing its job
