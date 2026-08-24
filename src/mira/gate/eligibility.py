@@ -243,11 +243,18 @@ def blocking_reasons(inputs: GateInputs, policy: EffectivePolicy) -> list[Reason
                     + (", ".join(sorted(inputs.ci.pending)[:5]) or "see checks"),
                 )
             )
+        elif state == "none":
+            reasons.append(
+                Reason(
+                    ReasonCode.CI_UNKNOWN,
+                    "No CI ran on this commit, so there is nothing to vouch for it",
+                )
+            )
         elif state != "success":
             reasons.append(
                 Reason(
                     ReasonCode.CI_UNKNOWN,
-                    "CI status could not be read, so it is treated as not green",
+                    f"CI reported {state!r}, which is not a passing result",
                 )
             )
 

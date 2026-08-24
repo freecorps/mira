@@ -108,7 +108,7 @@ the loop three more times.
 | `pr_too_many_files`, `pr_too_many_lines` | Above the size limits. |
 | `protected_path` | A protected path was touched. |
 | `codeowners_path`, `codeowners_unreadable` | CODEOWNERS assigns an owner, or could not be parsed. |
-| `ci_failing`, `ci_pending`, `ci_unknown` | CI is not green, has not finished, or could not be read. |
+| `ci_failing`, `ci_pending`, `ci_unknown` | CI is failing, has not finished, or produced no passing result — including a commit nothing ran on and one whose status could not be read. |
 | `review_incomplete` | Files in the PR were never reviewed. |
 | `review_failed` | The review did not complete (LLM failure, parse failure). |
 | `index_not_ready` | The repository index is incomplete, so cross-file context was partial. |
@@ -323,14 +323,24 @@ platforms. Counting it would let the gate read its own verdict back as a
 failing build, and would change the check count on every pass — which changes
 the inputs digest, which would manufacture a fresh decision row each time.
 
-GitLab needs one extra step. An external commit status posted through the API
-*joins* the head pipeline, so on a project with no CI the gate's own status
-creates a green pipeline for the next evaluation to read back as passing. The
-pipeline stays authoritative — it is the only view that reports a run blocked
-on a manual gate as green rather than pending forever, and the only one that
-finds a merged-results pipeline, which belongs to the merge-ref commit rather
-than the head SHA — and a second, cheap call asks the one question the pipeline
-cannot answer: is there anything recorded against this commit other than us?
+GitLab needs two extra steps, because an external commit status posted through
+the API *joins* the head pipeline — including the one the gate publishes.
+
+The pipeline stays authoritative: it is the only view that reports a run
+blocked on a manual gate as green rather than pending forever, and the only one
+that finds a merged-results pipeline, which belongs to the merge-ref commit
+rather than to the head SHA. A second, cheap call asks the one question the
+pipeline cannot answer — is anything recorded against this commit other than
+us? — so a project with no CI cannot have the gate's own status read back as a
+green build. Nothing recorded at all falls through to the pipeline, which is
+what keeps merged results working.
+
+And the status GitLab publishes is never red. GitLab has no blocking review
+event, so a failing status would claim a power the provider does not have, and
+since the status joins the pipeline it would corrupt the very signal the gate
+reads back — blocking the merge request on its own prior verdict, on that
+commit, forever. The verdict travels in the description instead, where it
+cannot break anything.
 
 ## Overrides
 
