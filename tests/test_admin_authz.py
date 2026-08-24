@@ -49,6 +49,34 @@ PROTECTED = [
         "POST",
         {"owner": "o", "repo": "r"},
     ),
+    # Phase 3 analytics. Read routes are listed too: the evaluation history
+    # spans every repo and carries finding titles, PR authors and reactions,
+    # so reading it is a governance action, not per-repo browsing.
+    ("/api/analytics/rules", "GET", {}),
+    (
+        "/api/analytics/rules/{owner}/{repo}/{rule_id}",
+        "GET",
+        {"owner": "o", "repo": "r", "rule_id": 1},
+    ),
+    (
+        "/api/analytics/rules/{owner}/{repo}/{rule_id}/evaluations",
+        "GET",
+        {"owner": "o", "repo": "r", "rule_id": 1},
+    ),
+    ("/api/analytics/summary", "GET", {}),
+    ("/api/analytics/regressions", "GET", {}),
+    (
+        "/api/analytics/regressions/{owner}/{repo}/{rule_id}/ack",
+        "POST",
+        {"owner": "o", "repo": "r", "rule_id": 1, "body": None},
+    ),
+    ("/api/analytics/audit", "GET", {}),
+    ("/api/analytics/export", "GET", {}),
+    (
+        "/api/analytics/rules/{owner}/{repo}/{rule_id}/export",
+        "GET",
+        {"owner": "o", "repo": "r", "rule_id": 1},
+    ),
 ]
 
 

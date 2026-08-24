@@ -205,7 +205,7 @@ def evaluation_details_sql(
     this list by an outcome yields exactly the count the aggregate reported.
     """
     where = _evaluation_filters(placeholder, filters)
-    outcome = outcome_case_sql()
+    outcome = outcome_case_sql(finding_ref="e.finding_id")
     addressed = addressed_case_sql()
     if outcome_filter:
         where.add(f"({outcome}) = ?", outcome_filter)
@@ -241,7 +241,7 @@ def count_evaluations_sql(
     placeholder: str, filters: dict[str, Any], *, outcome_filter: str = ""
 ) -> tuple[str, tuple[Any, ...]]:
     where = _evaluation_filters(placeholder, filters)
-    outcome = outcome_case_sql()
+    outcome = outcome_case_sql(finding_ref="e.finding_id")
     if outcome_filter:
         where.add(f"({outcome}) = ?", outcome_filter)
     sql = (
