@@ -293,6 +293,7 @@ class _StoreSharedMixin:
         *,
         dimension: str = "category",
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict]:
         """Outcome mix grouped by category, repo, author, scope or origin."""
         from mira.feedback.evaluation_sql import summary_sql
@@ -302,6 +303,7 @@ class _StoreSharedMixin:
             self._scoped_filters(filters),
             dimension=dimension,
             limit=limit,
+            offset=offset,
         )
         buckets = []
         for row in self._analytics_fetchall(sql, params):

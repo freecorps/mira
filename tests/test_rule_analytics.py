@@ -1449,3 +1449,71 @@ def test_repo_scope_still_covers_the_whole_review() -> None:
     ]
     linked = {e.finding_id for e in _build(_exposed("repo", ""), findings, ReviewScope())}
     assert linked == {None, "a", "b"}
+
+
+def test_summary_walks_high_cardinality_dimensions(isolated_index: Path) -> None:
+    """`author` has no small domain, so a fixed per-repo cap loses buckets.
+
+    Each repository here has many one-off authors that outrank `shared`
+    locally, but `shared` appears in both and wins globally. A capped
+    single-page read would drop it from both result sets.
+    """
+    from mira.feedback import analytics as analytics_module
+
+    original = analytics_module._SUMMARY_PAGE_SIZE
+    analytics_module._SUMMARY_PAGE_SIZE = 2
+    try:
+        for repo in ("one", "two"):
+            store = IndexStore.open("acme", repo)
+            try:
+                for index in range(5):
+                    finding_id = f"solo-{index}"
+                    _finding(store, finding_id)
+                    store.record_rule_evaluations(
+                        [
+                            _evaluation(
+                                finding_id,
+                                repo=repo,
+                                pr_author=f"solo-{repo}-{index}",
+                                head_sha=f"{repo}-solo-{index}",
+                            )
+                        ]
+                    )
+                # `shared` gets a single exposure per repo — last locally,
+                # but present in both.
+                _finding(store, "shared")
+                store.record_rule_evaluations(
+                    [
+                        _evaluation(
+                            "shared",
+                            repo=repo,
+                            pr_author="shared",
+                            head_sha=f"{repo}-shared",
+                        )
+                    ]
+                )
+            finally:
+                store.close()
+
+        buckets = {b["bucket"]: b for b in analytics_module.summarize(dimension="author")}
+        assert "shared" in buckets
+        assert buckets["shared"]["exposures"] == 2
+        # And the whole domain survived the walk: 10 solos plus shared.
+        assert len(buckets) == 11
+    finally:
+        analytics_module._SUMMARY_PAGE_SIZE = original
+
+
+def test_summary_paging_is_stable(store: IndexStore) -> None:
+    """Offset paging needs a deterministic order, including on ties."""
+    for index in range(6):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}", pr_author=f"user{index}")])
+
+    walked: list[str] = []
+    for offset in (0, 2, 4):
+        page = store.rule_analytics_summary(dimension="author", limit=2, offset=offset)
+        walked.extend(bucket["bucket"] for bucket in page)
+
+    assert len(walked) == 6
+    assert len(set(walked)) == 6

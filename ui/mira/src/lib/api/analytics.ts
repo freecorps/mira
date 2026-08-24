@@ -35,6 +35,14 @@ function query(params: Record<string, string | number | undefined>) {
   return rendered ? `?${rendered}` : ""
 }
 
+// Owners are not path-safe. `IndexStore.open` namespaces non-GitHub owners as
+// `_{platform}/{owner}`, and that value reaches the client on aggregate rows —
+// an unencoded slash would add a path segment and miss the route entirely.
+// `#`, `?` and `%` in a name break the same way.
+function seg(value: string | number) {
+  return encodeURIComponent(String(value))
+}
+
 function filterParams(f: RuleAnalyticsFilters) {
   return {
     owner: f.owner,
@@ -63,7 +71,7 @@ export const analyticsApi = {
 
   getRuleAnalytics: (owner: string, repo: string, ruleId: number) =>
     fetchJson<RuleAnalyticsDetail>(
-      `/api/analytics/rules/${owner}/${repo}/${ruleId}`
+      `/api/analytics/rules/${seg(owner)}/${seg(repo)}/${seg(ruleId)}`
     ),
 
   listRuleEvaluations: (
@@ -73,11 +81,13 @@ export const analyticsApi = {
     opts: { outcome?: string; limit?: number; offset?: number } = {}
   ) =>
     fetchJson<RuleEvaluationPage>(
-      `/api/analytics/rules/${owner}/${repo}/${ruleId}/evaluations${query({
-        outcome: opts.outcome,
-        limit: opts.limit,
-        offset: opts.offset,
-      })}`
+      `/api/analytics/rules/${seg(owner)}/${seg(repo)}/${seg(ruleId)}/evaluations${query(
+        {
+          outcome: opts.outcome,
+          limit: opts.limit,
+          offset: opts.offset,
+        }
+      )}`
     ),
 
   analyticsSummary: (dimension: string, f: RuleAnalyticsFilters = {}) =>
@@ -97,7 +107,7 @@ export const analyticsApi = {
     body: { action: "accepted" | "dismissed" | "deferred"; note?: string }
   ) =>
     postJson<{ ok: boolean; event_id: number }>(
-      `/api/analytics/regressions/${owner}/${repo}/${ruleId}/ack`,
+      `/api/analytics/regressions/${seg(owner)}/${seg(repo)}/${seg(ruleId)}/ack`,
       { action: body.action, note: body.note ?? "" }
     ),
 
@@ -124,8 +134,10 @@ export const analyticsApi = {
     fmt: "csv" | "json",
     outcome = ""
   ) =>
-    `${API_BASE}/api/analytics/rules/${owner}/${repo}/${ruleId}/export${query({
-      fmt,
-      outcome,
-    })}`,
+    `${API_BASE}/api/analytics/rules/${seg(owner)}/${seg(repo)}/${seg(ruleId)}/export${query(
+      {
+        fmt,
+        outcome,
+      }
+    )}`,
 }

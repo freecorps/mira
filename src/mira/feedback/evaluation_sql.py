@@ -260,8 +260,14 @@ def summary_sql(
     *,
     dimension: str,
     limit: int,
+    offset: int = 0,
 ) -> tuple[str, tuple[Any, ...]]:
-    """Aggregate outcomes grouped by one dimension (category/repo/author/...)."""
+    """Aggregate outcomes grouped by one dimension (category/repo/author/...).
+
+    Ordered by exposures then bucket name. The name tiebreak is what makes
+    offset paging stable: without it, equal-count buckets could reorder between
+    pages and the caller would skip or repeat one while walking the domain.
+    """
     column = SUMMARY_DIMENSIONS.get(dimension)
     if column is None:
         raise ValueError(f"unsupported summary dimension: {dimension}")
@@ -290,10 +296,10 @@ def summary_sql(
         "LEFT JOIN review_findings f ON f.id = e.finding_id "
         "LEFT JOIN signals s ON s.finding_id = e.finding_id "
         f"WHERE {where.render()} "
-        f"GROUP BY {column} ORDER BY exposures DESC "
-        f"LIMIT {placeholder}"
+        f"GROUP BY {column} ORDER BY exposures DESC, bucket ASC "
+        f"LIMIT {placeholder} OFFSET {placeholder}"
     )
-    return sql, (*where.params, limit)
+    return sql, (*where.params, limit, offset)
 
 
 def glob_to_like(pattern: str) -> str:
