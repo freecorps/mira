@@ -193,10 +193,11 @@ async def gather_inputs(
     if capability.can_read_ci:
         ci = await provider.get_ci_state(pr_info)
 
-    human_states: dict[str, str] = {}
-    states_getter = getattr(provider, "get_review_states", None)
-    if states_getter is not None:
-        human_states = dict(await states_getter(pr_info) or {})
+    if not capability.can_read_review_states:
+        # An empty mapping would read as "no human has objected", which is the
+        # one thing the gate must never assume on a provider's behalf.
+        raise GateUnavailable(f"{capability.provider} cannot report human review states")
+    human_states = dict(await provider.get_review_states(pr_info) or {})
 
     if signal.changed_paths is None:
         changed_paths, added, deleted = await provider.get_pr_change_stats(pr_info)

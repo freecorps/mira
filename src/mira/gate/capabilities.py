@@ -35,6 +35,10 @@ class GateCapabilities:
     can_read_ci: bool = False
     # Can report the author's association/permission on the repository.
     can_read_association: bool = False
+    # Can report each human reviewer's latest review state. Declared rather
+    # than assumed, because the base implementation returns an empty mapping
+    # and "{}" reads as "nobody objected".
+    can_read_review_states: bool = False
     # Can list labels on the pull request.
     can_read_labels: bool = False
     # Can read a CODEOWNERS file at the head ref.
@@ -50,6 +54,7 @@ class GateCapabilities:
             "can_publish_status": self.can_publish_status,
             "can_read_ci": self.can_read_ci,
             "can_read_association": self.can_read_association,
+            "can_read_review_states": self.can_read_review_states,
             "can_read_labels": self.can_read_labels,
             "can_read_codeowners": self.can_read_codeowners,
             "notes": list(self.notes),
@@ -65,6 +70,7 @@ NO_CAPABILITIES = GateCapabilities(
 
 GITHUB_CAPABILITIES = GateCapabilities(
     provider="github",
+    can_read_review_states=True,
     can_approve=True,
     can_request_changes=True,
     can_publish_status=True,
@@ -81,6 +87,7 @@ GITHUB_CAPABILITIES = GateCapabilities(
 # gate does not pretend otherwise.
 GITLAB_CAPABILITIES = GateCapabilities(
     provider="gitlab",
+    can_read_review_states=True,
     can_approve=True,
     can_request_changes=False,
     can_publish_status=True,
@@ -98,6 +105,7 @@ GITLAB_CAPABILITIES = GateCapabilities(
 
 FORGEJO_CAPABILITIES = GateCapabilities(
     provider="forgejo",
+    can_read_review_states=True,
     can_approve=True,
     can_request_changes=True,
     can_publish_status=True,
@@ -129,6 +137,7 @@ _FLAGS = (
     "can_publish_status",
     "can_read_ci",
     "can_read_association",
+    "can_read_review_states",
     "can_read_labels",
     "can_read_codeowners",
 )

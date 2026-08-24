@@ -283,6 +283,7 @@ _READ_ONLY = GateCapabilities(
     can_publish_status=True,
     can_read_ci=True,
     can_read_association=True,
+    can_read_review_states=True,
     can_read_labels=True,
 )
 
@@ -328,7 +329,11 @@ async def test_a_provider_that_cannot_read_labels_blocks_a_label_policy() -> Non
 async def test_a_provider_that_cannot_read_ci_never_clears_the_ci_requirement() -> None:
     provider = FakeProvider(
         capabilities=GateCapabilities(
-            provider="github", can_approve=True, can_read_labels=True, can_read_ci=False
+            provider="github",
+            can_approve=True,
+            can_read_labels=True,
+            can_read_review_states=True,
+            can_read_ci=False,
         )
     )
     decision = await _evaluate(provider, _config(mode="enforce"))
@@ -342,6 +347,7 @@ async def test_a_provider_that_cannot_read_association_never_clears_it() -> None
             provider="github",
             can_approve=True,
             can_read_labels=True,
+            can_read_review_states=True,
             can_read_ci=True,
             can_read_association=False,
         )
@@ -740,3 +746,20 @@ async def test_a_dry_run_review_is_still_scored_on_its_own_findings() -> None:
     )
     assert decision.state == "not_approved"
     assert ReasonCode.OPEN_BLOCKER in decision.reason_codes()
+
+
+async def test_a_provider_that_cannot_report_review_states_is_an_error() -> None:
+    """An empty mapping would read as "no human has objected"."""
+    provider = FakeProvider(
+        capabilities=GateCapabilities(
+            provider="github",
+            can_approve=True,
+            can_read_labels=True,
+            can_read_ci=True,
+            can_read_association=True,
+            can_read_review_states=False,
+        )
+    )
+    decision = await _evaluate(provider, _config(mode="enforce"))
+    assert decision.state == "error"
+    assert provider.verdicts == []
