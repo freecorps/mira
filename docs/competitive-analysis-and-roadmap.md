@@ -290,6 +290,9 @@ para leitura; toda nova interação de finding usa o modelo v2.
 
 **Objetivo:** transformar sinais em regras úteis, explícitas e governadas.
 
+**Status:** implementada em agosto de 2026, com auto-aplicação desativada por
+padrão e compatibilidade de migração para regras anteriores.
+
 - Sintetizar regra e rationale a partir do finding + resposta humana + contexto do código.
 - Deduplicar semanticamente candidatos equivalentes.
 - Inferir o menor escopo seguro: path/símbolo/linguagem/repo antes de organização.
@@ -302,6 +305,35 @@ para leitura; toda nova interação de finding usa o modelo v2.
 - Feature flags: `feedback_v2`, `learning_synthesis`, `learning_auto_apply` (última desligada por padrão).
 
 **Aceite:** uma discordância produz candidato explicável; candidato aprovado afeta apenas reviews no escopo; usuário consegue provar no dashboard por que uma regra foi criada e onde foi aplicada.
+
+#### Notas da implementação
+
+- Discordâncias textuais, rejeições explícitas e reações negativas com
+  proveniência completa geram `learning_candidates`; sinais incompletos ficam
+  auditáveis, mas não alimentam a síntese.
+- A classificação já usada para responder a threads propõe regra, rationale,
+  confiança e escopo. Um fallback determinístico cobre rejeições e reações que
+  não passam pelo classificador, sem acrescentar outra chamada de LLM ao
+  webhook.
+- A deduplicação usa fingerprint estável e similaridade de tokens, uma escolha
+  previsível e leve para o perfil Orange Pi. Evidências equivalentes são
+  agregadas no mesmo candidato.
+- O escopo proposto é limitado a símbolo/path com uma evidência; linguagem,
+  repositório e organização exigem respectivamente 3, 5 e 10 sinais por
+  padrão. Ampliar uma regra aprendida continua sujeito ao mesmo limite.
+- Candidatos ficam inativos até aprovação. O dashboard expõe rationale,
+  exemplos, SHA/path/finding de origem e permite editar, aprovar ou rejeitar;
+  editar uma regra aprovada cria uma nova versão e preserva a anterior como
+  `superseded`.
+- O retrieval filtra path, símbolo, linguagem, repositório e organização,
+  limita o orçamento por review e ordena regras manuais antes das aprendidas e
+  escopos específicos antes dos globais.
+- Regras aprovadas podem ser importadas/exportadas no formato YAML v1; imports
+  repetidos do mesmo fingerprint e escopo são idempotentes.
+- `learning.feedback_v2` e `learning.learning_synthesis` permitem desligar a
+  criação de candidatos. `learning.learning_auto_apply` permanece `false` por
+  padrão e, quando explicitamente habilitada, ainda exige confiança alta e a
+  quantidade mínima de evidências do escopo.
 
 ### Fase 3 — avaliação contínua e analytics (4–7 dias)
 

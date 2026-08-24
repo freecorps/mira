@@ -42,11 +42,13 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 
 ## Learning from feedback
 
-- `@miracodeai reject` thread resolution with feedback-event recording
-- Deterministic rule synthesis from reject signals
-- LLM-powered synthesis of human review patterns from merged PRs (extracts recurring themes from human reviewer comments)
-- Feedback stats API for inspecting the learning loop
-- Synthesized rules inject into future reviews automatically
+- Stable finding provenance for replies, explicit rejects, and supported 👍/👎 reactions
+- Explainable learning candidates with rationale, confidence, and linked evidence
+- Semantic candidate deduplication with conservative path/symbol/language/repo/org scopes
+- Admin approval queue: synthesized candidates are inactive by default
+- Rule comparison, editing, rejection, versioning, disabling, and YAML import/export in the dashboard
+- Scope-aware retrieval with manual and specific rules taking precedence
+- Feature flags for feedback capture, synthesis, and opt-in auto-application
 
 ## Platform integrations
 
