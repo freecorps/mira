@@ -37,6 +37,15 @@ _STATE_SUMMARY = {
     ),
 }
 
+# Delivery states that need a sentence to be read correctly. `partial` in
+# particular is easy to mistake for a failure when it is the opposite: the
+# explanation landed, and one of the ways it travels did not.
+_DELIVERY_NOTE = {
+    "partial": "the explanation reached the pull request, but one channel failed",
+    "failed": "the explanation did not reach the pull request",
+    "in_flight": "another worker is delivering this",
+}
+
 # Short status-check titles, which most platforms truncate hard.
 _STATE_TITLE = {
     "approved": "Approved",
@@ -128,6 +137,11 @@ def admin_explanation(decision: GateDecision) -> str:
         f"- **Mode**: `{decision.mode}` · **Policy**: `{decision.policy_version}`",
         f"- **Risk**: {decision.risk_score}/100 ({decision.risk_band})",
         f"- **Delivery**: `{decision.delivery_state}`"
+        + (
+            f" — {_DELIVERY_NOTE[decision.delivery_state]}"
+            if decision.delivery_state in _DELIVERY_NOTE
+            else ""
+        )
         + (f" → `{decision.delivery_ref}`" if decision.delivery_ref else "")
         + (f" after {decision.delivery_attempts} attempt(s)" if decision.delivery_attempts else ""),
     ]

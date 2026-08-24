@@ -53,9 +53,18 @@ DELIVERY_STATES: tuple[str, ...] = (
     "pending",
     "in_flight",
     "delivered",
+    # The explanation reached the pull request, and one of the ways it travels
+    # did not. Distinct from both neighbours on purpose: `delivered` would hide
+    # a missing status check behind a clean row, and `failed` would claim the
+    # decision never surfaced at all.
+    "partial",
     "failed",
     "skipped",
 )
+
+# Delivery states worth another attempt. Status checks and comments are
+# unclaimed precisely because re-sending one replaces it, so retrying is free.
+RETRYABLE_DELIVERY_STATES: frozenset[str] = frozenset({"pending", "failed", "partial"})
 
 RISK_BANDS: tuple[str, ...] = ("low", "medium", "high")
 

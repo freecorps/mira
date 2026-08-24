@@ -42,6 +42,7 @@ from mira.gate.explain import (
     status_title,
 )
 from mira.gate.models import (
+    RETRYABLE_DELIVERY_STATES,
     STATUS_CONTEXT,
     CIState,
     GateDecision,
@@ -376,7 +377,7 @@ async def evaluate(
     stored, created = _persist(decision)
     logger.info("Merge gate on %s: %s", pr_info.url, one_line(stored))
 
-    if deliver_side_effects and stored.delivery_state in {"pending", "failed"}:
+    if deliver_side_effects and stored.delivery_state in RETRYABLE_DELIVERY_STATES:
         stored = await deliver(provider, pr_info, stored, policy)
     return stored
 
@@ -446,20 +447,24 @@ async def deliver(
             outcomes.append(await _publish_comment(provider, pr_info, decision))
 
         if outcomes and not attempted_review_event:
-            # `delivered` when *any* channel got the explanation out, because
-            # that is the question this column answers: did the decision reach
-            # the pull request? Requiring all of them would let a repository
-            # with a broken comment surface re-deliver a perfectly published
-            # status check on every subsequent webhook, forever. The failure is
-            # not lost — it is recorded in `error` either way.
-            delivered = any(ok for ok, _ref, _error in outcomes)
+            # Three outcomes, not two. "Did the explanation reach the pull
+            # request?" and "is there still something to send?" are different
+            # questions, and collapsing them either hides a missing status
+            # check behind a clean row or re-sends one that published fine.
+            succeeded = sum(1 for ok, _ref, _error in outcomes if ok)
+            if succeeded == len(outcomes):
+                state = "delivered"
+            elif succeeded:
+                state = "partial"
+            else:
+                state = "failed"
             store.update_gate_decision_delivery(
                 decision.decision_key,
-                delivery_state="delivered" if delivered else "failed",
+                delivery_state=state,
                 delivery_ref=next((ref for ok, ref, _e in outcomes if ok and ref), ""),
                 error="; ".join(error for ok, _ref, error in outcomes if not ok),
             )
-            decision.delivery_state = "delivered" if delivered else "failed"
+            decision.delivery_state = state
 
         refreshed = store.get_gate_decision(decision.decision_key)
         return refreshed or decision
