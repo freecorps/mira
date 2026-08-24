@@ -30,7 +30,12 @@ from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
 from mira.exceptions import MiraError, ResponseParseError
-from mira.feedback.exposure import ExposedRule, exposed_rules_from_rows, record_review_exposures
+from mira.feedback.exposure import (
+    ExposedRule,
+    ReviewScope,
+    exposed_rules_from_rows,
+    record_review_exposures,
+)
 from mira.feedback.models import ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, new_finding_id
 from mira.feedback.retrieval import render_rule
@@ -458,6 +463,7 @@ class ReviewEngine:
         # Rules retrieval put in front of this review. Recorded as Phase 3
         # evaluations once the review has been posted and has an id.
         self._exposed_rules: list[ExposedRule] = []
+        self._review_scope = ReviewScope()
 
     async def _submit_verdict(self, pr_info: PRInfo, result: ReviewResult) -> None:
         """Submit an approve / request-changes review event, when opted in."""
@@ -1086,6 +1092,7 @@ class ReviewEngine:
                     head_sha=pr_info.head_sha,
                     findings=result.comments,
                     review_id=review_event.id,
+                    scope=self._review_scope,
                 )
             store.close()
 
@@ -1387,10 +1394,17 @@ class ReviewEngine:
                 )
 
                 changed_symbols: set[str] = set()
+                # Keep the per-file breakdown, not just the union: retrieval
+                # selects a language/symbol rule when *any* file matches, but
+                # Phase 3 attribution must only link the findings in the files
+                # that actually carry it.
+                symbols_by_path: dict[str, set[str]] = {}
                 for file in filtered:
                     summary = _rules_store.get_summary(file.path)
                     if summary:
-                        changed_symbols.update(symbol.name for symbol in summary.symbols)
+                        names = {symbol.name for symbol in summary.symbols}
+                        symbols_by_path[file.path] = names
+                        changed_symbols.update(names)
 
                 rule_rows = _rules_store.get_learned_rules_for_review(
                     paths=[file.path for file in filtered],
@@ -1404,6 +1418,10 @@ class ReviewEngine:
                 # persistence happen in different methods of the same run.
                 if self.config.learning.evaluation_analytics:
                     self._exposed_rules = exposed_rules_from_rows(rule_rows)
+                    self._review_scope = ReviewScope(
+                        languages={file.path: file.language for file in filtered if file.language},
+                        symbols=symbols_by_path,
+                    )
 
                 for ctx in _rules_store.list_review_context():
                     custom_rules.append({"title": ctx.title, "content": ctx.content})

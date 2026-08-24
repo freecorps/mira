@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import Any
 
@@ -50,20 +50,45 @@ def exposed_rules_from_rows(rows: list[Any]) -> list[ExposedRule]:
     return exposed
 
 
-def _rule_covers_finding(rule: ExposedRule, path: str, category: str) -> bool:
+@dataclass
+class ReviewScope:
+    """Per-file facts attribution needs, mirroring what retrieval matched on.
+
+    Retrieval selects a language- or symbol-scoped rule when *any* changed file
+    matches. Attribution has to be narrower: only the findings in a file that
+    actually carries that language or symbol belong to the rule. Without this,
+    a symbol-scoped rule collects feedback from every unrelated finding in the
+    review and its acceptance and regression numbers stop meaning anything.
+    """
+
+    languages: dict[str, str] = field(default_factory=dict)
+    symbols: dict[str, set[str]] = field(default_factory=dict)
+
+
+def _rule_covers_finding(rule: ExposedRule, path: str, category: str, scope: ReviewScope) -> bool:
     """Whether a produced finding falls inside the rule's declared scope.
 
     Attribution is scope-based and deliberately mechanical. We cannot know
     which prompt line the model actually leaned on, so we record the honest
     thing: the rule was in the prompt, and this finding is in its scope. The
     drill-down shows exactly that, so nobody has to trust a guess.
+
+    Language and symbol scopes fail closed when we have no metadata for the
+    file. Losing a link is recoverable -- the review-scoped exposure is still
+    recorded, so the rule never loses the fact that it ran -- while a wrong
+    link silently corrupts the rule's score.
     """
     if rule.category and category and rule.category != category:
         return False
     if rule.scope_type == "path" and rule.scope_value:
         return path == rule.scope_value or fnmatch(path, rule.scope_value)
-    # repo/org/language/symbol scopes cover every path in the review; the
-    # category check above is what narrows them.
+    if rule.scope_type == "language" and rule.scope_value:
+        language = scope.languages.get(path, "")
+        return bool(language) and language.lower() == rule.scope_value.lower()
+    if rule.scope_type == "symbol" and rule.scope_value:
+        return rule.scope_value in scope.symbols.get(path, set())
+    # repo/org scopes genuinely cover every path in the review; the category
+    # check above is what narrows them.
     return True
 
 
@@ -78,12 +103,14 @@ def build_rule_evaluations(
     head_sha: str,
     findings: list[Any],
     review_id: int = 0,
+    scope: ReviewScope | None = None,
 ) -> list[RuleEvaluation]:
     """Turn one review's exposures into the rows to persist.
 
     Produces a review-scoped row per rule (the rule was in play even if it
     produced nothing) plus one row per finding the rule's scope covers.
     """
+    review_scope = scope or ReviewScope()
     evaluations: list[RuleEvaluation] = []
     for rule in exposed:
         if not rule.rule_id:
@@ -130,7 +157,7 @@ def build_rule_evaluations(
                 continue
             path = str(getattr(finding, "path", "") or "")
             category = str(getattr(finding, "category", "") or "")
-            if not _rule_covers_finding(rule, path, category):
+            if not _rule_covers_finding(rule, path, category, review_scope):
                 continue
             evaluations.append(
                 RuleEvaluation(
@@ -165,6 +192,7 @@ def record_review_exposures(
     head_sha: str,
     findings: list[Any],
     review_id: int = 0,
+    scope: ReviewScope | None = None,
 ) -> int:
     """Persist the exposures for one review. Never raises.
 
@@ -184,6 +212,7 @@ def record_review_exposures(
             head_sha=head_sha,
             findings=findings,
             review_id=review_id,
+            scope=scope,
         )
         return int(store.record_rule_evaluations(evaluations))
     except Exception:
