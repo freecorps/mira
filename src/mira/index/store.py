@@ -9,7 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
-from mira.feedback.models import FeedbackEventV2, ReviewFinding
+from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.index._store_shared import _StoreSharedMixin
 from mira.models import PRFingerprint
@@ -217,6 +217,35 @@ CREATE TABLE IF NOT EXISTS feedback_events_v2 (
 CREATE INDEX IF NOT EXISTS idx_feedback_v2_finding
     ON feedback_events_v2(finding_id, created_at);
 
+CREATE TABLE IF NOT EXISTS learning_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    semantic_fingerprint TEXT NOT NULL,
+    rule_text TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    scope_type TEXT NOT NULL DEFAULT 'repo',
+    scope_value TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    synthesizer_version TEXT NOT NULL DEFAULT 'phase2-v1',
+    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+    positive_examples_json TEXT NOT NULL DEFAULT '[]',
+    negative_examples_json TEXT NOT NULL DEFAULT '[]',
+    source_finding_id TEXT,
+    source_feedback_id INTEGER,
+    superseded_by_id INTEGER,
+    cost_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0,
+    UNIQUE(semantic_fingerprint, scope_type, scope_value),
+    FOREIGN KEY (source_finding_id) REFERENCES review_findings(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_feedback_id) REFERENCES feedback_events_v2(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_learning_candidates_status
+    ON learning_candidates(status, updated_at);
+
 CREATE TABLE IF NOT EXISTS learned_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     rule_text TEXT NOT NULL DEFAULT '',
@@ -230,8 +259,20 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     status TEXT NOT NULL DEFAULT 'approved',
     -- Username of the admin who authored a manual rule; '' for synthesized.
     created_by TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    scope_type TEXT NOT NULL DEFAULT 'repo',
+    scope_value TEXT NOT NULL DEFAULT '',
+    origin_candidate_id INTEGER,
+    rationale TEXT NOT NULL DEFAULT '',
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    effective_from REAL NOT NULL DEFAULT 0,
+    disabled_at REAL,
+    supersedes_rule_id INTEGER,
+    semantic_fingerprint TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    FOREIGN KEY (origin_candidate_id) REFERENCES learning_candidates(id) ON DELETE SET NULL,
+    FOREIGN KEY (supersedes_rule_id) REFERENCES learned_rules(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS package_manifests (
@@ -395,6 +436,16 @@ class LearnedRuleRow:
     active: bool = True
     status: str = "approved"  # 'pending' | 'approved' | 'rejected'
     created_by: str = ""
+    version: int = 1
+    scope_type: str = "repo"
+    scope_value: str = ""
+    origin_candidate_id: int | None = None
+    rationale: str = ""
+    evidence_count: int = 0
+    effective_from: float = 0.0
+    disabled_at: float | None = None
+    supersedes_rule_id: int | None = None
+    semantic_fingerprint: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -480,6 +531,30 @@ class IndexStore(_StoreSharedMixin):
             self._conn.execute(
                 "ALTER TABLE learned_rules ADD COLUMN created_by TEXT NOT NULL DEFAULT ''"
             )
+        learning_rule_columns = {
+            "version": "INTEGER NOT NULL DEFAULT 1",
+            "scope_type": "TEXT NOT NULL DEFAULT 'repo'",
+            "scope_value": "TEXT NOT NULL DEFAULT ''",
+            "origin_candidate_id": "INTEGER",
+            "rationale": "TEXT NOT NULL DEFAULT ''",
+            "evidence_count": "INTEGER NOT NULL DEFAULT 0",
+            "effective_from": "REAL NOT NULL DEFAULT 0",
+            "disabled_at": "REAL",
+            "supersedes_rule_id": "INTEGER",
+            "semantic_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, ddl in learning_rule_columns.items():
+            if column not in lr_cols:
+                self._conn.execute(f"ALTER TABLE learned_rules ADD COLUMN {column} {ddl}")
+        self._conn.execute(
+            "UPDATE learned_rules SET scope_type = CASE WHEN path_pattern <> '' "
+            "AND scope_type = 'repo' AND scope_value = '' THEN 'path' ELSE scope_type END, "
+            "scope_value = CASE WHEN path_pattern <> '' AND scope_value = '' "
+            "THEN path_pattern ELSE scope_value END, evidence_count = CASE "
+            "WHEN evidence_count = 0 THEN sample_count ELSE evidence_count END, "
+            "effective_from = CASE WHEN effective_from = 0 AND status = 'approved' "
+            "AND active = 1 THEN created_at ELSE effective_from END"
+        )
         self._conn.commit()
         self._backfill_feedback_v2()
 
@@ -1691,6 +1766,202 @@ class IndexStore(_StoreSharedMixin):
             stats[key]["total"] += count
         return stats
 
+    # ── Governed learning candidates ──
+
+    _LC_COLS = (
+        "id, semantic_fingerprint, rule_text, rationale, scope_type, scope_value, "
+        "category, language, confidence, status, synthesizer_version, "
+        "evidence_ids_json, positive_examples_json, negative_examples_json, "
+        "source_finding_id, source_feedback_id, superseded_by_id, cost_tokens, "
+        "created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_learning_candidate(row: tuple) -> LearningCandidate:
+        return LearningCandidate(
+            id=row[0],
+            semantic_fingerprint=row[1],
+            rule_text=row[2],
+            rationale=row[3],
+            scope_type=row[4],
+            scope_value=row[5],
+            category=row[6],
+            language=row[7],
+            confidence=row[8],
+            status=row[9],
+            synthesizer_version=row[10],
+            evidence_ids_json=row[11],
+            positive_examples_json=row[12],
+            negative_examples_json=row[13],
+            source_finding_id=row[14],
+            source_feedback_id=row[15],
+            superseded_by_id=row[16],
+            cost_tokens=row[17],
+            created_at=row[18],
+            updated_at=row[19],
+        )
+
+    @staticmethod
+    def _merge_json_lists(current: str, incoming: str) -> str:
+        merged: list[object] = []
+        seen: set[str] = set()
+        for raw in (current, incoming):
+            try:
+                values = json.loads(raw or "[]")
+            except (TypeError, json.JSONDecodeError):
+                values = []
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                key = json.dumps(value, sort_keys=True)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(value)
+        return json.dumps(merged, sort_keys=True)
+
+    def upsert_learning_candidate(
+        self, candidate: LearningCandidate
+    ) -> tuple[LearningCandidate, bool]:
+        """Insert a proposal or merge equivalent evidence without changing governance."""
+        now = time.time()
+        existing = self._conn.execute(
+            f"SELECT {self._LC_COLS} FROM learning_candidates "
+            "WHERE semantic_fingerprint = ? AND scope_type = ? AND scope_value = ?",
+            (candidate.semantic_fingerprint, candidate.scope_type, candidate.scope_value),
+        ).fetchone()
+        if existing:
+            current = self._row_to_learning_candidate(existing)
+            evidence_json = self._merge_json_lists(
+                current.evidence_ids_json, candidate.evidence_ids_json
+            )
+            positives_json = self._merge_json_lists(
+                current.positive_examples_json, candidate.positive_examples_json
+            )
+            negatives_json = self._merge_json_lists(
+                current.negative_examples_json, candidate.negative_examples_json
+            )
+            self._conn.execute(
+                "UPDATE learning_candidates SET rule_text = ?, rationale = ?, category = ?, "
+                "language = ?, confidence = ?, evidence_ids_json = ?, "
+                "positive_examples_json = ?, negative_examples_json = ?, cost_tokens = ?, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    candidate.rule_text or current.rule_text,
+                    candidate.rationale or current.rationale,
+                    candidate.category or current.category,
+                    candidate.language or current.language,
+                    max(current.confidence, candidate.confidence),
+                    evidence_json,
+                    positives_json,
+                    negatives_json,
+                    current.cost_tokens + candidate.cost_tokens,
+                    now,
+                    current.id,
+                ),
+            )
+            self._conn.commit()
+            return self.get_learning_candidate(current.id), False  # type: ignore[return-value]
+
+        candidate.created_at = candidate.created_at or now
+        candidate.updated_at = now
+        cur = self._conn.execute(
+            "INSERT INTO learning_candidates "
+            "(semantic_fingerprint, rule_text, rationale, scope_type, scope_value, "
+            "category, language, confidence, status, synthesizer_version, "
+            "evidence_ids_json, positive_examples_json, negative_examples_json, "
+            "source_finding_id, source_feedback_id, superseded_by_id, cost_tokens, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?)",
+            (
+                candidate.semantic_fingerprint,
+                candidate.rule_text,
+                candidate.rationale,
+                candidate.scope_type,
+                candidate.scope_value,
+                candidate.category,
+                candidate.language,
+                candidate.confidence,
+                candidate.status,
+                candidate.synthesizer_version,
+                candidate.evidence_ids_json,
+                candidate.positive_examples_json,
+                candidate.negative_examples_json,
+                candidate.source_finding_id,
+                candidate.source_feedback_id,
+                candidate.superseded_by_id,
+                candidate.cost_tokens,
+                candidate.created_at,
+                candidate.updated_at,
+            ),
+        )
+        self._conn.commit()
+        if cur.lastrowid is None:
+            raise RuntimeError("INSERT into learning_candidates did not return a row id")
+        return self.get_learning_candidate(cur.lastrowid), True  # type: ignore[return-value]
+
+    def get_learning_candidate(self, candidate_id: int) -> LearningCandidate | None:
+        row = self._conn.execute(
+            f"SELECT {self._LC_COLS} FROM learning_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return self._row_to_learning_candidate(row) if row else None
+
+    def list_learning_candidates(
+        self, status: str | None = None, limit: int = 500
+    ) -> list[LearningCandidate]:
+        if status:
+            rows = self._conn.execute(
+                f"SELECT {self._LC_COLS} FROM learning_candidates WHERE status = ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT {self._LC_COLS} FROM learning_candidates ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._row_to_learning_candidate(row) for row in rows]
+
+    def update_learning_candidate(
+        self,
+        candidate_id: int,
+        *,
+        rule_text: str,
+        rationale: str,
+        scope_type: str,
+        scope_value: str,
+        category: str,
+        language: str,
+        semantic_fingerprint: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE learning_candidates SET rule_text = ?, rationale = ?, scope_type = ?, "
+            "scope_value = ?, category = ?, language = ?, semantic_fingerprint = ?, "
+            "updated_at = ? WHERE id = ?",
+            (
+                rule_text,
+                rationale,
+                scope_type,
+                scope_value,
+                category,
+                language,
+                semantic_fingerprint,
+                time.time(),
+                candidate_id,
+            ),
+        )
+        self._conn.commit()
+
+    def set_learning_candidate_status(
+        self, candidate_id: int, status: str, superseded_by_id: int | None = None
+    ) -> None:
+        self._conn.execute(
+            "UPDATE learning_candidates SET status = ?, superseded_by_id = ?, "
+            "updated_at = ? WHERE id = ?",
+            (status, superseded_by_id, time.time(), candidate_id),
+        )
+        self._conn.commit()
+
     def upsert_learned_rule(
         self,
         rule_text: str,
@@ -1710,8 +1981,18 @@ class IndexStore(_StoreSharedMixin):
             # must never silently re-activate a rejected rule or auto-approve.
             self._conn.execute(
                 "UPDATE learned_rules SET rule_text = ?, source_signal = ?, "
-                "sample_count = ?, updated_at = ? WHERE id = ?",
-                (rule_text, source_signal, sample_count, now, existing[0]),
+                "sample_count = ?, evidence_count = ?, scope_type = ?, scope_value = ?, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    rule_text,
+                    source_signal,
+                    sample_count,
+                    sample_count,
+                    "path" if path_pattern else "repo",
+                    path_pattern,
+                    now,
+                    existing[0],
+                ),
             )
             self._conn.commit()
             return LearnedRuleRow(
@@ -1728,8 +2009,22 @@ class IndexStore(_StoreSharedMixin):
         cur = self._conn.execute(
             "INSERT INTO learned_rules "
             "(rule_text, source_signal, category, path_pattern, sample_count, "
-            "active, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
-            (rule_text, source_signal, category, path_pattern, sample_count, status, now, now),
+            "active, status, scope_type, scope_value, evidence_count, effective_from, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rule_text,
+                source_signal,
+                category,
+                path_pattern,
+                sample_count,
+                status,
+                "path" if path_pattern else "repo",
+                path_pattern,
+                sample_count,
+                now if status == "approved" else 0.0,
+                now,
+                now,
+            ),
         )
         self._conn.commit()
         row_id = cur.lastrowid
@@ -1758,13 +2053,25 @@ class IndexStore(_StoreSharedMixin):
             active=bool(r[6]),
             status=r[7],
             created_by=r[8],
-            created_at=r[9],
-            updated_at=r[10],
+            version=r[9],
+            scope_type=r[10],
+            scope_value=r[11],
+            origin_candidate_id=r[12],
+            rationale=r[13],
+            evidence_count=r[14],
+            effective_from=r[15],
+            disabled_at=r[16],
+            supersedes_rule_id=r[17],
+            semantic_fingerprint=r[18],
+            created_at=r[19],
+            updated_at=r[20],
         )
 
     _LR_COLS = (
         "id, rule_text, source_signal, category, path_pattern, "
-        "sample_count, active, status, created_by, created_at, updated_at"
+        "sample_count, active, status, created_by, version, scope_type, scope_value, "
+        "origin_candidate_id, rationale, evidence_count, effective_from, disabled_at, "
+        "supersedes_rule_id, semantic_fingerprint, created_at, updated_at"
     )
 
     def list_active_learned_rules(self) -> list[LearnedRuleRow]:
@@ -1773,7 +2080,48 @@ class IndexStore(_StoreSharedMixin):
             f"SELECT {self._LR_COLS} FROM learned_rules "
             "WHERE active = 1 AND status = 'approved' ORDER BY sample_count DESC"
         ).fetchall()
-        return [self._row_to_learned_rule(r) for r in rows]
+        rules = [self._row_to_learned_rule(r) for r in rows]
+
+        # SQLite keeps one database per repository. Pull only organization-
+        # scoped rules from sibling databases so broader rules behave the same
+        # way as the shared PostgreSQL backend.
+        if not self._owner or not self._repo:
+            return rules
+        for row in list_learned_rules_org_wide_sqlite(limit=2000, status="approved"):
+            if (
+                row.get("platform") != self._platform
+                or row.get("owner") != self._owner
+                or row.get("repo") == self._repo
+                or row.get("scope_type") != "org"
+                or not row.get("active")
+            ):
+                continue
+            rules.append(
+                LearnedRuleRow(
+                    id=row["id"],
+                    rule_text=row["rule_text"],
+                    source_signal=row["source_signal"],
+                    category=row["category"],
+                    path_pattern=row["path_pattern"],
+                    sample_count=row["sample_count"],
+                    active=row["active"],
+                    status=row["status"],
+                    created_by=row["created_by"],
+                    version=row["version"],
+                    scope_type=row["scope_type"],
+                    scope_value=row["scope_value"],
+                    origin_candidate_id=row["origin_candidate_id"],
+                    rationale=row["rationale"],
+                    evidence_count=row["evidence_count"],
+                    effective_from=row["effective_from"],
+                    disabled_at=row["disabled_at"],
+                    supersedes_rule_id=row["supersedes_rule_id"],
+                    semantic_fingerprint=row["semantic_fingerprint"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+            )
+        return rules
 
     def list_learned_rules(self, status: str | None = None) -> list[LearnedRuleRow]:
         """List learned rules, optionally filtered by approval status."""
@@ -1804,22 +2152,43 @@ class IndexStore(_StoreSharedMixin):
         status: str = "approved",
         active: bool = True,
         created_by: str = "",
+        version: int = 1,
+        scope_type: str = "repo",
+        scope_value: str = "",
+        origin_candidate_id: int | None = None,
+        rationale: str = "",
+        evidence_count: int = 0,
+        supersedes_rule_id: int | None = None,
+        semantic_fingerprint: str = "",
     ) -> LearnedRuleRow:
         """Insert an admin-authored rule (not deduped against existing)."""
         now = time.time()
         cur = self._conn.execute(
             "INSERT INTO learned_rules "
             "(rule_text, source_signal, category, path_pattern, sample_count, "
-            "active, status, created_by, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            "active, status, created_by, version, scope_type, scope_value, "
+            "origin_candidate_id, rationale, evidence_count, effective_from, disabled_at, "
+            "supersedes_rule_id, semantic_fingerprint, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rule_text,
                 source_signal,
                 category,
                 path_pattern,
+                evidence_count,
                 int(active),
                 status,
                 created_by,
+                version,
+                scope_type,
+                scope_value,
+                origin_candidate_id,
+                rationale,
+                evidence_count,
+                now if status == "approved" and active else 0.0,
+                None if active else now,
+                supersedes_rule_id,
+                semantic_fingerprint,
                 now,
                 now,
             ),
@@ -1831,26 +2200,62 @@ class IndexStore(_StoreSharedMixin):
         return self.get_learned_rule(row_id)  # type: ignore[return-value]
 
     def update_learned_rule(
-        self, rule_id: int, rule_text: str, category: str, path_pattern: str
+        self,
+        rule_id: int,
+        rule_text: str,
+        category: str,
+        path_pattern: str,
+        *,
+        scope_type: str,
+        scope_value: str,
+        rationale: str,
+        semantic_fingerprint: str,
     ) -> None:
         self._conn.execute(
             "UPDATE learned_rules SET rule_text = ?, category = ?, path_pattern = ?, "
+            "scope_type = ?, scope_value = ?, rationale = ?, semantic_fingerprint = ?, "
             "updated_at = ? WHERE id = ?",
-            (rule_text, category, path_pattern, time.time(), rule_id),
+            (
+                rule_text,
+                category,
+                path_pattern,
+                scope_type,
+                scope_value,
+                rationale,
+                semantic_fingerprint,
+                time.time(),
+                rule_id,
+            ),
         )
         self._conn.commit()
 
     def set_learned_rule_status(self, rule_id: int, status: str) -> None:
+        now = time.time()
         self._conn.execute(
-            "UPDATE learned_rules SET status = ?, updated_at = ? WHERE id = ?",
-            (status, time.time(), rule_id),
+            "UPDATE learned_rules SET status = ?, effective_from = CASE "
+            "WHEN ? = 'approved' AND effective_from = 0 THEN ? ELSE effective_from END, "
+            "updated_at = ? WHERE id = ?",
+            (status, status, now, now, rule_id),
         )
         self._conn.commit()
 
     def set_learned_rule_active(self, rule_id: int, active: bool) -> None:
         self._conn.execute(
-            "UPDATE learned_rules SET active = ?, updated_at = ? WHERE id = ?",
-            (int(active), time.time(), rule_id),
+            "UPDATE learned_rules SET active = ?, disabled_at = ?, updated_at = ? WHERE id = ?",
+            (int(active), None if active else time.time(), time.time(), rule_id),
+        )
+        self._conn.commit()
+
+    def supersede_learned_rule(self, rule_id: int, replacement_id: int) -> None:
+        now = time.time()
+        self._conn.execute(
+            "UPDATE learned_rules SET active = 0, status = 'superseded', disabled_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (now, now, rule_id),
+        )
+        self._conn.execute(
+            "UPDATE learned_rules SET supersedes_rule_id = ?, updated_at = ? WHERE id = ?",
+            (rule_id, now, replacement_id),
         )
         self._conn.commit()
 
@@ -2201,6 +2606,55 @@ def list_vulnerabilities_org_wide_sqlite(limit: int = 1000) -> list[dict]:
     return rows[:limit]
 
 
+def list_learning_candidates_org_wide_sqlite(
+    limit: int = 500, status: str | None = None
+) -> list[dict]:
+    """List governed candidates across per-repository SQLite databases."""
+    index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
+    rows: list[dict] = []
+    for platform, owner, repo, db_path in _iter_repo_dbs(index_dir):
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "learning_candidates" not in tables:
+                    continue
+                where = ""
+                params: tuple[object, ...] = ()
+                if status:
+                    where, params = " WHERE status = ?", (status,)
+                query = (
+                    "SELECT id, semantic_fingerprint, rule_text, rationale, scope_type, "
+                    "scope_value, category, language, confidence, status, "
+                    "synthesizer_version, evidence_ids_json, positive_examples_json, "
+                    "negative_examples_json, source_finding_id, source_feedback_id, "
+                    "superseded_by_id, cost_tokens, created_at, updated_at "
+                    f"FROM learning_candidates{where} ORDER BY updated_at DESC"
+                )
+                for row in conn.execute(query, params).fetchall():
+                    candidate = IndexStore._row_to_learning_candidate(row)
+                    rows.append(
+                        {
+                            **candidate.__dict__,
+                            "evidence_count": candidate.evidence_count,
+                            "platform": platform,
+                            "owner": owner,
+                            "repo": repo,
+                        }
+                    )
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+    rows.sort(key=lambda row: -(row["updated_at"] or 0.0))
+    return rows[:limit]
+
+
 def list_learned_rules_org_wide_sqlite(limit: int = 500, status: str | None = None) -> list[dict]:
     """SQLite equivalent of pg_store.list_learned_rules_org_wide.
 
@@ -2220,12 +2674,30 @@ def list_learned_rules_org_wide_sqlite(limit: int = 500, status: str | None = No
                     continue
                 status_sel = "status" if has_status else "'approved'"
                 created_by_sel = "created_by" if "created_by" in cols else "''"
-                where, params = "", ()
+                version_sel = "version" if "version" in cols else "1"
+                scope_type_sel = (
+                    "scope_type"
+                    if "scope_type" in cols
+                    else "CASE WHEN path_pattern <> '' THEN 'path' ELSE 'repo' END"
+                )
+                scope_value_sel = "scope_value" if "scope_value" in cols else "path_pattern"
+                origin_sel = "origin_candidate_id" if "origin_candidate_id" in cols else "NULL"
+                rationale_sel = "rationale" if "rationale" in cols else "''"
+                evidence_sel = "evidence_count" if "evidence_count" in cols else "sample_count"
+                effective_sel = "effective_from" if "effective_from" in cols else "created_at"
+                disabled_sel = "disabled_at" if "disabled_at" in cols else "NULL"
+                supersedes_sel = "supersedes_rule_id" if "supersedes_rule_id" in cols else "NULL"
+                fingerprint_sel = "semantic_fingerprint" if "semantic_fingerprint" in cols else "''"
+                where = ""
+                params: tuple[object, ...] = ()
                 if status and has_status:
                     where, params = " WHERE status = ?", (status,)
                 cur = conn.execute(
                     "SELECT id, rule_text, source_signal, category, path_pattern, "
-                    f"sample_count, active, {status_sel}, {created_by_sel}, "
+                    f"sample_count, active, {status_sel}, {created_by_sel}, {version_sel}, "
+                    f"{scope_type_sel}, {scope_value_sel}, {origin_sel}, {rationale_sel}, "
+                    f"{evidence_sel}, {effective_sel}, {disabled_sel}, {supersedes_sel}, "
+                    f"{fingerprint_sel}, "
                     "created_at, updated_at "
                     f"FROM learned_rules{where} ORDER BY updated_at DESC",
                     params,
@@ -2245,8 +2717,18 @@ def list_learned_rules_org_wide_sqlite(limit: int = 500, status: str | None = No
                             "active": bool(r[6]),
                             "status": r[7],
                             "created_by": r[8],
-                            "created_at": r[9],
-                            "updated_at": r[10],
+                            "version": r[9],
+                            "scope_type": r[10],
+                            "scope_value": r[11],
+                            "origin_candidate_id": r[12],
+                            "rationale": r[13],
+                            "evidence_count": r[14],
+                            "effective_from": r[15],
+                            "disabled_at": r[16],
+                            "supersedes_rule_id": r[17],
+                            "semantic_fingerprint": r[18],
+                            "created_at": r[19],
+                            "updated_at": r[20],
                         }
                     )
             finally:

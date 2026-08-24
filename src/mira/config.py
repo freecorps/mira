@@ -323,6 +323,21 @@ class DatabaseConfig(BaseModel):
     )
 
 
+class LearningConfig(BaseModel):
+    """Feature gates and conservative limits for feedback-driven learning."""
+
+    feedback_v2: bool = True
+    learning_synthesis: bool = True
+    # Opt-in only. When disabled, every synthesized candidate requires an
+    # explicit approval before it can affect a review.
+    learning_auto_apply: bool = False
+    max_rules_per_review: int = Field(default=10, ge=1, le=50)
+    min_evidence_path: int = Field(default=1, ge=1)
+    min_evidence_language: int = Field(default=3, ge=1)
+    min_evidence_repo: int = Field(default=5, ge=1)
+    min_evidence_org: int = Field(default=10, ge=1)
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -330,6 +345,7 @@ class MiraConfig(BaseModel):
     index: IndexConfig = Field(default_factory=IndexConfig)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    learning: LearningConfig = Field(default_factory=LearningConfig)
 
 
 def find_config_file(start_dir: Path | None = None) -> Path | None:

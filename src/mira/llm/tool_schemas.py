@@ -187,8 +187,46 @@ SUBMIT_THREAD_REPLY_TOOL = {
                         "concede gracefully. For questions, answer directly."
                     ),
                 },
+                "learning": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "For disagreement only, an explicit reusable rule proposal derived "
+                        "from the original finding and the human's explanation. Null for all "
+                        "other intents. This is a pending candidate, never an active rule."
+                    ),
+                    "properties": {
+                        "rule": {
+                            "type": "string",
+                            "description": (
+                                "A concise instruction that prevents this false-positive "
+                                "pattern without suppressing genuine defects."
+                            ),
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "Why the human feedback supports this rule.",
+                        },
+                        "scope_type": {
+                            "type": "string",
+                            "enum": ["symbol", "path", "language", "repo"],
+                        },
+                        "scope_value": {"type": "string"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                    },
+                    "required": [
+                        "rule",
+                        "rationale",
+                        "scope_type",
+                        "scope_value",
+                        "confidence",
+                    ],
+                },
             },
-            "required": ["intent", "reply"],
+            "required": ["intent", "reply", "learning"],
         },
     },
 }

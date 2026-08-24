@@ -53,6 +53,20 @@ class _StoreSharedMixin:
             parts.append(f"### {entry.title}\n{entry.content}\n")
         return "\n".join(parts)
 
-    def get_learned_rules_text(self) -> list[str]:
-        rules = self.list_active_learned_rules()  # type: ignore[attr-defined]
-        return [r.rule_text for r in rules[:10]]
+    def get_learned_rules_text(
+        self,
+        paths: list[str] | None = None,
+        languages: list[str] | None = None,
+        symbols: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[str]:
+        from mira.feedback.retrieval import render_rule, retrieve_rules
+
+        rules = retrieve_rules(
+            self,
+            paths=paths or [],
+            languages=languages or [],
+            symbols=symbols or [],
+            limit=limit,
+        )
+        return [render_rule(rule) for rule in rules]

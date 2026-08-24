@@ -1365,7 +1365,18 @@ class ReviewEngine:
                     pr_info.owner, pr_info.repo, platform=pr_info.platform
                 )
 
-                learned_rules = _rules_store.get_learned_rules_text()
+                changed_symbols: set[str] = set()
+                for file in filtered:
+                    summary = _rules_store.get_summary(file.path)
+                    if summary:
+                        changed_symbols.update(symbol.name for symbol in summary.symbols)
+
+                learned_rules = _rules_store.get_learned_rules_text(
+                    paths=[file.path for file in filtered],
+                    languages=[file.language for file in filtered if file.language],
+                    symbols=sorted(changed_symbols),
+                    limit=self.config.learning.max_rules_per_review,
+                )
 
                 for ctx in _rules_store.list_review_context():
                     custom_rules.append({"title": ctx.title, "content": ctx.content})

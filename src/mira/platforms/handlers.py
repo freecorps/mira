@@ -13,16 +13,19 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader
 
 from mira.config import load_config
+from mira.core.diff_parser import parse_diff
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
 from mira.dashboard.models_config import llm_config_for
 from mira.feedback.models import FeedbackEventV2
 from mira.feedback.service import (
-    DISAGREEMENT_ACK,
+    create_learning_candidate_for_feedback,
+    feedback_ack,
     record_finding_feedback,
     resolve_finding,
     set_finding_state,
 )
+from mira.feedback.synthesis import synthesize_candidate
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
@@ -54,6 +57,38 @@ PAUSE_LABEL = "mira-paused"
 _PAUSE_KEYWORDS = {"pause"}
 
 _RESUME_KEYWORDS = {"resume"}
+
+_MAX_THREAD_CODE_CONTEXT = 6000
+
+
+async def _thread_code_context(
+    provider: Any,
+    pr_info: Any,
+    path: str,
+    line: int,
+) -> str:
+    """Fetch only the relevant diff hunk for reply classification/synthesis."""
+    if not path or not hasattr(provider, "get_pr_diff"):
+        return ""
+    try:
+        diff_text = await provider.get_pr_diff(pr_info)
+        if not isinstance(diff_text, str):
+            return ""
+        file = next((item for item in parse_diff(diff_text).files if item.path == path), None)
+        if file is None or not file.hunks:
+            return ""
+        hunk = next(
+            (
+                item
+                for item in file.hunks
+                if item.target_start <= line <= item.target_start + max(item.target_length - 1, 0)
+            ),
+            file.hunks[0],
+        )
+        return hunk.content[:_MAX_THREAD_CODE_CONTEXT]
+    except Exception as exc:
+        logger.debug("Could not load thread code context for %s: %s", path, exc)
+        return ""
 
 
 def _open_store(owner: str, repo: str, platform: str = "github") -> IndexStore:
@@ -299,9 +334,13 @@ async def run_thread_reply(
     """
     config = load_config()
     llm = create_llm(llm_config_for("indexing", config.llm))
+    code_context = await _thread_code_context(provider, pr_info, comment_path, comment_line)
     prompt = _THREAD_REPLY_TEMPLATE.render(
         user_reply=human_reply or "(empty)",
         original_suggestion=original_suggestion,
+        comment_path=comment_path,
+        comment_line=comment_line,
+        code_context=code_context,
     )
     # Tool calling forces a schema-valid result — more reliable than parsing
     # free-form JSON. The provider's tenacity decorator retries transient fails.
@@ -327,7 +366,7 @@ async def run_thread_reply(
         "other": "reply_other",
     }
     source_id = source_event_id or f"review-comment:{comment_id}"
-    finding, _event, created = record_finding_feedback(
+    finding, feedback_event, created = record_finding_feedback(
         pr_info,
         kind=kind_by_intent.get(intent, "reply_other"),
         source_event_id=source_id,
@@ -360,7 +399,16 @@ async def run_thread_reply(
         return
 
     if intent == "disagreement":
-        reply_text = DISAGREEMENT_ACK
+        proposal = data.get("learning")
+        candidate, _candidate_created = create_learning_candidate_for_feedback(
+            pr_info,
+            finding,
+            feedback_event,
+            proposal=proposal if isinstance(proposal, dict) else None,
+            platform=platform,
+            config=config.learning,
+        )
+        reply_text = feedback_ack(candidate, pr_info.owner, pr_info.repo)
     elif not reply_text:
         logger.warning("Free-form thread reply: empty reply (intent=%s). Recorded only.", intent)
         return
@@ -398,6 +446,7 @@ async def run_pr_merged_learning(
     """Record merge state without treating silence as positive feedback."""
     owner, repo, number, pr_url = pr_info.owner, pr_info.repo, pr_info.number, pr_info.url
     store = _open_store(owner, repo, platform)
+    learning_config = load_config().learning
     unobserved = 0
     fixed = 0
     try:
@@ -432,7 +481,7 @@ async def run_pr_merged_learning(
                 ("thumbs_down", thread.negative_reactors),
             ):
                 for reaction_actor in actors:
-                    store.record_feedback_v2(
+                    reaction_event, reaction_created = store.record_feedback_v2(
                         FeedbackEventV2(
                             id=0,
                             finding_id=finding.id,
@@ -454,6 +503,13 @@ async def run_pr_merged_learning(
                             ),
                         )
                     )
+                    if reaction_kind == "thumbs_down" and reaction_created:
+                        synthesize_candidate(
+                            store,
+                            finding,
+                            reaction_event,
+                            config=learning_config,
+                        )
             prior = store.list_feedback_v2(finding_id=finding.id, limit=100)
             if any(event.kind in {"thumbs_down", "reply_disagree", "dismissed"} for event in prior):
                 store.update_review_finding_state(finding.id, "dismissed")
