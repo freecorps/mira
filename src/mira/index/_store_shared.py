@@ -103,6 +103,17 @@ class _StoreSharedMixin:
     def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
         raise NotImplementedError  # pragma: no cover - backends implement this
 
+    def _scoped_filters(self, filters: dict[str, Any] | None) -> dict[str, Any]:
+        """Force the store's own repository onto every analytics filter.
+
+        SQLite keeps one database per repository, so its rows are already
+        scoped. Postgres shares one table across the whole install, where a
+        caller that forgot the filter would silently read another repo's
+        history - so `PgIndexStore` overrides this. A store opened with an
+        empty owner/repo is the deliberate org-wide handle and stays unscoped.
+        """
+        return dict(filters or {})
+
     def _counts_from_row(self, row: tuple, offset: int) -> RuleOutcomeCounts:
         """Read the shared aggregate column block starting at `offset`."""
         from mira.feedback.evaluation import RuleOutcomeCounts
@@ -140,7 +151,7 @@ class _StoreSharedMixin:
         from mira.feedback.evaluation import RuleAnalyticsRow, origin_for_rule
         from mira.feedback.evaluation_sql import aggregate_rules_sql, repeated_false_positives_sql
 
-        active_filters = dict(filters or {})
+        active_filters = self._scoped_filters(filters)
         sql, params = aggregate_rules_sql(
             self._analytics_placeholder,
             active_filters,
@@ -192,7 +203,7 @@ class _StoreSharedMixin:
     def count_rule_analytics(self, filters: dict[str, Any] | None = None) -> int:
         from mira.feedback.evaluation_sql import count_rules_sql
 
-        sql, params = count_rules_sql(self._analytics_placeholder, dict(filters or {}))
+        sql, params = count_rules_sql(self._analytics_placeholder, self._scoped_filters(filters))
         rows = self._analytics_fetchall(sql, params)
         return int(rows[0][0]) if rows else 0
 
@@ -209,7 +220,7 @@ class _StoreSharedMixin:
 
         sql, params = evaluation_details_sql(
             self._analytics_placeholder,
-            dict(filters or {}),
+            self._scoped_filters(filters),
             limit=limit,
             offset=offset,
             outcome_filter=outcome,
@@ -259,7 +270,7 @@ class _StoreSharedMixin:
         from mira.feedback.evaluation_sql import count_evaluations_sql
 
         sql, params = count_evaluations_sql(
-            self._analytics_placeholder, dict(filters or {}), outcome_filter=outcome
+            self._analytics_placeholder, self._scoped_filters(filters), outcome_filter=outcome
         )
         rows = self._analytics_fetchall(sql, params)
         return int(rows[0][0]) if rows else 0
@@ -276,7 +287,7 @@ class _StoreSharedMixin:
 
         sql, params = summary_sql(
             self._analytics_placeholder,
-            dict(filters or {}),
+            self._scoped_filters(filters),
             dimension=dimension,
             limit=limit,
         )

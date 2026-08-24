@@ -277,3 +277,193 @@ def test_postgres_org_rules_apply_across_repositories(fake_conn):
     assert "Use another organization's convention." not in {
         rule.rule_text for rule in target.list_active_learned_rules()
     }
+
+
+# ─────────────────────────── Phase 3 evaluation analytics ───────────────────
+
+
+def _pg_finding(store, finding_id, *, path="src/a.py", category="security", state="open"):
+    from mira.feedback.models import ReviewFinding
+
+    store.save_review_finding(
+        ReviewFinding(
+            id=finding_id,
+            fingerprint=f"fp-{finding_id}",
+            review_id=0,
+            platform="github",
+            owner=store._owner,
+            repo=store._repo,
+            pr_number=7,
+            pr_url="https://example.test/pull/7",
+            base_sha="base",
+            head_sha="head",
+            path=path,
+            start_line=10,
+            end_line=10,
+            symbol="",
+            category=category,
+            severity="warning",
+            confidence=0.9,
+            title="Unsafe call",
+            body="body",
+            suggestion="",
+            detector="main",
+            prompt_model="model",
+            state=state,
+        )
+    )
+    if state != "open":
+        store.update_review_finding_state(finding_id, state)
+
+
+def _pg_evaluation(store, finding_id, *, rule_id=1, decision="instruction"):
+    from mira.feedback.evaluation import RuleEvaluation, evaluation_key
+
+    return RuleEvaluation(
+        evaluation_key=evaluation_key(
+            platform="github",
+            owner=store._owner,
+            repo=store._repo,
+            pr_number=7,
+            head_sha="head",
+            rule_id=rule_id,
+            rule_version=1,
+            decision=decision,
+            finding_id=finding_id,
+        ),
+        rule_id=rule_id,
+        rule_version=1,
+        rule_origin="learned",
+        category="security",
+        decision=decision,
+        finding_id=finding_id,
+        platform="github",
+        owner=store._owner,
+        repo=store._repo,
+        pr_number=7,
+        pr_author="alice",
+        head_sha="head",
+    )
+
+
+def _pg_feedback(store, finding_id, kind, actor="bob"):
+    from mira.feedback.models import FeedbackEventV2
+
+    store.record_feedback_v2(
+        FeedbackEventV2(
+            id=0,
+            finding_id=finding_id,
+            kind=kind,
+            actor=actor,
+            actor_role="",
+            raw_text="",
+            rationale="",
+            platform="github",
+            source_event_id=f"{kind}:{finding_id}:{actor}",
+            head_sha="head",
+            thread_state="",
+            provenance_complete=True,
+        )
+    )
+
+
+def _seed_evaluation_fixture(store):
+    """The same mix of signals on both backends, so the numbers must match."""
+    plan = {
+        "up": "thumbs_up",
+        "down": "thumbs_down",
+        "question": "reply_question",
+        "silent": "unobserved",
+        "agree": "reply_agree",
+    }
+    for finding_id, kind in plan.items():
+        _pg_finding(store, finding_id)
+        store.record_rule_evaluations([_pg_evaluation(store, finding_id)])
+        _pg_feedback(store, finding_id, kind)
+    _pg_finding(store, "resolved", state="fixed")
+    store.record_rule_evaluations([_pg_evaluation(store, "resolved")])
+    _pg_feedback(store, "resolved", "fixed", actor="merger")
+    # A review-scoped exposure with no finding attached.
+    store.record_rule_evaluations([_pg_evaluation(store, None)])
+
+
+def test_rule_evaluation_retry_is_idempotent_on_postgres(store):
+    _pg_finding(store, "f1")
+    evaluation = _pg_evaluation(store, "f1")
+
+    assert store.record_rule_evaluations([evaluation]) == 1
+    assert store.record_rule_evaluations([evaluation]) == 0
+    assert store.count_rule_evaluations({"rule_id": 1}) == 1
+
+
+def test_rule_analytics_parity_between_backends(store, tmp_path, monkeypatch):
+    """Identical inputs must produce identical aggregates on both backends."""
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    sqlite_store = IndexStore.open("acme", "widgets")
+    try:
+        _seed_evaluation_fixture(sqlite_store)
+        sqlite_counts = sqlite_store.aggregate_rule_analytics({"rule_id": 1})[0].counts.as_dict()
+        sqlite_details = sqlite_store.list_rule_evaluations({"rule_id": 1}, limit=100)
+    finally:
+        sqlite_store.close()
+
+    _seed_evaluation_fixture(store)
+    pg_counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts.as_dict()
+    pg_details = store.list_rule_evaluations({"rule_id": 1}, limit=100)
+
+    assert pg_counts == sqlite_counts
+    assert sorted((r["finding_id"] or "", r["outcome"]) for r in pg_details) == sorted(
+        (r["finding_id"] or "", r["outcome"]) for r in sqlite_details
+    )
+    # And the shared semantics actually held, rather than both being empty.
+    assert sqlite_counts["exposures"] == 7
+    assert sqlite_counts["findings"] == 6
+    assert sqlite_counts["positive"] == 3  # thumbs_up, reply_agree, fixed
+    assert sqlite_counts["negative"] == 1
+    assert sqlite_counts["neutral"] == 1
+    assert sqlite_counts["unobserved"] == 1
+    assert sqlite_counts["addressed"] == 1
+
+
+def test_postgres_summary_and_evidence_agree(store):
+    _seed_evaluation_fixture(store)
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    for outcome in ("positive", "negative", "neutral", "unobserved"):
+        rows = store.list_rule_evaluations({"rule_id": 1}, outcome=outcome, limit=100)
+        assert getattr(counts, outcome) == len(rows)
+
+    buckets = {b["bucket"]: b for b in store.rule_analytics_summary(dimension="author")}
+    assert buckets["alice"]["exposures"] == 7
+
+
+def test_postgres_unobserved_is_never_positive(store):
+    _pg_finding(store, "f1", state="outdated")
+    store.record_rule_evaluations([_pg_evaluation(store, "f1")])
+    _pg_feedback(store, "f1", "unobserved", actor="merger")
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    assert counts.positive == 0
+    assert counts.addressed == 0
+    assert counts.acceptance_rate is None
+
+
+def test_postgres_audit_events_scoped_by_repo(fake_conn):
+    a = PgIndexStore("acme", "widgets", "postgresql://fake")
+    b = PgIndexStore("acme", "gadgets", "postgresql://fake")
+    a.record_learning_audit_event(event_type="regression_dismissed", rule_id=1, actor="admin")
+
+    assert len(a.list_learning_audit_events()) == 1
+    assert b.list_learning_audit_events() == []
+
+
+def test_postgres_rule_evaluations_scoped_by_repo(fake_conn):
+    a = PgIndexStore("acme", "widgets", "postgresql://fake")
+    b = PgIndexStore("acme", "gadgets", "postgresql://fake")
+    _pg_finding(a, "f1")
+    a.record_rule_evaluations([_pg_evaluation(a, "f1")])
+
+    assert a.count_rule_evaluations({"rule_id": 1}) == 1
+    assert b.count_rule_evaluations({"rule_id": 1}) == 0

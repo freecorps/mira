@@ -31,6 +31,14 @@ ORIGINS = ("manual", "learned")
 
 OUTCOMES = ("positive", "negative", "neutral", "unobserved")
 
+# A review-scoped exposure has no finding, so it has no outcome to report.
+# The drill-down labels those rows rather than dropping them into
+# `unobserved`, which would make a rule look ignored when it simply produced
+# nothing that review - and would break the guarantee that filtering the
+# drill-down by a bucket returns exactly the aggregate's count for it.
+NOT_APPLICABLE = "not_applicable"
+DETAIL_OUTCOMES = (*OUTCOMES, NOT_APPLICABLE)
+
 # Feedback kinds, bucketed. Anything unknown falls through to `unobserved`,
 # which is the only safe default: a signal we cannot interpret must not count
 # as approval.
@@ -340,16 +348,23 @@ def outcome_case_sql(
     positive: str = "s.has_positive",
     neutral: str = "s.has_neutral",
     state: str = "f.state",
+    finding_ref: str = "",
 ) -> str:
     """The single source of truth for outcome in SQL.
 
     Mirrors ``outcome_for_kinds`` exactly. Both the aggregate and the
     drill-down query use this, which is what makes "the number equals the
     events behind it" true by construction rather than by convention.
+
+    ``finding_ref`` is set by the drill-down, where rows with no finding must
+    be labelled ``not_applicable``. The aggregate instead guards each bucket on
+    ``finding_id IS NOT NULL``; the two agree, which is what keeps a filtered
+    drill-down equal to the bucket it came from.
     """
     addressed_states = _sql_list(ADDRESSED_FINDING_STATES)
+    prefix = f"CASE WHEN {finding_ref} IS NULL THEN '{NOT_APPLICABLE}' " if finding_ref else "CASE "
     return (
-        f"CASE WHEN COALESCE({negative}, 0) = 1 THEN 'negative' "
+        f"{prefix}WHEN COALESCE({negative}, 0) = 1 THEN 'negative' "
         f"WHEN COALESCE({positive}, 0) = 1 THEN 'positive' "
         f"WHEN COALESCE({state}, '') IN ({addressed_states}) THEN 'positive' "
         f"WHEN COALESCE({neutral}, 0) = 1 THEN 'neutral' "

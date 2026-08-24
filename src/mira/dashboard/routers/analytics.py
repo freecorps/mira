@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from mira.config import load_config
 from mira.dashboard.api import _require_admin, router
 from mira.feedback import analytics
-from mira.feedback.evaluation import DECISIONS, ORIGINS, OUTCOMES
+from mira.feedback.evaluation import DECISIONS, DETAIL_OUTCOMES, ORIGINS
 
 # Page sizes are capped rather than trusted: the Orange Pi profile is the
 # reason this whole feature paginates in the first place.
@@ -200,8 +200,10 @@ def list_rule_evaluations(
 ) -> EvaluationPage:
     """The individual evaluations behind a rule's aggregate numbers."""
     _require_admin(request)
-    if outcome and outcome not in OUTCOMES:
-        raise HTTPException(status_code=400, detail=f"outcome must be one of {sorted(OUTCOMES)}")
+    if outcome and outcome not in DETAIL_OUTCOMES:
+        raise HTTPException(
+            status_code=400, detail=f"outcome must be one of {sorted(DETAIL_OUTCOMES)}"
+        )
     limit, offset = _page(limit, offset)
     rows, total = analytics.list_rule_evaluations(
         owner=owner,
@@ -355,8 +357,10 @@ def export_rule_evaluations(
     _require_admin(request)
     if fmt not in {"csv", "json"}:
         raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'json'")
-    if outcome and outcome not in OUTCOMES:
-        raise HTTPException(status_code=400, detail=f"outcome must be one of {sorted(OUTCOMES)}")
+    if outcome and outcome not in DETAIL_OUTCOMES:
+        raise HTTPException(
+            status_code=400, detail=f"outcome must be one of {sorted(DETAIL_OUTCOMES)}"
+        )
     body, media_type = analytics.export_rule_evaluations(
         owner=owner,
         repo=repo,

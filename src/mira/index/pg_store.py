@@ -2720,6 +2720,21 @@ class PgIndexStore(_StoreSharedMixin):
     def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
         return self._fetchall(sql, params)
 
+    def _scoped_filters(self, filters: dict[str, Any] | None) -> dict[str, Any]:
+        """Pin analytics reads to this store's repository.
+
+        Every repo shares one table here, so a caller that omitted the filter
+        would read the whole install's history. The store's own owner/repo
+        always wins over whatever was passed in. An empty owner/repo is the
+        explicit org-wide handle the analytics service opens on purpose.
+        """
+        scoped = dict(filters or {})
+        if self._owner:
+            scoped["owner"] = self._owner
+        if self._repo:
+            scoped["repo"] = self._repo
+        return scoped
+
     def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
         """Persist rule exposures idempotently; return how many were new.
 

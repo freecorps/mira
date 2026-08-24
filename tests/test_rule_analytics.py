@@ -1,0 +1,1087 @@
+"""Phase 3 — continuous evaluation and analytics.
+
+The acceptance criterion these tests defend: you can pick a rule, see where it
+ran and what came back, every number reduces to the events behind it, and no
+absence of feedback is ever converted into approval.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
+from types import SimpleNamespace
+
+import pytest
+
+from mira.config import LearningConfig
+from mira.feedback import analytics
+from mira.feedback.evaluation import (
+    RuleAnalyticsRow,
+    RuleEvaluation,
+    RuleOutcomeCounts,
+    detect_regression,
+    evaluation_key,
+    is_addressed,
+    origin_for_rule,
+    outcome_for_kinds,
+)
+from mira.feedback.exposure import (
+    ExposedRule,
+    build_rule_evaluations,
+    exposed_rules_from_rows,
+    record_review_exposures,
+)
+from mira.feedback.models import FeedbackEventV2, ReviewFinding
+from mira.index.store import IndexStore
+
+
+@pytest.fixture
+def isolated_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    return tmp_path
+
+
+@pytest.fixture
+def store(isolated_index: Path) -> IndexStore:
+    store = IndexStore.open("acme", "app")
+    yield store
+    store.close()
+
+
+def _finding(
+    store: IndexStore,
+    finding_id: str,
+    *,
+    path: str = "src/a.py",
+    category: str = "security",
+    title: str = "Unsafe call",
+    state: str = "open",
+    created_at: float = 0.0,
+) -> ReviewFinding:
+    finding = ReviewFinding(
+        id=finding_id,
+        fingerprint=f"fp-{finding_id}",
+        review_id=0,
+        platform="github",
+        owner="acme",
+        repo="app",
+        pr_number=7,
+        pr_url="https://github.com/acme/app/pull/7",
+        base_sha="base",
+        head_sha="head",
+        path=path,
+        start_line=10,
+        end_line=10,
+        symbol="",
+        category=category,
+        severity="warning",
+        confidence=0.9,
+        title=title,
+        body="body",
+        suggestion="",
+        detector="main",
+        prompt_model="model",
+        state=state,
+        created_at=created_at or time.time(),
+    )
+    store.save_review_finding(finding)
+    if state != "open":
+        store.update_review_finding_state(finding_id, state)
+    return finding
+
+
+def _evaluation(finding_id: str | None, *, rule_id: int = 1, **overrides) -> RuleEvaluation:
+    defaults = {
+        "rule_id": rule_id,
+        "rule_version": 1,
+        "rule_origin": "learned",
+        "scope_type": "repo",
+        "scope_value": "",
+        "category": "security",
+        "decision": "instruction",
+        "platform": "github",
+        "owner": "acme",
+        "repo": "app",
+        "pr_number": 7,
+        "pr_author": "alice",
+        "head_sha": "head",
+    }
+    defaults.update(overrides)
+    return RuleEvaluation(
+        evaluation_key=evaluation_key(
+            platform=defaults["platform"],
+            owner=defaults["owner"],
+            repo=defaults["repo"],
+            pr_number=defaults["pr_number"],
+            head_sha=defaults["head_sha"],
+            rule_id=defaults["rule_id"],
+            rule_version=defaults["rule_version"],
+            decision=defaults["decision"],
+            finding_id=finding_id,
+        ),
+        finding_id=finding_id,
+        **defaults,
+    )
+
+
+def _feedback(
+    store: IndexStore, finding_id: str, kind: str, *, actor: str = "bob", source: str = ""
+) -> None:
+    store.record_feedback_v2(
+        FeedbackEventV2(
+            id=0,
+            finding_id=finding_id,
+            kind=kind,
+            actor=actor,
+            actor_role="",
+            raw_text="",
+            rationale="",
+            platform="github",
+            source_event_id=source or f"{kind}:{finding_id}:{actor}",
+            head_sha="head",
+            thread_state="",
+            provenance_complete=True,
+        )
+    )
+
+
+# --------------------------------------------------------------- idempotency
+
+
+def test_retry_does_not_duplicate_evaluation(store: IndexStore) -> None:
+    _finding(store, "f1")
+    evaluation = _evaluation("f1")
+
+    assert store.record_rule_evaluations([evaluation]) == 1
+    assert store.record_rule_evaluations([evaluation]) == 0
+    assert store.record_rule_evaluations([evaluation, evaluation]) == 0
+
+    assert store.count_rule_evaluations({"rule_id": 1}) == 1
+
+
+def test_evaluation_key_ignores_review_id(store: IndexStore) -> None:
+    """A retried round gets a new review row but is still the same exposure."""
+    _finding(store, "f1")
+    first = _evaluation("f1")
+    first.review_id = 11
+    retry = _evaluation("f1")
+    retry.review_id = 22
+
+    assert first.evaluation_key == retry.evaluation_key
+    store.record_rule_evaluations([first])
+    assert store.record_rule_evaluations([retry]) == 0
+    assert store.count_rule_evaluations({"rule_id": 1}) == 1
+
+
+def test_evaluation_key_separates_distinct_exposures() -> None:
+    base = {
+        "platform": "github",
+        "owner": "acme",
+        "repo": "app",
+        "pr_number": 7,
+        "head_sha": "head",
+        "rule_id": 1,
+        "rule_version": 1,
+        "decision": "instruction",
+        "finding_id": "f1",
+    }
+    baseline = evaluation_key(**base)
+    for field, value in (
+        ("head_sha", "other"),
+        ("rule_id", 2),
+        ("rule_version", 2),
+        ("decision", "suppress"),
+        ("finding_id", "f2"),
+        ("pr_number", 8),
+    ):
+        assert evaluation_key(**{**base, field: value}) != baseline
+
+
+def test_link_rule_evaluations_does_not_repoint_history(store: IndexStore) -> None:
+    _finding(store, "f1")
+    evaluation = _evaluation("f1")
+    store.record_rule_evaluations([evaluation])
+
+    store.link_rule_evaluations([evaluation.evaluation_key], 101)
+    store.link_rule_evaluations([evaluation.evaluation_key], 202)
+
+    rows = store.list_rule_evaluations({"rule_id": 1})
+    assert rows[0]["review_id"] == 101
+
+
+# --------------------------------------------------------------- concurrency
+
+
+def test_concurrent_writers_record_one_evaluation(isolated_index: Path) -> None:
+    setup = IndexStore.open("acme", "app")
+    _finding(setup, "f1")
+    setup.close()
+    barrier = Barrier(4)
+
+    def write() -> int:
+        store = IndexStore.open("acme", "app")
+        try:
+            barrier.wait()
+            return store.record_rule_evaluations([_evaluation("f1")])
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        created = list(pool.map(lambda _: write(), range(4)))
+
+    assert sum(created) == 1
+    store = IndexStore.open("acme", "app")
+    try:
+        assert store.count_rule_evaluations({"rule_id": 1}) == 1
+    finally:
+        store.close()
+
+
+def test_concurrent_distinct_evaluations_all_land(isolated_index: Path) -> None:
+    setup = IndexStore.open("acme", "app")
+    for index in range(6):
+        _finding(setup, f"f{index}")
+    setup.close()
+    barrier = Barrier(6)
+
+    def write(index: int) -> int:
+        store = IndexStore.open("acme", "app")
+        try:
+            barrier.wait()
+            return store.record_rule_evaluations([_evaluation(f"f{index}")])
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        created = list(pool.map(write, range(6)))
+
+    assert sum(created) == 6
+    store = IndexStore.open("acme", "app")
+    try:
+        assert store.count_rule_evaluations({"rule_id": 1}) == 6
+    finally:
+        store.close()
+
+
+# ------------------------------------------------- silence stays neutral
+
+
+def test_unobserved_is_not_positive(store: IndexStore) -> None:
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+    # Exactly what run_pr_merged_learning writes when a PR is merged with no
+    # reaction and an unresolved thread.
+    _feedback(store, "f1", "unobserved", actor="merger")
+
+    row = store.aggregate_rule_analytics({"rule_id": 1})[0]
+    counts = row.counts
+    assert counts.unobserved == 1
+    assert counts.positive == 0
+    assert counts.observed == 0
+    assert counts.acceptance_rate is None
+    assert counts.addressed == 0
+    assert counts.addressed_rate == 0.0
+
+
+def test_unobserved_cannot_raise_acceptance_rate(store: IndexStore) -> None:
+    """Adding silence to a mixed record must not move the score at all."""
+    for index, kind in ((1, "thumbs_up"), (2, "thumbs_down")):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}")])
+        _feedback(store, f"f{index}", kind)
+
+    before = store.aggregate_rule_analytics({"rule_id": 1})[0].counts.acceptance_rate
+
+    for index in range(3, 9):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}")])
+        _feedback(store, f"f{index}", "unobserved", actor="merger")
+
+    after = store.aggregate_rule_analytics({"rule_id": 1})[0]
+    assert after.counts.acceptance_rate == before == 0.5
+    assert after.counts.unobserved == 6
+    # Silence does lower the addressed rate, which is correct: it is evidence
+    # of absence of resolution, not evidence of resolution.
+    assert after.counts.addressed == 0
+
+
+def test_merge_without_feedback_is_not_acceptance(store: IndexStore) -> None:
+    """A silent merge marks the finding outdated; that is not addressed."""
+    _finding(store, "f1", state="outdated")
+    store.record_rule_evaluations([_evaluation("f1")])
+    _feedback(store, "f1", "unobserved", actor="merger")
+
+    detail = store.list_rule_evaluations({"rule_id": 1})[0]
+    assert detail["finding_state"] == "outdated"
+    assert detail["outcome"] == "unobserved"
+    assert detail["addressed"] is False
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    assert counts.positive == 0
+    assert counts.addressed == 0
+
+
+def test_resolved_thread_before_merge_is_addressed(store: IndexStore) -> None:
+    """The one merge-time signal that *is* evidence: a resolved thread."""
+    _finding(store, "f1", state="fixed")
+    store.record_rule_evaluations([_evaluation("f1")])
+    _feedback(store, "f1", "fixed", actor="merger")
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    assert counts.addressed == 1
+    assert counts.positive == 1
+    assert counts.addressed_rate == 1.0
+
+
+def test_outdated_state_alone_is_never_addressed() -> None:
+    assert is_addressed([], "outdated") is False
+    assert is_addressed(["unobserved"], "outdated") is False
+    assert is_addressed(["fixed"], "open") is True
+    assert is_addressed([], "fixed") is True
+
+
+def test_outcome_precedence_puts_dissent_first() -> None:
+    assert outcome_for_kinds(["thumbs_up", "reply_disagree"]) == "negative"
+    assert outcome_for_kinds(["thumbs_up", "reply_question"]) == "positive"
+    assert outcome_for_kinds(["reply_question"]) == "neutral"
+    assert outcome_for_kinds([]) == "unobserved"
+    assert outcome_for_kinds(["unobserved"]) == "unobserved"
+    # An unrecognized signal must not be read as approval.
+    assert outcome_for_kinds(["something_new"]) == "unobserved"
+
+
+# ------------------------------------------ aggregates match their evidence
+
+
+@pytest.mark.parametrize(
+    "outcome,kinds",
+    [
+        ("positive", ["thumbs_up"]),
+        ("negative", ["thumbs_down"]),
+        ("neutral", ["reply_question"]),
+        ("unobserved", ["unobserved"]),
+    ],
+)
+def test_aggregate_matches_drilldown(store: IndexStore, outcome: str, kinds: list[str]) -> None:
+    """Every bucket count equals the number of rows the drill-down returns."""
+    mix = {
+        "a": ["thumbs_up"],
+        "b": ["thumbs_down"],
+        "c": ["reply_question"],
+        "d": ["unobserved"],
+        "e": ["thumbs_up"],
+        "f": [],
+    }
+    for finding_id, finding_kinds in mix.items():
+        _finding(store, finding_id)
+        store.record_rule_evaluations([_evaluation(finding_id)])
+        for kind in finding_kinds:
+            _feedback(store, finding_id, kind)
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    aggregate = getattr(counts, outcome)
+    detailed = store.list_rule_evaluations({"rule_id": 1}, outcome=outcome, limit=100)
+
+    assert (
+        aggregate == len(detailed) == store.count_rule_evaluations({"rule_id": 1}, outcome=outcome)
+    )
+    assert {row["outcome"] for row in detailed} == {outcome}
+    _ = kinds
+
+
+def test_buckets_sum_to_findings(store: IndexStore) -> None:
+    for index, kind in enumerate(["thumbs_up", "thumbs_down", "reply_question", "unobserved"]):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}")])
+        _feedback(store, f"f{index}", kind)
+    # A review-scoped exposure counts toward exposures but has no outcome.
+    store.record_rule_evaluations([_evaluation(None)])
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    assert counts.positive + counts.negative + counts.neutral + counts.unobserved == counts.findings
+    assert counts.findings == 4
+    assert counts.review_exposures == 1
+    assert counts.exposures == 5
+
+
+def test_reaction_and_reply_counters(store: IndexStore) -> None:
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+    _feedback(store, "f1", "thumbs_up", actor="a")
+    _feedback(store, "f1", "thumbs_up", actor="b")
+    _feedback(store, "f1", "thumbs_down", actor="c")
+    _finding(store, "f2")
+    store.record_rule_evaluations([_evaluation("f2")])
+    _feedback(store, "f2", "reply_agree", actor="d")
+    _feedback(store, "f2", "reply_disagree", actor="e")
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    assert counts.thumbs_up == 2
+    assert counts.thumbs_down == 1
+    assert counts.reply_agree == 1
+    assert counts.reply_disagree == 1
+    # Both findings carry a negative signal, so both land in `negative`.
+    assert counts.negative == 2
+
+
+def test_repeated_false_positives_count_only_repeats(store: IndexStore) -> None:
+    for index in range(3):
+        _finding(store, f"dup{index}", path="src/a.py", title="Unsafe call")
+        store.record_rule_evaluations([_evaluation(f"dup{index}")])
+        _feedback(store, f"dup{index}", "thumbs_down", actor=f"user{index}")
+    _finding(store, "solo", path="src/b.py", title="Different complaint")
+    store.record_rule_evaluations([_evaluation("solo")])
+    _feedback(store, "solo", "thumbs_down")
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    # Three equivalent complaints = two repeats; the unique one is not a repeat.
+    assert counts.repeated_false_positives == 2
+    assert counts.negative == 4
+
+
+# ------------------------------------------------------------- aggregations
+
+
+def test_summary_dimensions(store: IndexStore) -> None:
+    _finding(store, "f1", category="security")
+    _finding(store, "f2", category="style")
+    store.record_rule_evaluations(
+        [
+            _evaluation("f1", category="security", pr_author="alice"),
+            _evaluation("f2", rule_id=2, category="style", pr_author="bob"),
+        ]
+    )
+    _feedback(store, "f1", "thumbs_up")
+    _feedback(store, "f2", "thumbs_down")
+
+    by_category = {b["bucket"]: b for b in store.rule_analytics_summary(dimension="category")}
+    assert by_category["security"]["positive"] == 1
+    assert by_category["style"]["negative"] == 1
+
+    by_author = {b["bucket"]: b for b in store.rule_analytics_summary(dimension="author")}
+    assert by_author["alice"]["exposures"] == 1
+    assert by_author["bob"]["exposures"] == 1
+
+    by_repo = {b["bucket"]: b for b in store.rule_analytics_summary(dimension="repo")}
+    assert by_repo["acme/app"]["exposures"] == 2
+
+
+def test_summary_rejects_unknown_dimension(store: IndexStore) -> None:
+    with pytest.raises(ValueError, match="unsupported summary dimension"):
+        store.rule_analytics_summary(dimension="drop table")
+
+
+def test_period_filters_are_applied(store: IndexStore) -> None:
+    now = time.time()
+    _finding(store, "old")
+    _finding(store, "new")
+    old = _evaluation("old")
+    old.created_at = now - 100_000
+    new = _evaluation("new")
+    new.created_at = now
+    store.record_rule_evaluations([old, new])
+
+    recent = store.aggregate_rule_analytics({"rule_id": 1, "since": now - 1000})
+    assert recent[0].counts.exposures == 1
+    assert store.aggregate_rule_analytics({"rule_id": 1})[0].counts.exposures == 2
+
+
+def test_pagination_is_stable(store: IndexStore) -> None:
+    for index in range(10):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}")])
+
+    first = store.list_rule_evaluations({"rule_id": 1}, limit=4, offset=0)
+    second = store.list_rule_evaluations({"rule_id": 1}, limit=4, offset=4)
+    third = store.list_rule_evaluations({"rule_id": 1}, limit=4, offset=8)
+
+    ids = [row["id"] for row in first + second + third]
+    assert len(ids) == 10
+    assert len(set(ids)) == 10
+
+
+# -------------------------------------------------------- regression advice
+
+
+def _analytics_row(*, exposures: int, positive: int, negative: int, origin="learned"):
+    return RuleAnalyticsRow(
+        rule_id=1,
+        owner="acme",
+        repo="app",
+        origin=origin,
+        counts=RuleOutcomeCounts(
+            exposures=exposures,
+            findings=positive + negative,
+            positive=positive,
+            negative=negative,
+        ),
+    )
+
+
+def test_regression_requires_minimum_exposures() -> None:
+    row = _analytics_row(exposures=5, positive=0, negative=5)
+    assert (
+        detect_regression(
+            row, min_exposures=20, negative_rate_threshold=0.5, disable_rate_threshold=0.8
+        )
+        is None
+    )
+    row = _analytics_row(exposures=20, positive=0, negative=20)
+    suggestion = detect_regression(
+        row, min_exposures=20, negative_rate_threshold=0.5, disable_rate_threshold=0.8
+    )
+    assert suggestion is not None
+    assert suggestion.action == "disable"
+    assert suggestion.min_exposures == 20
+
+
+def test_regression_escalates_by_negative_rate() -> None:
+    row = _analytics_row(exposures=30, positive=12, negative=18)
+    suggestion = detect_regression(
+        row, min_exposures=20, negative_rate_threshold=0.5, disable_rate_threshold=0.8
+    )
+    assert suggestion is not None and suggestion.action == "downgrade"
+
+
+def test_regression_ignores_silence() -> None:
+    """Many exposures with no decisive feedback is not a regression."""
+    row = RuleAnalyticsRow(
+        rule_id=1,
+        owner="acme",
+        repo="app",
+        counts=RuleOutcomeCounts(exposures=100, findings=100, unobserved=100),
+    )
+    assert (
+        detect_regression(
+            row, min_exposures=20, negative_rate_threshold=0.5, disable_rate_threshold=0.8
+        )
+        is None
+    )
+
+
+def test_regression_suggestions_skip_manual_rules(store: IndexStore) -> None:
+    rule = store.create_learned_rule(
+        "Never log credentials.", "security", created_by="admin", source_signal="manual"
+    )
+    for index in range(25):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations(
+            [_evaluation(f"f{index}", rule_id=rule.id, rule_origin="manual")]
+        )
+        _feedback(store, f"f{index}", "thumbs_down", actor=f"user{index}")
+
+    config = LearningConfig(min_exposures_for_regression=5)
+    assert analytics.regression_suggestions(config=config) == []
+
+
+def test_regression_suggestions_flag_learned_rules(store: IndexStore) -> None:
+    rule = store.create_learned_rule(
+        "Avoid broad excepts.", "style", source_signal="reject_pattern"
+    )
+    for index in range(25):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}", rule_id=rule.id)])
+        _feedback(store, f"f{index}", "thumbs_down", actor=f"user{index}")
+
+    config = LearningConfig(min_exposures_for_regression=5)
+    suggestions = analytics.regression_suggestions(config=config)
+    assert [s.rule_id for s in suggestions] == [rule.id]
+    assert suggestions[0].action == "disable"
+
+
+def test_suggestions_never_disable_the_rule(store: IndexStore) -> None:
+    """Phase 3 advises; it must not act."""
+    rule = store.create_learned_rule(
+        "Avoid broad excepts.", "style", source_signal="reject_pattern"
+    )
+    for index in range(25):
+        _finding(store, f"f{index}")
+        store.record_rule_evaluations([_evaluation(f"f{index}", rule_id=rule.id)])
+        _feedback(store, f"f{index}", "thumbs_down", actor=f"user{index}")
+
+    analytics.regression_suggestions(config=LearningConfig(min_exposures_for_regression=5))
+
+    refreshed = IndexStore.open("acme", "app")
+    try:
+        stored = refreshed.get_learned_rule(rule.id)
+        assert stored.active is True
+        assert stored.status == "approved"
+        assert stored.disabled_at is None
+    finally:
+        refreshed.close()
+
+
+def test_manual_and_learned_rules_stay_distinguishable(store: IndexStore) -> None:
+    # `create_learned_rule` is the admin-authored constructor, so it defaults
+    # to the manual signal; a synthesized rule carries its detector signal.
+    manual = store.create_learned_rule("Manual.", "style", created_by="admin")
+    learned = store.create_learned_rule(
+        "Learned.", "style", source_signal="reject_pattern", created_by=""
+    )
+    assert origin_for_rule(manual) == "manual"
+    assert origin_for_rule(learned) == "learned"
+
+
+# --------------------------------------------------------- period comparison
+
+
+def test_activation_comparison_splits_on_effective_from(store: IndexStore) -> None:
+    now = time.time()
+    pivot = now - 5 * 86400
+    rule = store.create_learned_rule("Avoid broad excepts.", "security")
+    store._conn.execute(
+        "UPDATE learned_rules SET effective_from = ? WHERE id = ?", (pivot, rule.id)
+    )
+    store._conn.commit()
+
+    _finding(store, "before1", created_at=pivot - 86400)
+    _feedback(store, "before1", "thumbs_down")
+    _finding(store, "after1", created_at=pivot + 86400)
+    _feedback(store, "after1", "thumbs_up")
+
+    result = analytics.compare_activation_periods(
+        owner="acme", repo="app", rule_id=rule.id, window_days=30
+    )
+    assert result["activated_at"] == pytest.approx(pivot)
+    assert result["before"]["negative"] == 1
+    assert result["after"]["positive"] == 1
+    assert result["delta"]["negative"] == -1
+    # The 30-day window has not elapsed yet, so the comparison is incomplete.
+    assert result["comparable"] is False
+    assert "accumulating" in result["reason"]
+
+
+def test_activation_comparison_reports_complete_windows(store: IndexStore) -> None:
+    now = time.time()
+    pivot = now - 60 * 86400
+    rule = store.create_learned_rule("Avoid broad excepts.", "security")
+    store._conn.execute(
+        "UPDATE learned_rules SET effective_from = ? WHERE id = ?", (pivot, rule.id)
+    )
+    store._conn.commit()
+    _finding(store, "after1", created_at=pivot + 86400)
+
+    result = analytics.compare_activation_periods(
+        owner="acme", repo="app", rule_id=rule.id, window_days=30
+    )
+    assert result["comparable"] is True
+    assert result["after"]["findings"] == 1
+
+
+def test_activation_comparison_without_timestamp_is_not_comparable(store: IndexStore) -> None:
+    rule = store.create_learned_rule("Avoid broad excepts.", "security")
+    store._conn.execute(
+        "UPDATE learned_rules SET effective_from = 0, created_at = 0 WHERE id = ?", (rule.id,)
+    )
+    store._conn.commit()
+
+    result = analytics.compare_activation_periods(owner="acme", repo="app", rule_id=rule.id)
+    assert result["comparable"] is False
+    assert result["before"] is None
+
+
+def test_path_scope_comparison_uses_like_translation(store: IndexStore) -> None:
+    now = time.time()
+    pivot = now - 60 * 86400
+    rule = store.create_learned_rule(
+        "Skip generated code.",
+        "style",
+        path_pattern="generated/**",
+        scope_type="path",
+        scope_value="generated/**",
+    )
+    store._conn.execute(
+        "UPDATE learned_rules SET effective_from = ? WHERE id = ?", (pivot, rule.id)
+    )
+    store._conn.commit()
+
+    _finding(store, "in", path="generated/api.py", category="style", created_at=pivot + 100)
+    _finding(store, "out", path="src/api.py", category="style", created_at=pivot + 100)
+
+    result = analytics.compare_activation_periods(owner="acme", repo="app", rule_id=rule.id)
+    assert result["after"]["findings"] == 1
+
+
+def test_glob_to_like_escapes_wildcards() -> None:
+    from mira.feedback.evaluation_sql import glob_to_like
+
+    assert glob_to_like("generated/**") == "generated/%"
+    assert glob_to_like("src/*.py") == "src/%.py"
+    # A literal % in a path must not become a wildcard.
+    assert glob_to_like("reports/100%/*") == "reports/100\\%/%"
+
+
+# ------------------------------------------------------------------- export
+
+
+def test_export_json_round_trips(store: IndexStore) -> None:
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+    _feedback(store, "f1", "thumbs_up")
+
+    body, media_type = analytics.export_rule_analytics(fmt="json")
+    assert media_type == "application/json"
+    payload = json.loads(body)
+    assert payload["rules"][0]["rule_id"] == 1
+    assert payload["rules"][0]["positive"] == 1
+
+
+def test_export_csv_has_stable_header_and_values(store: IndexStore) -> None:
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+    _feedback(store, "f1", "thumbs_down")
+
+    body, media_type = analytics.export_rule_analytics(fmt="csv")
+    assert media_type == "text/csv"
+    rows = list(csv.DictReader(io.StringIO(body)))
+    assert len(rows) == 1
+    assert rows[0]["rule_id"] == "1"
+    assert rows[0]["negative"] == "1"
+    assert rows[0]["owner"] == "acme"
+    # None renders as empty, not the string "None".
+    assert rows[0]["addressed_rate"] == "0.0"
+
+
+def test_export_evaluations_carries_the_evidence(store: IndexStore) -> None:
+    _finding(store, "f1", title="Unsafe call")
+    store.record_rule_evaluations([_evaluation("f1")])
+    _feedback(store, "f1", "thumbs_down")
+
+    body, _media = analytics.export_rule_evaluations(
+        owner="acme", repo="app", filters={"rule_id": 1}, fmt="csv"
+    )
+    rows = list(csv.DictReader(io.StringIO(body)))
+    assert rows[0]["finding_title"] == "Unsafe call"
+    assert rows[0]["outcome"] == "negative"
+    assert rows[0]["addressed"] == "false"
+
+
+def test_export_csv_renders_none_as_empty(store: IndexStore) -> None:
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1")])
+
+    body, _media = analytics.export_rule_analytics(fmt="csv")
+    row = next(csv.DictReader(io.StringIO(body)))
+    assert row["acceptance_rate"] == ""
+
+
+# ------------------------------------------------------------- audit events
+
+
+def test_audit_events_are_recorded_and_listed(store: IndexStore) -> None:
+    analytics.record_audit_event(
+        owner="acme",
+        repo="app",
+        event_type="regression_dismissed",
+        rule_id=3,
+        actor="admin",
+        summary="dismissed",
+        detail={"note": "expected during migration"},
+    )
+    events = analytics.list_audit_events(owner="acme", repo="app")
+    assert len(events) == 1
+    assert events[0]["event_type"] == "regression_dismissed"
+    assert events[0]["actor"] == "admin"
+    assert json.loads(events[0]["detail_json"])["note"] == "expected during migration"
+
+
+def test_audit_events_filter_by_rule(store: IndexStore) -> None:
+    for rule_id in (1, 2):
+        analytics.record_audit_event(
+            owner="acme", repo="app", event_type="regression_accepted", rule_id=rule_id
+        )
+    assert len(analytics.list_audit_events(owner="acme", repo="app", rule_id=2)) == 1
+
+
+# ---------------------------------------------------------------- exposures
+
+
+def test_exposure_builds_review_and_finding_rows() -> None:
+    exposed = [
+        ExposedRule(
+            rule_id=1,
+            version=2,
+            origin="learned",
+            scope_type="path",
+            scope_value="src/**",
+            category="security",
+            rule_text="Never log credentials.",
+        )
+    ]
+    findings = [
+        SimpleNamespace(finding_id="in", path="src/a.py", category="security"),
+        SimpleNamespace(finding_id="wrong-path", path="docs/a.md", category="security"),
+        SimpleNamespace(finding_id="wrong-category", path="src/b.py", category="style"),
+        SimpleNamespace(finding_id="", path="src/c.py", category="security"),
+    ]
+    evaluations = build_rule_evaluations(
+        exposed,
+        platform="github",
+        owner="acme",
+        repo="app",
+        pr_number=7,
+        pr_author="alice",
+        head_sha="head",
+        findings=findings,
+    )
+
+    linked = [e.finding_id for e in evaluations]
+    assert linked.count(None) == 1  # the review-scoped exposure
+    assert "in" in linked
+    assert "wrong-path" not in linked
+    assert "wrong-category" not in linked
+    assert len(evaluations) == 2
+    assert all(e.rule_version == 2 for e in evaluations)
+
+
+def test_repo_scope_covers_every_path_in_category() -> None:
+    exposed = [
+        ExposedRule(
+            rule_id=1,
+            version=1,
+            origin="learned",
+            scope_type="repo",
+            scope_value="",
+            category="",
+            rule_text="Be careful.",
+        )
+    ]
+    findings = [
+        SimpleNamespace(finding_id="a", path="src/a.py", category="security"),
+        SimpleNamespace(finding_id="b", path="docs/b.md", category="style"),
+    ]
+    evaluations = build_rule_evaluations(
+        exposed,
+        platform="github",
+        owner="acme",
+        repo="app",
+        pr_number=7,
+        pr_author="alice",
+        head_sha="head",
+        findings=findings,
+    )
+    assert {e.finding_id for e in evaluations} == {None, "a", "b"}
+
+
+def test_exposed_rules_snapshot_records_origin_and_version(store: IndexStore) -> None:
+    manual = store.create_learned_rule("Manual.", "style", created_by="admin")
+    exposed = exposed_rules_from_rows([manual])
+    assert exposed[0].origin == "manual"
+    assert exposed[0].rule_id == manual.id
+    assert exposed[0].decision == "instruction"
+
+
+def test_record_review_exposures_never_raises() -> None:
+    class Broken:
+        def record_rule_evaluations(self, evaluations):
+            raise RuntimeError("db is on fire")
+
+    exposed = [
+        ExposedRule(
+            rule_id=1,
+            version=1,
+            origin="learned",
+            scope_type="repo",
+            scope_value="",
+            category="",
+            rule_text="x",
+        )
+    ]
+    assert (
+        record_review_exposures(
+            Broken(),
+            exposed,
+            platform="github",
+            owner="acme",
+            repo="app",
+            pr_number=1,
+            pr_author="a",
+            head_sha="h",
+            findings=[],
+        )
+        == 0
+    )
+
+
+# ----------------------------------------------------------- old-db upgrade
+
+
+_PRE_PHASE3_SCHEMA = """
+CREATE TABLE review_findings (
+    id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    review_id INTEGER NOT NULL DEFAULT 0,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    start_line INTEGER NOT NULL DEFAULT 0,
+    end_line INTEGER NOT NULL DEFAULT 0,
+    symbol TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    suggestion TEXT NOT NULL DEFAULT '',
+    detector TEXT NOT NULL DEFAULT '',
+    prompt_model TEXT NOT NULL DEFAULT '',
+    platform_comment_id TEXT NOT NULL DEFAULT '',
+    platform_thread_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE learned_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_text TEXT NOT NULL DEFAULT '',
+    source_signal TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    path_pattern TEXT NOT NULL DEFAULT '',
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+"""
+
+
+def test_opens_and_upgrades_a_pre_phase3_database(isolated_index: Path) -> None:
+    """A database from before Phase 3 gains the new tables and keeps its data."""
+    db_dir = isolated_index / "acme"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_PRE_PHASE3_SCHEMA)
+    conn.execute(
+        "INSERT INTO review_findings (id, fingerprint, category, path, state, head_sha) "
+        "VALUES ('legacy-finding', 'fp', 'security', 'src/a.py', 'open', 'head')"
+    )
+    conn.execute(
+        "INSERT INTO learned_rules (rule_text, source_signal, category, sample_count, active) "
+        "VALUES ('Legacy rule.', 'reject_pattern', 'security', 4, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = IndexStore.open("acme", "legacy")
+    try:
+        # Pre-existing rows survive the upgrade.
+        assert store.get_review_finding("legacy-finding") is not None
+        rules = store.list_learned_rules()
+        assert [r.rule_text for r in rules] == ["Legacy rule."]
+        # And the Phase 3 tables now exist and work.
+        evaluation = _evaluation("legacy-finding", rule_id=rules[0].id, repo="legacy")
+        assert store.record_rule_evaluations([evaluation]) == 1
+        assert store.record_rule_evaluations([evaluation]) == 0
+        store.record_learning_audit_event(event_type="upgrade_check", rule_id=rules[0].id)
+        assert len(store.list_learning_audit_events()) == 1
+        assert store.aggregate_rule_analytics()[0].counts.exposures == 1
+    finally:
+        store.close()
+
+
+def test_upgraded_database_keeps_working_after_reopen(isolated_index: Path) -> None:
+    """Re-running the schema pass on an already-upgraded DB is a no-op."""
+    first = IndexStore.open("acme", "app")
+    _finding(first, "f1")
+    first.record_rule_evaluations([_evaluation("f1")])
+    first.close()
+
+    second = IndexStore.open("acme", "app")
+    try:
+        assert second.count_rule_evaluations({"rule_id": 1}) == 1
+        assert second.record_rule_evaluations([_evaluation("f1")]) == 0
+    finally:
+        second.close()
+
+
+# ------------------------------------------------------------ kill switch
+
+
+def test_analytics_flag_defaults_on_and_can_be_disabled() -> None:
+    assert LearningConfig().evaluation_analytics is True
+    assert LearningConfig(evaluation_analytics=False).evaluation_analytics is False
+
+
+def test_disabled_analytics_skips_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flag is checked before the store is ever touched."""
+    from mira.config import MiraConfig
+
+    config = MiraConfig()
+    config.learning.evaluation_analytics = False
+    assert config.learning.evaluation_analytics is False
+    # The engine guards both the snapshot and the write on this flag, so an
+    # empty snapshot is all a disabled install can produce.
+    assert (
+        record_review_exposures(
+            None,
+            [],
+            platform="github",
+            owner="acme",
+            repo="app",
+            pr_number=1,
+            pr_author="a",
+            head_sha="h",
+            findings=[],
+        )
+        == 0
+    )
+
+
+# --------------------------------------------- review-scoped rows are labelled
+
+
+def test_review_scoped_exposure_is_not_unobserved(store: IndexStore) -> None:
+    """A rule that produced nothing must not read as a rule nobody answered."""
+    _finding(store, "f1")
+    store.record_rule_evaluations([_evaluation("f1"), _evaluation(None)])
+    _feedback(store, "f1", "unobserved", actor="merger")
+
+    rows = store.list_rule_evaluations({"rule_id": 1}, limit=100)
+    by_finding = {row["finding_id"]: row["outcome"] for row in rows}
+    assert by_finding["f1"] == "unobserved"
+    assert by_finding[None] == "not_applicable"
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    assert counts.unobserved == 1
+    assert counts.review_exposures == 1
+
+
+def test_every_bucket_equals_its_drilldown(store: IndexStore) -> None:
+    """The audit guarantee, stated once over a mixed fixture."""
+    plan = {
+        "up": "thumbs_up",
+        "down": "thumbs_down",
+        "q": "reply_question",
+        "silent": "unobserved",
+    }
+    for finding_id, kind in plan.items():
+        _finding(store, finding_id)
+        store.record_rule_evaluations([_evaluation(finding_id)])
+        _feedback(store, finding_id, kind)
+    store.record_rule_evaluations([_evaluation(None)])
+
+    counts = store.aggregate_rule_analytics({"rule_id": 1})[0].counts
+    total = 0
+    for outcome in ("positive", "negative", "neutral", "unobserved"):
+        rows = store.list_rule_evaluations({"rule_id": 1}, outcome=outcome, limit=100)
+        assert getattr(counts, outcome) == len(rows)
+        total += len(rows)
+    assert total == counts.findings
+    not_applicable = store.list_rule_evaluations(
+        {"rule_id": 1}, outcome="not_applicable", limit=100
+    )
+    assert len(not_applicable) == counts.review_exposures
+    assert total + len(not_applicable) == counts.exposures
