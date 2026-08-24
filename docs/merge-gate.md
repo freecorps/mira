@@ -253,6 +253,7 @@ would silently downgrade a working install.
 | Status check | ✅ check run | ✅ commit status | ✅ commit status |
 | Read CI | ✅ check runs + statuses | ✅ head pipeline | ✅ commit statuses |
 | Read association | ✅ | ✅ access levels | ✅ permissions |
+| Read review states | ✅ | ✅ approvals only | ✅ |
 | Read labels | ✅ | ✅ | ✅ |
 
 When something is not supported, the decision **degrades explicitly** to
@@ -269,6 +270,18 @@ the decision stays `would_approve`.
 
 A provider may *narrow* the platform's capabilities (a token with reduced
 scopes) but never widen them.
+
+Two of these are not optional. A provider that cannot read labels, when the
+policy consults labels, and a provider that cannot report human review states
+both produce an `error` decision rather than a guess — an empty label list
+reads as "no `do-not-merge` label" and an empty review-state mapping reads as
+"nobody objected". CI state and author association, by contrast, have a safe
+unknown, so they report it and the gate treats it as not good enough.
+
+If a delivery claim is left `in_flight` by a worker that crashed mid-call, the
+decision stays un-approved and the claim is not retried. That is the safe
+direction, and the `in_flight` state is visible on the decision so it can be
+told from a delivery that simply has not been attempted.
 
 ## Idempotency and concurrency
 
