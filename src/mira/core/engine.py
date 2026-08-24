@@ -601,11 +601,23 @@ class ReviewEngine:
             logger.warning("Overlap detection failed, continuing: %s", exc)
             return []
 
+    def _reset_exposures(self) -> None:
+        """Drop the previous review's rule snapshot.
+
+        A ReviewEngine is reused across reviews. If retrieval fails or a later
+        review returns early, a stale snapshot would be recorded against the
+        wrong PR -- and the evaluation key is built from the *new* review's
+        identity, so it would look entirely legitimate.
+        """
+        self._exposed_rules = []
+        self._review_scope = ReviewScope()
+
     async def review_pr(self, pr_url: str) -> ReviewResult:
         """Full pipeline: fetch PR -> review -> post results.
 
         Runs thread resolution and diff fetching in parallel to reduce latency.
         """
+        self._reset_exposures()
         import asyncio as _asyncio
         import time as _time
 
@@ -1171,6 +1183,10 @@ class ReviewEngine:
         callers to post the walkthrough to GitHub well before chunked review
         completes. Exceptions in the callback are logged and swallowed.
         """
+        # `review_diff` reaches this without going through `review_pr`, and a
+        # failure before rule retrieval must not leave the last review's
+        # snapshot in place.
+        self._reset_exposures()
         import asyncio as _asyncio
 
         # Parse the full diff (not just the priority-selected subset) so the

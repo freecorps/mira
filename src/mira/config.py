@@ -344,6 +344,10 @@ class LearningConfig(BaseModel):
     # A rule needs this many exposures before Mira will suggest a downgrade.
     # Below it there simply isn't enough evidence to call a regression.
     min_exposures_for_regression: int = Field(default=20, ge=1)
+    # And this many *decisive* signals. Exposures alone are not evidence: a
+    # rule can reach the exposure floor on review-scoped rows and then hit a
+    # 100% negative rate from a single thumbs-down.
+    min_decisive_for_regression: int = Field(default=5, ge=1)
     # Share of *decisive* signals (positive + negative) that must be negative
     # before a rule is flagged. Unobserved findings never enter this ratio.
     regression_negative_rate: float = Field(default=0.5, ge=0.0, le=1.0)

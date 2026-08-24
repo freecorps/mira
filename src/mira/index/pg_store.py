@@ -2720,17 +2720,33 @@ class PgIndexStore(_StoreSharedMixin):
     def _analytics_fetchall(self, sql: str, params: tuple) -> list[tuple]:
         return self._fetchall(sql, params)
 
-    def _analytics_rule(self, owner: str, repo: str, rule_id: int) -> LearnedRuleRow | None:
-        """Resolve rule metadata by the aggregate row's repo, not the store's.
+    def _analytics_rules(
+        self, keys: list[tuple[str, str, int]]
+    ) -> dict[tuple[str, str, int], LearnedRuleRow | None]:
+        """Batch rule metadata by the aggregate rows' repos, not the store's.
 
         The org-wide handle has an empty owner/repo, so `get_learned_rule`
-        would find nothing and every rule would render without its text.
+        would find nothing and every rule would render without its text. One
+        query per distinct repository in the page keeps an export from issuing
+        thousands of single-row round trips.
         """
-        row = self._fetchone(
-            f"SELECT {self._LR_COLS} FROM learned_rules WHERE id=%s AND owner=%s AND repo=%s",
-            (rule_id, owner or self._owner, repo or self._repo),
-        )
-        return self._row_to_learned_rule(row) if row else None
+        by_repo: dict[tuple[str, str], list[int]] = {}
+        for owner, repo, rule_id in keys:
+            scope = (owner or self._owner, repo or self._repo)
+            by_repo.setdefault(scope, []).append(rule_id)
+
+        found: dict[tuple[str, str, int], LearnedRuleRow | None] = dict.fromkeys(keys)
+        for (owner, repo), rule_ids in by_repo.items():
+            placeholders = ", ".join(["%s"] * len(rule_ids))
+            rows = self._fetchall(
+                f"SELECT {self._LR_COLS} FROM learned_rules "
+                f"WHERE owner=%s AND repo=%s AND id IN ({placeholders})",
+                (owner, repo, *rule_ids),
+            )
+            for row in rows:
+                rule = self._row_to_learned_rule(row)
+                found[(owner, repo, rule.id)] = rule
+        return found
 
     def _scoped_filters(self, filters: dict[str, Any] | None) -> dict[str, Any]:
         """Pin analytics reads to this store's repository.

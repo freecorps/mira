@@ -230,10 +230,18 @@ def _platform_for(owner: str, repo: str) -> str:
         # `_{platform}/{owner}` value taken from an aggregate row. Both resolve
         # correctly through the GitHub path, which passes the owner unchanged.
         return "github"
-    for platform, _db_owner, db_repo in _repo_targets(owner, repo):
-        if db_repo == repo:
-            return platform
-    return "github"
+    # `_iter_repo_dbs` walks `_gitlab/` before `acme/`, so taking the first
+    # match would silently prefer GitLab for a repo that exists on both. Rank
+    # instead, in the same github -> gitlab -> forgejo order the dashboard
+    # routers use, so analytics opens the store the rest of the app would.
+    from mira.dashboard.api import _PLATFORM_ORDER
+
+    candidates = [
+        platform for platform, _db_owner, db_repo in _repo_targets(owner, repo) if db_repo == repo
+    ]
+    if not candidates:
+        return "github"
+    return min(candidates, key=lambda platform: _PLATFORM_ORDER.get(platform, 99))
 
 
 def summarize(
@@ -456,6 +464,7 @@ def regression_suggestions(
             min_exposures=learning.min_exposures_for_regression,
             negative_rate_threshold=learning.regression_negative_rate,
             disable_rate_threshold=learning.regression_disable_rate,
+            min_decisive=learning.min_decisive_for_regression,
         )
         if suggestion is not None:
             suggestions.append(suggestion)

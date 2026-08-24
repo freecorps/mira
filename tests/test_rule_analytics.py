@@ -361,16 +361,8 @@ def test_outcome_precedence_puts_dissent_first() -> None:
 # ------------------------------------------ aggregates match their evidence
 
 
-@pytest.mark.parametrize(
-    "outcome,kinds",
-    [
-        ("positive", ["thumbs_up"]),
-        ("negative", ["thumbs_down"]),
-        ("neutral", ["reply_question"]),
-        ("unobserved", ["unobserved"]),
-    ],
-)
-def test_aggregate_matches_drilldown(store: IndexStore, outcome: str, kinds: list[str]) -> None:
+@pytest.mark.parametrize("outcome", ["positive", "negative", "neutral", "unobserved"])
+def test_aggregate_matches_drilldown(store: IndexStore, outcome: str) -> None:
     """Every bucket count equals the number of rows the drill-down returns."""
     mix = {
         "a": ["thumbs_up"],
@@ -394,7 +386,6 @@ def test_aggregate_matches_drilldown(store: IndexStore, outcome: str, kinds: lis
         aggregate == len(detailed) == store.count_rule_evaluations({"rule_id": 1}, outcome=outcome)
     )
     assert {row["outcome"] for row in detailed} == {outcome}
-    _ = kinds
 
 
 def test_buckets_sum_to_findings(store: IndexStore) -> None:
@@ -1517,3 +1508,144 @@ def test_summary_paging_is_stable(store: IndexStore) -> None:
 
     assert len(walked) == 6
     assert len(set(walked)) == 6
+
+
+# ------------------------------------------------ review-round 3 regressions
+
+
+def test_engine_clears_exposures_between_reviews() -> None:
+    """A reused engine must not attribute one PR's rules to another.
+
+    The evaluation key is built from the *new* review's identity, so a stale
+    snapshot would record as a perfectly legitimate-looking exposure.
+    """
+    from mira.core.engine import ReviewEngine
+
+    engine = ReviewEngine.__new__(ReviewEngine)
+    engine._exposed_rules = [
+        ExposedRule(
+            rule_id=99,
+            version=1,
+            origin="learned",
+            scope_type="repo",
+            scope_value="",
+            category="",
+            rule_text="Stale.",
+        )
+    ]
+    engine._review_scope = ReviewScope(languages={"a.py": "Python"})
+
+    engine._reset_exposures()
+
+    assert engine._exposed_rules == []
+    assert engine._review_scope.languages == {}
+
+
+def test_path_scope_matching_is_case_insensitive(store: IndexStore) -> None:
+    """SQLite folds LIKE case and Postgres does not; both must agree."""
+    now = time.time()
+    pivot = now - 60 * 86400
+    rule = store.create_learned_rule(
+        "Skip generated code.",
+        "style",
+        path_pattern="Generated/**",
+        scope_type="path",
+        scope_value="Generated/**",
+    )
+    store._conn.execute(
+        "UPDATE learned_rules SET effective_from = ? WHERE id = ?", (pivot, rule.id)
+    )
+    store._conn.commit()
+    _finding(store, "lower", path="generated/api.py", category="style", created_at=pivot + 100)
+
+    result = analytics.compare_activation_periods(owner="acme", repo="app", rule_id=rule.id)
+    assert result["after"]["findings"] == 1
+
+
+def test_sqlite_platform_resolution_prefers_github(isolated_index: Path) -> None:
+    """`_iter_repo_dbs` visits `_gitlab/` first; ranking must still pick GitHub."""
+    for platform in ("gitlab", "github"):
+        store = IndexStore.open("acme", "app", platform=platform)
+        store.close()
+
+    assert analytics._platform_for("acme", "app") == "github"
+
+
+def test_regression_needs_decisive_signals_not_just_exposures() -> None:
+    """Exposures alone are not evidence of a regression.
+
+    A rule can clear the exposure floor on review-scoped rows and then reach a
+    100% negative rate from one thumbs-down; that must not read as "disable".
+    """
+    row = RuleAnalyticsRow(
+        rule_id=1,
+        owner="acme",
+        repo="app",
+        counts=RuleOutcomeCounts(exposures=30, review_exposures=29, findings=1, negative=1),
+    )
+    assert (
+        detect_regression(
+            row,
+            min_exposures=20,
+            negative_rate_threshold=0.5,
+            disable_rate_threshold=0.8,
+            min_decisive=5,
+        )
+        is None
+    )
+    # With enough people actually objecting, it is flagged.
+    row.counts.negative = 6
+    row.counts.findings = 6
+    assert (
+        detect_regression(
+            row,
+            min_exposures=20,
+            negative_rate_threshold=0.5,
+            disable_rate_threshold=0.8,
+            min_decisive=5,
+        )
+        is not None
+    )
+
+
+def test_analytics_routes_reject_path_traversal() -> None:
+    """owner/repo reach a filesystem path, so they are validated as segments."""
+    from fastapi import HTTPException
+
+    import mira.dashboard.routers.analytics as routes
+
+    admin = SimpleNamespace(
+        state=SimpleNamespace(user=SimpleNamespace(is_admin=True, username="root"))
+    )
+    for owner, repo in (("..", "app"), ("acme", ".."), ("a/b", "app"), ("acme", "a/b")):
+        with pytest.raises(HTTPException) as exc:
+            routes.rule_analytics_detail(admin, owner, repo, 1)
+        assert exc.value.status_code == 400, (owner, repo)
+
+
+def test_namespaced_owner_is_accepted() -> None:
+    """The stores emit `_{platform}/{owner}` themselves, so it must pass."""
+    from mira.dashboard.routers.analytics import _NAMESPACED_OWNER, _public_owner
+
+    assert _NAMESPACED_OWNER.match("_gitlab/acme")
+    assert _public_owner("_gitlab/acme") == "acme"
+    # But it cannot be used to smuggle a traversal through.
+    assert not _NAMESPACED_OWNER.match("_gitlab/../etc")
+
+
+def test_unregistered_repo_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import HTTPException
+
+    import mira.dashboard.routers.analytics as routes
+
+    class _Empty:
+        def get_repo_any_platform(self, owner: str, repo: str):
+            return []
+
+    monkeypatch.setattr("mira.dashboard.api._app_db", _Empty())
+    admin = SimpleNamespace(
+        state=SimpleNamespace(user=SimpleNamespace(is_admin=True, username="root"))
+    )
+    with pytest.raises(HTTPException) as exc:
+        routes.rule_analytics_detail(admin, "acme", "app", 1)
+    assert exc.value.status_code == 404

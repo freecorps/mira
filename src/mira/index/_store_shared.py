@@ -114,17 +114,21 @@ class _StoreSharedMixin:
         """
         return dict(filters or {})
 
-    def _analytics_rule(self, owner: str, repo: str, rule_id: int) -> Any:
-        """Look up a rule's metadata for an aggregate row.
+    def _analytics_rules(self, keys: list[tuple[str, str, int]]) -> dict[tuple[str, str, int], Any]:
+        """Batch-load rule metadata for a page of aggregate rows.
+
+        One query per page, not per row: `export_rule_analytics` asks for up to
+        5000 rules, and a per-row lookup would be 5000 round trips on Postgres.
 
         SQLite has one database per repository, so `rule_id` alone is
-        unambiguous. Postgres shares the table and its `get_learned_rule` is
-        pinned to the store's own owner/repo -- which is empty on the org-wide
-        handle, so it would return None and blank out every rule's text.
-        `PgIndexStore` overrides this to look the rule up by the row's repo.
+        unambiguous and the owner/repo in each key is only used to shape the
+        result. `PgIndexStore` overrides this because its table is shared and
+        the store's own scope is empty on the org-wide handle.
         """
-        del owner, repo
-        return self.get_learned_rule(rule_id)  # type: ignore[attr-defined]
+        rules: dict[tuple[str, str, int], Any] = {}
+        for owner, repo, rule_id in keys:
+            rules[(owner, repo, rule_id)] = self.get_learned_rule(rule_id)  # type: ignore[attr-defined]
+        return rules
 
     def _counts_from_row(self, row: tuple, offset: int) -> RuleOutcomeCounts:
         """Read the shared aggregate column block starting at `offset`."""
@@ -181,12 +185,15 @@ class _StoreSharedMixin:
             for r in self._analytics_fetchall(repeat_sql, repeat_params)
         }
 
+        keys = [(str(row[0]), str(row[1]), int(row[2])) for row in rows]
+        metadata = self._analytics_rules(keys) if keys else {}
+
         results: list[RuleAnalyticsRow] = []
-        for row in rows:
-            owner, repo, rule_id = str(row[0]), str(row[1]), int(row[2])
+        for row, key in zip(rows, keys, strict=True):
+            owner, repo, rule_id = key
             counts = self._counts_from_row(row, 9)
-            counts.repeated_false_positives = repeats.get((owner, repo, rule_id), 0)
-            rule = self._analytics_rule(owner, repo, rule_id)
+            counts.repeated_false_positives = repeats.get(key, 0)
+            rule = metadata.get(key)
             results.append(
                 RuleAnalyticsRow(
                     rule_id=rule_id,
@@ -271,7 +278,10 @@ class _StoreSharedMixin:
         )
         results = []
         for row in self._analytics_fetchall(sql, params):
-            record = dict(zip(columns, row, strict=False))
+            # strict: the column names must stay aligned with the SELECT in
+            # `evaluation_details_sql`. Drifting silently would drop fields
+            # from every drill-down row and CSV export.
+            record = dict(zip(columns, row, strict=True))
             record["addressed"] = bool(record.get("addressed"))
             results.append(record)
         return results

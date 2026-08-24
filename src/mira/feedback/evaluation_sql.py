@@ -338,7 +338,10 @@ def period_findings_sql(
     if category:
         where.add("f.category = ?", category)
     if path_like:
-        where.add("f.path LIKE ? ESCAPE '\\'", path_like)
+        # SQLite's LIKE folds ASCII case, Postgres' does not. Fold both sides
+        # explicitly so a scope glob selects the same findings on either
+        # backend -- parity here is a requirement, not a nicety.
+        where.add("LOWER(f.path) LIKE LOWER(?) ESCAPE '\\'", path_like)
     outcome = outcome_case_sql()
     addressed = addressed_case_sql()
     sql = (

@@ -387,14 +387,23 @@ def detect_regression(
     min_exposures: int,
     negative_rate_threshold: float,
     disable_rate_threshold: float,
+    min_decisive: int = 1,
 ) -> RegressionSuggestion | None:
     """Suggest a downgrade or disable - never perform one.
 
     Phase 3 only advises. Acting on the advice stays an explicit admin
     decision, recorded in the audit log.
+
+    Two independent floors, because they measure different things. `exposures`
+    says the rule has had a fair chance to run; `min_decisive` says enough
+    people actually responded. Without the second, a rule could clear the
+    exposure floor on review-scoped rows alone and then be flagged for disable
+    on the strength of one thumbs-down.
     """
     counts = row.counts
     if counts.exposures < min_exposures:
+        return None
+    if counts.positive + counts.negative < min_decisive:
         return None
     negative_rate = counts.negative_rate
     # No decisive feedback at all means no evidence of regression. Silence is

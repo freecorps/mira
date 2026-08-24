@@ -282,7 +282,7 @@ def test_postgres_org_rules_apply_across_repositories(fake_conn):
 # ─────────────────────────── Phase 3 evaluation analytics ───────────────────
 
 
-def _pg_finding(store, finding_id, *, path="src/a.py", category="security", state="open"):
+def _pg_finding(store, finding_id, *, path="src/a.py", category="security", state="open") -> None:
     from mira.feedback.models import ReviewFinding
 
     store.save_review_finding(
@@ -316,7 +316,7 @@ def _pg_finding(store, finding_id, *, path="src/a.py", category="security", stat
         store.update_review_finding_state(finding_id, state)
 
 
-def _pg_evaluation(store, finding_id, *, rule_id=1, decision="instruction"):
+def _pg_evaluation(store, finding_id, *, rule_id=1, decision="instruction"):  # noqa: ANN201
     from mira.feedback.evaluation import RuleEvaluation, evaluation_key
 
     return RuleEvaluation(
@@ -346,7 +346,7 @@ def _pg_evaluation(store, finding_id, *, rule_id=1, decision="instruction"):
     )
 
 
-def _pg_feedback(store, finding_id, kind, actor="bob"):
+def _pg_feedback(store, finding_id, kind, actor="bob") -> None:
     from mira.feedback.models import FeedbackEventV2
 
     store.record_feedback_v2(
@@ -367,7 +367,7 @@ def _pg_feedback(store, finding_id, kind, actor="bob"):
     )
 
 
-def _seed_evaluation_fixture(store):
+def _seed_evaluation_fixture(store) -> None:
     """The same mix of signals on both backends, so the numbers must match."""
     plan = {
         "up": "thumbs_up",
