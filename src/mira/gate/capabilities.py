@@ -90,14 +90,23 @@ GITLAB_CAPABILITIES = GateCapabilities(
     can_read_review_states=True,
     can_approve=True,
     can_request_changes=False,
-    can_publish_status=True,
+    # A GitLab commit status is not a neutral annotation: it joins the head
+    # pipeline, so publishing one both corrupts the CI signal the gate reads
+    # back and — on a project with no other CI and "Pipelines must succeed"
+    # enabled — can satisfy the merge restriction the gate just refused to
+    # satisfy. There is no status the gate can safely write here, so it does
+    # not write one. The explanation goes to `gate.comment` and the dashboard.
+    can_publish_status=False,
     can_read_ci=True,
     can_read_association=True,
     can_read_labels=True,
     can_read_codeowners=True,
     notes=(
-        "GitLab has no REQUEST_CHANGES review event; blockers are reported as "
-        "review comments and a failed commit status instead.",
+        "GitLab has no REQUEST_CHANGES review event; blockers are reported as review comments.",
+        "The gate publishes no commit status on GitLab: a status joins the head "
+        "pipeline, so it would corrupt the CI signal and could satisfy a "
+        "'pipelines must succeed' rule the gate had just refused. Turn on "
+        "gate.comment to surface the explanation on the merge request.",
         "Merge-request approvals may be unavailable on the project's tier — "
         "delivery degrades to would_approve if the API refuses.",
     ),

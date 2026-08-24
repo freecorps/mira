@@ -247,14 +247,10 @@ def _gitlab() -> GitLabProvider:
     return provider
 
 
-def _gitlab_ci(pipeline: dict | None, *status_names: str, statuses_status: int = 200):
-    """Serve the MR (with its head pipeline) and the head commit's statuses."""
+def _gitlab_pipeline(pipeline: dict | None):
+    """Serve the merge request, with or without a head pipeline."""
 
     def handler(method, url, **kw):
-        if "/statuses" in url:
-            if statuses_status != 200:
-                return _FakeResp(status=statuses_status, json_data=[])
-            return _FakeResp(json_data=[{"name": name} for name in status_names])
         return _FakeResp(json_data={"head_pipeline": pipeline} if pipeline else {})
 
     return handler
@@ -281,54 +277,42 @@ def _gitlab_ci(pipeline: dict | None, *status_names: str, statuses_status: int =
     ],
 )
 async def test_gitlab_pipeline_mapping(status: str, expected: str) -> None:
-    handler = _gitlab_ci({"id": 1, "status": status, "sha": "head123"}, "build")
-    with _patch_gitlab(handler):
+    with _patch_gitlab(_gitlab_pipeline({"id": 1, "status": status, "sha": "head123"})):
         assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == expected
 
 
 async def test_gitlab_no_pipeline_is_none_not_success() -> None:
-    with _patch_gitlab(_gitlab_ci(None)):
+    with _patch_gitlab(_gitlab_pipeline(None)):
         assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "none"
 
 
-async def test_gitlab_ci_ignores_a_pipeline_made_only_of_the_gates_own_status() -> None:
-    """An external status joins the pipeline — including the gate's own.
-
-    On a project with no CI, the gate's status creates a green pipeline. Reading
-    that back as passing would be the gate approving on its own say-so.
-    """
-    handler = _gitlab_ci({"id": 9, "status": "success", "sha": "head123"}, STATUS_CONTEXT)
-    with _patch_gitlab(handler):
-        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "none"
-
-
-async def test_gitlab_real_ci_alongside_the_gates_status_still_counts() -> None:
-    handler = _gitlab_ci({"id": 9, "status": "success", "sha": "head123"}, "build", STATUS_CONTEXT)
-    with _patch_gitlab(handler):
-        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "success"
-
-
-async def test_gitlab_merged_results_pipelines_are_still_read() -> None:
+async def test_gitlab_merged_results_pipelines_are_read_on_every_pass() -> None:
     """The pipeline belongs to the merge-ref commit, not to the head SHA.
 
-    Its statuses lookup finds nothing, and an empty result must fall through to
-    the pipeline rather than reading as "no CI" — otherwise no merge request in
-    such a project could ever be approved.
+    Reading `head_pipeline` finds it regardless, which is the whole reason the
+    gate reads the pipeline rather than the head commit's statuses — and the
+    reason it must never publish a status of its own onto that commit.
     """
-    handler = _gitlab_ci({"id": 3, "status": "success", "sha": "mergeref"})
-    with _patch_gitlab(handler):
-        state = await _gitlab().get_ci_state(_pr("gitlab"))
-    assert state.state == "success"
+    pipeline = {"id": 3, "status": "success", "sha": "mergeref"}
+    with _patch_gitlab(_gitlab_pipeline(pipeline)):
+        first = await _gitlab().get_ci_state(_pr("gitlab"))
+        second = await _gitlab().get_ci_state(_pr("gitlab"))
+    assert first.state == "success"
+    assert second.state == "success"
 
 
-async def test_gitlab_unreadable_statuses_are_unknown_not_green() -> None:
+async def test_gitlab_reads_ci_in_a_single_call() -> None:
+    """Nothing writes into the pipeline, so nothing has to be read back out."""
+    seen: list[str] = []
+
     def handler(method, url, **kw):
-        if "/statuses" in url:
-            raise RuntimeError("upstream is down")
+        seen.append(url)
         return _FakeResp(json_data={"head_pipeline": {"id": 1, "status": "success"}})
 
     with _patch_gitlab(handler):
-        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "unknown"
+        await _gitlab().get_ci_state(_pr("gitlab"))
+    assert len(seen) == 1
+    assert not any("/statuses" in url for url in seen)
 
 
 async def test_gitlab_unreadable_pipeline_is_unknown() -> None:
@@ -402,18 +386,18 @@ async def test_gitlab_labels_raise_rather_than_read_as_absent() -> None:
 
 
 @pytest.mark.parametrize("conclusion", ["success", "neutral", "failure"])
-async def test_gitlab_never_publishes_a_red_commit_status(conclusion: str) -> None:
-    """The status is an explanation here, not a verdict.
+async def test_gitlab_publishes_no_commit_status_at_all(conclusion: str) -> None:
+    """A GitLab commit status joins the head pipeline, so the gate writes none.
 
-    GitLab has no blocking review event, so a red status would claim a power
-    this provider does not have — and because an external status joins the head
-    pipeline, it would corrupt the very signal `get_ci_state` reads back.
+    It would corrupt the CI signal the gate reads back, and on a project with
+    no other CI a green status *becomes* a green pipeline — which can satisfy a
+    "pipelines must succeed" rule the gate had just refused to satisfy. The gate
+    manufacturing the permission it withheld is the worst outcome available.
     """
-    captured: dict = {}
+    called: list[str] = []
 
     def handler(method, url, **kw):
-        captured["url"] = url
-        captured["params"] = kw.get("params")
+        called.append(url)
         return _FakeResp(status=201, json_data={"id": 5})
 
     with _patch_gitlab(handler):
@@ -424,12 +408,15 @@ async def test_gitlab_never_publishes_a_red_commit_status(conclusion: str) -> No
             title="Not approved",
             summary="s",
         )
-    assert ref == "5"
-    assert "/statuses/head123" in captured["url"]
-    assert captured["params"]["state"] == "success"
-    assert captured["params"]["name"] == "mira/merge-gate"
-    # The verdict travels where it cannot break anything.
-    assert captured["params"]["description"] == "Not approved"
+    assert ref == ""
+    assert called == []
+
+
+def test_gitlab_declares_that_it_cannot_publish_a_status() -> None:
+    """Declared, so the decision degrades explicitly rather than silently."""
+    capabilities = for_provider(GitLabProvider.__new__(GitLabProvider))
+    assert capabilities.can_publish_status is False
+    assert any("commit status" in note for note in capabilities.notes)
 
 
 # ───────────────────────────────────────────────────────────────── Forgejo ──
@@ -651,34 +638,3 @@ async def test_forgejo_codeowners_decodes_the_contents_api() -> None:
         path, content = await _forgejo().get_codeowners(_pr("forgejo"))
     assert path in CODEOWNERS_LOCATIONS["forgejo"]
     assert "@backend" in content
-
-
-async def test_gitlab_an_unaddressable_commit_falls_through_to_the_pipeline() -> None:
-    """A 404 on the statuses endpoint means "nothing recorded", not "unknown".
-
-    Merged-results pipelines belong to the merge-ref commit, and the guard has
-    no business blocking a project just because the head commit carries no
-    statuses of its own.
-    """
-    handler = _gitlab_ci({"id": 3, "status": "success"}, statuses_status=404)
-    with _patch_gitlab(handler):
-        assert (await _gitlab().get_ci_state(_pr("gitlab"))).state == "success"
-
-
-async def test_gitlab_reads_the_guard_from_the_head_commit() -> None:
-    """The gate posts against the head SHA, so that is where it must look."""
-    seen: list[str] = []
-
-    def handler(method, url, **kw):
-        if "/statuses" in url:
-            seen.append(url)
-            return _FakeResp(json_data=[{"name": STATUS_CONTEXT}])
-        return _FakeResp(
-            json_data={"head_pipeline": {"id": 1, "status": "success", "sha": "mergeref"}}
-        )
-
-    with _patch_gitlab(handler):
-        state = await _gitlab().get_ci_state(_pr("gitlab"))
-    assert state.state == "none"
-    assert all("head123" in url for url in seen)
-    assert not any("mergeref" in url for url in seen)
