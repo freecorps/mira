@@ -120,7 +120,16 @@ docker run -p 8000:8000 --env-file .env \
 filter:
   confidence_threshold: 0.5  # noisier repo → lower bar
   max_comments: 10
+
+learning:
+  feedback_v2: true
+  learning_synthesis: true
+  learning_auto_apply: false  # keep human approval in the loop
 ```
+
+Set `MIRA_DASHBOARD_URL` to the externally reachable dashboard base URL (for
+example, `https://mira.example.com`) so feedback acknowledgements can link
+directly to their candidate and evidence.
 
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 

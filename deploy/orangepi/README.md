@@ -59,4 +59,6 @@ gh attestation verify \
 
 Keep `mira.env`, the GitHub App private key, and CLI Proxy credentials out of
 Git. The dashboard and webhook should be published through a TLS reverse proxy;
-the container port remains bound to loopback.
+the container port remains bound to loopback. Add the public base URL as
+`MIRA_DASHBOARD_URL=https://mira.example.com` in `mira.env` to make feedback
+candidate links clickable from pull-request comments.
