@@ -31,6 +31,7 @@ from mira.platforms.handlers import (
     _REJECT_KEYWORDS,
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
+    run_gate_evaluation,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -531,6 +532,22 @@ async def dispatch_github_event(
         background_tasks.add_task(handle_pull_request, payload, app_auth, bot_name)
         return "processing"
 
+    # The merge gate's inputs move without a new commit: CI finishes, a
+    # `do-not-merge` label goes on or comes off, a draft is marked ready. Each
+    # of those makes the last decision stale, and re-deciding costs no LLM
+    # call — so the gate listens for them even though the review does not.
+    if event in {"check_suite", "check_run"} and action == "completed":
+        background_tasks.add_task(handle_gate_recheck, payload, app_auth, bot_name)
+        return "processing"
+
+    if (
+        event == "pull_request"
+        and action in _GATE_RECHECK_ACTIONS
+        and payload.get("sender", {}).get("login", "") != f"{bot_name}[bot]"
+    ):
+        background_tasks.add_task(handle_gate_pr_event, payload, app_auth, bot_name)
+        return "processing"
+
     if event == "issue_comment" and action == "created":
         comment_body = payload.get("comment", {}).get("body", "")
         comment_user = payload.get("comment", {}).get("user", {}).get("login", "")
@@ -599,6 +616,76 @@ async def dispatch_github_event(
             return "processing"
 
     return "ignored"
+
+
+# Pull-request actions that change a gate input without changing the code.
+_GATE_RECHECK_ACTIONS = {"labeled", "unlabeled", "ready_for_review", "converted_to_draft"}
+
+
+async def handle_gate_recheck(
+    payload: dict[str, Any],
+    app_auth: GitHubAppAuth,
+    bot_name: str,
+) -> None:
+    """Re-evaluate the gate for every PR a finished check suite belongs to."""
+    installation_id: int = payload.get("installation", {}).get("id", 0)
+    container = payload.get("check_suite") or payload.get("check_run") or {}
+    pull_requests = container.get("pull_requests") or []
+    if not pull_requests:
+        return
+    owner = payload.get("repository", {}).get("owner", {}).get("login", "")
+    repo = payload.get("repository", {}).get("name", "")
+    if not owner or not repo:
+        return
+    try:
+        token = await app_auth.get_installation_token(installation_id)
+        provider = create_provider("github", token)
+    except Exception as exc:
+        logger.warning("Gate recheck could not authenticate for %s/%s: %s", owner, repo, exc)
+        return
+    # Bounded: a check suite belongs to a handful of PRs, but the payload is
+    # attacker-adjacent input and an unbounded loop here would be a free
+    # amplification primitive.
+    for pull_request in pull_requests[:10]:
+        number = int(pull_request.get("number") or 0)
+        if not number:
+            continue
+        await run_gate_evaluation(
+            provider,
+            owner,
+            repo,
+            number,
+            f"https://github.com/{owner}/{repo}/pull/{number}",
+            bot_name,
+        )
+
+
+async def handle_gate_pr_event(
+    payload: dict[str, Any],
+    app_auth: GitHubAppAuth,
+    bot_name: str,
+) -> None:
+    """Re-evaluate the gate after a label or draft-state change."""
+    installation_id: int = payload.get("installation", {}).get("id", 0)
+    owner = payload.get("repository", {}).get("owner", {}).get("login", "")
+    repo = payload.get("repository", {}).get("name", "")
+    number = int((payload.get("pull_request") or {}).get("number") or 0)
+    if not owner or not repo or not number:
+        return
+    try:
+        token = await app_auth.get_installation_token(installation_id)
+        provider = create_provider("github", token)
+    except Exception as exc:
+        logger.warning("Gate recheck could not authenticate for %s/%s: %s", owner, repo, exc)
+        return
+    await run_gate_evaluation(
+        provider,
+        owner,
+        repo,
+        number,
+        f"https://github.com/{owner}/{repo}/pull/{number}",
+        bot_name,
+    )
 
 
 async def handle_pull_request(

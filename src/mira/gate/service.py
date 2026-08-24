@@ -1,0 +1,693 @@
+"""Running the gate: gather, decide, persist, deliver.
+
+The order is load-bearing and never varies.
+
+1. **Resolve the policy.** If the gate is off for this repository, stop here.
+   Nothing is fetched, nothing is written but a `skipped` row — an install that
+   never turned the gate on must not pay for it, and a repository that opted
+   out must not have its pull-request data copied into a decision.
+2. **Gather inputs**, under a wall-clock budget. Anything that raises, and any
+   budget overrun, produces an ``error`` decision.
+3. **Decide**, purely, in :mod:`mira.gate.decide`.
+4. **Persist** before acting. A decision that was delivered but never recorded
+   is an approval nobody can audit; a decision recorded but not yet delivered
+   is a retry.
+5. **Deliver**, claiming each side effect first so a redelivered webhook or a
+   second worker cannot approve twice.
+
+The state only becomes ``approved`` in step 5, after the platform confirms it.
+Every earlier step's failure path leaves it at something else, which is what
+"fail closed" means here: not a handler that catches the bad case, but a value
+that was never set to the good one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from mira.config import MiraConfig, load_config
+from mira.gate import capabilities as caps
+from mira.gate.codeowners import CodeownersFile
+from mira.gate.codeowners import parse as parse_codeowners
+from mira.gate.decide import decide
+from mira.gate.eligibility import classify_paths
+from mira.gate.explain import (
+    admin_explanation,
+    one_line,
+    public_explanation,
+    status_conclusion,
+    status_title,
+)
+from mira.gate.models import (
+    CIState,
+    GateDecision,
+    GateInputs,
+    Reason,
+    ReasonCode,
+    decision_key,
+    delivery_key,
+    override_key,
+)
+from mira.gate.policy import EffectivePolicy, resolve_policy
+
+logger = logging.getLogger(__name__)
+
+# Name of the check run / commit status the gate publishes. Stable, because
+# re-publishing under a new name would leave the old one on the commit forever.
+STATUS_CONTEXT = "mira/merge-gate"
+
+# Marker for the gate's PR comment, so updates land in place instead of
+# stacking a new comment on every push.
+COMMENT_MARKER = "<!-- mira:merge-gate -->"
+
+
+class GateUnavailable(Exception):
+    """An input the decision depends on could not be read.
+
+    Raised rather than returning a partial :class:`GateInputs`, so there is no
+    code path where a missing fact silently reads as a benign one.
+    """
+
+
+@dataclass
+class ReviewSignal:
+    """What the review pass knows, passed in rather than re-fetched.
+
+    The gate usually runs right after a review that has already parsed the
+    diff, counted the findings and knows whether every file was covered.
+    Re-deriving that would cost a second diff fetch per PR for nothing.
+    """
+
+    changed_paths: list[str] | None = None
+    added_lines: int = 0
+    deleted_lines: int = 0
+    open_blockers: int | None = None
+    open_findings: int | None = None
+    warnings: int = 0
+    suggestions: int = 0
+    security_findings: int = 0
+    worst_severity: str = ""
+    review_complete: bool = True
+    skipped_paths: list[str] | None = None
+    review_failed: str = ""
+    review_id: int = 0
+
+
+def _open_store(owner: str, repo: str, platform: str) -> Any:
+    from mira.index.store import IndexStore
+
+    return IndexStore.open(owner, repo, platform=platform)
+
+
+def _index_ready(owner: str, repo: str, platform: str) -> bool:
+    """Whether the repository index is complete enough to have informed the review.
+
+    A registry that cannot be reached returns False. "We could not check" and
+    "the index is missing" lead to the same conservative place, and the gate
+    has no business inventing a third.
+    """
+    try:
+        from mira.dashboard.api import _app_db
+
+        if _app_db is None:  # pragma: no cover - unconfigured installs
+            return False
+        record = _app_db.get_repo(owner, repo, platform=platform)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Gate could not read repo index status for %s/%s: %s", owner, repo, exc)
+        return False
+    return bool(record and record.status == "ready")
+
+
+async def _codeowners_for(provider: Any, pr_info: Any, policy: EffectivePolicy) -> CodeownersFile:
+    """Read and parse CODEOWNERS, or say why it could not be read.
+
+    Only called when the integration is enabled. A read failure becomes
+    ``unreadable`` rather than propagating, because the *policy* decides what
+    an unreadable ownership map means — and in ``block`` mode it means no
+    automatic approval, which is a decision, not an error.
+    """
+    if policy.codeowners == "off":
+        return CodeownersFile(status="not_checked")
+    getter = getattr(provider, "get_codeowners", None)
+    if getter is None:
+        return CodeownersFile(status="unreadable", error="provider cannot read CODEOWNERS")
+    try:
+        path, content = await getter(pr_info)
+    except Exception as exc:  # noqa: BLE001 - conservative, not fatal
+        return CodeownersFile(status="unreadable", error=str(exc))
+    if not content:
+        return CodeownersFile(status="absent", path=path)
+    return parse_codeowners(content, source_path=path)
+
+
+async def gather_inputs(
+    provider: Any,
+    pr_info: Any,
+    policy: EffectivePolicy,
+    *,
+    bot_name: str = "",
+    signal: ReviewSignal | None = None,
+    capabilities: caps.GateCapabilities | None = None,
+) -> GateInputs:
+    """Collect every fact the decision needs. Raises on anything unreadable."""
+    signal = signal or ReviewSignal()
+    capability = capabilities or caps.for_provider(provider)
+
+    labels: list[str] = []
+    if capability.can_read_labels:
+        labels = list(await provider.get_pr_labels(pr_info))
+    elif policy.blocked_labels or policy.required_labels:
+        # The policy asks a question this provider cannot answer, and guessing
+        # the answer is exactly the failure the gate exists to prevent.
+        raise GateUnavailable(
+            f"{capability.provider} cannot read pull-request labels, which this policy requires"
+        )
+
+    association = "UNKNOWN"
+    if capability.can_read_association:
+        association = str(await provider.get_author_association(pr_info) or "UNKNOWN").upper()
+
+    ci = CIState(state="unknown")
+    if capability.can_read_ci:
+        ci = await provider.get_ci_state(pr_info)
+
+    human_states: dict[str, str] = {}
+    states_getter = getattr(provider, "get_review_states", None)
+    if states_getter is not None:
+        human_states = dict(await states_getter(pr_info) or {})
+
+    if signal.changed_paths is None:
+        changed_paths, added, deleted = await provider.get_pr_change_stats(pr_info)
+    else:
+        changed_paths = list(signal.changed_paths)
+        added, deleted = signal.added_lines, signal.deleted_lines
+
+    generated, protected = classify_paths(changed_paths, policy)
+
+    codeowners = await _codeowners_for(provider, pr_info, policy)
+    owned = codeowners.owned_paths(changed_paths) if codeowners.status == "ok" else []
+
+    owner = pr_info.owner
+    repo = pr_info.repo
+    platform = getattr(pr_info, "platform", "github")
+
+    blockers = signal.open_blockers
+    open_findings = signal.open_findings
+    worst = signal.worst_severity
+    warnings = signal.warnings
+    security = signal.security_findings
+    if blockers is None or open_findings is None:
+        store = _open_store(owner, repo, platform)
+        try:
+            counts = store.gate_finding_counts(pr_info.number)
+        finally:
+            store.close()
+        blockers = counts["blockers"] if blockers is None else blockers
+        open_findings = counts["open"] if open_findings is None else open_findings
+        warnings = warnings or counts["warnings"]
+        security = security or counts["security"]
+        worst = worst or counts["worst"]
+
+    return GateInputs(
+        platform=platform,
+        owner=owner,
+        repo=repo,
+        pr_number=pr_info.number,
+        pr_url=pr_info.url,
+        pr_author=getattr(pr_info, "author", "") or "",
+        base_branch=pr_info.base_branch,
+        head_branch=pr_info.head_branch,
+        head_sha=getattr(pr_info, "head_sha", "") or "",
+        base_sha=getattr(pr_info, "base_sha", "") or "",
+        draft=bool(getattr(pr_info, "draft", False)),
+        labels=labels,
+        author_association=association,
+        changed_paths=list(changed_paths),
+        changed_files=len(changed_paths),
+        added_lines=int(added),
+        deleted_lines=int(deleted),
+        generated_paths=generated,
+        protected_matches=protected,
+        codeowner_matches=owned,
+        codeowners_status=codeowners.status,
+        ci=ci,
+        open_blockers=int(blockers or 0),
+        open_findings=int(open_findings or 0),
+        worst_severity=worst,
+        review_complete=signal.review_complete,
+        review_skipped_paths=list(signal.skipped_paths or []),
+        review_failed=signal.review_failed,
+        index_ready=_index_ready(owner, repo, platform),
+        human_states=human_states,
+        bot_login=bot_name,
+        review_id=signal.review_id,
+    )
+
+
+def _error_decision(
+    pr_info: Any,
+    policy: EffectivePolicy,
+    message: str,
+    *,
+    code: str = ReasonCode.EVALUATION_ERROR,
+) -> GateDecision:
+    """A decision that records the failure and approves nothing.
+
+    Given its own inputs snapshot rather than a partial one, so an audit can
+    never mistake "these are the facts we decided on" for "these are the facts
+    we managed to fetch before it broke".
+    """
+    inputs = GateInputs(
+        platform=getattr(pr_info, "platform", "github"),
+        owner=pr_info.owner,
+        repo=pr_info.repo,
+        pr_number=pr_info.number,
+        pr_url=pr_info.url,
+        pr_author=getattr(pr_info, "author", "") or "",
+        base_branch=getattr(pr_info, "base_branch", ""),
+        head_sha=getattr(pr_info, "head_sha", "") or "",
+    )
+    return GateDecision(
+        decision_key=decision_key(
+            platform=inputs.platform,
+            owner=inputs.owner,
+            repo=inputs.repo,
+            pr_number=inputs.pr_number,
+            head_sha=inputs.head_sha,
+            policy_version=policy.version,
+            mode=policy.mode,
+            inputs_digest=f"error:{code}",
+        ),
+        state="error",
+        mode=policy.mode,  # type: ignore[arg-type]
+        policy_version=policy.version,
+        inputs=inputs,
+        reasons=[Reason(code, message)],
+        delivery_state="skipped",
+        error=message,
+    )
+
+
+async def evaluate(
+    provider: Any,
+    pr_info: Any,
+    *,
+    config: MiraConfig | None = None,
+    bot_name: str = "",
+    signal: ReviewSignal | None = None,
+    deliver_side_effects: bool = True,
+) -> GateDecision:
+    """Evaluate one pull request and record the decision. Never raises."""
+    config = config or load_config()
+    policy = resolve_policy(config.gate, pr_info.owner, pr_info.repo)
+
+    if not policy.active:
+        decision = decide(
+            GateInputs(
+                platform=getattr(pr_info, "platform", "github"),
+                owner=pr_info.owner,
+                repo=pr_info.repo,
+                pr_number=pr_info.number,
+                pr_url=pr_info.url,
+                head_sha=getattr(pr_info, "head_sha", "") or "",
+            ),
+            policy,
+        )
+        _persist(decision)
+        return decision
+
+    capability = caps.for_provider(provider)
+    try:
+        inputs = await asyncio.wait_for(
+            gather_inputs(
+                provider,
+                pr_info,
+                policy,
+                bot_name=bot_name,
+                signal=signal,
+                capabilities=capability,
+            ),
+            timeout=policy.timeout_seconds,
+        )
+    except TimeoutError:
+        decision = _error_decision(
+            pr_info,
+            policy,
+            f"Gate evaluation exceeded its {policy.timeout_seconds:g}s budget",
+            code=ReasonCode.EVALUATION_TIMEOUT,
+        )
+        _persist(decision)
+        logger.warning("Merge gate timed out on %s", pr_info.url)
+        return decision
+    except Exception as exc:  # noqa: BLE001 - every failure is a non-approval
+        decision = _error_decision(pr_info, policy, f"{type(exc).__name__}: {exc}")
+        _persist(decision)
+        logger.warning("Merge gate could not evaluate %s: %s", pr_info.url, exc)
+        return decision
+
+    signal = signal or ReviewSignal()
+    decision = decide(
+        inputs,
+        policy,
+        capabilities=capability,
+        warnings=signal.warnings,
+        suggestions=signal.suggestions,
+        security_findings=signal.security_findings,
+    )
+    stored, created = _persist(decision)
+    logger.info("Merge gate on %s: %s", pr_info.url, one_line(stored))
+
+    if deliver_side_effects and stored.delivery_state in {"pending", "failed"}:
+        stored = await deliver(provider, pr_info, stored, policy)
+    return stored
+
+
+def _persist(decision: GateDecision) -> tuple[GateDecision, bool]:
+    """Write the decision, tolerating a store that is unavailable.
+
+    A decision that cannot be recorded still has to be *returned* — the caller
+    may be about to act on it — but it must not be acted on as if it were
+    auditable, so the delivery state is forced to skipped.
+    """
+    inputs = decision.inputs
+    try:
+        store = _open_store(inputs.owner, inputs.repo, inputs.platform)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Merge gate could not open its store for %s: %s", inputs.pr_url, exc)
+        decision.delivery_state = "skipped"
+        decision.error = decision.error or f"decision not recorded: {exc}"
+        return decision, False
+    try:
+        return store.record_gate_decision(decision)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Merge gate could not record a decision for %s: %s", inputs.pr_url, exc)
+        decision.delivery_state = "skipped"
+        decision.error = decision.error or f"decision not recorded: {exc}"
+        return decision, False
+    finally:
+        store.close()
+
+
+async def deliver(
+    provider: Any,
+    pr_info: Any,
+    decision: GateDecision,
+    policy: EffectivePolicy,
+) -> GateDecision:
+    """Perform the platform-side effects this decision calls for.
+
+    Each irreversible action is claimed first. The claim is what makes a
+    redelivered webhook, a retried background task and a second worker safe:
+    the winner acts, the losers do nothing, and a *failed* attempt is
+    reclaimable so a transient error still gets a second chance.
+    """
+    inputs = decision.inputs
+    store = _open_store(inputs.owner, inputs.repo, inputs.platform)
+    try:
+        # Whether a review event — the delivery that actually matters — was
+        # attempted. If one was, its outcome owns `delivery_state`: a status
+        # check that published fine must not overwrite a failed approval with
+        # "delivered", which would read as an approval that never happened.
+        attempted_review_event = False
+        if decision.request_changes:
+            attempted_review_event = True
+            await _deliver_review_event(provider, pr_info, decision, store, "REQUEST_CHANGES")
+        elif decision.state == "would_approve" and policy.enforcing:
+            capability = caps.for_provider(provider)
+            if capability.can_approve:
+                attempted_review_event = True
+                await _deliver_review_event(provider, pr_info, decision, store, "APPROVE")
+
+        if policy.publish_status:
+            await _publish_status(
+                provider, pr_info, decision, store, owns_delivery_state=not attempted_review_event
+            )
+        if policy.comment:
+            await _publish_comment(provider, pr_info, decision)
+
+        refreshed = store.get_gate_decision(decision.decision_key)
+        return refreshed or decision
+    finally:
+        store.close()
+
+
+async def _deliver_review_event(
+    provider: Any,
+    pr_info: Any,
+    decision: GateDecision,
+    store: Any,
+    event: str,
+) -> None:
+    """Submit APPROVE / REQUEST_CHANGES exactly once per PR head commit."""
+    inputs = decision.inputs
+    kind = "approval" if event == "APPROVE" else "request_changes"
+    key = delivery_key(
+        platform=inputs.platform,
+        owner=inputs.owner,
+        repo=inputs.repo,
+        pr_number=inputs.pr_number,
+        head_sha=inputs.head_sha,
+        kind=kind,
+    )
+    if not store.claim_gate_delivery(
+        delivery_key=key,
+        decision_key=decision.decision_key,
+        platform=inputs.platform,
+        owner=inputs.owner,
+        repo=inputs.repo,
+        pr_number=inputs.pr_number,
+        head_sha=inputs.head_sha,
+        kind=kind,
+    ):
+        existing = store.get_gate_delivery(key) or {}
+        logger.info(
+            "Merge gate skipping a duplicate %s on %s (delivery already %s)",
+            event,
+            inputs.pr_url,
+            existing.get("state", "claimed"),
+        )
+        if event == "APPROVE" and existing.get("state") == "delivered":
+            # Another worker already approved this exact commit. Reflecting
+            # that here keeps the two decision rows consistent instead of
+            # leaving this one saying `would_approve` about an approved PR.
+            store.update_gate_decision_delivery(
+                decision.decision_key,
+                delivery_state="delivered",
+                delivery_ref=str(existing.get("ref", "")),
+                state="approved",
+            )
+            decision.state = "approved"
+        return
+
+    body = public_explanation(decision)
+    try:
+        submitted = bool(await provider.submit_verdict(pr_info, event, body))
+    except Exception as exc:  # noqa: BLE001 - a failed delivery is not an approval
+        store.finish_gate_delivery(key, state="failed", error=str(exc))
+        store.update_gate_decision_delivery(
+            decision.decision_key,
+            delivery_state="failed",
+            error=str(exc),
+            bump_attempts=True,
+        )
+        decision.delivery_state = "failed"
+        logger.warning("Merge gate could not submit %s on %s: %s", event, inputs.pr_url, exc)
+        return
+
+    if not submitted:
+        # The platform refused — self-approval, missing permission, a tier that
+        # does not have approvals. The decision stays advisory and says so, in
+        # the stored row as well as in memory: a decision whose reasons predate
+        # its own delivery cannot explain itself to whoever reads it later.
+        decision.reasons.append(
+            Reason(
+                ReasonCode.APPROVAL_REFUSED,
+                "The platform refused to record the review event",
+                "info",
+            )
+        )
+        store.finish_gate_delivery(key, state="failed", error="platform refused the review event")
+        store.update_gate_decision_delivery(
+            decision.decision_key,
+            delivery_state="failed",
+            error="platform refused the review event",
+            bump_attempts=True,
+            reasons=decision.reasons,
+        )
+        decision.delivery_state = "failed"
+        return
+
+    store.finish_gate_delivery(key, state="delivered")
+    if event == "APPROVE":
+        store.update_gate_decision_delivery(
+            decision.decision_key,
+            delivery_state="delivered",
+            state="approved",
+            bump_attempts=True,
+        )
+        decision.state = "approved"
+    else:
+        store.update_gate_decision_delivery(
+            decision.decision_key, delivery_state="delivered", bump_attempts=True
+        )
+    decision.delivery_state = "delivered"
+
+
+async def _publish_status(
+    provider: Any,
+    pr_info: Any,
+    decision: GateDecision,
+    store: Any,
+    *,
+    owns_delivery_state: bool,
+) -> None:
+    """Publish the explanation as a check run / commit status.
+
+    Not claimed: a status is an update to a named artifact, so re-sending one
+    replaces it. A failure here never changes what the decision *is* — it is
+    how the decision is announced.
+
+    ``owns_delivery_state`` is False whenever a review event was attempted for
+    this decision. The approval's outcome is then the one that gets recorded: a
+    status check that published cleanly must never turn a failed approval into
+    a row that reads ``delivered``.
+    """
+    capability = caps.for_provider(provider)
+    if not capability.can_publish_status:
+        return
+    try:
+        ref = await provider.publish_gate_status(
+            pr_info,
+            context=STATUS_CONTEXT,
+            conclusion=status_conclusion(decision),
+            title=status_title(decision),
+            summary=public_explanation(decision),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Merge gate could not publish its status on %s: %s", pr_info.url, exc)
+        if owns_delivery_state and decision.delivery_state != "delivered":
+            store.update_gate_decision_delivery(
+                decision.decision_key, delivery_state="failed", error=str(exc)
+            )
+            decision.delivery_state = "failed"
+        return
+    if owns_delivery_state and decision.delivery_state != "delivered":
+        store.update_gate_decision_delivery(
+            decision.decision_key, delivery_state="delivered", delivery_ref=str(ref or "")
+        )
+        decision.delivery_state = "delivered"
+
+
+async def _publish_comment(provider: Any, pr_info: Any, decision: GateDecision) -> None:
+    """Post or update the gate's PR comment. Best-effort by design."""
+    body = f"{COMMENT_MARKER}\n{public_explanation(decision)}"
+    try:
+        existing = await provider.find_bot_comment(pr_info, COMMENT_MARKER)
+        if existing is not None:
+            await provider.update_comment(pr_info, existing, body)
+        else:
+            await provider.post_comment(pr_info, body)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Merge gate could not post its comment on %s: %s", pr_info.url, exc)
+
+
+# ─────────────────────────────────────────────────────────────── overrides ──
+
+
+class OverrideDenied(Exception):
+    """An override that policy or a veto does not permit."""
+
+
+@dataclass
+class OverrideResult:
+    decision: GateDecision
+    override: dict[str, Any]
+    created: bool
+
+
+def apply_override(
+    *,
+    owner: str,
+    repo: str,
+    platform: str,
+    decision_id: int,
+    actor: str,
+    reason: str,
+    new_state: str,
+    config: MiraConfig | None = None,
+    nonce: str = "",
+) -> OverrideResult:
+    """Move a recorded decision by hand, with the trail that makes it auditable.
+
+    An override changes *Mira's record*. It never submits or retracts a review
+    event on the platform. That boundary is the point: if an override could
+    reach through to an approval, "who may administer Mira" and "who may
+    approve this pull request" would collapse into one permission, and the
+    platform's own review would stop being the thing that gates the merge.
+
+    Authorization has already been checked by the caller — this function
+    enforces the *policy* limits, which are a separate question from who the
+    actor is:
+
+    - Overrides can be disabled entirely for the deployment.
+    - Forcing an approval is its own opt-in, distinct from revoking one.
+      Revoking is always available; that asymmetry is deliberate.
+    - No override can approve past a hard veto. A protected path, an open
+      blocker or a human's requested changes are not opinions the gate formed
+      and an admin can wave off — they are the reasons this phase exists.
+    """
+    config = config or load_config()
+    policy = resolve_policy(config.gate, owner, repo)
+    if not policy.allow_overrides:
+        raise OverrideDenied("Overrides are disabled for this deployment")
+    if new_state not in {"approved", "not_approved"}:
+        raise OverrideDenied("An override can only set 'approved' or 'not_approved'")
+    if not reason.strip():
+        raise OverrideDenied("An override must record a reason")
+
+    store = _open_store(owner, repo, platform)
+    try:
+        decision = store.get_gate_decision_by_id(decision_id)
+        if decision is None:
+            raise OverrideDenied("No such gate decision")
+        if new_state == "approved":
+            if not policy.allow_approval_override:
+                raise OverrideDenied(
+                    "Forcing an approval is disabled (gate.allow_approval_override)"
+                )
+            vetoes = decision.hard_vetoes
+            if vetoes:
+                raise OverrideDenied(
+                    "This decision cannot be overridden into an approval: "
+                    + "; ".join(veto.message for veto in vetoes)
+                )
+        key = override_key(
+            decision_key_value=decision.decision_key,
+            actor=actor,
+            new_state=new_state,
+            nonce=nonce,
+        )
+        override, created = store.record_gate_override(
+            override_key=key,
+            decision=decision,
+            actor=actor,
+            reason=reason.strip(),
+            new_state=new_state,
+            detail={
+                "previous_delivery_state": decision.delivery_state,
+                "previous_reasons": [item.as_dict() for item in decision.reasons],
+                "policy_version": decision.policy_version,
+            },
+        )
+        refreshed = store.get_gate_decision(decision.decision_key) or decision
+        return OverrideResult(decision=refreshed, override=override or {}, created=created)
+    finally:
+        store.close()
+
+
+def explain(decision: GateDecision, *, admin: bool = False) -> str:
+    """The rendered explanation for a stored decision."""
+    return admin_explanation(decision) if admin else public_explanation(decision)

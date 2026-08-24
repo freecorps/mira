@@ -429,6 +429,11 @@ class PRInfo:
     # and surfaced (with avatar) in the activity dashboard.
     author: str = ""
     author_avatar_url: str = ""
+    # Work-in-progress marker. Providers that cannot report it leave it False,
+    # which the merge gate reads as "not a draft" — it never treats an unknown
+    # draft state as a reason to approve, only the eligibility check consults it
+    # and every other guard still applies.
+    draft: bool = False
 
 
 @dataclass

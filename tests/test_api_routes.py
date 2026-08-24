@@ -32,6 +32,14 @@ EXPECTED_ROUTES = {
     ("/api/analytics/rules/{owner}/{repo}/{rule_id}/export", "GET"),
     ("/api/analytics/summary", "GET"),
     ("/api/contributors", "GET"),
+    # Phase 4 — the risk-oriented merge gate (all admin-only; the override
+    # route additionally requires the gate's own override permission).
+    ("/api/gate/config", "GET"),
+    ("/api/gate/config", "PUT"),
+    ("/api/gate/decisions", "GET"),
+    ("/api/gate/decisions/{owner}/{repo}/{decision_id}", "GET"),
+    ("/api/gate/decisions/{owner}/{repo}/{decision_id}/override", "POST"),
+    ("/api/gate/summary", "GET"),
     ("/api/contributors/summary", "GET"),
     ("/api/contributors/backfill/status", "GET"),
     ("/api/contributors/refresh", "POST"),

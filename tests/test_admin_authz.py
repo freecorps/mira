@@ -77,6 +77,23 @@ PROTECTED = [
         "GET",
         {"owner": "o", "repo": "r", "rule_id": 1},
     ),
+    # Phase 4 merge gate. Reads are listed for the same reason as the analytics
+    # reads: a decision quotes PR authors, protected paths and CI failures for
+    # every repository in the install.
+    ("/api/gate/decisions", "GET", {}),
+    ("/api/gate/summary", "GET", {}),
+    (
+        "/api/gate/decisions/{owner}/{repo}/{decision_id}",
+        "GET",
+        {"owner": "o", "repo": "r", "decision_id": 1},
+    ),
+    (
+        "/api/gate/decisions/{owner}/{repo}/{decision_id}/override",
+        "POST",
+        {"owner": "o", "repo": "r", "decision_id": 1, "body": None},
+    ),
+    ("/api/gate/config", "GET", {}),
+    ("/api/gate/config", "PUT", {"body": None}),
 ]
 
 

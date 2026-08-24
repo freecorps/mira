@@ -204,6 +204,39 @@ async def run_pr_review(
         await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
 
 
+async def run_gate_evaluation(
+    provider: Any,
+    owner: str,
+    repo: str,
+    number: int,
+    pr_url: str,
+    bot_name: str,
+    platform: str = "github",
+) -> None:
+    """Re-evaluate the merge gate for a PR without re-running the review.
+
+    A gate decision is only as current as the facts behind it, and the two that
+    move without a new commit are CI and labels. Re-evaluating on those events
+    is what turns "not approved: CI has not finished" into an answer instead of
+    a permanent state — and it costs no LLM call, which is why it can afford to
+    happen on every check-suite completion.
+
+    Cheap to call when the gate is off: the policy is resolved first, and an
+    inactive gate returns before anything is fetched.
+    """
+    from mira.gate import service as gate_service
+    from mira.gate.policy import resolve_policy
+
+    config = load_config()
+    if not resolve_policy(config.gate, owner, repo).active:
+        return
+    try:
+        pr_info = await provider.get_pr_info(pr_url)
+        await gate_service.evaluate(provider, pr_info, config=config, bot_name=bot_name)
+    except Exception as exc:
+        logger.warning("Merge gate re-evaluation failed for %s: %s", pr_url, exc)
+
+
 async def run_pr_command(
     provider: Any,
     owner: str,

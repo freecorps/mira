@@ -11,12 +11,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from contextlib import suppress
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from mira.exceptions import ProviderError
+from mira.gate.capabilities import GITLAB_CAPABILITIES, GateCapabilities
+from mira.gate.codeowners import CODEOWNERS_LOCATIONS
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -163,6 +167,9 @@ class GitLabProvider(BaseProvider):
             base_sha=(mr.get("diff_refs") or {}).get("base_sha") or "",
             head_sha=mr.get("sha") or "",
             platform="gitlab",
+            author=((mr.get("author") or {}).get("username")) or "",
+            author_avatar_url=((mr.get("author") or {}).get("avatar_url")) or "",
+            draft=bool(mr.get("draft") or mr.get("work_in_progress") or False),
         )
 
     async def _changes(self, pr_info: PRInfo) -> dict[str, Any]:
@@ -496,6 +503,172 @@ class GitLabProvider(BaseProvider):
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
         await self._request("PUT", self._mr(pr_info), data={"remove_labels": label})
+
+    # ── Merge gate (Phase 4) ──
+
+    def gate_capabilities(self) -> GateCapabilities:
+        return GITLAB_CAPABILITIES
+
+    async def submit_verdict(self, pr_info: PRInfo, event: str, body: str) -> bool:
+        """Approve a merge request; report anything else as unsupported.
+
+        GitLab has approvals but no REQUEST_CHANGES review event. Rather than
+        approximate one with a comment that no merge rule reads, this returns
+        False so the gate records `would_approve`/`not_approved` honestly and
+        the findings stay where they already are — in the review comments.
+
+        Approvals are a tiered feature and can be turned off per project, so a
+        refusal is expected, not exceptional: it degrades the decision instead
+        of failing the review.
+        """
+        if event != "APPROVE":
+            logger.info("GitLab has no %s review event; leaving the findings as MR comments", event)
+            return False
+        try:
+            await self._request("POST", f"{self._mr(pr_info)}/approve", ok=(201, 200))
+        except Exception as exc:  # noqa: BLE001 - a refused approval is a downgrade
+            logger.warning("GitLab refused the approval on %s: %s", pr_info.url, exc)
+            return False
+        if body:
+            with suppress(Exception):
+                await self.post_comment(pr_info, body)
+        return True
+
+    async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
+        """Approvals as review states. GitLab has no "changes requested"."""
+        try:
+            resp = await self._request("GET", f"{self._mr(pr_info)}/approvals")
+        except Exception as exc:
+            # Not "{}": that reads as "nobody objected".
+            logger.debug("Could not read MR approvals for %s: %s", pr_info.url, exc)
+            raise ProviderError(f"Failed to read MR approvals: {exc}") from exc
+        data = resp.json() or {}
+        states: dict[str, str] = {}
+        for entry in data.get("approved_by") or []:
+            username = ((entry or {}).get("user") or {}).get("username", "")
+            if username:
+                states[username] = "APPROVED"
+        return states
+
+    async def get_ci_state(self, pr_info: PRInfo) -> CIState:
+        """The merge request's head pipeline, mapped onto the gate vocabulary.
+
+        A merge request with no pipeline reports "none", which is not success —
+        the gate treats a repository that never ran CI on this commit as one it
+        cannot vouch for, which is the same answer it gives for a pipeline it
+        could not read.
+        """
+        try:
+            resp = await self._request("GET", self._mr(pr_info))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read MR pipeline for %s: %s", pr_info.url, exc)
+            return CIState(state="unknown")
+        pipeline = (resp.json() or {}).get("head_pipeline") or {}
+        if not pipeline:
+            return CIState(state="none", total=0)
+        status = str(pipeline.get("status") or "").lower()
+        name = f"pipeline #{pipeline.get('id', '?')}"
+        if status in {"success", "manual"}:
+            # `manual` means every automatic job passed and a human gate remains.
+            return CIState(state="success", total=1)
+        if status in {
+            "created",
+            "waiting_for_resource",
+            "preparing",
+            "pending",
+            "running",
+            "scheduled",
+        }:
+            return CIState(state="pending", total=1, pending=[name])
+        if status in {"failed", "canceled", "skipped"}:
+            return CIState(state="failure", total=1, failing=[f"{name} ({status})"])
+        return CIState(state="unknown", total=1)
+
+    async def get_pr_labels(self, pr_info: PRInfo) -> list[str]:
+        try:
+            resp = await self._request("GET", self._mr(pr_info))
+        except Exception as exc:
+            # An empty list would read as "no blocking label present".
+            logger.warning("Could not read MR labels for %s: %s", pr_info.url, exc)
+            raise ProviderError(f"Failed to read MR labels: {exc}") from exc
+        return [str(label) for label in (resp.json() or {}).get("labels") or []]
+
+    async def get_author_association(self, pr_info: PRInfo) -> str:
+        """Project membership mapped onto GitHub's association vocabulary.
+
+        GitLab access levels are numeric; anything below Developer cannot push,
+        so it is reported as a plain contributor and never clears the default
+        association allowlist.
+        """
+        if not pr_info.author:
+            return "UNKNOWN"
+        url = f"{self._project(pr_info)}/members/all?query={quote(pr_info.author, safe='')}"
+        try:
+            resp = await self._request("GET", url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read MR author association for %s: %s", pr_info.url, exc)
+            return "UNKNOWN"
+        members = resp.json() or []
+        level = 0
+        for member in members:
+            if str((member or {}).get("username", "")).lower() == pr_info.author.lower():
+                level = max(level, int((member or {}).get("access_level", 0) or 0))
+        if level >= 50:
+            return "OWNER"
+        if level >= 40:
+            return "MEMBER"
+        if level >= 30:
+            return "COLLABORATOR"
+        if level > 0:
+            return "CONTRIBUTOR"
+        return "NONE"
+
+    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
+        ref = pr_info.head_sha or pr_info.head_branch
+        for candidate in CODEOWNERS_LOCATIONS["gitlab"]:
+            content = await self.get_file_content(pr_info, candidate, ref)
+            if content:
+                return candidate, content
+        return "", ""
+
+    async def publish_gate_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        """Publish the decision as a commit status on the head SHA.
+
+        GitLab has no check runs; a commit status is the closest equivalent and
+        is keyed by `name`, so re-publishing after a retry updates in place.
+        `neutral` has no GitLab spelling, so a dry run posts `success` with an
+        explicit "would approve" description rather than a green tick that
+        claims more than it should — the description is the payload, and the
+        status is deliberately non-blocking unless the decision blocks.
+        """
+        sha = pr_info.head_sha
+        if not sha:
+            return ""
+        state = {"success": "success", "failure": "failed", "neutral": "success"}.get(
+            conclusion, "success"
+        )
+        params: dict[str, Any] = {
+            "state": state,
+            "name": context,
+            "description": title[:255],
+        }
+        if target_url:
+            params["target_url"] = target_url
+        url = f"{self._project(pr_info)}/statuses/{quote(sha, safe='')}"
+        try:
+            resp = await self._request("POST", url, params=params, ok=(200, 201))
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"Failed to publish gate status: {exc}") from exc
+        return str((resp.json() or {}).get("id", "") or "")
 
 
 def _next_link(link_header: str) -> str | None:

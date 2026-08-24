@@ -22,6 +22,9 @@ from urllib.parse import quote
 import httpx
 
 from mira.exceptions import ProviderError
+from mira.gate.capabilities import FORGEJO_CAPABILITIES, GateCapabilities
+from mira.gate.codeowners import CODEOWNERS_LOCATIONS
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -134,6 +137,9 @@ class ForgejoProvider(BaseProvider):
             base_sha=(pr.get("base") or {}).get("sha") or "",
             head_sha=(pr.get("head") or {}).get("sha") or "",
             platform="forgejo",
+            author=((pr.get("user") or {}).get("login")) or "",
+            author_avatar_url=((pr.get("user") or {}).get("avatar_url")) or "",
+            draft=bool(pr.get("draft") or False),
         )
 
     async def get_pr_diff(self, pr_info: PRInfo) -> str:
@@ -516,6 +522,177 @@ class ForgejoProvider(BaseProvider):
             return (resp.json().get("body") or "")[:1500]
         except Exception:
             return ""
+
+    # ── Merge gate (Phase 4) ──
+
+    def gate_capabilities(self) -> GateCapabilities:
+        return FORGEJO_CAPABILITIES
+
+    async def submit_verdict(self, pr_info: PRInfo, event: str, body: str) -> bool:
+        """Submit an APPROVE / REQUEST_CHANGES review on the pull request.
+
+        Forgejo implements the Gitea review API, which carries both events, so
+        this is a real review the merge rules can see — not an approximation.
+        A refusal (self-approval, missing permission) degrades to False and the
+        gate records that the platform said no.
+        """
+        if event not in {"APPROVE", "REQUEST_CHANGES"}:
+            return False
+        try:
+            await self._request(
+                "POST",
+                f"{self._pr(pr_info)}/reviews",
+                json={"event": event, "body": body},
+                ok=(200, 201),
+            )
+        except Exception as exc:  # noqa: BLE001 - a refused verdict is a downgrade
+            logger.warning("Forgejo refused %s on %s: %s", event, pr_info.url, exc)
+            return False
+        return True
+
+    async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
+        """Latest review state per reviewer login."""
+        try:
+            reviews = await self._paginate(f"{self._pr(pr_info)}/reviews")
+        except Exception as exc:
+            # Not "{}": that reads as "nobody objected".
+            logger.debug("Could not read reviews for %s: %s", pr_info.url, exc)
+            raise ProviderError(f"Failed to read reviews: {exc}") from exc
+        latest: dict[str, str] = {}
+        for review in reviews:
+            login = ((review or {}).get("user") or {}).get("login", "")
+            state = str((review or {}).get("state") or "").upper()
+            if not login or state in {"COMMENT", "COMMENTED", "PENDING", ""}:
+                continue
+            if state == "DISMISSED":
+                latest.pop(login, None)
+                continue
+            latest[login] = state
+        return latest
+
+    async def get_ci_state(self, pr_info: PRInfo) -> CIState:
+        """Combined commit status for the head SHA.
+
+        Forgejo reports CI through commit statuses. A repository with no CI
+        integration reports none, which is "none" and not "success" — the gate
+        cannot vouch for a commit nothing ever built.
+        """
+        sha = pr_info.head_sha
+        if not sha:
+            return CIState(state="unknown")
+        try:
+            resp = await self._request(
+                "GET", f"{self._repo(pr_info)}/commits/{quote(sha, safe='')}/statuses"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read commit statuses for %s: %s", pr_info.url, exc)
+            return CIState(state="unknown")
+        statuses = resp.json() or []
+        seen: set[str] = set()
+        failing: list[str] = []
+        pending: list[str] = []
+        total = 0
+        for status in statuses:
+            context = str((status or {}).get("context") or "status")
+            if context in seen:
+                continue
+            seen.add(context)
+            total += 1
+            state = str((status or {}).get("status") or "").lower()
+            if state == "pending":
+                pending.append(context)
+            elif state != "success":
+                failing.append(context)
+        if pending:
+            return CIState(state="pending", total=total, failing=failing, pending=pending)
+        if failing:
+            return CIState(state="failure", total=total, failing=failing)
+        if total == 0:
+            return CIState(state="none", total=0)
+        return CIState(state="success", total=total)
+
+    async def get_pr_labels(self, pr_info: PRInfo) -> list[str]:
+        try:
+            labels = await self._paginate(f"{self._repo(pr_info)}/issues/{pr_info.number}/labels")
+        except Exception as exc:
+            # An empty list would read as "no blocking label present".
+            logger.warning("Could not read labels for %s: %s", pr_info.url, exc)
+            raise ProviderError(f"Failed to read labels: {exc}") from exc
+        return [
+            str((label or {}).get("name") or "") for label in labels if (label or {}).get("name")
+        ]
+
+    async def get_author_association(self, pr_info: PRInfo) -> str:
+        """Collaborator permission mapped onto GitHub's association vocabulary."""
+        if not pr_info.author:
+            return "UNKNOWN"
+        url = f"{self._repo(pr_info)}/collaborators/{quote(pr_info.author, safe='')}/permission"
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read author association for %s: %s", pr_info.url, exc)
+            return "UNKNOWN"
+        if resp.status_code == 404:
+            return "NONE"
+        permission = str((resp.json() or {}).get("permission") or "").lower()
+        if permission == "owner":
+            return "OWNER"
+        if permission == "admin":
+            return "MEMBER"
+        if permission == "write":
+            return "COLLABORATOR"
+        if permission == "read":
+            return "CONTRIBUTOR"
+        return "NONE"
+
+    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
+        ref = pr_info.head_sha or pr_info.head_branch
+        for candidate in CODEOWNERS_LOCATIONS["forgejo"]:
+            content = await self.get_file_content(pr_info, candidate, ref)
+            if content:
+                return candidate, content
+        return "", ""
+
+    async def publish_gate_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        """Publish the decision as a commit status on the head SHA.
+
+        Keyed by `context`, so a retry updates the existing entry. Forgejo has
+        no neutral state; a dry run posts `success` whose description says it
+        is a dry run, because the alternative — posting `failure` for a PR the
+        gate would have approved — would be a worse lie in the other direction.
+        """
+        sha = pr_info.head_sha
+        if not sha:
+            return ""
+        state = {"success": "success", "failure": "failure", "neutral": "success"}.get(
+            conclusion, "success"
+        )
+        payload: dict[str, Any] = {
+            "state": state,
+            "context": context,
+            "description": title[:255],
+        }
+        if target_url:
+            payload["target_url"] = target_url
+        try:
+            resp = await self._request(
+                "POST",
+                f"{self._repo(pr_info)}/statuses/{quote(sha, safe='')}",
+                json=payload,
+                ok=(200, 201),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"Failed to publish gate status: {exc}") from exc
+        return str((resp.json() or {}).get("id", "") or "")
 
 
 def _next_link(link_header: str) -> str | None:
