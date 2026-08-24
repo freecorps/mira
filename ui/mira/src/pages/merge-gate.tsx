@@ -318,6 +318,14 @@ function DecisionDetail({
             ? ` after ${decision.delivery_attempts} attempt(s)`
             : ""}
         </span>
+        {/* A `partial` delivery reached the pull request through one channel
+            and not the other, and stays retryable — so the error behind it is
+            the operator's only clue about which one is broken. */}
+        {decision.error && (
+          <span className="text-xs text-orange-600 dark:text-orange-400">
+            {decision.error}
+          </span>
+        )}
       </div>
 
       {decision.reasons.length > 0 && (

@@ -312,6 +312,10 @@ reclaimable, so a transient error still gets a second chance.
 
 Status checks and PR comments are not claimed: they are updates to a named
 artifact (a fixed check name, a comment marker), so re-sending one replaces it.
+Because re-sending is free, a delivery that only partly succeeded is recorded
+as `partial` and stays retryable — `delivered` would hide a missing check run
+behind a clean row, and `failed` would claim the decision never surfaced at
+all. The dashboard shows the state and the error beside it.
 
 The gate re-evaluates on `check_suite`/`check_run` completion and on
 label/draft changes, because those are the two things that make a decision
