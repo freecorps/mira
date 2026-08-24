@@ -337,6 +337,22 @@ class LearningConfig(BaseModel):
     min_evidence_repo: int = Field(default=5, ge=1)
     min_evidence_org: int = Field(default=10, ge=1)
 
+    # Phase 3 — continuous evaluation. The kill switch stops Mira recording
+    # rule exposures; the review itself runs exactly the same either way, since
+    # recording happens after the comments have already been posted.
+    evaluation_analytics: bool = True
+    # A rule needs this many exposures before Mira will suggest a downgrade.
+    # Below it there simply isn't enough evidence to call a regression.
+    min_exposures_for_regression: int = Field(default=20, ge=1)
+    # Share of *decisive* signals (positive + negative) that must be negative
+    # before a rule is flagged. Unobserved findings never enter this ratio.
+    regression_negative_rate: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Above this the suggestion escalates from "downgrade" to "disable".
+    # Mira still only suggests; nothing is disabled without an admin acting.
+    regression_disable_rate: float = Field(default=0.8, ge=0.0, le=1.0)
+    # Default window, in days, for the before/after activation comparison.
+    evaluation_window_days: int = Field(default=30, ge=1, le=365)
+
 
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
