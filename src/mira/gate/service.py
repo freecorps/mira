@@ -446,7 +446,13 @@ async def deliver(
             outcomes.append(await _publish_comment(provider, pr_info, decision))
 
         if outcomes and not attempted_review_event:
-            delivered = all(ok for ok, _ref, _error in outcomes)
+            # `delivered` when *any* channel got the explanation out, because
+            # that is the question this column answers: did the decision reach
+            # the pull request? Requiring all of them would let a repository
+            # with a broken comment surface re-deliver a perfectly published
+            # status check on every subsequent webhook, forever. The failure is
+            # not lost — it is recorded in `error` either way.
+            delivered = any(ok for ok, _ref, _error in outcomes)
             store.update_gate_decision_delivery(
                 decision.decision_key,
                 delivery_state="delivered" if delivered else "failed",
@@ -600,14 +606,19 @@ async def _publish_comment(
     Returns ``(posted, reference, error)``. On a provider with no status check
     this is the only place the explanation reaches the pull request, so whether
     it got through is worth recording.
+
+    The reference is always empty. This comment is addressed by its marker
+    rather than by an id — that is what lets an update land in place — and
+    ``post_comment`` does not return one anyway, so reporting an id on updates
+    and nothing on creations would only make the column arbitrary.
     """
     body = f"{COMMENT_MARKER}\n{public_explanation(decision)}"
     try:
         existing = await provider.find_bot_comment(pr_info, COMMENT_MARKER)
         if existing is not None:
             await provider.update_comment(pr_info, existing, body)
-            return True, str(existing), ""
-        await provider.post_comment(pr_info, body)
+        else:
+            await provider.post_comment(pr_info, body)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Merge gate could not post its comment on %s: %s", pr_info.url, exc)
         return False, "", str(exc)

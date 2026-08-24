@@ -959,6 +959,25 @@ async def test_a_comment_only_delivery_is_recorded_as_delivered() -> None:
     assert _decisions()[0].delivery_state == "delivered"
 
 
+async def test_a_status_that_published_survives_a_comment_that_did_not() -> None:
+    """`delivered` answers "did the decision reach the pull request?"
+
+    Requiring every channel would let a repository with a broken comment
+    surface re-deliver a perfectly published status check on every later
+    webhook. The failure is still recorded.
+    """
+
+    class MuteProvider(FakeProvider):
+        async def post_comment(self, pr_info, body):
+            raise ProviderError("the discussion API is down")
+
+    provider = MuteProvider()
+    decision = await _evaluate(provider, _config(mode="shadow", comment=True))
+    assert provider.statuses  # the check run went out
+    assert decision.delivery_state == "delivered"
+    assert "discussion API" in _decisions()[0].error
+
+
 async def test_a_comment_that_could_not_be_posted_is_recorded_as_failed() -> None:
     class MuteProvider(FakeProvider):
         async def post_comment(self, pr_info, body):
