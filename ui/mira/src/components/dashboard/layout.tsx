@@ -1,5 +1,6 @@
 import {
   Activity,
+  BarChart3,
   BookOpen,
   Brain,
   ChevronRight,
@@ -78,6 +79,12 @@ const navItems = [
   { to: "/relationships", icon: GitFork, label: "Relationships" },
   { to: "/rules", icon: BookOpen, label: "Rules" },
   { to: "/learnings", icon: Brain, label: "Learnings" },
+  {
+    to: "/learnings/analytics",
+    icon: BarChart3,
+    label: "Rule analytics",
+    adminOnly: true,
+  },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
 
@@ -98,6 +105,7 @@ const PAGE_LABELS: Record<string, string> = {
   relationships: "Relationships",
   rules: "Rules",
   learnings: "Learnings",
+  analytics: "Rule analytics",
   settings: "Settings",
   users: "Users",
   new: "New",

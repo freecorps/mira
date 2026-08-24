@@ -12,6 +12,7 @@ import { ContributorDetailPage } from "@/pages/contributor-detail"
 import { ContributorsPage } from "@/pages/contributors"
 import { DashboardPage } from "@/pages/dashboard"
 import { LearnedRulesPage } from "@/pages/learned-rules"
+import { RuleAnalyticsPage } from "@/pages/rule-analytics"
 import { LearningFormPage } from "@/pages/learning-form"
 import { LoginPage } from "@/pages/login"
 import { PackagesPage } from "@/pages/packages"
@@ -205,11 +206,15 @@ export function App() {
           <Route path="repos" element={<ReposPage />} />
           <Route path="repos/:owner/:repo" element={<RepoDetailPage />} />
           <Route path="contributors" element={<ContributorsPage />} />
-          <Route path="contributors/:login" element={<ContributorDetailPage />} />
+          <Route
+            path="contributors/:login"
+            element={<ContributorDetailPage />}
+          />
           <Route path="packages" element={<PackagesPage />} />
           <Route path="relationships" element={<RelationshipsPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="learnings" element={<LearnedRulesPage />} />
+          <Route path="learnings/analytics" element={<RuleAnalyticsPage />} />
           <Route path="learnings/new" element={<LearningFormPage />} />
           <Route path="learnings/edit" element={<LearningFormPage />} />
           <Route path="vulnerabilities" element={<VulnerabilitiesPage />} />
