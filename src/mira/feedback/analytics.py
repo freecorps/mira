@@ -29,10 +29,19 @@ logger = logging.getLogger(__name__)
 
 DAY_SECONDS = 86400.0
 
-# Rules per repository pulled before merging in the SQLite path. Rules are
-# governed artifacts -- a repo has tens of them, not thousands -- so this is a
-# safety valve against a pathological index, not a routine truncation.
-_PER_REPO_RULE_CAP = 500
+# Rows pulled per round trip when walking a repository's aggregates. This is
+# a batch size, not a ceiling: the walk keeps paging until the repository is
+# exhausted, so no rule is ever dropped from a total or a later page.
+_MERGE_PAGE_SIZE = 500
+
+# Absolute backstop on a single repository's merge walk, so a pathological
+# index cannot spin forever. Crossing it is logged, never silent.
+_MERGE_MAX_ROWS = 20_000
+
+# Buckets read per repository before merging a summary. The grouping
+# dimensions are all low-cardinality (category, scope, origin, repo, author),
+# so this covers the real domain; hitting it is logged.
+_SUMMARY_DOMAIN_CAP = 5_000
 
 
 def _postgres_url() -> str:
@@ -107,27 +116,54 @@ def list_rule_analytics(
             total = store.count_rule_analytics(active)
         return rows, total
 
+    # Every repository is walked to exhaustion before sorting, because a global
+    # page cannot be taken from per-repository pages: the rule ranked first
+    # overall may be second in each database. Only already-aggregated rows are
+    # held, one per rule, not the evaluation history behind them.
     merged: list[RuleAnalyticsRow] = []
     for platform, db_owner, db_repo in _repo_targets(owner, repo):
         try:
-            with open_analytics_store(db_owner, db_repo, platform) as store:
-                rows = store.aggregate_rule_analytics(
-                    active, limit=_PER_REPO_RULE_CAP, offset=0, sort=sort, descending=descending
+            merged.extend(
+                _walk_repo_rules(
+                    db_owner, db_repo, platform, active, sort=sort, descending=descending
                 )
-            if len(rows) == _PER_REPO_RULE_CAP:
-                # Never truncate silently: a capped page would read as
-                # "that's all of them".
-                logger.warning(
-                    "%s/%s hit the %d-rule analytics cap; totals exclude the remainder",
-                    db_owner,
-                    db_repo,
-                    _PER_REPO_RULE_CAP,
-                )
-            merged.extend(rows)
+            )
         except Exception:
             logger.exception("Rule analytics failed for %s/%s", db_owner, db_repo)
     merged.sort(key=lambda row: (_merged_sort_key(row, sort), row.rule_id), reverse=descending)
     return merged[offset : offset + limit], len(merged)
+
+
+def _walk_repo_rules(
+    db_owner: str,
+    db_repo: str,
+    platform: str,
+    filters: dict[str, Any],
+    *,
+    sort: str,
+    descending: bool,
+) -> list[RuleAnalyticsRow]:
+    """Every aggregate row for one repository, fetched in bounded pages."""
+    collected: list[RuleAnalyticsRow] = []
+    with open_analytics_store(db_owner, db_repo, platform) as store:
+        while len(collected) < _MERGE_MAX_ROWS:
+            page = store.aggregate_rule_analytics(
+                filters,
+                limit=_MERGE_PAGE_SIZE,
+                offset=len(collected),
+                sort=sort,
+                descending=descending,
+            )
+            collected.extend(page)
+            if len(page) < _MERGE_PAGE_SIZE:
+                return collected
+    logger.warning(
+        "%s/%s exceeded the %d-rule analytics backstop; totals exclude the remainder",
+        db_owner,
+        db_repo,
+        _MERGE_MAX_ROWS,
+    )
+    return collected
 
 
 def list_rule_evaluations(
@@ -193,12 +229,26 @@ def summarize(
         with open_analytics_store(owner or "", repo or "", platform) as store:
             return store.rule_analytics_summary(active, dimension=dimension, limit=limit)
 
+    # The caller's `limit` is a *global* top-N and cannot be pushed down into
+    # each repository: a category ranked second everywhere can still have the
+    # largest combined total, and per-repo limiting would drop it from every
+    # result set. Take each repository's full bucket domain, merge, then slice.
     accumulator: dict[str, dict] = {}
     numeric_keys: set[str] = set()
     for platform, db_owner, db_repo in _repo_targets(owner, repo):
         try:
             with open_analytics_store(db_owner, db_repo, platform) as store:
-                buckets = store.rule_analytics_summary(active, dimension=dimension, limit=limit)
+                buckets = store.rule_analytics_summary(
+                    active, dimension=dimension, limit=_SUMMARY_DOMAIN_CAP
+                )
+            if len(buckets) == _SUMMARY_DOMAIN_CAP:
+                logger.warning(
+                    "%s/%s produced %d '%s' buckets, the cap; the merged view may omit some",
+                    db_owner,
+                    db_repo,
+                    _SUMMARY_DOMAIN_CAP,
+                    dimension,
+                )
         except Exception:
             logger.exception("Analytics summary failed for %s/%s", db_owner, db_repo)
             continue
@@ -484,6 +534,11 @@ _EXPORT_EVALUATION_COLUMNS = (
 )
 
 
+# Leading characters a spreadsheet treats as the start of a formula. Tab and
+# carriage return are included because Excel strips them before parsing.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
 def rows_to_csv(rows: list[dict], columns: tuple[str, ...]) -> str:
     """Render export rows as CSV with a stable column order."""
     buffer = io.StringIO()
@@ -494,13 +549,28 @@ def rows_to_csv(rows: list[dict], columns: tuple[str, ...]) -> str:
     return buffer.getvalue()
 
 
+def _neutralize_formula(text: str) -> str:
+    """Stop a spreadsheet from executing an exported cell.
+
+    Rule text, finding titles, paths and PR author names all originate from
+    pull requests, so an export can carry attacker-chosen strings. CSV quoting
+    does nothing about this -- Excel still evaluates a cell starting with `=`.
+    A leading apostrophe makes the cell literal text.
+    """
+    if text.startswith(_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
 def _csv_value(value: Any) -> Any:
     if value is None:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True)
+        return _neutralize_formula(json.dumps(value, sort_keys=True))
+    if isinstance(value, str):
+        return _neutralize_formula(value)
     return value
 
 

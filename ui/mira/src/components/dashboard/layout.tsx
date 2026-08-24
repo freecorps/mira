@@ -70,7 +70,7 @@ import {
 import { UserAvatar } from "@/components/ui/user-avatar"
 
 const navItems = [
-  { to: "/", icon: LayoutDashboard, label: "Dashboard" },
+  { to: "/", icon: LayoutDashboard, label: "Dashboard", end: true },
   { to: "/activity", icon: Activity, label: "Activity" },
   { to: "/repos", icon: Database, label: "Repositories" },
   { to: "/contributors", icon: Users2, label: "Reviewers", adminOnly: true },
@@ -78,7 +78,8 @@ const navItems = [
   { to: "/vulnerabilities", icon: ShieldAlert, label: "Vulnerabilities" },
   { to: "/relationships", icon: GitFork, label: "Relationships" },
   { to: "/rules", icon: BookOpen, label: "Rules" },
-  { to: "/learnings", icon: Brain, label: "Learnings" },
+  // `end` so the nested analytics route highlights only its own entry.
+  { to: "/learnings", icon: Brain, label: "Learnings", end: true },
   {
     to: "/learnings/analytics",
     icon: BarChart3,
@@ -266,7 +267,7 @@ export function DashboardLayout() {
                       tooltip={item.label}
                       className={navActive}
                     >
-                      <NavLink to={item.to} end={item.to === "/"}>
+                      <NavLink to={item.to} end={"end" in item && item.end}>
                         <item.icon />
                         <span>{item.label}</span>
                       </NavLink>

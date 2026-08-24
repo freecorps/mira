@@ -1208,3 +1208,116 @@ def test_summary_omits_metrics_it_does_not_compute(store: IndexStore) -> None:
     bucket = store.rule_analytics_summary(dimension="category")[0]
     assert "repeated_false_positives" not in bucket
     assert bucket["exposures"] == 1
+
+
+# ------------------------------------------------------------ review findings
+
+
+def test_csv_export_neutralizes_spreadsheet_formulas(store: IndexStore) -> None:
+    """Exported cells come from pull requests, so they can be hostile."""
+    _finding(store, "f1", path="=cmd|'/c calc'!A1", title="@SUM(1+1)")
+    store.record_rule_evaluations([_evaluation("f1", pr_author="+evil")])
+
+    body, _media = analytics.export_rule_evaluations(
+        owner="acme", repo="app", filters={"rule_id": 1}, fmt="csv"
+    )
+    row = next(csv.DictReader(io.StringIO(body)))
+    assert row["finding_title"].startswith("'@")
+    assert row["finding_path"].startswith("'=")
+    assert row["pr_author"].startswith("'+")
+    # Harmless values are untouched.
+    assert row["outcome"] == "unobserved"
+
+
+def test_json_export_is_not_formula_escaped(store: IndexStore) -> None:
+    """The apostrophe is a spreadsheet workaround; JSON must stay faithful."""
+    _finding(store, "f1", title="=DANGER")
+    store.record_rule_evaluations([_evaluation("f1")])
+
+    body, _media = analytics.export_rule_evaluations(
+        owner="acme", repo="app", filters={"rule_id": 1}, fmt="json"
+    )
+    assert json.loads(body)["evaluations"][0]["finding_title"] == "=DANGER"
+
+
+def test_rule_pagination_covers_every_repository_page(isolated_index: Path) -> None:
+    """Merged pagination must not stop at one page per repository.
+
+    Regression guard for a per-repo cap that both dropped later pages and
+    reported a total smaller than reality.
+    """
+    from mira.feedback import analytics as analytics_module
+
+    monkey_cap = 3
+    original = analytics_module._MERGE_PAGE_SIZE
+    analytics_module._MERGE_PAGE_SIZE = monkey_cap
+    try:
+        store = IndexStore.open("acme", "app")
+        try:
+            for rule_id in range(1, 11):
+                _finding(store, f"f{rule_id}")
+                store.record_rule_evaluations([_evaluation(f"f{rule_id}", rule_id=rule_id)])
+        finally:
+            store.close()
+
+        rows, total = analytics_module.list_rule_analytics(limit=100)
+        assert total == 10
+        assert {row.rule_id for row in rows} == set(range(1, 11))
+
+        # Later pages are reachable and disjoint.
+        first, _ = analytics_module.list_rule_analytics(limit=4, offset=0)
+        second, _ = analytics_module.list_rule_analytics(limit=4, offset=4)
+        third, _ = analytics_module.list_rule_analytics(limit=4, offset=8)
+        seen = [row.rule_id for row in first + second + third]
+        assert len(seen) == 10
+        assert len(set(seen)) == 10
+    finally:
+        analytics_module._MERGE_PAGE_SIZE = original
+
+
+def test_summary_limit_is_global_not_per_repository(isolated_index: Path) -> None:
+    """A bucket ranked second everywhere can still be the global winner.
+
+    Applying the caller's limit inside each repository would drop it from every
+    result set and lose it entirely.
+    """
+    # In each repo `runner-up` is second locally, but it wins overall.
+    layout = {
+        "one": {"winner-a": 5, "runner-up": 4},
+        "two": {"winner-b": 5, "runner-up": 4},
+    }
+    for repo, categories in layout.items():
+        store = IndexStore.open("acme", repo)
+        try:
+            for category, count in categories.items():
+                for index in range(count):
+                    finding_id = f"{category}-{index}"
+                    _finding(store, finding_id, category=category)
+                    store.record_rule_evaluations(
+                        [
+                            _evaluation(
+                                finding_id,
+                                rule_id=1,
+                                category=category,
+                                repo=repo,
+                                head_sha=f"{repo}-{category}-{index}",
+                            )
+                        ]
+                    )
+        finally:
+            store.close()
+
+    top = analytics.summarize(dimension="category", limit=1)
+    assert [bucket["bucket"] for bucket in top] == ["runner-up"]
+    assert top[0]["exposures"] == 8
+
+
+def test_audit_listing_spans_repositories(isolated_index: Path) -> None:
+    for repo in ("one", "two"):
+        analytics.record_audit_event(
+            owner="acme", repo=repo, event_type="regression_dismissed", rule_id=1
+        )
+
+    org_wide = analytics.list_audit_events()
+    assert {event["repo"] for event in org_wide} == {"one", "two"}
+    assert len(analytics.list_audit_events(owner="acme", repo="one")) == 1

@@ -232,7 +232,11 @@ function RuleDetail({
     () => api.getRuleAnalytics(owner, repo, ruleId),
     [owner, repo, ruleId, reload]
   )
-  const { data: evaluations, loading: loadingEvaluations } = useAsync(
+  const {
+    data: evaluations,
+    loading: loadingEvaluations,
+    error: evaluationsError,
+  } = useAsync(
     () =>
       api.listRuleEvaluations(owner, repo, ruleId, {
         outcome: outcome === ALL ? "" : outcome,
@@ -484,6 +488,13 @@ function RuleDetail({
 
           {loadingEvaluations ? (
             <TableSkeleton />
+          ) : evaluationsError ? (
+            // An unreachable audit trail must never render as an empty one --
+            // that would present a failed request as proof the count is zero.
+            <ErrorState
+              message={evaluationsError}
+              onRetry={() => setReload((n) => n + 1)}
+            />
           ) : !evaluations || evaluations.evaluations.length === 0 ? (
             <EmptyState
               title="No evaluations match"
