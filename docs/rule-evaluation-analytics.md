@@ -124,6 +124,10 @@ never implicit.
 A rule is flagged when **all** of the following hold:
 
 - it has at least `learning.min_exposures_for_regression` exposures (default 20);
+- at least `learning.min_decisive_for_regression` people actually responded
+  (default 5). This floor is separate on purpose: `exposures` counts
+  review-scoped rows too, so without it a rule could clear the exposure bar
+  without anyone reacting and then be flagged for disable on one thumbs-down;
 - the negative share of *decisive* signals is at least
   `learning.regression_negative_rate` (default 0.5);
 - it is a learned rule, not a manual one.
@@ -174,6 +178,7 @@ Rollback is preserved for at least one release.
 learning:
   evaluation_analytics: true # kill switch for the whole recording path
   min_exposures_for_regression: 20
+  min_decisive_for_regression: 5
   regression_negative_rate: 0.5
   regression_disable_rate: 0.8
   evaluation_window_days: 30
@@ -189,6 +194,12 @@ change nor break a review.
 All routes are admin-only. The evaluation history spans every repository and
 carries finding titles, PR authors and reviewer reactions — governance data,
 gated like rule approval itself.
+
+Owner and repo are validated before any store is opened: they must be single
+path segments (the `_{platform}/{owner}` form the stores emit is also accepted)
+and the repository must be registered, or the route returns 400/404. Those
+values reach a filesystem path through `IndexStore.open`, and an admin session
+should not double as a filesystem primitive.
 
 | Route                                                        | Purpose                                   |
 | ------------------------------------------------------------ | ----------------------------------------- |

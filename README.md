@@ -126,7 +126,8 @@ learning:
   learning_synthesis: true
   learning_auto_apply: false  # keep human approval in the loop
   evaluation_analytics: true  # record which rules ran and what came of it
-  min_exposures_for_regression: 20  # evidence needed before flagging a rule
+  min_exposures_for_regression: 20  # exposures needed before flagging a rule
+  min_decisive_for_regression: 5    # and this many people actually responding
 ```
 
 Set `MIRA_DASHBOARD_URL` to the externally reachable dashboard base URL (for
