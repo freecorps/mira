@@ -20,7 +20,7 @@ import httpx
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITLAB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
-from mira.gate.models import STATUS_CONTEXT, CIState
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -562,49 +562,19 @@ class GitLabProvider(BaseProvider):
         }
     )
 
-    async def _foreign_commit_status(self, pr_info: PRInfo) -> bool | None:
-        """Is anything other than the gate recorded against the head commit?
-
-        ``True`` — yes, so the pipeline describes real work.
-        ``False`` — only the gate's own status is here, so there is no CI.
-        ``None`` — nothing at all is recorded, which is what a merged-results
-        pipeline looks like from the head commit: it belongs to the merge-ref
-        commit instead. The caller then trusts the pipeline.
-
-        Deliberately one page and one question. Answering a boolean by walking
-        every retried job of a large pipeline would cost several sequential
-        requests on every gate evaluation.
-        """
-        sha = pr_info.head_sha
-        if not sha:
-            return None
-        url = (
-            f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}"
-            "/statuses?per_page=100"
-        )
-        resp = await self._request("GET", url, ok=(200, 404))
-        if resp.status_code == 404:
-            return None
-        entries = resp.json() or []
-        if not entries:
-            return None
-        return any(str((entry or {}).get("name") or "") != STATUS_CONTEXT for entry in entries)
-
     async def get_ci_state(self, pr_info: PRInfo) -> CIState:
         """The merge request's head pipeline, mapped onto the gate vocabulary.
 
-        The pipeline is authoritative because it is the only view that gets the
-        awkward cases right: a run blocked on a manual gate reports `manual`
-        rather than leaving its downstream jobs looking pending forever, and a
-        merged-results pipeline is found even though it belongs to the
-        merge-ref commit rather than to the head SHA.
+        The pipeline is the right view, and the only one that gets the awkward
+        cases right: a run blocked on a manual gate reports `manual` rather than
+        leaving its downstream jobs looking pending forever, and a
+        merged-results pipeline is found even though it belongs to the merge-ref
+        commit rather than to the head SHA.
 
-        It has one blind spot, and it is the one that matters here. An external
-        commit status posted through the API *joins* the pipeline — including
-        the status the gate itself publishes — so on a project with no CI the
-        gate would create a green pipeline and read it back as passing on the
-        next pass. Hence the second call, which asks only whether anything
-        other than the gate is recorded against this commit.
+        Reading it is only safe because the gate publishes nothing into it — see
+        `publish_gate_status`. A commit status posted through the API joins this
+        pipeline, so a gate that wrote here would be reading its own verdict
+        back as a build.
 
         A merge request with no pipeline reports "none", which is not success —
         the gate cannot vouch for a commit that nothing ever built, and says so
@@ -617,15 +587,6 @@ class GitLabProvider(BaseProvider):
             return CIState(state="unknown")
         pipeline = (resp.json() or {}).get("head_pipeline") or {}
         if not pipeline:
-            return CIState(state="none", total=0)
-
-        try:
-            foreign = await self._foreign_commit_status(pr_info)
-        except Exception as exc:  # noqa: BLE001 - unknown, never assumed green
-            logger.warning("Could not read commit statuses for %s: %s", pr_info.url, exc)
-            return CIState(state="unknown")
-        if foreign is False:
-            # The pipeline exists because the gate posted into it.
             return CIState(state="none", total=0)
 
         status = str(pipeline.get("status") or "").lower()
@@ -715,41 +676,21 @@ class GitLabProvider(BaseProvider):
         summary: str,
         target_url: str = "",
     ) -> str:
-        """Publish the decision as a commit status on the head SHA.
+        """Not supported on GitLab, deliberately.
 
-        GitLab has no check runs; a commit status is the closest equivalent and
-        is keyed by `name`, so re-publishing after a retry updates in place.
-        The state is always `success` and the verdict travels in the
-        description. GitLab has no blocking review event, so a red status would
-        claim a power this provider does not have; and because an external
-        status joins the head pipeline, posting one would corrupt the very
-        signal `get_ci_state` reads back. The status is an explanation here, not
-        a verdict — which is also why a dry run is not a lie: it says "would
-        approve" in the words next to the tick.
+        A GitLab commit status is not a neutral annotation — it joins the head
+        pipeline. Publishing one would corrupt the CI signal `get_ci_state`
+        reads back, and on a project with no other CI and "Pipelines must
+        succeed" enabled a green status *becomes* a green pipeline, which can
+        satisfy the merge restriction the gate had just refused to satisfy. The
+        gate manufacturing the permission it withheld is the worst outcome
+        available here, so it writes nothing.
+
+        `GITLAB_CAPABILITIES` declares this, so the decision degrades explicitly
+        rather than silently. Turn on `gate.comment` to put the explanation on
+        the merge request; the dashboard always has it.
         """
-        sha = pr_info.head_sha
-        if not sha:
-            return ""
-        # Always `success`. GitLab has no blocking review event, so a red status
-        # would claim a power this provider does not have — and an external
-        # status *joins* the head pipeline, so posting `failed` would turn the
-        # pipeline red and the gate would read its own verdict back as a failing
-        # build on the next pass, forever, on that commit. The verdict travels
-        # in the description, where it cannot break anything.
-        state = "success"
-        params: dict[str, Any] = {
-            "state": state,
-            "name": context or STATUS_CONTEXT,
-            "description": title[:255],
-        }
-        if target_url:
-            params["target_url"] = target_url
-        url = f"{self._project(pr_info)}/statuses/{quote(sha, safe='')}"
-        try:
-            resp = await self._request("POST", url, params=params, ok=(200, 201))
-        except Exception as exc:  # noqa: BLE001
-            raise ProviderError(f"Failed to publish gate status: {exc}") from exc
-        return str((resp.json() or {}).get("id", "") or "")
+        return ""
 
 
 def _next_link(link_header: str) -> str | None:
