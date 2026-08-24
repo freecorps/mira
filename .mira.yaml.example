@@ -87,3 +87,74 @@ review:
     approve_max_severity: "suggestion"
     # Never approve when files were skipped for exceeding max_diff_size.
     require_all_files_reviewed: true
+
+# ── Merge gate (Phase 4) ──
+#
+# A conservative approval decision, kept separate from `review.verdict`. The
+# verdict says whether the code is good; the gate says whether Mira may put its
+# name on merging it. It ships off, and start it in `shadow` — that records the
+# decision it *would* have acted on without acting, which is what makes the
+# false-approval rate measurable before rollout.
+#
+# NOTE: gate policy is deployment configuration. The server reads its own
+# config, so a `gate:` block committed inside a reviewed repository does not
+# change how that repository is gated. Set it on the server or in the dashboard.
+#
+# Full reference: docs/merge-gate.md
+gate:
+  #   off      — do not run (default)
+  #   shadow   — decide, explain and record; never approve
+  #   enforce  — the same decision, plus a real approval when it says so
+  mode: "off"
+  # Hard-disable everywhere, independent of mode and every per-repo override.
+  kill_switch: false
+
+  # Eligibility. Empty allowlists mean "any"; blocklists always win.
+  # allowed_base_branches: ["main"]
+  # required_labels: ["ready-for-review"]
+  blocked_labels: ["do-not-merge", "wip", "hold", "mira-paused"]
+  allowed_author_associations: ["OWNER", "MEMBER", "COLLABORATOR"]
+  max_changed_files: 20
+  max_changed_lines: 500
+
+  # A protected path is an absolute veto — never auto-approved, and no override
+  # can force one. Leave `protected_paths` unset to keep the built-in list
+  # (CI definitions, migrations, Terraform/Helm/k8s, key material, CODEOWNERS)
+  # and add to it here.
+  # extra_protected_paths:
+  #   - "infra/**"
+  #   - "*.tf"
+
+  # off | risk | block. An owned path is only ever a reason NOT to approve.
+  codeowners: "off"
+
+  # Each of these resolves an unknown to "no approval".
+  require_ci_success: true
+  require_all_files_reviewed: true
+  require_index_ready: true
+  approve_max_severity: "suggestion"
+
+  # A PR scoring above this is never approved, however clean it looks.
+  risk_threshold: 25
+
+  # Enforce mode only, blockers only, and never over an existing human review.
+  request_changes_on_blockers: false
+  # Publish the explanation as a check run / commit status. Neutral in shadow.
+  publish_status: true
+
+  # Revoking a decision by hand is always available to an authorized admin;
+  # forcing an approval is a separate power, and is still refused past a
+  # protected path, an open blocker, or a human who asked for changes.
+  allow_overrides: true
+  allow_approval_override: false
+  # Admins permitted to move a decision. Empty = every admin.
+  # override_admins: ["release-manager"]
+
+  # Per-repository policy. `null`/absent inherits; anything else overrides,
+  # including `[]`, which is how a repo opts out of an inherited requirement.
+  # repositories:
+  #   acme/payments:
+  #     mode: "off"
+  #   acme/docs:
+  #     mode: "enforce"
+  #     max_changed_files: 50

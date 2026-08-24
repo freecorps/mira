@@ -139,6 +139,26 @@ Rule analytics live at `/learnings/analytics` (admin only). Setting
 behave identically either way, since exposures are written only after the
 review has already been posted.
 
+The **merge gate** is a separate, conservative approval decision — the review
+verdict says whether the code is good, the gate says whether Mira may put its
+name on merging it. It ships off. Turn it on in shadow first, which records the
+decision it *would* have acted on so you can measure false approvals before
+letting it act:
+
+```yaml
+gate:
+  mode: "shadow"          # off | shadow | enforce
+  risk_threshold: 25
+  codeowners: "block"     # an owned path is never auto-approved
+```
+
+Gate policy is deployment configuration and nothing in a pull request can
+change it. A protected path, an open blocker, a pending CI run or an unreadable
+input never results in an approval. The history and policy panels live at
+`/merge-gate` (admin only).
+
+→ [Merge gate docs](docs/merge-gate.md)
+
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 
 ## Development
