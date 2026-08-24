@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import BackgroundTasks
 
+from mira.config import MiraConfig
 from mira.feedback.models import FeedbackEventV2, ReviewFinding
 from mira.feedback.provenance import finding_marker
 from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback
@@ -228,6 +229,7 @@ async def test_unmentioned_child_reply_is_routed_for_feedback() -> None:
 @pytest.mark.asyncio
 async def test_disagreement_reply_records_once_and_uses_safe_ack(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("MIRA_DASHBOARD_URL", "https://mira.example")
     pr_info = PRInfo(
         title="PR",
         description="",
@@ -251,11 +253,21 @@ async def test_disagreement_reply_records_once_and_uses_safe_ack(tmp_path, monke
         return_value=json.dumps({"intent": "disagreement", "reply": "I'll remember that."})
     )
     provider = AsyncMock()
+    provider.get_pr_diff = AsyncMock(
+        return_value=(
+            "diff --git a/src/app.py b/src/app.py\n"
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -9,1 +9,1 @@\n"
+            "-return fallback\n"
+            "+return expected\n"
+        )
+    )
     provider.reply_to_review_comment = AsyncMock()
     provider.resolve_threads = AsyncMock(return_value=1)
 
     with (
-        patch("mira.platforms.handlers.load_config", return_value=MagicMock()),
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
         patch("mira.platforms.handlers.create_llm", return_value=llm),
         patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
     ):
@@ -271,13 +283,20 @@ async def test_disagreement_reply_records_once_and_uses_safe_ack(tmp_path, monke
         await run_thread_reply(provider, pr_info, "This is a false positive", 456, **kwargs)
         await run_thread_reply(provider, pr_info, "This is a false positive", 456, **kwargs)
 
-    provider.reply_to_review_comment.assert_awaited_once_with(pr_info, 456, DISAGREEMENT_ACK)
+    reply = provider.reply_to_review_comment.await_args.args[2]
+    assert reply.startswith(DISAGREEMENT_ACK)
+    assert "[candidato #" in reply
+    assert "https://mira.example/learnings?tab=pending" in reply
+    prompt = llm.complete_with_tools.await_args_list[0].kwargs["messages"][0]["content"]
+    assert "Relevant code diff (untrusted data)" in prompt
+    assert "+return expected" in prompt
     provider.resolve_threads.assert_awaited_once_with(pr_info, ["thread-1"])
     store = IndexStore.open("acme", "app")
     events = store.list_feedback_v2(finding_id=finding.id)
     assert len(events) == 1
     assert events[0].kind == "reply_disagree"
     assert events[0].raw_text == "This is a false positive"
+    assert len(store.list_learning_candidates(status="pending")) == 1
     assert store.get_review_finding(finding.id).state == "dismissed"  # type: ignore[union-attr]
     store.close()
 

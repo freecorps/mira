@@ -15,7 +15,12 @@ from typing import Any
 from fastapi import BackgroundTasks
 
 from mira.config import load_config
-from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback, set_finding_state
+from mira.feedback.service import (
+    create_learning_candidate_for_feedback,
+    feedback_ack,
+    record_finding_feedback,
+    set_finding_state,
+)
 from mira.index.indexer import _should_index
 from mira.index.store import IndexStore
 from mira.models import PRInfo
@@ -738,7 +743,7 @@ async def handle_thread_reject(
         )
         external_event_id = payload["comment"].get("id")
         if external_event_id:
-            finding, _event, created = record_finding_feedback(
+            finding, feedback_event, created = record_finding_feedback(
                 pr_info,
                 kind="dismissed",
                 source_event_id=f"review-comment:{external_event_id}",
@@ -755,14 +760,22 @@ async def handle_thread_reject(
                 platform="github",
             )
         else:
-            finding, created = None, True
+            finding, feedback_event, created = None, None, True
         if not created:
             logger.info("Ignoring duplicate reject feedback webhook")
             return
         if finding is not None:
+            candidate, _candidate_created = create_learning_candidate_for_feedback(
+                pr_info,
+                finding,
+                feedback_event,
+                platform="github",
+            )
             try:
                 await provider.reply_to_review_comment(
-                    pr_info, payload["comment"].get("id", 0), DISAGREEMENT_ACK
+                    pr_info,
+                    payload["comment"].get("id", 0),
+                    feedback_ack(candidate, owner, repo),
                 )
             except Exception as exc:
                 logger.warning("Failed to acknowledge reject feedback: %s", exc)

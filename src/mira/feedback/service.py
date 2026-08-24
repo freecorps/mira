@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
+from urllib.parse import urlencode
 
+from mira.config import LearningConfig, load_config
 from mira.feedback.models import FeedbackEventV2, ReviewFinding
 from mira.feedback.provenance import (
     finding_fingerprint,
@@ -163,3 +166,76 @@ def set_finding_state(pr_info: Any, finding_id: str, state: str, platform: str) 
         store.update_review_finding_state(finding_id, state)
     finally:
         store.close()
+
+
+def create_learning_candidate_for_feedback(
+    pr_info: Any,
+    finding: ReviewFinding | None,
+    event: FeedbackEventV2 | None,
+    *,
+    proposal: dict[str, Any] | None = None,
+    platform: str = "github",
+    config: LearningConfig | None = None,
+) -> tuple[Any | None, bool]:
+    """Synthesize a governed candidate after the feedback event is durable."""
+    from mira.feedback.lifecycle import approve_candidate, evidence_required
+    from mira.feedback.synthesis import synthesize_candidate
+
+    learning_config = config if isinstance(config, LearningConfig) else load_config().learning
+    store = IndexStore.open(pr_info.owner, pr_info.repo, platform=platform)
+    try:
+        candidate, created = synthesize_candidate(
+            store,
+            finding,
+            event,
+            proposal=proposal,
+            config=learning_config,
+        )
+        if (
+            candidate is not None
+            and learning_config.learning_auto_apply
+            and candidate.confidence >= 0.95
+            and candidate.evidence_count >= evidence_required(candidate.scope_type, learning_config)
+        ):
+            approve_candidate(
+                store,
+                candidate.id,
+                actor="mira-auto-apply",
+                config=learning_config,
+            )
+            candidate = store.get_learning_candidate(candidate.id)
+        return candidate, created
+    finally:
+        store.close()
+
+
+def feedback_ack(candidate: Any | None, owner: str, repo: str) -> str:
+    """Keep the Phase 1 acknowledgement and add an auditable candidate link."""
+    if candidate is None:
+        return DISAGREEMENT_ACK
+    base = os.environ.get("MIRA_DASHBOARD_URL", "").rstrip("/")
+    status = getattr(candidate, "status", "pending")
+    tab = status if status in {"approved", "rejected"} else "pending"
+    label = f"candidato #{candidate.id}"
+    if base:
+        query = urlencode(
+            {
+                "tab": tab,
+                "candidate": candidate.id,
+                "owner": owner,
+                "repo": repo,
+            }
+        )
+        url = f"{base}/learnings?{query}"
+        label = f"[{label}]({url})"
+    if status == "approved":
+        return f"{DISAGREEMENT_ACK}\n\nAssociei esta evidência ao {label}, que já foi aprovado."
+    if status == "rejected":
+        return (
+            f"{DISAGREEMENT_ACK}\n\nAssociei esta evidência ao {label}; "
+            "ele continua rejeitado e inativo."
+        )
+    return (
+        f"{DISAGREEMENT_ACK}\n\nRegistrei o {label} para revisão; "
+        "ele não afeta reviews até ser aprovado."
+    )

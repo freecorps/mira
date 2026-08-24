@@ -18,7 +18,11 @@ from typing import Any
 import httpx
 
 from mira.config import load_config
-from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback
+from mira.feedback.service import (
+    create_learning_candidate_for_feedback,
+    feedback_ack,
+    record_finding_feedback,
+)
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.fetch import make_fetcher
@@ -319,7 +323,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
 
         # Explicit reject on an inline (diff) comment → record feedback.
         if first_word in _REJECT_KEYWORDS and (comment_path or parent_comment_id):
-            finding, _event, created = record_finding_feedback(
+            finding, feedback_event, created = record_finding_feedback(
                 pr_info,
                 kind="dismissed",
                 source_event_id=f"comment:{comment.get('id', '')}",
@@ -335,8 +339,16 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
                 platform="forgejo",
             )
             if finding is not None and created:
+                candidate, _candidate_created = create_learning_candidate_for_feedback(
+                    pr_info,
+                    finding,
+                    feedback_event,
+                    platform="forgejo",
+                )
                 await provider.reply_to_review_comment(
-                    pr_info, comment.get("id", 0), DISAGREEMENT_ACK
+                    pr_info,
+                    comment.get("id", 0),
+                    feedback_ack(candidate, owner, repo_name),
                 )
             return
 

@@ -7,11 +7,14 @@ database — real behavior coverage without a Postgres server.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
 import pytest
 
+from mira.feedback.lifecycle import approve_candidate, version_rule
+from mira.feedback.models import LearningCandidate
 from mira.index import pg_store
 from mira.index.pg_store import _PG_SCHEMA, PgIndexStore
 from mira.index.store import IndexStore
@@ -44,10 +47,15 @@ class _FakeConn:
     def __init__(self):
         self._conn = sqlite3.connect(":memory:")
         # SERIAL isn't a rowid alias in SQLite — ids would insert as NULL.
-        self._conn.executescript(_PG_SCHEMA.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY"))
+        sqlite_schema = _PG_SCHEMA.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY")
+        sqlite_schema = sqlite_schema.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY")
+        self._conn.executescript(sqlite_schema)
 
     def cursor(self):
         return _FakeCursor(self._conn)
+
+    def commit(self):
+        self._conn.commit()
 
 
 @pytest.fixture
@@ -154,3 +162,81 @@ def test_fingerprints_scoped_by_repo(fake_conn):
     assert [fp.pr_number for fp in a.list_pr_fingerprints()] == [1]
     assert [fp.pr_number for fp in b.list_pr_fingerprints()] == [1]
     assert b.list_pr_fingerprints()[0].updated_at < now - IndexStore._FINGERPRINT_TTL
+
+
+def test_governed_learning_candidate_parity(store):
+    candidate = LearningCandidate(
+        id=0,
+        semantic_fingerprint="semantic-1",
+        rule_text="Do not flag generated fixtures.",
+        rationale="A maintainer identified the fixture as synthetic.",
+        scope_type="path",
+        scope_value="tests/fixtures/**",
+        category="security",
+        language="python",
+        confidence=0.9,
+        status="pending",
+        synthesizer_version="test",
+        evidence_ids_json="[1]",
+        negative_examples_json='[{"feedback_id": 1}]',
+    )
+    first, created = store.upsert_learning_candidate(candidate)
+    assert created and first.evidence_count == 1
+
+    candidate.evidence_ids_json = "[2]"
+    candidate.negative_examples_json = '[{"feedback_id": 2}]'
+    merged, created = store.upsert_learning_candidate(candidate)
+    assert not created
+    assert json.loads(merged.evidence_ids_json) == [1, 2]
+
+    rule = approve_candidate(store, merged.id, actor="admin")
+    assert rule.origin_candidate_id == merged.id
+    assert store.get_learning_candidate(merged.id).status == "approved"
+    assert [item.id for item in store.list_active_learned_rules()] == [rule.id]
+
+
+def test_governed_learning_rule_version_parity(store):
+    original = store.create_learned_rule(
+        "Ignore style in generated code.",
+        "style",
+        path_pattern="generated/**",
+        scope_type="path",
+        scope_value="generated/**",
+        created_by="admin",
+    )
+    replacement = version_rule(
+        store,
+        original.id,
+        rule_text="Do not report style issues in generated code.",
+        category="style",
+        scope_type="path",
+        scope_value="generated/**",
+        actor="admin",
+    )
+
+    assert replacement.version == 2
+    assert replacement.supersedes_rule_id == original.id
+    assert store.get_learned_rule(original.id).status == "superseded"
+
+
+def test_postgres_org_rules_apply_across_repositories(fake_conn):
+    source = PgIndexStore("acme", "policy", "postgresql://fake")
+    target = PgIndexStore("acme", "widgets", "postgresql://fake")
+    outsider = PgIndexStore("other", "policy", "postgresql://fake")
+    org_rule = source.create_learned_rule(
+        "Never log credentials.",
+        "security",
+        scope_type="org",
+        scope_value="acme",
+    )
+    outsider.create_learned_rule(
+        "Use another organization's convention.",
+        "style",
+        scope_type="org",
+        scope_value="other",
+    )
+
+    assert org_rule.rule_text in {rule.rule_text for rule in target.list_active_learned_rules()}
+    assert "Use another organization's convention." not in {
+        rule.rule_text for rule in target.list_active_learned_rules()
+    }

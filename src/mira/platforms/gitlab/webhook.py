@@ -16,7 +16,12 @@ from typing import Any
 import httpx
 
 from mira.config import load_config
-from mira.feedback.service import DISAGREEMENT_ACK, record_finding_feedback, set_finding_state
+from mira.feedback.service import (
+    create_learning_candidate_for_feedback,
+    feedback_ack,
+    record_finding_feedback,
+    set_finding_state,
+)
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.fetch import _next_link, make_fetcher
@@ -251,7 +256,7 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
 
         # Explicit reject on an inline (diff) note → record before resolving.
         if first_word in _REJECT_KEYWORDS and discussion_id and position:
-            finding, _event, created = record_finding_feedback(
+            finding, feedback_event, created = record_finding_feedback(
                 pr_info,
                 kind="dismissed",
                 source_event_id=f"note:{attrs.get('id', '')}",
@@ -268,7 +273,17 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
             if not created:
                 return
             if finding is not None:
-                await provider.reply_to_review_comment(pr_info, attrs.get("id"), DISAGREEMENT_ACK)
+                candidate, _candidate_created = create_learning_candidate_for_feedback(
+                    pr_info,
+                    finding,
+                    feedback_event,
+                    platform="gitlab",
+                )
+                await provider.reply_to_review_comment(
+                    pr_info,
+                    attrs.get("id"),
+                    feedback_ack(candidate, owner, repo),
+                )
             await provider.resolve_threads(pr_info, [str(discussion_id)])
             if finding is not None:
                 set_finding_state(pr_info, finding.id, "dismissed", "gitlab")
@@ -336,7 +351,7 @@ async def handle_gitlab_emoji(payload: dict[str, Any], auth: PlatformAuth) -> No
         pr_info = await provider.get_pr_info(mr_url)
         position = note.get("position") or note.get("original_position") or {}
         actor = (payload.get("user") or {}).get("username", "")
-        finding, _event, created = record_finding_feedback(
+        finding, feedback_event, created = record_finding_feedback(
             pr_info,
             kind=kind,
             source_event_id=f"emoji:{attrs.get('id', '')}",
@@ -353,8 +368,16 @@ async def handle_gitlab_emoji(payload: dict[str, Any], auth: PlatformAuth) -> No
         if finding is None or not created:
             return
         if kind == "thumbs_down":
+            candidate, _candidate_created = create_learning_candidate_for_feedback(
+                pr_info,
+                finding,
+                feedback_event,
+                platform="gitlab",
+            )
             await provider.reply_to_review_comment(
-                pr_info, int(note.get("id", 0) or 0), DISAGREEMENT_ACK
+                pr_info,
+                int(note.get("id", 0) or 0),
+                feedback_ack(candidate, owner, repo),
             )
             set_finding_state(pr_info, finding.id, "dismissed", "gitlab")
     except Exception:

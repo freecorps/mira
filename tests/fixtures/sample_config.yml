@@ -14,3 +14,8 @@ filter:
 review:
   context_lines: 5
   include_summary: true
+
+learning:
+  feedback_v2: true
+  learning_synthesis: true
+  learning_auto_apply: false

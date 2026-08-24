@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
-from mira.feedback.models import FeedbackEventV2, ReviewFinding
+from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.index._store_shared import _StoreSharedMixin
 from mira.index.store import (
@@ -248,6 +248,35 @@ CREATE TABLE IF NOT EXISTS feedback_events_v2 (
 CREATE INDEX IF NOT EXISTS idx_pg_feedback_v2_finding
     ON feedback_events_v2(owner, repo, finding_id, created_at);
 
+CREATE TABLE IF NOT EXISTS learning_candidates (
+    id BIGSERIAL PRIMARY KEY,
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    semantic_fingerprint TEXT NOT NULL,
+    rule_text TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    scope_type TEXT NOT NULL DEFAULT 'repo',
+    scope_value TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    synthesizer_version TEXT NOT NULL DEFAULT 'phase2-v1',
+    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+    positive_examples_json TEXT NOT NULL DEFAULT '[]',
+    negative_examples_json TEXT NOT NULL DEFAULT '[]',
+    source_finding_id TEXT REFERENCES review_findings(id) ON DELETE SET NULL,
+    source_feedback_id BIGINT REFERENCES feedback_events_v2(id) ON DELETE SET NULL,
+    superseded_by_id BIGINT,
+    cost_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE(owner, repo, semantic_fingerprint, scope_type, scope_value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_learning_candidates_status
+    ON learning_candidates(owner, repo, status, updated_at);
+
 CREATE TABLE IF NOT EXISTS learned_rules (
     id SERIAL PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -260,6 +289,16 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     active INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'approved',
     created_by TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    scope_type TEXT NOT NULL DEFAULT 'repo',
+    scope_value TEXT NOT NULL DEFAULT '',
+    origin_candidate_id BIGINT REFERENCES learning_candidates(id) ON DELETE SET NULL,
+    rationale TEXT NOT NULL DEFAULT '',
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    effective_from DOUBLE PRECISION NOT NULL DEFAULT 0,
+    disabled_at DOUBLE PRECISION,
+    supersedes_rule_id INTEGER REFERENCES learned_rules(id) ON DELETE SET NULL,
+    semantic_fingerprint TEXT NOT NULL DEFAULT '',
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
@@ -347,6 +386,31 @@ def _get_conn(url: str) -> Any:
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS created_by "
                     "TEXT NOT NULL DEFAULT ''"
                 )
+                for column, ddl in {
+                    "version": "INTEGER NOT NULL DEFAULT 1",
+                    "scope_type": "TEXT NOT NULL DEFAULT 'repo'",
+                    "scope_value": "TEXT NOT NULL DEFAULT ''",
+                    "origin_candidate_id": "BIGINT",
+                    "rationale": "TEXT NOT NULL DEFAULT ''",
+                    "evidence_count": "INTEGER NOT NULL DEFAULT 0",
+                    "effective_from": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+                    "disabled_at": "DOUBLE PRECISION",
+                    "supersedes_rule_id": "INTEGER",
+                    "semantic_fingerprint": "TEXT NOT NULL DEFAULT ''",
+                }.items():
+                    cur.execute(
+                        f"ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS {column} {ddl}"
+                    )
+                cur.execute(
+                    "UPDATE learned_rules SET scope_type = CASE WHEN path_pattern <> '' "
+                    "AND scope_type = 'repo' AND scope_value = '' THEN 'path' "
+                    "ELSE scope_type END, scope_value = CASE WHEN path_pattern <> '' "
+                    "AND scope_value = '' THEN path_pattern ELSE scope_value END, "
+                    "evidence_count = CASE "
+                    "WHEN evidence_count = 0 THEN sample_count ELSE evidence_count END, "
+                    "effective_from = CASE WHEN effective_from = 0 AND status = 'approved' "
+                    "AND active = 1 THEN created_at ELSE effective_from END"
+                )
                 cur.execute(
                     "ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS pr_author "
                     "TEXT NOT NULL DEFAULT ''"
@@ -381,7 +445,9 @@ def list_learned_rules_org_wide(
         cur.execute(
             "SELECT id, owner, repo, rule_text, source_signal, category, "
             "path_pattern, sample_count, active, status, created_by, "
-            "created_at, updated_at "
+            "version, scope_type, scope_value, origin_candidate_id, rationale, "
+            "evidence_count, effective_from, disabled_at, supersedes_rule_id, "
+            "semantic_fingerprint, created_at, updated_at "
             f"FROM learned_rules {where} "
             "ORDER BY updated_at DESC LIMIT %s",
             params,
@@ -400,11 +466,51 @@ def list_learned_rules_org_wide(
             "active": bool(r[8]),
             "status": r[9],
             "created_by": r[10],
-            "created_at": r[11],
-            "updated_at": r[12],
+            "version": r[11],
+            "scope_type": r[12],
+            "scope_value": r[13],
+            "origin_candidate_id": r[14],
+            "rationale": r[15],
+            "evidence_count": r[16],
+            "effective_from": r[17],
+            "disabled_at": r[18],
+            "supersedes_rule_id": r[19],
+            "semantic_fingerprint": r[20],
+            "created_at": r[21],
+            "updated_at": r[22],
         }
         for r in rows
     ]
+
+
+def list_learning_candidates_org_wide(
+    url: str, limit: int = 1000, status: str | None = None
+) -> list[dict]:
+    where = "WHERE status = %s" if status else ""
+    params: tuple = (status, limit) if status else (limit,)
+    with _pg_cursor(url) as cur:
+        cur.execute(
+            "SELECT id, owner, repo, semantic_fingerprint, rule_text, rationale, "
+            "scope_type, scope_value, category, language, confidence, status, "
+            "synthesizer_version, evidence_ids_json, positive_examples_json, "
+            "negative_examples_json, source_finding_id, source_feedback_id, "
+            "superseded_by_id, cost_tokens, created_at, updated_at "
+            f"FROM learning_candidates {where} ORDER BY updated_at DESC LIMIT %s",
+            params,
+        )
+        rows = cur.fetchall()
+    result: list[dict] = []
+    for row in rows:
+        candidate = PgIndexStore._row_to_learning_candidate((row[0], *row[3:]))
+        result.append(
+            {
+                **candidate.__dict__,
+                "evidence_count": candidate.evidence_count,
+                "owner": row[1],
+                "repo": row[2],
+            }
+        )
+    return result
 
 
 def count_vulnerabilities_org_wide(url: str) -> dict[str, int]:
@@ -1813,6 +1919,200 @@ class PgIndexStore(_StoreSharedMixin):
             stats[key]["total"] += count
         return stats
 
+    # ── Governed learning candidates ──
+
+    _LC_COLS = (
+        "id, semantic_fingerprint, rule_text, rationale, scope_type, scope_value, "
+        "category, language, confidence, status, synthesizer_version, "
+        "evidence_ids_json, positive_examples_json, negative_examples_json, "
+        "source_finding_id, source_feedback_id, superseded_by_id, cost_tokens, "
+        "created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_learning_candidate(row: tuple) -> LearningCandidate:
+        return LearningCandidate(
+            id=row[0],
+            semantic_fingerprint=row[1],
+            rule_text=row[2],
+            rationale=row[3],
+            scope_type=row[4],
+            scope_value=row[5],
+            category=row[6],
+            language=row[7],
+            confidence=row[8],
+            status=row[9],
+            synthesizer_version=row[10],
+            evidence_ids_json=row[11],
+            positive_examples_json=row[12],
+            negative_examples_json=row[13],
+            source_finding_id=row[14],
+            source_feedback_id=row[15],
+            superseded_by_id=row[16],
+            cost_tokens=row[17],
+            created_at=row[18],
+            updated_at=row[19],
+        )
+
+    def upsert_learning_candidate(
+        self, candidate: LearningCandidate
+    ) -> tuple[LearningCandidate, bool]:
+        now = time.time()
+        existing = self._fetchone(
+            f"SELECT {self._LC_COLS} FROM learning_candidates "
+            "WHERE owner=%s AND repo=%s AND semantic_fingerprint=%s "
+            "AND scope_type=%s AND scope_value=%s",
+            (
+                self._owner,
+                self._repo,
+                candidate.semantic_fingerprint,
+                candidate.scope_type,
+                candidate.scope_value,
+            ),
+        )
+        if existing:
+            current = self._row_to_learning_candidate(existing)
+            evidence_json = IndexStore._merge_json_lists(
+                current.evidence_ids_json, candidate.evidence_ids_json
+            )
+            positives_json = IndexStore._merge_json_lists(
+                current.positive_examples_json, candidate.positive_examples_json
+            )
+            negatives_json = IndexStore._merge_json_lists(
+                current.negative_examples_json, candidate.negative_examples_json
+            )
+            with self._cursor() as cur:
+                cur.execute(
+                    "UPDATE learning_candidates SET rule_text=%s, rationale=%s, category=%s, "
+                    "language=%s, confidence=%s, evidence_ids_json=%s, "
+                    "positive_examples_json=%s, negative_examples_json=%s, cost_tokens=%s, "
+                    "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
+                    (
+                        candidate.rule_text or current.rule_text,
+                        candidate.rationale or current.rationale,
+                        candidate.category or current.category,
+                        candidate.language or current.language,
+                        max(current.confidence, candidate.confidence),
+                        evidence_json,
+                        positives_json,
+                        negatives_json,
+                        current.cost_tokens + candidate.cost_tokens,
+                        now,
+                        current.id,
+                        self._owner,
+                        self._repo,
+                    ),
+                )
+            self._commit()
+            return self.get_learning_candidate(current.id), False  # type: ignore[return-value]
+
+        candidate.created_at = candidate.created_at or now
+        candidate.updated_at = now
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO learning_candidates "
+                "(owner, repo, semantic_fingerprint, rule_text, rationale, scope_type, "
+                "scope_value, category, language, confidence, status, synthesizer_version, "
+                "evidence_ids_json, positive_examples_json, negative_examples_json, "
+                "source_finding_id, source_feedback_id, superseded_by_id, cost_tokens, "
+                "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (
+                    self._owner,
+                    self._repo,
+                    candidate.semantic_fingerprint,
+                    candidate.rule_text,
+                    candidate.rationale,
+                    candidate.scope_type,
+                    candidate.scope_value,
+                    candidate.category,
+                    candidate.language,
+                    candidate.confidence,
+                    candidate.status,
+                    candidate.synthesizer_version,
+                    candidate.evidence_ids_json,
+                    candidate.positive_examples_json,
+                    candidate.negative_examples_json,
+                    candidate.source_finding_id,
+                    candidate.source_feedback_id,
+                    candidate.superseded_by_id,
+                    candidate.cost_tokens,
+                    candidate.created_at,
+                    candidate.updated_at,
+                ),
+            )
+            row_id = cur.fetchone()[0]
+        self._commit()
+        return self.get_learning_candidate(row_id), True  # type: ignore[return-value]
+
+    def get_learning_candidate(self, candidate_id: int) -> LearningCandidate | None:
+        row = self._fetchone(
+            f"SELECT {self._LC_COLS} FROM learning_candidates WHERE id=%s AND owner=%s AND repo=%s",
+            (candidate_id, self._owner, self._repo),
+        )
+        return self._row_to_learning_candidate(row) if row else None
+
+    def list_learning_candidates(
+        self, status: str | None = None, limit: int = 500
+    ) -> list[LearningCandidate]:
+        if status:
+            rows = self._fetchall(
+                f"SELECT {self._LC_COLS} FROM learning_candidates "
+                "WHERE owner=%s AND repo=%s AND status=%s ORDER BY updated_at DESC LIMIT %s",
+                (self._owner, self._repo, status, limit),
+            )
+        else:
+            rows = self._fetchall(
+                f"SELECT {self._LC_COLS} FROM learning_candidates "
+                "WHERE owner=%s AND repo=%s ORDER BY updated_at DESC LIMIT %s",
+                (self._owner, self._repo, limit),
+            )
+        return [self._row_to_learning_candidate(row) for row in rows]
+
+    def update_learning_candidate(
+        self,
+        candidate_id: int,
+        *,
+        rule_text: str,
+        rationale: str,
+        scope_type: str,
+        scope_value: str,
+        category: str,
+        language: str,
+        semantic_fingerprint: str,
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE learning_candidates SET rule_text=%s, rationale=%s, scope_type=%s, "
+                "scope_value=%s, category=%s, language=%s, semantic_fingerprint=%s, "
+                "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
+                (
+                    rule_text,
+                    rationale,
+                    scope_type,
+                    scope_value,
+                    category,
+                    language,
+                    semantic_fingerprint,
+                    time.time(),
+                    candidate_id,
+                    self._owner,
+                    self._repo,
+                ),
+            )
+        self._commit()
+
+    def set_learning_candidate_status(
+        self, candidate_id: int, status: str, superseded_by_id: int | None = None
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE learning_candidates SET status=%s, superseded_by_id=%s, "
+                "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
+                (status, superseded_by_id, time.time(), candidate_id, self._owner, self._repo),
+            )
+        self._commit()
+
     # ── Learned rules ──
 
     def upsert_learned_rule(
@@ -1835,8 +2135,18 @@ class PgIndexStore(_StoreSharedMixin):
             with self._cursor() as cur:
                 cur.execute(
                     "UPDATE learned_rules SET rule_text=%s, source_signal=%s, "
-                    "sample_count=%s, updated_at=%s WHERE id=%s",
-                    (rule_text, source_signal, sample_count, now, existing[0]),
+                    "sample_count=%s, evidence_count=%s, scope_type=%s, scope_value=%s, "
+                    "updated_at=%s WHERE id=%s",
+                    (
+                        rule_text,
+                        source_signal,
+                        sample_count,
+                        sample_count,
+                        "path" if path_pattern else "repo",
+                        path_pattern,
+                        now,
+                        existing[0],
+                    ),
                 )
             self._commit()
             return LearnedRuleRow(
@@ -1854,8 +2164,9 @@ class PgIndexStore(_StoreSharedMixin):
             cur.execute(
                 "INSERT INTO learned_rules "
                 "(owner, repo, rule_text, source_signal, category, path_pattern, "
-                "sample_count, active, status, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s) RETURNING id",
+                "sample_count, active, status, scope_type, scope_value, evidence_count, "
+                "effective_from, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, "
+                "%s, 1, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     self._owner,
                     self._repo,
@@ -1865,6 +2176,10 @@ class PgIndexStore(_StoreSharedMixin):
                     path_pattern,
                     sample_count,
                     status,
+                    "path" if path_pattern else "repo",
+                    path_pattern,
+                    sample_count,
+                    now if status == "approved" else 0.0,
                     now,
                     now,
                 ),
@@ -1885,7 +2200,9 @@ class PgIndexStore(_StoreSharedMixin):
 
     _LR_COLS = (
         "id, rule_text, source_signal, category, path_pattern, "
-        "sample_count, active, status, created_by, created_at, updated_at"
+        "sample_count, active, status, created_by, version, scope_type, scope_value, "
+        "origin_candidate_id, rationale, evidence_count, effective_from, disabled_at, "
+        "supersedes_rule_id, semantic_fingerprint, created_at, updated_at"
     )
 
     def _row_to_learned_rule(self, r: tuple) -> LearnedRuleRow:
@@ -1899,14 +2216,25 @@ class PgIndexStore(_StoreSharedMixin):
             active=bool(r[6]),
             status=r[7],
             created_by=r[8],
-            created_at=r[9],
-            updated_at=r[10],
+            version=r[9],
+            scope_type=r[10],
+            scope_value=r[11],
+            origin_candidate_id=r[12],
+            rationale=r[13],
+            evidence_count=r[14],
+            effective_from=r[15],
+            disabled_at=r[16],
+            supersedes_rule_id=r[17],
+            semantic_fingerprint=r[18],
+            created_at=r[19],
+            updated_at=r[20],
         )
 
     def list_active_learned_rules(self) -> list[LearnedRuleRow]:
         rows = self._fetchall(
             f"SELECT {self._LR_COLS} FROM learned_rules "
-            "WHERE owner=%s AND repo=%s AND active=1 AND status='approved' "
+            "WHERE owner=%s AND (repo=%s OR scope_type='org') "
+            "AND active=1 AND status='approved' "
             "ORDER BY sample_count DESC",
             (self._owner, self._repo),
         )
@@ -1943,14 +2271,25 @@ class PgIndexStore(_StoreSharedMixin):
         status: str = "approved",
         active: bool = True,
         created_by: str = "",
+        version: int = 1,
+        scope_type: str = "repo",
+        scope_value: str = "",
+        origin_candidate_id: int | None = None,
+        rationale: str = "",
+        evidence_count: int = 0,
+        supersedes_rule_id: int | None = None,
+        semantic_fingerprint: str = "",
     ) -> LearnedRuleRow:
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO learned_rules "
                 "(owner, repo, rule_text, source_signal, category, path_pattern, "
-                "sample_count, active, status, created_by, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s) RETURNING id",
+                "sample_count, active, status, created_by, version, scope_type, scope_value, "
+                "origin_candidate_id, rationale, evidence_count, effective_from, disabled_at, "
+                "supersedes_rule_id, semantic_fingerprint, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     self._owner,
                     self._repo,
@@ -1958,9 +2297,20 @@ class PgIndexStore(_StoreSharedMixin):
                     source_signal,
                     category,
                     path_pattern,
+                    evidence_count,
                     int(active),
                     status,
                     created_by,
+                    version,
+                    scope_type,
+                    scope_value,
+                    origin_candidate_id,
+                    rationale,
+                    evidence_count,
+                    now if status == "approved" and active else 0.0,
+                    None if active else now,
+                    supersedes_rule_id,
+                    semantic_fingerprint,
                     now,
                     now,
                 ),
@@ -1970,31 +2320,78 @@ class PgIndexStore(_StoreSharedMixin):
         return self.get_learned_rule(row_id)  # type: ignore[return-value]
 
     def update_learned_rule(
-        self, rule_id: int, rule_text: str, category: str, path_pattern: str
+        self,
+        rule_id: int,
+        rule_text: str,
+        category: str,
+        path_pattern: str,
+        *,
+        scope_type: str,
+        scope_value: str,
+        rationale: str,
+        semantic_fingerprint: str,
     ) -> None:
         with self._cursor() as cur:
             cur.execute(
                 "UPDATE learned_rules SET rule_text=%s, category=%s, path_pattern=%s, "
+                "scope_type=%s, scope_value=%s, rationale=%s, semantic_fingerprint=%s, "
                 "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
-                (rule_text, category, path_pattern, time.time(), rule_id, self._owner, self._repo),
+                (
+                    rule_text,
+                    category,
+                    path_pattern,
+                    scope_type,
+                    scope_value,
+                    rationale,
+                    semantic_fingerprint,
+                    time.time(),
+                    rule_id,
+                    self._owner,
+                    self._repo,
+                ),
             )
         self._commit()
 
     def set_learned_rule_status(self, rule_id: int, status: str) -> None:
+        now = time.time()
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE learned_rules SET status=%s, updated_at=%s "
+                "UPDATE learned_rules SET status=%s, effective_from=CASE "
+                "WHEN %s = 'approved' AND effective_from=0 THEN %s ELSE effective_from END, "
+                "updated_at=%s "
                 "WHERE id=%s AND owner=%s AND repo=%s",
-                (status, time.time(), rule_id, self._owner, self._repo),
+                (status, status, now, now, rule_id, self._owner, self._repo),
             )
         self._commit()
 
     def set_learned_rule_active(self, rule_id: int, active: bool) -> None:
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE learned_rules SET active=%s, updated_at=%s "
+                "UPDATE learned_rules SET active=%s, disabled_at=%s, updated_at=%s "
                 "WHERE id=%s AND owner=%s AND repo=%s",
-                (int(active), time.time(), rule_id, self._owner, self._repo),
+                (
+                    int(active),
+                    None if active else time.time(),
+                    time.time(),
+                    rule_id,
+                    self._owner,
+                    self._repo,
+                ),
+            )
+        self._commit()
+
+    def supersede_learned_rule(self, rule_id: int, replacement_id: int) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE learned_rules SET active=0, status='superseded', disabled_at=%s, "
+                "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
+                (now, now, rule_id, self._owner, self._repo),
+            )
+            cur.execute(
+                "UPDATE learned_rules SET supersedes_rule_id=%s, updated_at=%s "
+                "WHERE id=%s AND owner=%s AND repo=%s",
+                (rule_id, now, replacement_id, self._owner, self._repo),
             )
         self._commit()
 
