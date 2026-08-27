@@ -1319,6 +1319,69 @@ class AppDatabase:
         """Replace the admin-set runtime overrides. Pass `{}` to clear."""
         self.set_setting(self._GLOBAL_OVERRIDES_KEY, json.dumps(overrides))
 
+    # Section names the panels may write. A section becomes a JSON path in the
+    # statement below, so the set is closed rather than taken from a request.
+    _OVERRIDE_SECTIONS = frozenset({"review", "filter", "learning", "gate", "autofix"})
+
+    def update_global_review_overrides_section(
+        self, section: str, value: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Replace one section of the override blob and return the whole result.
+
+        One statement, not read-modify-write. Every settings panel edits its own
+        key inside a single JSON row, so two admins saving different panels at
+        the same time would each read the blob, each replace their own section,
+        and the second write would carry the first one's *old* section back —
+        silently reverting a change whose form said it had been saved.
+
+        Passing ``None`` removes the section, which is how a panel is cleared.
+        """
+        if section not in self._OVERRIDE_SECTIONS:  # pragma: no cover - closed set
+            raise ValueError(f"{section!r} is not a settings section")
+        key = self._GLOBAL_OVERRIDES_KEY
+        path = f"$.{section}"
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            # `json_valid` guards the row an older build could have left as ''.
+            base = "CASE WHEN json_valid(value) THEN value ELSE '{}' END"
+            if value is None:
+                self._sqlite_conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, '{}') "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    f"value = json_remove({base}, ?)",
+                    (key, path),
+                )
+            else:
+                payload = json.dumps(value)
+                self._sqlite_conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, json_set('{}', ?, json(?))) "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    f"value = json_set({base}, ?, json(?))",
+                    (key, path, payload, path, payload),
+                )
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                base = "COALESCE(NULLIF(settings.value, '')::jsonb, '{}'::jsonb)"
+                if value is None:
+                    cur.execute(
+                        "INSERT INTO settings (key, value) VALUES (%s, '{}') "
+                        "ON CONFLICT(key) DO UPDATE SET "
+                        f"value = ({base} - %s)::text",
+                        (key, section),
+                    )
+                else:
+                    payload = json.dumps(value)
+                    cur.execute(
+                        "INSERT INTO settings (key, value) VALUES (%s, "
+                        "jsonb_build_object(%s, %s::jsonb)::text) "
+                        "ON CONFLICT(key) DO UPDATE SET "
+                        f"value = jsonb_set({base}, ARRAY[%s], %s::jsonb, true)::text",
+                        (key, section, payload, section, payload),
+                    )
+            self._pg_commit()
+        return self.get_global_review_overrides()
+
     # Outbound webhooks live in their own settings row (not in the review
     # overrides blob) so their secret URLs never leak into the effective-config
     # dump returned by GET /api/admin/settings.

@@ -809,49 +809,63 @@ class ForgejoProvider(BaseProvider):
         return str(data.get("sha") or ""), decoded
 
     async def files_match(self, pr_info: PRInfo, branch: str, files: dict[str, str]) -> bool:
+        """Whether every path already holds exactly this content on ``branch``.
+
+        The blob sha has to be non-empty for a match to count. ``_file_sha``
+        answers ``("", "")`` both for a file that is not there and for a read
+        that failed, so on a patch whose content happens to be empty the
+        contents alone would compare equal to a file nobody could read — and
+        the publisher would skip the commit and open a pull request containing
+        no change at all.
+        """
         for path, content in files.items():
-            _sha, existing = await self._file_sha(pr_info, branch, path)
-            if existing != content:
+            sha, existing = await self._file_sha(pr_info, branch, path)
+            if not sha or existing != content:
                 return False
         return True
 
     async def commit_files(
         self, pr_info: PRInfo, branch: str, files: dict[str, str], message: str
     ) -> str:
-        """Commit each file through the contents API.
+        """Commit every changed file in one request, and therefore one commit.
 
-        Forgejo's Gitea-compatible API has no multi-file commit endpoint, so a
-        multi-file patch lands as one commit per file on the fix branch. That
-        is declared in `FORGEJO_CAPABILITIES` rather than hidden: the branch is
-        Mira's own and nobody has reviewed it yet, so several commits are untidy
-        rather than harmful — and squashing them would mean a force push, which
-        is the one thing this phase does not do.
+        The batch `POST /contents` endpoint is used rather than one
+        `PUT /contents/{path}` per file. A patch is validated as a unit, and a
+        sequence of per-file commits is not that unit: a call that failed
+        halfway — or a concurrent writer that invalidated a later file's blob
+        sha — would leave the earlier commits on the branch, in a state nothing
+        ever checked. In `pr_branch` mode that state is on a contributor's live
+        branch, and it can be missing exactly the companion edit that made the
+        patch safe.
 
-        Each write carries the previous blob sha, so a concurrent change makes
-        the call fail instead of silently overwriting it.
+        One request has no halfway. Either the whole tree lands or nothing
+        does, including on a Forgejo old enough not to have the endpoint, where
+        the request is refused before it writes anything.
+
+        Each entry carries the previous blob sha, so a file that moved under us
+        makes the call fail instead of being silently overwritten.
         """
-        last = ""
+        entries: list[dict[str, Any]] = []
         for path, content in sorted(files.items()):
             sha, _existing = await self._file_sha(pr_info, branch, path)
-            payload: dict[str, Any] = {
-                "branch": branch,
+            entry: dict[str, Any] = {
+                "operation": "update" if sha else "create",
+                "path": path,
                 "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-                "message": message if not last else f"{message.splitlines()[0]} ({path})",
             }
             if sha:
-                payload["sha"] = sha
-            method = "PUT" if sha else "POST"
-            try:
-                resp = await self._request(
-                    method,
-                    f"{self._repo(pr_info)}/contents/{quote(path, safe='')}",
-                    json=payload,
-                    ok=(200, 201),
-                )
-            except Exception as e:
-                raise ProviderError(f"Failed to commit {path} to {branch} via {method}: {e}") from e
-            last = str(((resp.json() or {}).get("commit") or {}).get("sha") or "")
-        return last
+                entry["sha"] = sha
+            entries.append(entry)
+        try:
+            resp = await self._request(
+                "POST",
+                f"{self._repo(pr_info)}/contents",
+                json={"branch": branch, "message": message, "files": entries},
+                ok=(200, 201),
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to commit {len(entries)} file(s) to {branch}: {e}") from e
+        return str(((resp.json() or {}).get("commit") or {}).get("sha") or "")
 
     async def create_pull_request(
         self, pr_info: PRInfo, *, head: str, base: str, title: str, body: str
@@ -871,9 +885,12 @@ class ForgejoProvider(BaseProvider):
     async def find_open_pull_request(self, pr_info: PRInfo, head: str) -> tuple[int, str] | None:
         try:
             resp = await self._request("GET", f"{self._repo(pr_info)}/pulls?state=open&limit=100")
-        except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
-            logger.debug("Could not look for an open pull request from %s: %s", head, exc)
-            return None
+        except Exception as exc:
+            # See the GitLab adapter: "no pull request" and "could not tell"
+            # are different answers, and only the first may open a new one.
+            raise ProviderError(
+                f"Failed to look for an open pull request from {head}: {exc}"
+            ) from exc
         for item in resp.json() or []:
             if str(((item or {}).get("head") or {}).get("ref") or "") == head:
                 return int((item or {}).get("number") or 0), str((item or {}).get("html_url") or "")

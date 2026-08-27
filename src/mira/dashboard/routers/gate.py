@@ -404,11 +404,9 @@ def set_gate_config(body: GateConfigUpdate, request: Request) -> dict:
 
     if _app_db is None:  # pragma: no cover - only unconfigured installs
         raise HTTPException(status_code=503, detail="No settings store is configured")
-    current = dict(_app_db.get_global_review_overrides() or {})
-    if body.gate:
-        current["gate"] = body.gate
-    else:
-        current.pop("gate", None)
-    _app_db.set_global_review_overrides(current)
+    # One statement rather than read-modify-write: the autofix panel edits a
+    # sibling key in the same JSON row, and a save that read the blob before
+    # that panel wrote would carry its old section back over the new one.
+    _app_db.update_global_review_overrides_section("gate", body.gate or None)
     logger.info("Gate policy updated by %s", _actor(request) or "an admin")
     return {"ok": True, "gate": body.gate}

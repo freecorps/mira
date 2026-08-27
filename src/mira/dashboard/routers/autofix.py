@@ -94,6 +94,18 @@ class AutofixConfigUpdate(BaseModel):
     autofix: dict[str, Any] = Field(default_factory=dict)
 
 
+def _unknown_keys(payload: dict[str, Any]) -> list[str]:
+    """Keys in an override that `AutofixConfig` does not define, outermost only.
+
+    Outermost only on purpose: the nested models are validated by pydantic in
+    the usual way, and what this catches is the case pydantic is *quiet* about
+    — a misspelt top-level section that would be dropped on load, leaving an
+    admin looking at a saved form that changed nothing.
+    """
+    known = set(AutofixConfig.model_fields)
+    return sorted(key for key in payload if key not in known)
+
+
 class AutofixCancelInput(BaseModel):
     reason: str = ""
 
@@ -379,13 +391,45 @@ def set_autofix_config(body: AutofixConfigUpdate, request: Request) -> dict:
 
     Validated against the real model before anything is written, so a typo
     fails the request rather than the next fix request. Only the ``autofix``
-    section is touched — the review, filter and gate overrides an admin set
-    elsewhere are read back and rewritten unchanged, so two panels editing one
-    blob cannot clobber each other.
+    section is touched, and it is replaced in a single statement, so two panels
+    editing one blob cannot clobber each other.
+
+    Two things this route deliberately will not do.
+
+    It will not accept a ``validation`` section. Those entries are argv lists
+    that a worker executes as the Mira service account, and ``["/bin/sh", "-c",
+    "…"]`` is a perfectly well-formed argv list. Storing commands as lists stops
+    a *pull request* from injecting one; it does nothing about an admin session
+    that types one in. Validation commands come from deployment configuration —
+    the file, the environment — where changing them means having the host.
+
+    It will not accept a key the model does not define. Pydantic ignores unknown
+    fields by default, so ``{"mod": "on"}`` would validate, persist, change
+    nothing, and report success — which is the worst of the three outcomes.
     """
     _require_admin(request)
     from pydantic import ValidationError
 
+    if "validation" in body.autofix:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "field": "validation",
+                "message": (
+                    "Validation commands are deployment configuration and cannot be "
+                    "set from the dashboard"
+                ),
+            },
+        )
+    unknown = _unknown_keys(body.autofix)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "field": unknown[0],
+                "message": f"Unknown autofix setting(s): {', '.join(unknown)}",
+            },
+        )
     try:
         AutofixConfig.model_validate(body.autofix)
     except ValidationError as exc:
@@ -406,11 +450,6 @@ def set_autofix_config(body: AutofixConfigUpdate, request: Request) -> dict:
 
     if _app_db is None:  # pragma: no cover - only unconfigured installs
         raise HTTPException(status_code=503, detail="No settings store is configured")
-    current = dict(_app_db.get_global_review_overrides() or {})
-    if body.autofix:
-        current["autofix"] = body.autofix
-    else:
-        current.pop("autofix", None)
-    _app_db.set_global_review_overrides(current)
+    _app_db.update_global_review_overrides_section("autofix", body.autofix or None)
     logger.info("Autofix policy updated by %s", _actor(request) or "an admin")
     return {"ok": True, "autofix": body.autofix}

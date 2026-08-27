@@ -34,6 +34,24 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
 
+def _section_writer(stored: dict) -> Any:
+    """Stand-in for `AppDatabase.update_global_review_overrides_section`.
+
+    The real one replaces a section in a single statement so two panels saving
+    at once cannot carry each other's old section back; the stub only has to
+    have the same observable effect.
+    """
+
+    def _update(section: str, value: dict | None) -> dict:
+        if value is None:
+            stored.pop(section, None)
+        else:
+            stored[section] = value
+        return dict(stored)
+
+    return _update
+
+
 def _request(username: str = "admin", is_admin: bool = True) -> SimpleNamespace:
     user = SimpleNamespace(id=1, username=username, is_admin=is_admin)
     return SimpleNamespace(state=SimpleNamespace(user=user))
@@ -88,6 +106,7 @@ def known_repo(monkeypatch: pytest.MonkeyPatch) -> dict:
         get_repo_any_platform=lambda owner, repo: [SimpleNamespace(platform="github")],
         get_global_review_overrides=lambda: dict(stored),
         set_global_review_overrides=stored.update,
+        update_global_review_overrides_section=_section_writer(stored),
     )
     import mira.dashboard.api as api
 
@@ -297,6 +316,51 @@ def test_a_shell_string_in_the_command_allowlist_is_rejected(known_repo: dict) -
             request=_request(),
         )
     assert exc.value.status_code == 400
+
+
+def test_the_dashboard_cannot_install_a_validation_command(known_repo: dict) -> None:
+    """A well-formed argv list is still a shell if the argv names one.
+
+    Storing commands as lists stops a *pull request* from injecting one; it
+    does nothing about an admin session that types one in, and the worker runs
+    whatever is there as the Mira service account. Validation commands are
+    deployment configuration, where changing them means having the host.
+    """
+    hostile = {"validation": {"commands": [{"name": "fmt", "command": ["/bin/sh", "-c", "id"]}]}}
+    with pytest.raises(HTTPException) as exc:
+        autofix_routes.set_autofix_config(
+            body=autofix_routes.AutofixConfigUpdate(autofix=hostile),
+            request=_request(),
+        )
+    assert exc.value.status_code == 400
+    assert "deployment configuration" in str(exc.value.detail)
+    assert "autofix" not in known_repo
+
+
+def test_an_empty_validation_section_is_refused_too(known_repo: dict) -> None:
+    """The key is what is refused, not one shape of its contents."""
+    with pytest.raises(HTTPException) as exc:
+        autofix_routes.set_autofix_config(
+            body=autofix_routes.AutofixConfigUpdate(autofix={"validation": {}}),
+            request=_request(),
+        )
+    assert exc.value.status_code == 400
+
+
+def test_a_misspelt_setting_fails_instead_of_being_dropped(known_repo: dict) -> None:
+    """Pydantic ignores unknown fields, so a typo would save and change nothing.
+
+    Reporting success for a setting that will never take effect is worse than
+    either applying it or refusing it.
+    """
+    with pytest.raises(HTTPException) as exc:
+        autofix_routes.set_autofix_config(
+            body=autofix_routes.AutofixConfigUpdate(autofix={"mod": "on", "max_files": 2}),
+            request=_request(),
+        )
+    assert exc.value.status_code == 400
+    assert "mod" in str(exc.value.detail)
+    assert "autofix" not in known_repo
 
 
 def test_editing_autofix_leaves_the_other_sections_alone(known_repo: dict) -> None:

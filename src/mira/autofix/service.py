@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -286,7 +287,24 @@ async def request_fix(
                 actor=authorization.actor,
                 batch=batch,
             )
-            stored, created = store.enqueue_autofix_job(job)
+            # The ceiling travels with the insert rather than being trusted from
+            # the count above: `room` was read before this loop and before every
+            # `await` in it, so on its own it bounds one request rather than the
+            # repository. A refusal here is the queue being genuinely full.
+            stored, created = store.enqueue_autofix_job(job, max_active=policy.max_concurrent_jobs)
+            if not created and stored.id == 0:
+                outcome.skipped.append(
+                    (
+                        finding.id,
+                        Reason(
+                            ReasonCode.CONCURRENCY_LIMIT,
+                            "the repository's concurrent-job limit filled up while this "
+                            "request was being queued; ask again once it drains",
+                            "info",
+                        ),
+                    )
+                )
+                continue
             if not created and stored.terminal:
                 outcome.skipped.append(
                     (
@@ -476,7 +494,14 @@ async def run_job(
     decided from that reason rather than from the exception type — a path
     traversal is not going to succeed on the second try, and burning attempts
     on it would only delay telling somebody.
+
+    ``config`` *pins* the configuration for the whole attempt. Passing one says
+    "run this job under exactly this policy", which is what a test wants and
+    what a caller reconstructing an old decision wants. The worker deliberately
+    passes none, because a run takes minutes and the kill switch has to be able
+    to land inside one — see :func:`_policy_now`.
     """
+    reload_config = None if config is not None else load_config
     config = config or load_config()
     policy = resolve_policy(config.autofix, job.owner, job.repo)
     owned_store = store is None
@@ -500,7 +525,16 @@ async def run_job(
             )
         try:
             result = await asyncio.wait_for(
-                _run_phases(provider, job, policy, config, llm, store, recorder),
+                _run_phases(
+                    provider,
+                    job,
+                    policy,
+                    config,
+                    llm,
+                    store,
+                    recorder,
+                    reload_config=reload_config,
+                ),
                 timeout=policy.job_timeout_seconds,
             )
         except TimeoutError:
@@ -541,6 +575,8 @@ async def _run_phases(
     llm: Any,
     store: Any,
     recorder: _Recorder,
+    *,
+    reload_config: Callable[[], MiraConfig] | None = None,
 ) -> RunResult:
     pr_info = await provider.get_pr_info(job.pr_url)
     finding = store.get_review_finding(job.finding_id)
@@ -555,7 +591,16 @@ async def _run_phases(
         )
 
     if job.mode == "handoff":
-        return await _run_handoff(provider, pr_info, job, finding, policy, store, recorder)
+        return await _run_handoff(
+            provider,
+            pr_info,
+            job,
+            finding,
+            policy,
+            store,
+            recorder,
+            reload_config=reload_config,
+        )
 
     # ── generate ────────────────────────────────────────────────────────
     llm = llm or _default_llm(config)
@@ -606,36 +651,58 @@ async def _run_phases(
         detail="; ".join(f"{c.name}: {c.outcome}" for c in validation.checks),
     )
     if not validation.ok:
-        failures = ", ".join(check.name for check in validation.failures)
-        return _fail(
-            store,
-            job,
-            recorder,
-            "validate",
-            [
-                Reason(
-                    ReasonCode.VALIDATION_FAILED,
-                    f"The patch did not survive validation ({failures})",
-                )
-            ],
-            policy,
-            record=False,
-            patch=patch,
-        )
+        if not validation.executed:
+            # Nothing objected because nothing looked. Publishing here would
+            # write a model's output to a repository on no evidence at all, so
+            # it is refused — and refused permanently, because the next attempt
+            # would find the same disabled configuration.
+            reason = Reason(
+                ReasonCode.VALIDATION_NOT_RUN,
+                "No validation ran: `autofix.validation.syntax_check` is off and no "
+                "commands are configured, so there is no evidence this patch is sound",
+            )
+        else:
+            failures = ", ".join(check.name for check in validation.failures)
+            reason = Reason(
+                ReasonCode.VALIDATION_FAILED,
+                f"The patch did not survive validation ({failures})",
+            )
+        return _fail(store, job, recorder, "validate", [reason], policy, record=False, patch=patch)
 
     # ── publish ─────────────────────────────────────────────────────────
     #
     # The last read before the first write. Everything above this line is
     # reversible by doing nothing; everything below it puts something on a
-    # platform, so the job's own row is consulted one final time. An admin who
-    # cancelled while the model was thinking gets what they asked for, and the
-    # `cancelled` state is not overwritten by a result nobody wants.
+    # platform, so both incident controls are consulted one final time: the
+    # job's own row, and the policy that governs it. An admin who cancelled —
+    # or who threw the kill switch — while the model was thinking gets what
+    # they asked for, rather than a pull request that raced them.
     stopped = _stopped_by_admin(store, job)
     if stopped is not None:
+        if stopped.code != ReasonCode.CANCELLED_BY_ADMIN:
+            return _fail(store, job, recorder, "publish", [stopped], policy, patch=patch)
         recorder.record("publish", "cancelled", reasons=[stopped], patch=patch)
         logger.info("Autofix job %s was cancelled before it wrote anything", job.job_key)
         return RunResult(
             job=store.get_autofix_job(job.job_key) or job, reasons=[stopped], patch=patch
+        )
+
+    policy = _policy_now(job, policy, reload_config)
+    if not policy.active:
+        return _fail(
+            store,
+            job,
+            recorder,
+            "publish",
+            [
+                Reason(
+                    ReasonCode.KILL_SWITCH,
+                    "Assisted correction was turned off while this patch was being "
+                    "prepared; nothing was written",
+                )
+            ],
+            policy,
+            patch=patch,
         )
 
     if not policy.writing:
@@ -696,13 +763,33 @@ async def _run_handoff(
     policy: EffectivePolicy,
     store: Any,
     recorder: _Recorder,
+    *,
+    reload_config: Callable[[], MiraConfig] | None = None,
 ) -> RunResult:
     # A handoff writes too — the built-in adapter posts on the pull request —
     # so it gets the same last read before the first write that publishing does.
     stopped = _stopped_by_admin(store, job)
     if stopped is not None:
+        if stopped.code != ReasonCode.CANCELLED_BY_ADMIN:
+            return _fail(store, job, recorder, "handoff", [stopped], policy)
         recorder.record("handoff", "cancelled", reasons=[stopped])
         return RunResult(job=store.get_autofix_job(job.job_key) or job, reasons=[stopped])
+
+    policy = _policy_now(job, policy, reload_config)
+    if not policy.active:
+        return _fail(
+            store,
+            job,
+            recorder,
+            "handoff",
+            [
+                Reason(
+                    ReasonCode.KILL_SWITCH,
+                    "Assisted correction was turned off before this handoff was sent",
+                )
+            ],
+            policy,
+        )
 
     context = handoff_module.HandoffContext(
         job=job,
@@ -739,6 +826,34 @@ async def _run_handoff(
     return RunResult(job=stored or job, reasons=reasons)
 
 
+def _policy_now(
+    job: AutofixJob,
+    fallback: EffectivePolicy,
+    reload_config: Callable[[], MiraConfig] | None,
+) -> EffectivePolicy:
+    """Re-resolve this job's policy from configuration as it stands *now*.
+
+    The policy the job started under was read when it was claimed, and a model
+    call plus a validation pass can take minutes. The kill switch means "no more
+    writes", not "no more writes by jobs that had not started yet", so the
+    decision to write is made against freshly loaded configuration rather than
+    against a snapshot as old as the attempt.
+
+    ``reload_config`` is ``None`` when the caller pinned a configuration; then
+    the snapshot *is* the answer, because re-reading a file would ignore what
+    the caller passed. Configuration that cannot be loaded also falls back to
+    the snapshot: an unreadable file is not evidence that anything was turned
+    off, and treating it as such would stop the whole queue on a bad deploy.
+    """
+    if reload_config is None:
+        return fallback
+    try:
+        return resolve_policy(reload_config().autofix, job.owner, job.repo)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not re-read the autofix policy for %s: %s", job.job_key, exc)
+        return fallback
+
+
 def _stopped_by_admin(store: Any, job: AutofixJob) -> Reason | None:
     """Whether this job stopped being ours while we were working on it.
 
@@ -748,15 +863,20 @@ def _stopped_by_admin(store: Any, job: AutofixJob) -> Reason | None:
     turns "the worker will stop soon" into "nothing was written", which is the
     only version of cancellation worth having.
 
-    A store that cannot answer is *not* treated as a cancellation: an unreadable
-    row is an infrastructure problem, and refusing to publish a validated patch
-    over one would turn a database blip into a lost fix.
+    A store that cannot answer stops the write too, under its own code. The
+    guard exists to establish that nobody has revoked this job; a read that
+    failed establishes nothing, and "we could not check" is not a licence to
+    write. The reason is retryable, so the attempt comes back once the database
+    does rather than being lost.
     """
     try:
         current = store.get_autofix_job(job.job_key)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not re-read %s before publishing: %s", job.job_key, exc)
-        return None
+        return Reason(
+            ReasonCode.STATE_UNREADABLE,
+            "This job's state could not be re-read before writing, so nothing was written",
+        )
     if current is None or current.state != "cancelled":
         return None
     actor = current.cancelled_by or "an admin"

@@ -1522,9 +1522,24 @@ class GitHubProvider(BaseProvider):
             gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             ref = gh_repo.get_git_ref(f"heads/{branch}")
             parent = gh_repo.get_git_commit(ref.object.sha)
-            base_tree = gh_repo.get_git_tree(parent.tree.sha)
+            base_tree = gh_repo.get_git_tree(parent.tree.sha, recursive=True)
+            # Carry each path's existing mode forward. A tree element is a
+            # whole entry, not a content patch, so writing `100644` over a
+            # `100755` file silently removes its executable bit — a change the
+            # fix never proposed, does not appear in the rendered diff, and
+            # stops a script from running. Genuinely new paths get `100644`.
+            modes = {
+                str(element.path): str(element.mode or "100644")
+                for element in (base_tree.tree or [])
+                if str(element.type or "") == "blob"
+            }
             elements = [
-                InputGitTreeElement(path=path, mode="100644", type="blob", content=content)
+                InputGitTreeElement(
+                    path=path,
+                    mode=modes.get(path, "100644"),
+                    type="blob",
+                    content=content,
+                )
                 for path, content in sorted(files.items())
             ]
             tree = gh_repo.create_git_tree(elements, base_tree)
@@ -1563,9 +1578,12 @@ class GitHubProvider(BaseProvider):
 
         try:
             return await asyncio.to_thread(_find)
-        except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
-            logger.debug("Could not look for an open pull request from %s: %s", head, exc)
-            return None
+        except Exception as e:
+            # `None` means "there is no pull request from this branch", and the
+            # publisher opens one on that answer — after the branch and commit
+            # already exist. A lookup that failed is not that answer, and
+            # returning it as one is how a retry opens a second pull request.
+            raise ProviderError(f"Failed to look for an open pull request from {head}: {e}") from e
 
     async def pr_head_is_fork(self, pr_info: PRInfo) -> bool:
         """Whether the head branch lives in a different repository.

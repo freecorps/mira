@@ -786,7 +786,15 @@ class GitLabProvider(BaseProvider):
         already exists on the branch, because GitLab rejects the wrong verb
         rather than doing the obvious thing. There is no force option on this
         endpoint, which is why it is the one used.
+
+        `last_commit_id` binds the commit to the tip the actions were computed
+        against. These are whole-file writes: without it, a push that landed
+        between reading the branch and writing to it would be overwritten
+        silently, and the resulting tree would not be the one Mira validated.
+        With it GitLab rejects the request instead, and the attempt is retried
+        against the branch as it actually is.
         """
+        head = await self.get_branch_head(pr_info, branch)
         actions = []
         for path, content in sorted(files.items()):
             exists = await self._file_exists(pr_info, branch, path)
@@ -797,11 +805,18 @@ class GitLabProvider(BaseProvider):
                     "content": content,
                 }
             )
+        payload: dict[str, Any] = {
+            "branch": branch,
+            "commit_message": message,
+            "actions": actions,
+        }
+        if head:
+            payload["last_commit_id"] = head
         try:
             resp = await self._request(
                 "POST",
                 f"{self._project(pr_info)}/repository/commits",
-                json={"branch": branch, "commit_message": message, "actions": actions},
+                json=payload,
             )
         except Exception as e:
             raise ProviderError(f"Failed to commit to {branch}: {e}") from e
@@ -844,9 +859,13 @@ class GitLabProvider(BaseProvider):
         )
         try:
             resp = await self._request("GET", url)
-        except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
-            logger.debug("Could not look for an open merge request from %s: %s", head, exc)
-            return None
+        except Exception as exc:
+            # `None` here means "there is no merge request from this branch",
+            # and the publisher opens one on that answer. A failed lookup is
+            # not that answer, so it is raised rather than flattened into one.
+            raise ProviderError(
+                f"Failed to look for an open merge request from {head}: {exc}"
+            ) from exc
         for item in resp.json() or []:
             return int((item or {}).get("iid") or 0), str((item or {}).get("web_url") or "")
         return None

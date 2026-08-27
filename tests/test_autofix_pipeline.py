@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from mira.autofix import service as service_module
 from mira.autofix.capabilities import (
     FORGEJO_CAPABILITIES,
     GITHUB_CAPABILITIES,
@@ -26,8 +27,14 @@ from mira.autofix.capabilities import (
     AutofixCapabilities,
 )
 from mira.autofix.models import AutofixJob, ReasonCode, job_key
+from mira.autofix.policy import resolve_policy
 from mira.autofix.service import FixRequest, request_fix, run_job
-from mira.config import AutofixConfig, AutofixRepoPolicy, MiraConfig
+from mira.config import (
+    AutofixConfig,
+    AutofixRepoPolicy,
+    AutofixValidationConfig,
+    MiraConfig,
+)
 from mira.feedback.models import ReviewFinding
 from mira.index.store import IndexStore
 from mira.models import FileChangeStat
@@ -208,6 +215,7 @@ class FakeProvider:
         return number, f"https://github.com/acme/app/pull/{number}"
 
     async def find_open_pull_request(self, pr_info: Any, head: str) -> tuple[int, str] | None:
+        self._maybe_raise("find_pr")
         if self._existing_pr is not None:
             return self._existing_pr
         for record in self.pulls:
@@ -1095,15 +1103,133 @@ async def test_a_cancelled_job_is_not_marked_opened_in_suggest_mode() -> None:
     assert result.job.state == "cancelled"
 
 
-async def test_an_unreadable_store_does_not_cancel_a_validated_fix() -> None:
-    """A database blip is not an administrative decision."""
+async def test_an_unreadable_store_stops_the_write_rather_than_allowing_it() -> None:
+    """The guard establishes that nobody revoked the job. A failed read does not.
+
+    Failing open here would mean a database outage is enough to publish a job an
+    admin had already cancelled. The reason is retryable, so the attempt comes
+    back when the database does instead of being lost.
+    """
+    from mira.autofix.models import NON_RETRYABLE_CODES
     from mira.autofix.service import _stopped_by_admin
 
     class Broken:
         def get_autofix_job(self, job_key: str):  # noqa: ANN001
             raise RuntimeError("the database went away")
 
-    assert _stopped_by_admin(Broken(), AutofixJob(job_key="k")) is None
+    reason = _stopped_by_admin(Broken(), AutofixJob(job_key="k"))
+    assert reason is not None
+    assert reason.code == ReasonCode.STATE_UNREADABLE
+    assert reason.code not in NON_RETRYABLE_CODES
+
+
+async def test_a_failed_pull_request_lookup_does_not_open_a_second_one() -> None:
+    """The branch and the commit already exist by the time this call is made.
+
+    Treating "the lookup failed" as "there is no pull request" is how a retry
+    turns one fix into two open pull requests against the same branch.
+    """
+    _save(_finding())
+    provider = FakeProvider(raise_on="find_pr")
+    config = _config()
+    await _accept(provider, config, finding_id=_finding().id)
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+    finally:
+        store.close()
+    assert provider.pulls == []
+    assert result.job.state in ("failed", "dead_letter")
+    assert any(reason.code == ReasonCode.PUBLISH_FAILED for reason in result.reasons)
+
+
+async def test_the_kill_switch_lands_between_validation_and_publication() -> None:
+    """A run takes minutes; "no more writes" has to be able to arrive inside one.
+
+    The policy read when the job was claimed is not the policy the decision to
+    write is made on — the worker passes no pinned configuration precisely so
+    this recheck has something to reread.
+    """
+    _save(_finding())
+    provider = FakeProvider()
+    live = [_config()]
+
+    store = IndexStore.open("acme", "app")
+    try:
+        await request_fix(
+            provider, _pr(), FixRequest(actor="alice", finding_id=_finding().id), config=live[0]
+        )
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+
+        def _reload() -> MiraConfig:
+            # Thrown while the model was thinking.
+            return _config(kill_switch=True)
+
+        recorder = service_module._Recorder(store, job)
+        policy = resolve_policy(live[0].autofix, "acme", "app")
+        result = await service_module._run_phases(
+            provider,
+            job,
+            policy,
+            live[0],
+            FakeLLM(),
+            store,
+            recorder,
+            reload_config=_reload,
+        )
+    finally:
+        store.close()
+
+    assert provider.commits == []
+    assert provider.pulls == []
+    assert provider.branches.get("mira/fix/pr-7/11111111") is None
+    assert any(reason.code == ReasonCode.KILL_SWITCH for reason in result.reasons)
+
+
+async def test_a_pinned_configuration_is_the_one_the_job_runs_under() -> None:
+    """Passing `config=` says "run under exactly this", and it is honoured.
+
+    Rereading the file underneath a caller that pinned a policy would make the
+    argument advisory, which is not what a test or a replay wants.
+    """
+    _save(_finding())
+    provider = FakeProvider()
+    config = _config()
+    await _accept(provider, config, finding_id=_finding().id)
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+    finally:
+        store.close()
+    assert result.job.state == "opened"
+
+
+async def test_a_patch_nothing_validated_is_never_published() -> None:
+    """Turning every check off is not a way to skip validation, it is a refusal.
+
+    An empty check list has nothing blocking in it, which used to read as a
+    pass — so an install with the syntax check off and no commands published a
+    model's output having verified nothing about it.
+    """
+    _save(_finding())
+    provider = FakeProvider()
+    config = _config(
+        validation=AutofixValidationConfig(syntax_check=False, commands=[]),
+    )
+    await _accept(provider, config, finding_id=_finding().id)
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+    finally:
+        store.close()
+    assert provider.commits == []
+    assert provider.pulls == []
+    # Permanent: the next attempt would meet the same disabled configuration.
+    assert result.job.state == "dead_letter"
+    assert ReasonCode.VALIDATION_NOT_RUN in result.job.reason_codes()
 
 
 async def test_a_cancelled_handoff_posts_nothing() -> None:

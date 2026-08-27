@@ -277,7 +277,9 @@ class AutofixStoreMixin:
 
     # -------------------------------------------------------------- enqueue
 
-    def enqueue_autofix_job(self, job: AutofixJob) -> tuple[AutofixJob, bool]:
+    def enqueue_autofix_job(
+        self, job: AutofixJob, *, max_active: int = 0
+    ) -> tuple[AutofixJob, bool]:
         """Persist one job. Returns ``(stored, created)``.
 
         Insert-only by design. An existing row with the same key describes the
@@ -286,6 +288,15 @@ class AutofixStoreMixin:
         re-arm a job that has already opened a pull request, or resurrect one
         an admin cancelled. The caller gets the stored row back and can see
         from ``created`` whether this request was the first.
+
+        ``max_active`` is the per-repository ceiling, and it is enforced *in the
+        insert* rather than by a count the caller took earlier. Counting first
+        and inserting later leaves a window several ``await`` points wide, and
+        two `fix all` requests arriving together would each read the same free
+        capacity and each fill it. Here the count is a subquery: on SQLite the
+        write lock makes that exact, and on Postgres it narrows the window from
+        the length of a request to the length of one statement. Zero means no
+        ceiling, which is what every call that is not admission control passes.
         """
         now = time.time()
         created_at = job.created_at or now
@@ -318,20 +329,32 @@ class AutofixStoreMixin:
             created_at,
             job.updated_at or created_at,
         )
-        inserted = self._autofix_exec(
-            self._ph(
-                f"{self._autofix_insert_ignore} autofix_jobs "
-                "(job_key, state, mode, request_kind, platform, owner, repo, pr_number, "
-                "pr_url, base_branch, head_branch, head_sha, finding_id, finding_title, "
-                "requested_by, request_id, policy_version, attempts, max_attempts, "
-                "ci_attempts, max_ci_attempts, available_at, model, reasons_json, "
-                "validation_json, created_at, updated_at) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            ),
-            params,
+        columns = (
+            "(job_key, state, mode, request_kind, platform, owner, repo, pr_number, "
+            "pr_url, base_branch, head_branch, head_sha, finding_id, finding_title, "
+            "requested_by, request_id, policy_version, attempts, max_attempts, "
+            "ci_attempts, max_ci_attempts, available_at, model, reasons_json, "
+            "validation_json, created_at, updated_at)"
         )
+        values = ", ".join("?" for _ in params)
+        if max_active > 0:
+            room_sql, room_params = self._autofix_room_clause(
+                owner=self._autofix_owner() or job.owner,
+                repo=self._autofix_repo() or job.repo,
+            )
+            sql = (
+                f"{self._autofix_insert_ignore} autofix_jobs {columns} "
+                f"SELECT {values} WHERE ({room_sql}) < ?"
+            )
+            params = (*params, *room_params, int(max_active))
+        else:
+            sql = f"{self._autofix_insert_ignore} autofix_jobs {columns} VALUES ({values})"
+        inserted = self._autofix_exec(self._ph(sql), params)
         stored = self.get_autofix_job(job.job_key)
-        if stored is None:  # pragma: no cover - only a vanished row
+        if stored is None:
+            # No row and no conflict: the ceiling refused the insert. The job
+            # handed back is the one that was *not* persisted, and its `id` of
+            # zero is how the caller tells "already there" from "no room".
             return job, bool(inserted)
         return stored, bool(inserted)
 
@@ -452,12 +475,20 @@ class AutofixStoreMixin:
 
     # ----------------------------------------------------------------- queue
 
-    def count_active_autofix_jobs(self, *, owner: str = "", repo: str = "") -> int:
-        """Jobs neither finished nor abandoned, for the per-repository ceiling."""
-        active = ("queued", "running", "validating", "publishing", "failed")
-        placeholders = ", ".join("?" for _ in active)
+    # States that count against the per-repository ceiling: everything a worker
+    # might still pick up. `failed` is in there because a failed job with
+    # attempts left is queued work wearing a different label.
+    _ACTIVE_STATES = ("queued", "running", "validating", "publishing", "failed")
+
+    def _autofix_room_clause(self, *, owner: str = "", repo: str = "") -> tuple[str, tuple]:
+        """``(subquery, params)`` counting the jobs that occupy the ceiling.
+
+        Shared by the standalone count and by the conditional insert, so a
+        change to what "active" means cannot apply to one and not the other.
+        """
+        placeholders = ", ".join("?" for _ in self._ACTIVE_STATES)
         clauses = [f"state IN ({placeholders})"]
-        params: list[Any] = list(active)
+        params: list[Any] = list(self._ACTIVE_STATES)
         if owner:
             clauses.append("owner = ?")
             params.append(owner)
@@ -467,9 +498,12 @@ class AutofixStoreMixin:
         scope_clause, scope_params = self._autofix_scope()
         where = " AND ".join(clauses) + scope_clause
         params.extend(scope_params)
-        rows = self._autofix_query(
-            self._ph(f"SELECT COUNT(*) FROM autofix_jobs WHERE {where}"), tuple(params)
-        )
+        return f"SELECT COUNT(*) FROM autofix_jobs WHERE {where}", tuple(params)
+
+    def count_active_autofix_jobs(self, *, owner: str = "", repo: str = "") -> int:
+        """Jobs neither finished nor abandoned, for the per-repository ceiling."""
+        sql, params = self._autofix_room_clause(owner=owner, repo=repo)
+        rows = self._autofix_query(self._ph(sql), params)
         return int(rows[0][0]) if rows else 0
 
     def claim_autofix_job(

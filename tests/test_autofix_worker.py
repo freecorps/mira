@@ -420,6 +420,33 @@ async def test_the_ci_sweep_clock_is_per_queue_not_per_worker(monkeypatch) -> No
     assert len(swept) == 2
 
 
+async def test_shutting_the_worker_down_is_not_a_successful_poll(monkeypatch) -> None:
+    """Cancelling `poll_once` must propagate, not be read as the heartbeat's doing.
+
+    Cancelling a task that is awaiting a child also cancels the child, so the
+    `CancelledError` raised by `await running` looks identical whichever end it
+    came from. Swallowing it turns "stop the worker" into "one more job ran",
+    and the loop keeps going after a shutdown was requested.
+    """
+    _enqueue(_job(max_attempts=1))
+    started = asyncio.Event()
+
+    async def slow_run(provider, job, **kwargs):  # noqa: ANN001
+        started.set()
+        await asyncio.sleep(30)
+        return SimpleNamespace(job=job)
+
+    monkeypatch.setattr(worker_module, "run_job", slow_run)
+    worker = AutofixWorker(provider_factory=lambda job: object())
+    poll = asyncio.create_task(worker.poll_once(config=_config(lease_seconds=600)))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    poll.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await poll
+    assert worker.jobs_run == 0
+
+
 async def test_cancelling_mid_flight_stops_the_job_before_it_writes(monkeypatch) -> None:
     """The finding that mattered: a heartbeat that only *returned* left the job
     running to completion, so a cancelled fix could still open a pull request."""
