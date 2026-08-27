@@ -14,7 +14,7 @@ is not, the run stops. There is no override flag. A flag to disable this would
 be the feature, and it would be used by exactly the person who should not have
 it.
 
-Two pieces make it work.
+Three pieces make it work.
 
 **Configuration is anchored to the repository, not to the process.**
 :func:`repo_config_path` resolves ``.mira.yaml`` from the repository root that
@@ -22,14 +22,24 @@ is actually being reviewed. Without that, running ``mira local review`` on a
 sibling checkout would apply *this* directory's configuration to *that*
 directory's code — which is the whole failure mode in one command.
 
-**The comparison is against the repository's own answer.** The baseline is
-built the way the server builds it: repository configuration, deployment
-defaults and dashboard overrides, with the process environment's ``MIRA_MODEL``
-removed. The effective destination is the same computation with the command
-line's overrides applied. Anything the command line moved is therefore visible,
-and anything the deployment already decided cancels out — because for those the
-CLI and the server would send to the same place, which is the property being
-protected.
+**The destination comes from the base, not from the change.** The working
+tree's ``.mira.yaml`` is part of what is being reviewed. If it decided where the
+code went, a branch could add four lines naming an attacker's ``base_url`` and
+an ``api_key_env`` pointing at any environment variable on the machine, and the
+guard would compare that file against itself and agree. So the baseline is read
+with ``git show <base>:.mira.yaml`` — the committed file at the commit the
+review is measured against — and a change that moves the destination is refused
+rather than obeyed. Everything else the working tree's configuration says still
+applies: thresholds, filters and check policy decide how the review reads, not
+who receives it.
+
+**The comparison is against that trusted answer.** The baseline is built the
+way any other configuration is: deployment defaults, dashboard overrides, then
+the committed repository file, with the process environment's ``MIRA_MODEL``
+removed. The effective destination is the same computation over the working
+tree's file with the command line's overrides applied. Anything the command
+line or the branch moved is therefore visible, and anything the deployment
+already decided cancels out.
 
 Comparison is on the endpoint and the model *vendor*, not on the exact model
 id. Switching from a vendor's small model to its large one is a cost decision
@@ -40,6 +50,7 @@ API protocol is a different recipient of the source code and does not.
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -72,9 +83,11 @@ class DestinationRefused(Exception):
         self.requested = requested
         super().__init__(
             f"Refusing to send this repository's code to a different {purpose} destination.\n"
-            f"  configured for this repository: {configured.describe()}\n"
-            f"  this command would have used:   {requested.describe()}\n"
-            "Change the repository's .mira.yaml if the new destination is intended."
+            f"  configured at the base of this review: {configured.describe()}\n"
+            f"  this command would have used:          {requested.describe()}\n"
+            "The destination comes from .mira.yaml as committed at the base, not from "
+            "the working tree, because a change under review must not be able to choose "
+            "where it is sent. Commit the new destination on the base first."
         )
 
 
@@ -218,14 +231,69 @@ def load_repo_config(
     return load_config(repo_config_path(repo_root), overrides)
 
 
-def check_destinations(repo_root: Path, *, effective: MiraConfig) -> list[Destination]:
-    """Compare the run's destinations with the repository's, or raise.
+def committed_config_text(repo_root: Path, base_rev: str) -> str:
+    """``.mira.yaml`` as committed at ``base_rev``, or "" when there is none.
+
+    ``git show`` rather than the file on disk, because the file on disk is part
+    of what is being reviewed. Both accepted filenames are tried, in the same
+    order :func:`repo_config_path` tries them.
+    """
+    from mira.local.gitcmd import GitError, run_git
+
+    if not base_rev:
+        return ""
+    for name in CONFIG_FILENAMES:
+        try:
+            result = run_git(repo_root, "show", f"{base_rev}:{name}")
+        except GitError:
+            return ""
+        if result.ok:
+            return result.stdout
+    return ""
+
+
+def trusted_config(repo_root: Path, base_rev: str) -> MiraConfig:
+    """The configuration the destination is allowed to come from.
+
+    Deployment defaults, dashboard overrides, and ``.mira.yaml`` **as committed
+    at the base of what is being reviewed** — never the working tree's copy, and
+    never a file discovered by walking up from the current directory. The
+    committed text is materialised into a temporary file so it goes through the
+    same loader, validator and layering as any other configuration; an empty
+    file is written when the base carries none, because passing ``None`` would
+    send :func:`mira.config.load_config` back to walking up from the current
+    directory and straight into the file this function exists to distrust.
+    """
+    text = committed_config_text(repo_root, base_rev)
+    with tempfile.TemporaryDirectory(prefix="mira-local-baseline-") as scratch:
+        path = Path(scratch) / CONFIG_FILENAMES[0]
+        path.write_text(text, encoding="utf-8")
+        with _without_env("MIRA_MODEL"):
+            return load_config(path)
+
+
+def check_destinations(
+    repo_root: Path, *, effective: MiraConfig, base_rev: str
+) -> list[Destination]:
+    """Compare the run's destinations with the trusted ones, or raise.
+
+    ``base_rev`` is the commit the review is measured against — ``HEAD`` for the
+    working tree and the index, the range's base for a range. It is what makes
+    the comparison meaningful: the working tree's ``.mira.yaml`` is *part of the
+    change under review*, so letting it name the destination would mean a branch
+    could redirect its own review to any endpoint, under any environment
+    variable named as the credential. The trusted answer therefore comes from
+    the committed file at the base, and a change that moves the destination is
+    refused rather than obeyed.
+
+    Everything else in the working tree's configuration still applies —
+    thresholds, filters, check policy — because none of it decides who receives
+    the code.
 
     Returns the effective destinations, in :data:`CONTENT_PURPOSES` order, so
     the caller can report where the code went.
     """
-    with _without_env("MIRA_MODEL"):
-        baseline = load_repo_config(repo_root)
+    baseline = trusted_config(repo_root, base_rev)
 
     destinations: list[Destination] = []
     for purpose in CONTENT_PURPOSES:

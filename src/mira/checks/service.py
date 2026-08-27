@@ -220,12 +220,16 @@ async def gather_context(
     return ctx, inputs
 
 
-def _failed_run(pr_info: Any, policy: EffectiveChecksPolicy, message: str) -> CheckRun:
+def failed_run(pr_info: Any, policy: EffectiveChecksPolicy, message: str) -> CheckRun:
     """A run that records why nothing ran, and reports nothing about the change.
 
     Given its own inputs snapshot rather than a partial one, so an audit can
     never mistake "these are the facts we checked" for "these are the facts we
     managed to fetch before it broke".
+
+    Public because the local review surface builds one too: it runs the same
+    checks through the same pure runner, and a failure there has to arrive at
+    the exit decision as `incomplete` rather than as an absence.
     """
     inputs = CheckRunInputs(
         platform=getattr(pr_info, "platform", "github"),
@@ -343,12 +347,12 @@ async def evaluate(
     try:
         ctx, inputs = await gather_context(provider, pr_info, policy, config=config, signal=signal)
     except ChecksUnavailable as exc:
-        run = _failed_run(pr_info, policy, str(exc))
+        run = failed_run(pr_info, policy, str(exc))
         _persist(run)
         logger.warning("Pre-merge checks could not start on %s: %s", pr_info.url, exc)
         return run
     except Exception as exc:  # noqa: BLE001 - every failure is a non-answer
-        run = _failed_run(pr_info, policy, f"{type(exc).__name__}: {exc}")
+        run = failed_run(pr_info, policy, f"{type(exc).__name__}: {exc}")
         _persist(run)
         logger.warning("Pre-merge checks could not start on %s: %s", pr_info.url, exc)
         return run

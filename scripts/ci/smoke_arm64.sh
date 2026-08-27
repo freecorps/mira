@@ -8,6 +8,9 @@ registry_port="${MIRA_SMOKE_REGISTRY_PORT:-15000}"
 container_name="mira-arm64-smoke-${GITHUB_RUN_ID:-$$}"
 registry_name="${container_name}-registry"
 candidate_seed_name="${container_name}-candidate-seed"
+# Tagged rather than anonymous so the exit trap can remove it whether the
+# checks passed or `set -e` cut the run short at the first failure.
+local_cli_image="mira:ci-arm64-local-cli-${GITHUB_RUN_ID:-$$}"
 data_dir="$(mktemp -d)"
 update_stack_dir="${data_dir}/updater-stack"
 registry_image="127.0.0.1:${registry_port}/mira:edge"
@@ -39,6 +42,7 @@ cleanup() {
   fi
   docker rm -f "$container_name" "$candidate_seed_name" "$registry_name" \
     >/dev/null 2>&1 || true
+  docker rmi "$local_cli_image" >/dev/null 2>&1 || true
   # `|| true` for the same reason as the chown above: this runs from an EXIT
   # trap, so a failure here would overwrite the exit status of the assertions
   # and fail a job that passed.
@@ -161,7 +165,7 @@ verify_local_cli_without_git() {
 # aarch64 without changing what ships.
 verify_local_cli_with_git() {
   local image=$1
-  local helper="mira:ci-arm64-local-cli"
+  local helper="$local_cli_image"
   local context
   context="$(mktemp -d)"
   cat >"${context}/Dockerfile" <<DOCKERFILE
@@ -175,7 +179,6 @@ DOCKERFILE
   docker run --rm --platform linux/arm64 \
     --volume "$(pwd)/scripts/ci:/ci:ro" \
     --entrypoint sh "$helper" /ci/arm64_local_cli_check.sh
-  docker rmi "$helper" >/dev/null 2>&1 || true
 }
 
 echo "Pulling deployed ARM64 baseline: ${baseline_image}"
