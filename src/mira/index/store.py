@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -847,6 +848,10 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
         self._owner = owner
         self._repo = repo
         self._platform = platform
+        # Owned by this instance, so `_checks_atomic` deferring its commits on
+        # it is safe. The lock is per instance for the same reason: two
+        # instances have two connections and SQLite serialises them itself.
+        self._checks_lock = threading.RLock()
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -2842,30 +2847,34 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
 
     def _checks_exec(self, sql: str, params: tuple = ()) -> int:
         cursor = self._conn.execute(sql, params)
-        if not self._checks_in_transaction:
+        if not self._checks_depth:
             self._conn.commit()
         return int(cursor.rowcount or 0)
 
-    # Set while `_checks_atomic` is open, so the writes inside it commit
-    # together. A gate reading a run mid-write would otherwise compute a
-    # verdict from whichever of its results had landed.
-    _checks_in_transaction = False
+    # Guard for `_checks_atomic`. A re-entrant lock plus a depth count rather
+    # than a bare flag: a flag cannot tell a genuinely nested call from an
+    # unrelated concurrent one, so a second writer would silently join the
+    # first's transaction and could have its results committed — or rolled
+    # back — by a call that had nothing to do with it. The lock serialises the
+    # unrelated case and, being re-entrant, lets the nested one through to the
+    # depth count, which is what decides when to commit.
+    _checks_depth = 0
 
     @contextmanager
     def _checks_atomic(self):  # type: ignore[no-untyped-def]
-        if self._checks_in_transaction:  # pragma: no cover - not nested today
-            yield
-            return
-        self._checks_in_transaction = True
-        try:
-            yield
-        except Exception:
-            self._conn.rollback()
-            raise
-        else:
-            self._conn.commit()
-        finally:
-            self._checks_in_transaction = False
+        with self._checks_lock:
+            self._checks_depth += 1
+            try:
+                yield
+            except Exception:
+                if self._checks_depth == 1:
+                    self._conn.rollback()
+                raise
+            else:
+                if self._checks_depth == 1:
+                    self._conn.commit()
+            finally:
+                self._checks_depth -= 1
 
     def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
         """Persist rule exposures idempotently; return how many were new.

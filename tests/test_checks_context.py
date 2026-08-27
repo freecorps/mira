@@ -614,10 +614,17 @@ async def test_a_reference_to_another_repository_is_not_followed_by_default() ->
     outcome = await ticket.run(ctx)
 
     assert provider.asked == [], "Mira must not have asked about another repository"
-    # Present but unverified: nothing failed, so this is not an error.
-    assert outcome.state == "pass"
+    # Not a pass: `Closes nonexistent/repo#1` costs a contributor nothing, and
+    # treating the text alone as satisfying the check would turn the guard into
+    # a way round it. Unanswered, so a blocking check stays closed.
+    assert outcome.state == "skipped"
+    assert outcome.skip_reason == SkipReason.UNSUPPORTED
     assert "does not follow" in outcome.summary
     assert "secret-org/secret-repo#1" in outcome.summary
+
+    from mira.checks.models import UNANSWERED_SKIPS
+
+    assert outcome.skip_reason in UNANSWERED_SKIPS
 
 
 async def test_an_issue_url_naming_another_repository_is_refused_too() -> None:
@@ -676,3 +683,29 @@ async def test_a_refusal_is_not_reported_as_an_infrastructure_error() -> None:
     outcome = await ticket.run(ctx)
     assert outcome.state != "infrastructure_error"
     assert outcome.error == ""
+
+
+async def test_a_refused_reference_cannot_satisfy_a_blocking_check() -> None:
+    """The guard must not become the way round the check it guards."""
+    provider = _AnyIssue()
+    ctx = _ctx(provider=provider, pr_body="Closes nonexistent/repo#1.")
+    ctx.pr_info = _pr_info()
+    outcome = await ticket.run(ctx)
+
+    from mira.checks.context import CheckOutcome
+    from mira.checks.models import UNANSWERED_SKIPS
+
+    assert isinstance(outcome, CheckOutcome)
+    assert outcome.state != "pass"
+    assert outcome.skip_reason in UNANSWERED_SKIPS
+
+
+async def test_a_real_reference_beside_a_refused_one_still_passes() -> None:
+    """The pull request did name a real issue here, which is what is asked."""
+    provider = _AnyIssue()
+    ctx = _ctx(provider=provider, pr_body="Closes #12 and other/repo#1.")
+    ctx.pr_info = _pr_info()
+    outcome = await ticket.run(ctx)
+    assert outcome.state == "pass"
+    assert provider.asked == [("", "", 12)]
+    assert "other/repo#1" in outcome.summary
