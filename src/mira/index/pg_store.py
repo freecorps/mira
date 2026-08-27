@@ -957,6 +957,10 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         self._owner = owner
         self._repo = repo
         self._url = url
+        # Guards `_checks_atomic`. Per instance, because the dedicated
+        # connection it opens is per call — the lock only has to stop two
+        # callers *on this store* sharing one cursor.
+        self._checks_lock = threading.RLock()
         _get_conn(url)  # eager connect + schema init
         self._backfill_feedback_v2()
 
@@ -3063,8 +3067,10 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         self._commit()
         return rowcount
 
-    # The cursor `_checks_atomic` is holding, or None outside one.
+    # The cursor `_checks_atomic` is holding, or None outside one, with the
+    # guard that decides who may set it.
     _checks_cursor: Any = None
+    _checks_depth = 0
 
     @contextmanager
     def _checks_atomic(self):  # type: ignore[no-untyped-def]
@@ -3076,16 +3082,29 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         this run's half-written rows along with its own, which is the failure
         the transaction exists to prevent. The same reasoning the governed
         learning transitions already use.
+
+        Guarded by a re-entrant lock and a depth count rather than a bare
+        cursor check. A bare check cannot tell a genuinely nested call from an
+        unrelated concurrent one on the same store, so a second writer would
+        silently borrow the first's cursor — and have its results committed, or
+        rolled back, by a call that had nothing to do with it.
         """
-        if self._checks_cursor is not None:  # pragma: no cover - not nested today
-            yield
-            return
-        with self._transaction_cursor() as cur:
-            self._checks_cursor = cur
-            try:
-                yield
-            finally:
-                self._checks_cursor = None
+        with self._checks_lock:
+            if self._checks_depth:  # pragma: no cover - not nested today
+                self._checks_depth += 1
+                try:
+                    yield
+                finally:
+                    self._checks_depth -= 1
+                return
+            with self._transaction_cursor() as cur:
+                self._checks_cursor = cur
+                self._checks_depth = 1
+                try:
+                    yield
+                finally:
+                    self._checks_depth = 0
+                    self._checks_cursor = None
 
     def _checks_scope(self) -> tuple[str, tuple[Any, ...]]:
         """Pin check reads to this store's repository.

@@ -417,3 +417,40 @@ async def test_a_quote_of_a_removed_line_is_still_accepted() -> None:
     outcome = await evaluate(ctx, RULE)
     assert outcome.state == "violation"
     assert outcome.findings[0].evidence[0].snippet == "@limiter.limit('10/s')"
+
+
+async def test_a_quote_longer_than_a_window_still_gets_a_line() -> None:
+    """`_verify` searches the whole file, so `_locate` must be able to agree.
+
+    A fixed window made them disagree in the worst direction: the evidence that
+    survived verification was exactly the evidence with no line on it.
+    """
+    long_body = "".join(f"line {n}\n" for n in range(40))
+    quote = "".join(f"line {n}\n" for n in range(5, 35))
+    llm = _LLM(
+        {
+            "verdict": "violation",
+            "explanation": "A long span.",
+            "evidence": [{"path": "src/api/ingest.py", "line": 1, "quote": quote}],
+        }
+    )
+    diff = (
+        "diff --git a/src/api/ingest.py b/src/api/ingest.py\n"
+        "--- a/src/api/ingest.py\n"
+        "+++ b/src/api/ingest.py\n"
+        "@@ -0,0 +1,40 @@\n"
+    ) + "".join(f"+line {n}\n" for n in range(40))
+    ctx = _ctx(llm, files={"src/api/ingest.py": long_body}, diff=diff)
+
+    outcome = await evaluate(ctx, RULE)
+    assert outcome.state == "violation"
+    # Line 6, 1-based: the quote starts at "line 5", the sixth line.
+    assert outcome.findings[0].evidence[0].start_line == 6
+
+
+def test_evidence_with_no_line_renders_as_a_path_not_a_zero() -> None:
+    """A locator that could not be derived must not read as line zero."""
+    from mira.checks.models import Evidence
+
+    assert Evidence(path="src/a.py", start_line=0).locator == "src/a.py"
+    assert Evidence(path="src/a.py", start_line=4).locator == "src/a.py:4"

@@ -115,10 +115,19 @@ async def run(ctx: CheckContext) -> CheckOutcome:
             )
         return CheckOutcome.violation(summary=summary, findings=findings)
 
-    # A reference the deployment declined to follow is *present* — the pull
-    # request named something — and simply not verified. That is a pass with a
-    # note, not an error: nothing failed, and an operator's own setting has no
-    # business appearing in the column that tracks outages.
+    # A reference the deployment declined to follow is *present* and *not
+    # verified*, and those are two different things that must both be said.
+    #
+    # Reporting it as a pass would turn the cross-repository guard into a way
+    # round the check: `Closes nonexistent/repo#1` is syntactically valid, costs
+    # a contributor nothing, and would satisfy a blocking ticket check without
+    # Mira having confirmed that the repository exists, let alone the issue.
+    # So an all-refused set is an unanswered skip — shown as the skip it is, and
+    # still keeping a blocking gate closed.
+    #
+    # A reference that *did* resolve alongside a refused one is different: the
+    # pull request named a real issue in this repository, which is what the
+    # check asks for. That passes, and names what was not followed.
     if resolution.refused and not resolution.unresolved and not resolution.missing:
         refused = ", ".join(sorted(resolution.refused))
         if resolution.found:
@@ -138,16 +147,12 @@ async def run(ctx: CheckContext) -> CheckOutcome:
                     for label, found in sorted(resolution.found.items())
                 ],
             )
-        return CheckOutcome.passed(
-            summary=(
-                f"References {refused}, which points outside this repository. This "
-                "deployment does not follow cross-repository references, so Mira "
-                "confirmed the reference is there and not that the issue exists."
-            ),
-            evidence=[
-                _reference_evidence(ref, "reference to another repository, not followed")
-                for ref in resolution.refs
-            ],
+        return CheckOutcome.skipped(
+            f"The only issue this pull request references is {refused}, which points "
+            "outside this repository. This deployment does not follow cross-repository "
+            "references, so Mira has not confirmed that it exists — and is not treating "
+            "the reference alone as satisfying this check.",
+            SkipReason.UNSUPPORTED,
         )
 
     if resolution.found and resolution.unresolved:

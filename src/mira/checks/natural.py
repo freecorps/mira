@@ -258,20 +258,39 @@ def _locate(quote: str, content: str) -> int:
     reader clicks, and a model that quoted the right code and guessed the wrong
     line produces evidence that opens at nothing — which is indistinguishable,
     to the reader, from evidence that was invented.
+
+    The search window is sized from the quote rather than fixed. A fixed window
+    made this disagree with :func:`_verify`, which searches the whole file: a
+    quote longer than the window was accepted there and unlocatable here, so
+    the evidence that survived was exactly the evidence with no line on it.
+    Sized this way the two agree, and a quote that verifies can be placed.
     """
     needle = _normalize(quote)
     if not needle:
         return 0
     lines = content.splitlines()
-    first = needle.split(" ")[0]
+
+    # A quote that fits on one line is the common case and has an exact answer:
+    # the line that contains it. Done first, because a fragment like
+    # `router.get("/ingest")` taken from the middle of a longer line would never
+    # anchor a window.
     for index, line in enumerate(lines, start=1):
-        normalized = _normalize(line)
-        if not normalized or first not in normalized:
-            continue
-        # Match against a window, so a quote spanning several lines still
-        # anchors to the line it starts on.
-        window = _normalize(" ".join(lines[index - 1 : index + 10]))
-        if needle in window:
+        if needle and needle in _normalize(line):
+            return index
+
+    # A quote spanning several lines anchors to the line it *starts* on, so the
+    # window has to begin with it. `in` would match anywhere inside the window
+    # and return whichever earlier line happened to contain the quote's first
+    # word — which is how a thirty-line quote reported line 1.
+    #
+    # The window is sized from the quote rather than fixed, so this agrees with
+    # `_verify`, which searches the whole file. A fixed size made them disagree
+    # in the worst direction: the evidence that survived verification was
+    # exactly the evidence too long to place.
+    span = len(quote.splitlines()) + 5
+    for index in range(1, len(lines) + 1):
+        window = _normalize(" ".join(lines[index - 1 : index - 1 + span]))
+        if window.startswith(needle):
             return index
     return 0
 
