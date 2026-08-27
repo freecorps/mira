@@ -19,7 +19,7 @@ from mira.autofix import ci as autofix_ci
 from mira.autofix import runtime as autofix_runtime
 from mira.autofix import worker as worker_module
 from mira.autofix.models import AutofixJob, ReasonCode, job_key
-from mira.autofix.worker import AutofixWorker, cancel_job, retry_after_ci
+from mira.autofix.worker import _REPO_SCAN_LIMIT, AutofixWorker, cancel_job, retry_after_ci
 from mira.config import AutofixConfig, MiraConfig
 from mira.gate.models import CIState
 from mira.index.store import IndexStore
@@ -369,3 +369,90 @@ async def test_the_worker_refuses_to_run_without_an_installation(monkeypatch) ->
     factory = autofix_runtime.provider_factory({"github": Auth()})
     with pytest.raises(RuntimeError, match="installation"):
         await factory(_job())
+
+
+# ── the review's findings, pinned ────────────────────────────────────────────
+
+
+def test_the_repository_scan_rotates_instead_of_starving_the_tail(monkeypatch) -> None:
+    """A fixed prefix would be a starvation bug rather than a cap: every
+    repository past the limit would be polled never, not late."""
+    every = [("github", "acme", f"repo{index}") for index in range(_REPO_SCAN_LIMIT + 25)]
+    monkeypatch.setattr(worker_module, "_targets", lambda: every)
+    worker = AutofixWorker(provider_factory=lambda job: object())
+
+    seen: set[tuple[str, str, str]] = set()
+    for _ in range(4):
+        window = worker._scan_window()
+        assert len(window) == _REPO_SCAN_LIMIT
+        seen.update(window)
+    assert seen == set(every)
+
+
+def test_a_small_install_is_scanned_whole_every_poll(monkeypatch) -> None:
+    every = [("github", "acme", f"repo{index}") for index in range(3)]
+    monkeypatch.setattr(worker_module, "_targets", lambda: every)
+    worker = AutofixWorker(provider_factory=lambda job: object())
+    assert worker._scan_window() == every
+    assert worker._scan_window() == every
+
+
+async def test_the_ci_sweep_clock_is_per_queue_not_per_worker(monkeypatch) -> None:
+    """One clock would let whichever repository is polled first spend the whole
+    interval, and the poll order is stable — so the same ones would never be
+    swept."""
+    swept: list[str] = []
+
+    async def fake_sweep(*, provider_factory, store, config):  # noqa: ANN001
+        swept.append(getattr(store, "_repo", "?"))
+        return 0
+
+    monkeypatch.setattr("mira.autofix.ci.sweep", fake_sweep)
+    worker = AutofixWorker(provider_factory=lambda job: object())
+    store = IndexStore.open("acme", "app")
+    try:
+        await worker._maybe_sweep_ci(store, _config(), target="github:acme/one")
+        await worker._maybe_sweep_ci(store, _config(), target="github:acme/two")
+        # …and neither is swept again inside the interval.
+        await worker._maybe_sweep_ci(store, _config(), target="github:acme/one")
+    finally:
+        store.close()
+    assert len(swept) == 2
+
+
+async def test_cancelling_mid_flight_stops_the_job_before_it_writes(monkeypatch) -> None:
+    """The finding that mattered: a heartbeat that only *returned* left the job
+    running to completion, so a cancelled fix could still open a pull request."""
+    _enqueue(_job(max_attempts=1))
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def slow_run(provider, job, **kwargs):  # noqa: ANN001
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        finally:
+            finished.set()
+        return SimpleNamespace(job=job)
+
+    monkeypatch.setattr(worker_module, "run_job", slow_run)
+    # A lease short enough that the heartbeat fires promptly.
+    config = _config(lease_seconds=3)
+    worker = AutofixWorker(provider_factory=lambda job: object())
+    poll = asyncio.create_task(worker.poll_once(config=config))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    cancel_job(
+        owner="acme",
+        repo="app",
+        platform="github",
+        job_key=_job().job_key,
+        actor="root",
+        reason="stop it now",
+    )
+    await asyncio.wait_for(poll, timeout=15)
+
+    assert finished.is_set()  # the coroutine really was stopped
+    job = _get(_job().job_key)
+    assert job.state == "cancelled"
+    assert job.cancelled_by == "root"

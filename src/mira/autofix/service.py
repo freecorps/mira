@@ -624,6 +624,20 @@ async def _run_phases(
         )
 
     # ── publish ─────────────────────────────────────────────────────────
+    #
+    # The last read before the first write. Everything above this line is
+    # reversible by doing nothing; everything below it puts something on a
+    # platform, so the job's own row is consulted one final time. An admin who
+    # cancelled while the model was thinking gets what they asked for, and the
+    # `cancelled` state is not overwritten by a result nobody wants.
+    stopped = _stopped_by_admin(store, job)
+    if stopped is not None:
+        recorder.record("publish", "cancelled", reasons=[stopped], patch=patch)
+        logger.info("Autofix job %s was cancelled before it wrote anything", job.job_key)
+        return RunResult(
+            job=store.get_autofix_job(job.job_key) or job, reasons=[stopped], patch=patch
+        )
+
     if not policy.writing:
         stored = store.update_autofix_job(
             job.job_key,
@@ -716,6 +730,34 @@ async def _run_handoff(
     )
     recorder.record("handoff", "ok", reasons=reasons, detail=result.ref)
     return RunResult(job=stored or job, reasons=reasons)
+
+
+def _stopped_by_admin(store: Any, job: AutofixJob) -> Reason | None:
+    """Whether this job stopped being ours while we were working on it.
+
+    Cancellation clears the lease and moves the state, which the worker's
+    heartbeat notices — but a heartbeat runs on a timer and a publish does not
+    wait for one. Re-reading the row immediately before the first write is what
+    turns "the worker will stop soon" into "nothing was written", which is the
+    only version of cancellation worth having.
+
+    A store that cannot answer is *not* treated as a cancellation: an unreadable
+    row is an infrastructure problem, and refusing to publish a validated patch
+    over one would turn a database blip into a lost fix.
+    """
+    try:
+        current = store.get_autofix_job(job.job_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not re-read %s before publishing: %s", job.job_key, exc)
+        return None
+    if current is None or current.state != "cancelled":
+        return None
+    actor = current.cancelled_by or "an admin"
+    return Reason(
+        ReasonCode.CANCELLED_BY_ADMIN,
+        f"@{actor} cancelled this job before anything was written",
+        "info",
+    )
 
 
 def _fail(

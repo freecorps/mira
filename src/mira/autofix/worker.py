@@ -71,14 +71,14 @@ def _postgres() -> bool:
 
 
 def _targets() -> list[tuple[str, str, str]]:
-    """``(platform, owner, repo)`` for every queue this worker should poll."""
+    """``(platform, owner, repo)`` for every queue this worker could poll."""
     if _postgres():
         # One table for the install; the org-wide handle sees all of it.
         return [("", "", "")]
     from mira.feedback.analytics import _repo_targets
 
     try:
-        return list(_repo_targets("", ""))[:_REPO_SCAN_LIMIT]
+        return list(_repo_targets("", ""))
     except Exception as exc:  # noqa: BLE001 - an unreachable registry is a quiet poll
         logger.debug("Autofix worker could not list repositories: %s", exc)
         return []
@@ -113,7 +113,13 @@ class AutofixWorker:
         self._config = config
         self._identity = identity or worker_id()
         self._stopped = asyncio.Event()
-        self._last_ci_sweep = 0.0
+        # Keyed by target, not one clock for the worker. A single timestamp
+        # would let the first repository in the list consume the interval and
+        # leave every later one unswept — and the list order is stable, so the
+        # same repositories would lose every time.
+        self._last_ci_sweep: dict[str, float] = {}
+        # Where the next SQLite scan starts. See `_scan_window`.
+        self._scan_offset = 0
         self.jobs_run = 0
 
     @property
@@ -144,6 +150,24 @@ class AutofixWorker:
                     await asyncio.wait_for(self._stopped.wait(), timeout=delay)
         logger.info("Autofix worker %s stopped", self._identity)
 
+    def _scan_window(self) -> list[tuple[str, str, str]]:
+        """The repositories to visit this poll, rotating across polls.
+
+        A fixed prefix would be a starvation bug rather than a cap: an install
+        with more than `_REPO_SCAN_LIMIT` repositories would poll the same first
+        slice forever and never claim a job in any of the others. Advancing the
+        offset each poll means every repository comes round, and the cap only
+        decides how long that takes.
+        """
+        every = _targets()
+        if len(every) <= _REPO_SCAN_LIMIT:
+            self._scan_offset = 0
+            return every
+        start = self._scan_offset % len(every)
+        window = (every + every)[start : start + _REPO_SCAN_LIMIT]
+        self._scan_offset = (start + _REPO_SCAN_LIMIT) % len(every)
+        return window
+
     async def poll_once(self, *, config: MiraConfig | None = None) -> bool:
         """Run at most one job. Returns whether it found one."""
         config = config or self._config or load_config()
@@ -154,7 +178,7 @@ class AutofixWorker:
             # more writes", and a queue that drains itself afterwards would
             # make that switch a suggestion.
             return False
-        for platform, owner, repo in _targets():
+        for platform, owner, repo in self._scan_window():
             store = None
             try:
                 store = _open(platform, owner, repo)
@@ -163,7 +187,7 @@ class AutofixWorker:
                     worker=self._identity, lease_seconds=policy.lease_seconds
                 )
                 if job is None:
-                    await self._maybe_sweep_ci(store, config)
+                    await self._maybe_sweep_ci(store, config, target=f"{platform}:{owner}/{repo}")
                     continue
                 await self._run(job, store=store, config=config)
                 self.jobs_run += 1
@@ -176,18 +200,22 @@ class AutofixWorker:
                         store.close()
         return False
 
-    async def _maybe_sweep_ci(self, store: Any, config: MiraConfig) -> None:
-        """Ask CI about published fixes, at most every few minutes.
+    async def _maybe_sweep_ci(self, store: Any, config: MiraConfig, *, target: str) -> None:
+        """Ask CI about one queue's published fixes, at most every few minutes.
 
-        Runs only when there was no job to claim, so a busy queue never delays
-        real work to go looking for something to retry. The interval is
+        Runs only when there was no job to claim there, so a busy queue never
+        delays real work to go looking for something to retry. The interval is
         deliberately much longer than the poll interval: a build takes minutes,
         and asking faster only spends API quota discovering it is still running.
+
+        The interval is tracked *per queue*. One clock for the worker would let
+        whichever repository is polled first spend the whole interval, and the
+        poll order is stable — so the same repositories would never be swept.
         """
         now = time.time()
-        if now - self._last_ci_sweep < _CI_SWEEP_SECONDS:
+        if now - self._last_ci_sweep.get(target, 0.0) < _CI_SWEEP_SECONDS:
             return
-        self._last_ci_sweep = now
+        self._last_ci_sweep[target] = now
         from mira.autofix.ci import sweep
 
         try:
@@ -203,30 +231,44 @@ class AutofixWorker:
     async def _run(self, job: AutofixJob, *, store: Any, config: MiraConfig) -> None:
         """Run one leased job, keeping the lease alive while it runs."""
         policy = resolve_policy(config.autofix, job.owner, job.repo)
-        heartbeat = asyncio.create_task(self._heartbeat(job, store, policy.lease_seconds))
         try:
             provider = await self._provider(job)
         except Exception as exc:  # noqa: BLE001
-            heartbeat.cancel()
             logger.warning("Autofix could not authenticate for %s: %s", job.pr_url, exc)
             # Hand the job back rather than consuming an attempt: a token that
             # could not be minted is an infrastructure problem, and burning the
             # retry budget on it would dead-letter work that is perfectly fine.
             store.release_autofix_lease(job.job_key, worker=self._identity)
             return
+
+        running = asyncio.create_task(run_job(provider, job, config=config, store=store))
+        heartbeat = asyncio.create_task(self._heartbeat(job, store, policy.lease_seconds, running))
         try:
-            await run_job(provider, job, config=config, store=store)
+            await running
+        except asyncio.CancelledError:
+            # The heartbeat stopped it: an admin cancelled, or another worker
+            # took the lease. Either way this process no longer owns the job,
+            # and `run_job` re-reads the row before it writes anything, so the
+            # worst case is a model call nobody wanted rather than a change.
+            logger.info("Autofix job %s was stopped mid-flight", job.job_key)
         finally:
             heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await heartbeat
 
-    async def _heartbeat(self, job: AutofixJob, store: Any, lease_seconds: float) -> None:
+    async def _heartbeat(
+        self, job: AutofixJob, store: Any, lease_seconds: float, running: asyncio.Task
+    ) -> None:
         """Extend the lease while the job is genuinely still running.
 
         Renewed at a third of the lease, so two missed renewals still leave the
         job leased. A worker that hangs stops renewing and the job is taken
         back; a worker that is merely slow keeps it.
+
+        Losing the lease **stops the work**. Cancellation clears the lease, and
+        a heartbeat that merely returned would leave the job running to
+        completion — which is how a cancelled job used to be able to open a
+        pull request anyway.
         """
         interval = max(1.0, lease_seconds / 3)
         while True:
@@ -236,8 +278,11 @@ class AutofixWorker:
                     job.job_key, worker=self._identity, lease_seconds=lease_seconds
                 ):
                     logger.info(
-                        "Autofix worker %s lost the lease on %s", self._identity, job.job_key
+                        "Autofix worker %s lost the lease on %s; stopping the job",
+                        self._identity,
+                        job.job_key,
                     )
+                    running.cancel()
                     return
             except Exception as exc:  # noqa: BLE001 - a failed renewal is not fatal
                 logger.debug("Lease renewal failed for %s: %s", job.job_key, exc)

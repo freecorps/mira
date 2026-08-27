@@ -25,7 +25,7 @@ from mira.autofix.capabilities import (
     NO_CAPABILITIES,
     AutofixCapabilities,
 )
-from mira.autofix.models import ReasonCode, job_key
+from mira.autofix.models import AutofixJob, ReasonCode, job_key
 from mira.autofix.service import FixRequest, request_fix, run_job
 from mira.config import AutofixConfig, AutofixRepoPolicy, MiraConfig
 from mira.feedback.models import ReviewFinding
@@ -1025,3 +1025,82 @@ async def test_a_handoff_cannot_rescue_an_unauthorized_requester() -> None:
     assert not outcome.ok
     assert ReasonCode.ACTOR_LACKS_WRITE in [reason.code for reason in outcome.reasons]
     assert provider.comments == []
+
+
+# ── cancellation ─────────────────────────────────────────────────────────────
+
+
+async def test_a_job_cancelled_while_it_ran_writes_nothing() -> None:
+    """The last read before the first write.
+
+    The worker's heartbeat runs on a timer and a publish does not wait for one,
+    so the row is consulted once more immediately before anything reaches the
+    platform. Without it, "cancelled" would mean "will stop soon" rather than
+    "nothing was written".
+    """
+    _save(_finding())
+    provider = FakeProvider()
+    config = _config()
+    await _accept(provider, config, finding_id=_finding().id)
+
+    class CancellingLLM(FakeLLM):
+        """An admin cancels while the model is thinking."""
+
+        def __init__(self, store, job_key: str) -> None:
+            super().__init__()
+            self._store = store
+            self._job_key = job_key
+
+        async def complete_with_tools(self, messages, tools, temperature=None):  # noqa: ANN001
+            self._store.cancel_autofix_job(self._job_key, actor="root", reason="wrong finding")
+            return await super().complete_with_tools(messages, tools, temperature)
+
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+        result = await run_job(
+            provider,
+            job,
+            config=config,
+            llm=CancellingLLM(store, job.job_key),
+            store=store,
+        )
+    finally:
+        store.close()
+
+    assert result.job.state == "cancelled"
+    assert result.job.cancelled_by == "root"
+    assert ReasonCode.CANCELLED_BY_ADMIN in [reason.code for reason in result.reasons]
+    # Nothing reached the platform, and the cancellation was not overwritten.
+    assert provider.branches == {"main": "main000", "feature/divide": "head456"}
+    assert provider.commits == []
+    assert provider.pulls == []
+
+
+async def test_a_cancelled_job_is_not_marked_opened_in_suggest_mode() -> None:
+    """Suggest writes nothing to the platform, but it still must not rewrite
+    `cancelled` into a result nobody wants."""
+    _save(_finding())
+    provider = FakeProvider()
+    config = _config(mode="suggest")
+    await _accept(provider, config, finding_id=_finding().id)
+
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+        store.cancel_autofix_job(job.job_key, actor="root", reason="never mind")
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+    finally:
+        store.close()
+    assert result.job.state == "cancelled"
+
+
+async def test_an_unreadable_store_does_not_cancel_a_validated_fix() -> None:
+    """A database blip is not an administrative decision."""
+    from mira.autofix.service import _stopped_by_admin
+
+    class Broken:
+        def get_autofix_job(self, job_key: str):  # noqa: ANN001
+            raise RuntimeError("the database went away")
+
+    assert _stopped_by_admin(Broken(), AutofixJob(job_key="k")) is None

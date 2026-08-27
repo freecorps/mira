@@ -773,3 +773,97 @@ def test_an_adapter_must_have_a_name() -> None:
 
     with pytest.raises(ValueError, match="name"):
         handoff.register(object())
+
+
+# ── creating a file, when the policy allows it ───────────────────────────────
+
+
+def test_a_new_file_is_created_by_an_edit_with_nothing_to_quote() -> None:
+    """A file that does not exist has no code to quote, so an empty `find` is
+    how one is written — and `allow_new_files` would be dead config otherwise."""
+    policy = _policy(allow_new_files=True, restrict_to_changed_files=False)
+    patch = apply_patch(
+        [FileEdit(path="src/guard.py", find="", replace="def guard():\n    return True\n")],
+        sources={},
+        policy=policy,
+        changed_paths=set(),
+    )
+    assert patch.files["src/guard.py"] == "def guard():\n    return True\n"
+    assert patch.changed_files == 1
+    assert "/dev/null" in patch.diff
+
+
+def test_creating_a_file_still_needs_the_policy_to_allow_it() -> None:
+    with pytest.raises(PatchRefused) as caught:
+        apply_patch(
+            [FileEdit(path="src/guard.py", find="", replace="x = 1\n")],
+            sources={},
+            policy=_policy(restrict_to_changed_files=False),
+            changed_paths=set(),
+        )
+    assert caught.value.reason.code == ReasonCode.NEW_FILE_REFUSED
+
+
+def test_creating_a_protected_path_is_still_refused() -> None:
+    with pytest.raises(PatchRefused) as caught:
+        apply_patch(
+            [FileEdit(path=".github/workflows/evil.yml", find="", replace="on: push\n")],
+            sources={},
+            policy=_policy(allow_new_files=True, restrict_to_changed_files=False),
+            changed_paths=set(),
+        )
+    assert caught.value.reason.code == ReasonCode.PATH_PROTECTED
+
+
+def test_an_empty_find_on_an_existing_file_is_still_a_refusal() -> None:
+    """ "Replace nothing" is not an edit anybody meant to make."""
+    with pytest.raises(PatchRefused) as caught:
+        _apply([_edit(find="", replace="x = 1")], policy=_policy(allow_new_files=True))
+    assert caught.value.reason.code == ReasonCode.PATCH_INVALID
+
+
+def test_creating_an_empty_file_is_refused() -> None:
+    with pytest.raises(PatchRefused) as caught:
+        apply_patch(
+            [FileEdit(path="src/guard.py", find="", replace="")],
+            sources={},
+            policy=_policy(allow_new_files=True, restrict_to_changed_files=False),
+            changed_paths=set(),
+        )
+    assert caught.value.reason.code == ReasonCode.PATCH_EMPTY
+
+
+def test_a_second_edit_to_a_just_created_file_needs_an_exact_quote() -> None:
+    """Once this patch has written it, it is a file like any other."""
+    policy = _policy(allow_new_files=True, restrict_to_changed_files=False)
+    patch = apply_patch(
+        [
+            FileEdit(path="src/guard.py", find="", replace="x = 1\ny = 2\n"),
+            FileEdit(path="src/guard.py", find="y = 2", replace="y = 3"),
+        ],
+        sources={},
+        policy=policy,
+        changed_paths=set(),
+    )
+    assert patch.files["src/guard.py"] == "x = 1\ny = 3\n"
+
+    with pytest.raises(PatchRefused) as caught:
+        apply_patch(
+            [
+                FileEdit(path="src/guard.py", find="", replace="x = 1\n"),
+                FileEdit(path="src/guard.py", find="", replace="z = 9\n"),
+            ],
+            sources={},
+            policy=policy,
+            changed_paths=set(),
+        )
+    assert caught.value.reason.code == ReasonCode.PATCH_INVALID
+
+
+def test_the_schema_tells_the_model_when_an_empty_find_is_allowed() -> None:
+    from mira.autofix.generate import SUBMIT_FIX_TOOL
+
+    find = SUBMIT_FIX_TOOL["function"]["parameters"]["properties"]["edits"]["items"]["properties"][
+        "find"
+    ]["description"]
+    assert "create a file that does not exist yet" in find

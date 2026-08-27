@@ -646,8 +646,16 @@ class AutofixStoreMixin:
             params.append(int(extra_attempts))
 
         clause, scope_params = self._autofix_scope()
+        # `cancelled` is final, and it is made final *here* rather than by every
+        # caller remembering to check. A worker that was already generating when
+        # an admin cancelled will still try to record its progress, and a
+        # read-then-write in the worker cannot win that race — an update that
+        # matches no row can.
         self._autofix_exec(
-            self._ph(f"UPDATE autofix_jobs SET {', '.join(sets)} WHERE job_key = ?{clause}"),
+            self._ph(
+                f"UPDATE autofix_jobs SET {', '.join(sets)} "
+                f"WHERE job_key = ? AND state <> 'cancelled'{clause}"
+            ),
             (*params, job_key, *scope_params),
         )
         return self.get_autofix_job(job_key)
