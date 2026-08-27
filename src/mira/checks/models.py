@@ -454,6 +454,17 @@ class CheckRun:
         """
         if not self.results:
             return "not_run"
+        # Every check switched off is not a pass. The run happened, but nothing
+        # looked at anything, and a dashboard row reading "Passed — 0 passed"
+        # is the sort of small lie this phase is written to avoid. A check that
+        # ran and correctly had no opinion (`not_applicable`, `out_of_scope`)
+        # is deliberately *not* in this set: it answered.
+        if all(
+            result.state == "skipped"
+            and result.skip_reason in {SkipReason.DISABLED, SkipReason.KILL_SWITCH}
+            for result in self.results
+        ):
+            return "not_run"
         blocking = self.blocking_results
         if any(result.is_violation for result in blocking):
             return "violation"
