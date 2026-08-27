@@ -23,14 +23,22 @@ from mira.autofix.capabilities import (
 from mira.autofix.capabilities import (
     AutofixCapabilities,
 )
+from mira.checks.capabilities import (
+    GITLAB_CAPABILITIES as GITLAB_CHECK_CAPABILITIES,
+)
+from mira.checks.capabilities import (
+    CheckCapabilities,
+)
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITLAB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
 from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
+    CIJobFailure,
     FileHistoryEntry,
     HumanReviewComment,
+    IssueInfo,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
@@ -695,6 +703,119 @@ class GitLabProvider(BaseProvider):
         `GITLAB_CAPABILITIES` declares this, so the decision degrades explicitly
         rather than silently. Turn on `gate.comment` to put the explanation on
         the merge request; the dashboard always has it.
+        """
+        return ""
+
+    # ── Pre-merge checks (Phase 6) ──
+
+    def checks_capabilities(self) -> CheckCapabilities:
+        return GITLAB_CHECK_CAPABILITIES
+
+    async def get_issue(
+        self, pr_info: PRInfo, number: int, *, owner: str = "", repo: str = ""
+    ) -> IssueInfo | None:
+        """One project issue, or None when GitLab says there is no such issue.
+
+        404 is the only failure turned into ``None``. Everything else raises,
+        because a check that read a revoked token as a missing issue would
+        blame the pull request for the deployment's credentials.
+        """
+        project = (
+            f"{self._api}/projects/{quote(f'{owner}/{repo}', safe='')}"
+            if owner and repo
+            else self._project(pr_info)
+        )
+        resp = await self._request("GET", f"{project}/issues/{int(number)}", ok=(200, 404))
+        if resp.status_code == 404:
+            return None
+        data = resp.json() or {}
+        return IssueInfo(
+            number=int(data.get("iid") or number),
+            title=str(data.get("title") or ""),
+            body=str(data.get("description") or ""),
+            state=str(data.get("state") or ""),
+            url=str(data.get("web_url") or ""),
+            labels=[str(label) for label in (data.get("labels") or [])],
+            owner=owner or pr_info.owner,
+            repo=repo or pr_info.repo,
+        )
+
+    async def get_ci_failures(
+        self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
+    ) -> list[CIJobFailure]:
+        """Failed jobs in the head pipeline, with the tail of each trace.
+
+        The tail, not the head: a build failure is at the bottom of the log and
+        the first sixteen kilobytes of a CI job are dependency downloads. The
+        trace is raw text written by whatever ran, so it is bounded here and
+        redacted at the check boundary before it goes anywhere else.
+
+        A job whose trace cannot be read is still returned, with
+        ``log_unavailable`` set — "this job failed" is worth reporting even
+        when "and here is why" is not available.
+        """
+        try:
+            resp = await self._request("GET", self._mr(pr_info))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            raise ProviderError(f"Failed to read the merge request pipeline: {exc}") from exc
+        pipeline = (resp.json() or {}).get("head_pipeline") or {}
+        pipeline_id = pipeline.get("id")
+        if not pipeline_id:
+            return []
+
+        jobs_resp = await self._request(
+            "GET",
+            f"{self._project(pr_info)}/pipelines/{int(pipeline_id)}/jobs"
+            "?scope[]=failed&per_page=20",
+        )
+        failures: list[CIJobFailure] = []
+        for job in jobs_resp.json() or []:
+            if len(failures) >= max_jobs:
+                break
+            job_id = job.get("id")
+            excerpt = ""
+            unavailable = True
+            if job_id:
+                try:
+                    trace = await self._request(
+                        "GET",
+                        f"{self._project(pr_info)}/jobs/{int(job_id)}/trace",
+                        ok=(200, 404),
+                    )
+                    if trace.status_code == 200 and trace.text:
+                        excerpt = trace.text[-max_log_bytes:]
+                        unavailable = False
+                except Exception as exc:  # noqa: BLE001 - one unreadable trace is not fatal
+                    logger.debug("Could not read job trace %s: %s", job_id, exc)
+            failures.append(
+                CIJobFailure(
+                    name=str(job.get("name") or "job"),
+                    job_id=str(job_id or ""),
+                    conclusion=str(job.get("status") or "failed"),
+                    url=str(job.get("web_url") or ""),
+                    step=str(job.get("stage") or ""),
+                    excerpt=excerpt,
+                    log_unavailable=unavailable,
+                )
+            )
+        return failures
+
+    async def publish_checks_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        """Not supported on GitLab, for the same reason the gate does not publish.
+
+        A commit status joins the head pipeline. A pre-merge check publishing a
+        green one could satisfy a "pipelines must succeed" rule using nothing
+        but its own opinion, and a red one would be read back by the CI check
+        on the next event as a failing build. Neither is a status worth having.
         """
         return ""
 

@@ -27,14 +27,23 @@ from mira.autofix.capabilities import (
 from mira.autofix.capabilities import (
     AutofixCapabilities,
 )
+from mira.checks.capabilities import (
+    FORGEJO_CAPABILITIES as FORGEJO_CHECK_CAPABILITIES,
+)
+from mira.checks.capabilities import (
+    CheckCapabilities,
+)
+from mira.checks.models import mira_status_contexts
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import FORGEJO_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
-from mira.gate.models import STATUS_CONTEXT, CIState
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
+    CIJobFailure,
     FileHistoryEntry,
     HumanReviewComment,
+    IssueInfo,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
@@ -44,6 +53,11 @@ from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 
 logger = logging.getLogger(__name__)
+
+# Every commit-status context Mira publishes itself. Filtered out of the CI it
+# reads back, so neither the gate nor the pre-merge checks can see their own
+# red status and conclude the build is failing.
+_OWN_STATUS_CONTEXTS = mira_status_contexts()
 
 # https://forgejo.example.com/owner/repo/pulls/123
 _PR_URL_PATTERN = re.compile(
@@ -600,9 +614,9 @@ class ForgejoProvider(BaseProvider):
         total = 0
         for status in statuses:
             context = str((status or {}).get("context") or "status")
-            if context in seen or context == STATUS_CONTEXT:
-                # The gate's own status. Counting it would let the gate read
-                # its own verdict back as a failing build.
+            if context in seen or context in _OWN_STATUS_CONTEXTS:
+                # One of Mira's own published statuses. Counting it would let
+                # Mira read its own verdict back as a failing build.
                 continue
             seen.add(context)
             total += 1
@@ -720,6 +734,82 @@ class ForgejoProvider(BaseProvider):
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(f"Failed to publish gate status: {exc}") from exc
         return str((resp.json() or {}).get("id", "") or "")
+
+    # ── Pre-merge checks (Phase 6) ──
+
+    def checks_capabilities(self) -> CheckCapabilities:
+        return FORGEJO_CHECK_CAPABILITIES
+
+    async def get_issue(
+        self, pr_info: PRInfo, number: int, *, owner: str = "", repo: str = ""
+    ) -> IssueInfo | None:
+        """One issue, or None when Forgejo says there is no such issue.
+
+        404 is the only failure turned into ``None``; everything else raises,
+        so a self-hosted instance that is down reads as an infrastructure
+        error rather than as every pull request referencing a ghost.
+        """
+        base = (
+            f"{self._api}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+            if owner and repo
+            else self._repo(pr_info)
+        )
+        resp = await self._request("GET", f"{base}/issues/{int(number)}", ok=(200, 404))
+        if resp.status_code == 404:
+            return None
+        data = resp.json() or {}
+        return IssueInfo(
+            number=int(data.get("number") or number),
+            title=str(data.get("title") or ""),
+            body=str(data.get("body") or ""),
+            state=str(data.get("state") or ""),
+            url=str(data.get("html_url") or ""),
+            labels=[str((label or {}).get("name") or "") for label in (data.get("labels") or [])],
+            owner=owner or pr_info.owner,
+            repo=repo or pr_info.repo,
+        )
+
+    async def get_ci_failures(
+        self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
+    ) -> list[CIJobFailure]:
+        """Failing commit statuses on the head commit.
+
+        Forgejo reports CI as commit statuses, which carry a context, a
+        description and a link — and no job output at all. So every failure
+        here comes back with ``log_unavailable`` set unless the status wrote
+        something into its description. That is the honest shape: the check
+        reports the job and the link, and says plainly that the log was not
+        available rather than quoting an empty string as evidence.
+        """
+        sha = pr_info.head_sha
+        if not sha:
+            return []
+        resp = await self._request(
+            "GET", f"{self._repo(pr_info)}/commits/{quote(sha, safe='')}/statuses"
+        )
+        failures: list[CIJobFailure] = []
+        seen: set[str] = set()
+        for status in resp.json() or []:
+            if len(failures) >= max_jobs:
+                break
+            context = str((status or {}).get("context") or "status")
+            if context in seen or context in _OWN_STATUS_CONTEXTS:
+                continue
+            seen.add(context)
+            state = str((status or {}).get("status") or "").lower()
+            if state in {"success", "pending", ""}:
+                continue
+            description = str((status or {}).get("description") or "")
+            failures.append(
+                CIJobFailure(
+                    name=context,
+                    conclusion=state or "failure",
+                    url=str((status or {}).get("target_url") or ""),
+                    excerpt=description[-max_log_bytes:],
+                    log_unavailable=not description,
+                )
+            )
+        return failures
 
     # ── Assisted correction (Phase 5) ──
 

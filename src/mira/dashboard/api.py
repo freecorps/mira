@@ -1329,6 +1329,7 @@ class TimeSeriesPoint(BaseModel):
 import mira.dashboard.routers.admin  # noqa: E402,F401
 import mira.dashboard.routers.analytics  # noqa: E402,F401
 import mira.dashboard.routers.autofix  # noqa: E402,F401
+import mira.dashboard.routers.checks  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
 import mira.dashboard.routers.gate  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401

@@ -225,6 +225,13 @@ async def gather_inputs(
     store = _open_store(owner, repo, platform)
     try:
         counts = store.gate_finding_counts(pr_info.number)
+        # Read from the same store handle rather than through
+        # `checks.service.latest_verdict`, which would open a second one: this
+        # runs inside the gate's wall-clock budget, and on SQLite opening an
+        # index store is a file open plus a schema pass.
+        check_run = store.latest_check_run(
+            pr_number=pr_info.number, head_sha=getattr(pr_info, "head_sha", "") or ""
+        )
     finally:
         store.close()
     blockers = max(counts["blockers"], signal.open_blockers)
@@ -265,6 +272,14 @@ async def gather_inputs(
         review_complete=signal.review_complete,
         review_skipped_paths=list(signal.skipped_paths or []),
         review_failed=signal.review_failed,
+        # A run against an older commit is not evidence about this one, and
+        # `latest_check_run` is asked for this head sha, so a pull request that
+        # was pushed to since its last check run reports `not_run` — which the
+        # gate ignores rather than treating as a pass.
+        checks_verdict=check_run.verdict if check_run else "not_run",
+        checks_blocking=(
+            sorted(result.check_id for result in check_run.blocking_results) if check_run else []
+        ),
         index_ready=_index_ready(owner, repo, platform),
         human_states=human_states,
         bot_login=bot_name,

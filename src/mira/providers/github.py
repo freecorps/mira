@@ -20,15 +20,24 @@ from mira.autofix.capabilities import (
 from mira.autofix.capabilities import (
     AutofixCapabilities,
 )
+from mira.checks.capabilities import (
+    GITHUB_CAPABILITIES as GITHUB_CHECK_CAPABILITIES,
+)
+from mira.checks.capabilities import (
+    CheckCapabilities,
+)
+from mira.checks.models import mira_status_contexts
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITHUB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
-from mira.gate.models import STATUS_CONTEXT, CIState
+from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
+    CIJobFailure,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
+    IssueInfo,
     OpenPRRef,
     PRInfo,
     ReviewComment,
@@ -49,6 +58,11 @@ from mira.providers.formatting import (
 from mira.providers.formatting import (
     format_key_issues as _format_key_issues,
 )
+
+# Every check-run name Mira publishes itself. Filtered out of the CI it reads
+# back, so neither the gate nor the pre-merge checks can see their own red
+# status and conclude the build is failing.
+_OWN_STATUS_CONTEXTS = mira_status_contexts()
 
 # Transient errors worth retrying — network issues and GitHub server errors.
 _RETRYABLE = (ConnectionError, TimeoutError, httpx.TransportError, GithubException)
@@ -1238,9 +1252,9 @@ class GitHubProvider(BaseProvider):
             total = 0
             for run in commit.get_check_runs():
                 name = run.name or "check"
-                if name == STATUS_CONTEXT:
-                    # The gate's own check. Counting it would let the gate read
-                    # its own verdict back as a failing build.
+                if name in _OWN_STATUS_CONTEXTS:
+                    # One of Mira's own published check runs. Counting it would
+                    # let Mira read its own verdict back as a failing build.
                     continue
                 total += 1
                 if (run.status or "") != "completed":
@@ -1255,7 +1269,7 @@ class GitHubProvider(BaseProvider):
                 # Chronological, newest first, per context — only the first
                 # entry for a context describes its current state.
                 context = status.context or "status"
-                if context in seen_contexts or context == STATUS_CONTEXT:
+                if context in seen_contexts or context in _OWN_STATUS_CONTEXTS:
                     continue
                 seen_contexts.add(context)
                 total += 1
@@ -1393,6 +1407,147 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             logger.warning("Could not publish gate status on %s: %s", pr_info.url, e)
             raise ProviderError(f"Failed to publish gate status: {e}") from e
+
+    # ── Pre-merge checks (Phase 6) ──
+
+    def checks_capabilities(self) -> CheckCapabilities:
+        return GITHUB_CHECK_CAPABILITIES
+
+    async def get_issue(
+        self, pr_info: PRInfo, number: int, *, owner: str = "", repo: str = ""
+    ) -> IssueInfo | None:
+        """One issue, or None when GitHub says there is no such issue.
+
+        A 404 is the answer "it does not exist" and is the only failure turned
+        into ``None``. Everything else — a rate limit, a revoked token, a 500 —
+        propagates, because a check that reported those as a missing issue
+        would blame a pull request for an outage.
+
+        Pull requests are issues on GitHub and this deliberately does not
+        filter them out: a repository whose convention is to reference a
+        tracking pull request is referencing something that exists, which is
+        all this method claims to establish.
+        """
+        target_owner = owner or pr_info.owner
+        target_repo = repo or pr_info.repo
+
+        @_retry_transient
+        def _fetch() -> IssueInfo | None:
+            gh_repo = self._github.get_repo(f"{target_owner}/{target_repo}")
+            try:
+                issue = gh_repo.get_issue(number=int(number))
+            except GithubException as exc:
+                if getattr(exc, "status", 0) == 404:
+                    return None
+                raise
+            return IssueInfo(
+                number=int(getattr(issue, "number", number) or number),
+                title=str(getattr(issue, "title", "") or ""),
+                body=str(getattr(issue, "body", "") or ""),
+                state=str(getattr(issue, "state", "") or ""),
+                url=str(getattr(issue, "html_url", "") or ""),
+                labels=[str(getattr(label, "name", "") or "") for label in (issue.labels or [])],
+                owner=target_owner,
+                repo=target_repo,
+            )
+
+        return await asyncio.to_thread(_fetch)
+
+    async def get_ci_failures(
+        self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
+    ) -> list[CIJobFailure]:
+        """Failing check runs and statuses on the head commit, with their output.
+
+        The evidence is the check run's own ``output`` — the summary and text
+        the action published — rather than the raw Actions log archive. That is
+        a deliberate trade: the archive is a zip fetched over a redirect,
+        typically megabytes, and on the deployment profile Mira targets the
+        cost of downloading it dwarfs the value of the extra lines. What an
+        action chose to publish is what it wanted a reader to see.
+
+        A failing check run that published no output is returned with
+        ``log_unavailable`` set, so the check can say "this job failed and told
+        us nothing" instead of quoting an empty string as evidence.
+        """
+
+        @_retry_transient
+        def _fetch() -> list[CIJobFailure]:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            sha = pr_info.head_sha or gh_repo.get_pull(pr_info.number).head.sha
+            commit = gh_repo.get_commit(sha)
+            failures: list[CIJobFailure] = []
+            for run in commit.get_check_runs():
+                if len(failures) >= max_jobs:
+                    break
+                name = run.name or "check"
+                if name in _OWN_STATUS_CONTEXTS:
+                    continue
+                if (run.status or "") != "completed":
+                    continue
+                conclusion = (run.conclusion or "").lower()
+                if conclusion in {"success", "neutral", "skipped", ""}:
+                    continue
+                output = getattr(run, "output", None)
+                pieces = [
+                    str(getattr(output, "title", "") or ""),
+                    str(getattr(output, "summary", "") or ""),
+                    str(getattr(output, "text", "") or ""),
+                ]
+                excerpt = "\n".join(piece for piece in pieces if piece).strip()
+                failures.append(
+                    CIJobFailure(
+                        name=name,
+                        job_id=str(getattr(run, "id", "") or ""),
+                        conclusion=conclusion,
+                        url=str(getattr(run, "html_url", "") or ""),
+                        step=str(getattr(output, "title", "") or ""),
+                        # From the end: a build failure is at the bottom.
+                        excerpt=excerpt[-max_log_bytes:],
+                        log_unavailable=not excerpt,
+                    )
+                )
+            seen: set[str] = set()
+            for status in commit.get_statuses():
+                if len(failures) >= max_jobs:
+                    break
+                context = status.context or "status"
+                if context in seen or context in _OWN_STATUS_CONTEXTS:
+                    continue
+                seen.add(context)
+                if (status.state or "").lower() in {"success", "pending", ""}:
+                    continue
+                description = str(getattr(status, "description", "") or "")
+                failures.append(
+                    CIJobFailure(
+                        name=context,
+                        conclusion=str(status.state or "failure").lower(),
+                        url=str(getattr(status, "target_url", "") or ""),
+                        excerpt=description[-max_log_bytes:],
+                        log_unavailable=not description,
+                    )
+                )
+            return failures
+
+        return await asyncio.to_thread(_fetch)
+
+    async def publish_checks_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        return await self.publish_gate_status(
+            pr_info,
+            context=context,
+            conclusion=conclusion,
+            title=title,
+            summary=summary,
+            target_url=target_url,
+        )
 
     # ── Assisted correction (Phase 5) ──
 

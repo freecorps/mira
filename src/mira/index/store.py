@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 
 from mira.autofix.persistence import AutofixStoreMixin
+from mira.checks.persistence import ChecksStoreMixin
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -532,6 +533,96 @@ CREATE TABLE IF NOT EXISTS autofix_attempts (
 CREATE INDEX IF NOT EXISTS idx_autofix_attempts_job
     ON autofix_attempts(job_key, created_at);
 
+-- Phase 6 pre-merge checks. One row per evaluation of one pull request:
+-- `run_key` hashes the pull request, head commit, resolved policy *and* the
+-- facts, so a redelivered webhook over unchanged inputs converges here instead
+-- of stacking rows, while a re-run after a push is recorded as the new run it
+-- is.
+--
+-- Unlike `gate_decisions`, a repeat write *updates* this row. A gate decision
+-- is an act that may already have been delivered; a check run is an answer to
+-- a question, and when the same question is asked again the newest answer is
+-- the one worth keeping. `attempts` records that it took more than one go.
+CREATE TABLE IF NOT EXISTS check_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    review_id INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL DEFAULT '',
+    -- 'pass' | 'violation' | 'incomplete' | 'not_run'
+    verdict TEXT NOT NULL DEFAULT 'not_run',
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    counts_json TEXT NOT NULL DEFAULT '{}',
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_check_runs_pr
+    ON check_runs(pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_check_runs_head
+    ON check_runs(pr_number, head_sha);
+CREATE INDEX IF NOT EXISTS idx_check_runs_verdict
+    ON check_runs(verdict, created_at);
+CREATE INDEX IF NOT EXISTS idx_check_runs_created
+    ON check_runs(created_at);
+
+-- One row per check per run. `state` is what a human reads and `incomplete` is
+-- what a gate reads: they are deliberately different questions, because a
+-- check skipped for a missing linter must show as skipped and must still keep
+-- a blocking gate closed.
+CREATE TABLE IF NOT EXISTS check_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    result_key TEXT NOT NULL UNIQUE,
+    run_id INTEGER NOT NULL DEFAULT 0,
+    run_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    check_id TEXT NOT NULL DEFAULT '',
+    check_version TEXT NOT NULL DEFAULT '1',
+    title TEXT NOT NULL DEFAULT '',
+    -- 'native' | 'natural_language' | 'tool' | 'context'
+    origin TEXT NOT NULL DEFAULT 'native',
+    -- 'off' | 'warning' | 'error'
+    mode TEXT NOT NULL DEFAULT 'off',
+    -- 'pass' | 'violation' | 'infrastructure_error' | 'skipped' | 'timeout'
+    state TEXT NOT NULL DEFAULT 'skipped',
+    summary TEXT NOT NULL DEFAULT '',
+    skip_reason TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    -- Content hash of the configuration this one check ran under, so two
+    -- results are comparable exactly when the rules behind them were the same.
+    config_digest TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    findings_json TEXT NOT NULL DEFAULT '[]',
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    incomplete INTEGER NOT NULL DEFAULT 0,
+    blocking INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_check_results_run
+    ON check_results(run_key, check_id);
+CREATE INDEX IF NOT EXISTS idx_check_results_check
+    ON check_results(check_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_check_results_state
+    ON check_results(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_check_results_pr
+    ON check_results(pr_number, created_at);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -741,7 +832,7 @@ class BlastRadiusEntry:
     depth: int
 
 
-class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
+class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksStoreMixin):
     """SQLite-backed index for a single repository."""
 
     def __init__(
@@ -2735,6 +2826,20 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
         return self._conn.execute(sql, params).fetchall()
 
     def _autofix_exec(self, sql: str, params: tuple = ()) -> int:
+        cursor = self._conn.execute(sql, params)
+        self._conn.commit()
+        return int(cursor.rowcount or 0)
+
+    # ---------------------------------------------------------------- Phase 6
+    # The primitives `ChecksStoreMixin` needs. The upsert it writes uses
+    # `ON CONFLICT ... DO UPDATE`, which SQLite has had since 3.24 and Postgres
+    # since forever — so unlike the gate's insert-or-ignore, the statement
+    # itself is identical on both backends and there is no dialect hook here.
+
+    def _checks_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def _checks_exec(self, sql: str, params: tuple = ()) -> int:
         cursor = self._conn.execute(sql, params)
         self._conn.commit()
         return int(cursor.rowcount or 0)

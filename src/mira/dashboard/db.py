@@ -199,6 +199,27 @@ CREATE TABLE IF NOT EXISTS pr_reviewers (
     bare_approval INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (owner, repo, pr_number, reviewer)
 );
+
+-- Every change an admin makes to a policy section of the settings blob, with
+-- what it was and what it became. Append-only: the blob itself only ever
+-- carries the current value, so without this a policy that was loosened and
+-- tightened again leaves no trace that it was ever loosened.
+--
+-- Not scoped to a repository, because these sections are not: an
+-- organisation-level or global check policy applies to every repository in the
+-- install, and an audit that lived in one repository's index would miss it.
+CREATE TABLE IF NOT EXISTS config_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    section TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'update',
+    previous_json TEXT NOT NULL DEFAULT '{}',
+    new_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_audit_section
+    ON config_audit_events(section, created_at);
 """
 
 _PG_SCHEMA = """
@@ -350,6 +371,19 @@ CREATE TABLE IF NOT EXISTS pr_reviewers (
     state TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (owner, repo, pr_number, reviewer)
 );
+
+CREATE TABLE IF NOT EXISTS config_audit_events (
+    id SERIAL PRIMARY KEY,
+    section TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'update',
+    previous_json TEXT NOT NULL DEFAULT '{}',
+    new_json TEXT NOT NULL DEFAULT '{}',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_audit_section
+    ON config_audit_events(section, created_at);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -1321,7 +1355,7 @@ class AppDatabase:
 
     # Section names the panels may write. A section becomes a JSON path in the
     # statement below, so the set is closed rather than taken from a request.
-    _OVERRIDE_SECTIONS = frozenset({"review", "filter", "learning", "gate", "autofix"})
+    _OVERRIDE_SECTIONS = frozenset({"review", "filter", "learning", "gate", "autofix", "checks"})
 
     def update_global_review_overrides_section(
         self, section: str, value: dict[str, Any] | None
@@ -1381,6 +1415,116 @@ class AppDatabase:
                     )
             self._pg_commit()
         return self.get_global_review_overrides()
+
+    # ── Policy audit ────────────────────────────────────────────────────
+    #
+    # The overrides blob only ever holds the *current* value of a section. A
+    # policy that was loosened for an afternoon and tightened again therefore
+    # leaves no trace in it at all, which is exactly the change somebody would
+    # want to find later. These two methods are that trace.
+
+    def record_config_audit(
+        self,
+        *,
+        section: str,
+        actor: str,
+        previous: dict[str, Any] | None,
+        new: dict[str, Any] | None,
+        action: str = "update",
+    ) -> None:
+        """Append one policy change to the trail. Never raises.
+
+        Best effort by design: an audit write that failed must not stop an
+        admin from making a change they are entitled to make, and the failure
+        is logged where an operator will see it. The alternative — refusing the
+        edit — would mean a full disk turned the settings page into a brick.
+        """
+        payload = (
+            section,
+            actor or "",
+            action,
+            json.dumps(previous or {}, sort_keys=True, default=str),
+            json.dumps(new or {}, sort_keys=True, default=str),
+            time.time(),
+        )
+        try:
+            if self._backend == "sqlite":
+                assert self._sqlite_conn is not None
+                self._sqlite_conn.execute(
+                    "INSERT INTO config_audit_events "
+                    "(section, actor, action, previous_json, new_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    payload,
+                )
+                self._sqlite_conn.commit()
+            else:
+                with self._pg_cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO config_audit_events "
+                        "(section, actor, action, previous_json, new_json, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        payload,
+                    )
+                self._pg_commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not record a config audit entry for %s: %s", section, exc)
+
+    def list_config_audit(
+        self, *, section: str = "", limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """The policy-change trail, newest first."""
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        columns = "id, section, actor, action, previous_json, new_json, created_at"
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            if section:
+                rows = self._sqlite_conn.execute(
+                    f"SELECT {columns} FROM config_audit_events WHERE section = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (section, limit, offset),
+                ).fetchall()
+            else:
+                rows = self._sqlite_conn.execute(
+                    f"SELECT {columns} FROM config_audit_events "
+                    "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+        else:
+            with self._pg_cursor() as cur:
+                if section:
+                    cur.execute(
+                        f"SELECT {columns} FROM config_audit_events WHERE section = %s "
+                        "ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+                        (section, limit, offset),
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT {columns} FROM config_audit_events "
+                        "ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+                        (limit, offset),
+                    )
+                rows = cur.fetchall()
+
+        def _load(raw: Any) -> dict[str, Any]:
+            try:
+                parsed = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        return [
+            {
+                "id": int(row[0]),
+                "section": str(row[1] or ""),
+                "actor": str(row[2] or ""),
+                "action": str(row[3] or "update"),
+                "previous": _load(row[4]),
+                "new": _load(row[5]),
+                "created_at": float(row[6] or 0.0),
+            }
+            for row in rows
+        ]
 
     # Outbound webhooks live in their own settings row (not in the review
     # overrides blob) so their secret URLs never leak into the effective-config

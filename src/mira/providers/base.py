@@ -10,13 +10,21 @@ from mira.autofix.capabilities import (
 from mira.autofix.capabilities import (
     AutofixCapabilities,
 )
+from mira.checks.capabilities import (
+    NO_CAPABILITIES as NO_CHECK_CAPABILITIES,
+)
+from mira.checks.capabilities import (
+    CheckCapabilities,
+)
 from mira.gate.capabilities import NO_CAPABILITIES, GateCapabilities
 from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
+    CIJobFailure,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
+    IssueInfo,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
@@ -254,6 +262,75 @@ class BaseProvider(abc.ABC):
         Returns a provider reference for the audit trail, or "" if unsupported.
         """
         return ""
+
+    # ── Pre-merge checks (Phase 6) ──
+    #
+    # Read-only, all of it. Every default below reports *ignorance* and none of
+    # them reports good news: a provider that does not implement `get_issue`
+    # makes the ticket check skip with the reason, never pass; one that cannot
+    # list failing jobs makes the CI check say so rather than infer a green
+    # build. Adding a provider therefore degrades checks rather than weakening
+    # them.
+
+    def checks_capabilities(self) -> CheckCapabilities:
+        """What this provider can do for pre-merge checks.
+
+        Declared, not probed, for the same reasons as the gate's table.
+        """
+        return NO_CHECK_CAPABILITIES
+
+    async def get_issue(
+        self, pr_info: PRInfo, number: int, *, owner: str = "", repo: str = ""
+    ) -> IssueInfo | None:
+        """The issue ``number`` in ``owner/repo``, defaulting to the PR's own repo.
+
+        ``None`` means the platform answered and there is no such issue — a
+        fact about the pull request's reference. Anything that stops the
+        provider from *asking* must raise, because "we could not find out" and
+        "it does not exist" lead to opposite conclusions, and a check that
+        cannot tell them apart would report an API outage as a bad reference.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot read issues")
+
+    async def get_ci_failures(
+        self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
+    ) -> list[CIJobFailure]:
+        """The failing CI jobs on the head commit, with an excerpt of each.
+
+        Bounded by the caller, because the caller is about to put this text in
+        front of a model and in a database. A provider that can name a failing
+        job but not read its output returns the job with
+        ``log_unavailable=True`` rather than an empty excerpt that would read
+        as "the job printed nothing".
+        """
+        return []
+
+    async def publish_checks_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        conclusion: str,
+        title: str,
+        summary: str,
+        target_url: str = "",
+    ) -> str:
+        """Publish the check run's verdict as a check run / commit status.
+
+        Idempotent by ``context``: re-publishing replaces the previous entry
+        rather than adding one. Returns a provider reference for the audit
+        trail, or "" if unsupported. Defaults to the gate's implementation on
+        providers that have one, because the two publish the same artifact type
+        under different names.
+        """
+        return await self.publish_gate_status(
+            pr_info,
+            context=context,
+            conclusion=conclusion,
+            title=title,
+            summary=summary,
+            target_url=target_url,
+        )
 
     # ── Assisted correction (Phase 5) ──
     #

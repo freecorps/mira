@@ -115,6 +115,12 @@ class ReasonCode:
     CI_UNKNOWN = "ci_unknown"
     REVIEW_INCOMPLETE = "review_incomplete"
     REVIEW_FAILED = "review_failed"
+    # Phase 6. Two codes rather than one, because the two facts are different:
+    # a blocking pre-merge check found a real problem, or a blocking pre-merge
+    # check could not answer at all. Reporting the second as the first would be
+    # the exact confusion the check framework exists to remove.
+    CHECKS_VIOLATION = "checks_violation"
+    CHECKS_INCOMPLETE = "checks_incomplete"
     INDEX_NOT_READY = "index_not_ready"
     OPEN_BLOCKER = "open_blocker"
     SEVERITY_ABOVE_CEILING = "severity_above_ceiling"
@@ -149,6 +155,12 @@ HARD_VETO_CODES: frozenset[str] = frozenset(
         ReasonCode.LLM_FAILURE,
         ReasonCode.EVALUATION_ERROR,
         ReasonCode.EVALUATION_TIMEOUT,
+        # "A blocking check could not answer" is the same class of fact as an
+        # evaluation error: the gate does not know, and forcing an approval
+        # past not knowing is what fail-closed exists to prevent. A check that
+        # *did* answer and objected is deliberately not here — that is a
+        # judgement an admin may override, with the override recorded.
+        ReasonCode.CHECKS_INCOMPLETE,
     }
 )
 
@@ -259,6 +271,15 @@ class GateInputs:
     review_skipped_paths: list[str] = field(default_factory=list)
     review_failed: str = ""
     index_ready: bool = True
+    # Verdict of the newest pre-merge check run for this head commit:
+    # "pass" | "violation" | "incomplete" | "not_run". Recorded on the inputs
+    # rather than fetched inside `decide()`, so the decision stays pure and a
+    # gate woken by a finished CI run scores the same pull request the same way
+    # a gate woken by the review does.
+    checks_verdict: str = "not_run"
+    # Check ids that blocked, for the reason's own message. A decision that
+    # said "a check objected" without naming it would be unactionable.
+    checks_blocking: list[str] = field(default_factory=list)
     human_states: dict[str, str] = field(default_factory=dict)
     bot_login: str = ""
     review_id: int = 0
@@ -272,6 +293,7 @@ class GateInputs:
             data[key] = sorted(data[key])[:200]
         data["labels"] = sorted(data["labels"])[:100]
         data["review_skipped_paths"] = sorted(data["review_skipped_paths"])[:100]
+        data["checks_blocking"] = sorted(data["checks_blocking"])[:50]
         return data
 
     @property

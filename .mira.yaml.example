@@ -163,3 +163,111 @@ gate:
   #   acme/docs:
   #     mode: "enforce"
   #     max_changed_files: 50
+
+# ── Pre-merge checks (Phase 6) ────────────────────────────────────────────
+# Reproducible, evidenced answers about a pull request, each with an identity,
+# a version and one of five states. The distinction the whole section is built
+# around: a `violation` is a statement about the pull request, and
+# `infrastructure_error`, `timeout` and `skipped` are statements about Mira.
+#
+# Nothing in a pull request reaches any value below — not a mode, not a rule,
+# not a path glob, not an argument. Full guide: docs/pre-merge-checks.md
+checks:
+  # Off by default. Turning it on with everything in `warning` reports
+  # everything and blocks nothing, which is the recommended first step.
+  enabled: false
+  # Hard-disable every check everywhere, independent of `enabled` and of every
+  # per-scope override. For an incident, not for a policy edit.
+  kill_switch: false
+
+  #   off      — does not run. Recorded as skipped, not as a pass.
+  #   warning  — runs and reports. Never blocks a merge.
+  #   error    — runs, reports, and blocks on a violation *or* on an inability
+  #              to answer. Fail closed, in that order.
+  default_mode: "warning"
+  # modes:
+  #   native.tests: "error"
+  #   context.ci: "error"
+  #   tool.gitleaks: "error"
+
+  # Budget. The defaults assume a four-core board also serving webhooks. A
+  # check that overruns is a `timeout`; one that never started because the run
+  # budget was spent is `skipped: budget_exhausted`. Neither is a pass.
+  max_concurrency: 2
+  check_timeout_seconds: 60
+  total_timeout_seconds: 300
+  max_evidence_per_check: 10
+
+  # Publish the run as a check run / commit status where the provider supports
+  # one. Neutral while every check is in warning mode; never red for a check
+  # Mira could not run.
+  publish_status: true
+  # Also post the summary as a PR comment, updated in place.
+  comment: false
+
+  # The issue a pull request claims to be about. No external tracker is
+  # required: "auto" asks the hosting platform Mira already talks to, and
+  # "none" disables lookups entirely while leaving reference extraction on.
+  ticket:
+    provider: "auto"
+    require_reference: true
+    require_acceptance_criteria: false
+    # Extra shapes for project-specific keys. Compiled at config load.
+    # reference_patterns: ["(?P<key>ACME-\d+)"]
+    exempt_labels: ["no-ticket", "chore", "dependencies"]
+
+  # What CI said, quoted rather than paraphrased. Every limit here is a
+  # security control: a CI log is written by whoever can open a pull request.
+  ci:
+    max_jobs: 3
+    max_log_bytes: 16000
+    max_evidence_lines: 20
+    # Off by default: the job name, step and quoted lines are already evidence,
+    # and a deployment that does not want its CI output leaving the box does
+    # not have to send it anywhere.
+    summarize_with_llm: false
+
+  # Deterministic analysers. `name` comes from a closed allowlist — semgrep,
+  # ruff, eslint, gitleaks, osv — checked when the config loads. `args` is an
+  # argument *list*: there is no shell, so there is nothing to inject into.
+  # A tool that is not installed is reported as skipped with the binary named,
+  # never as a pass.
+  # tools:
+  #   - name: "ruff"
+  #     mode: "warning"
+  #   - name: "gitleaks"
+  #     mode: "error"
+  #   - name: "semgrep"
+  #     # Repository-relative, validated at load. Absolute paths and `..` are
+  #     # refused.
+  #     config_path: ".semgrep.yml"
+  #     # Substring of the tool's own --version. A mismatch is a skip naming
+  #     # both versions, not a run under rules nobody reviewed.
+  #     require_version: "1.9"
+  #   - name: "osv"
+  #     # Reuses the review's existing OSV scan rather than repeating it.
+
+  # Checks written as instructions. The instruction is policy and lives in the
+  # system prompt; the diff and the pull request's text go in untrusted blocks.
+  # A violation must quote code that exists — the quote is verified — and an
+  # `uncertain` answer becomes a skip rather than an invented finding.
+  # natural_language:
+  #   - id: "rate-limit"
+  #     title: "Endpoints declare a rate limit"
+  #     instruction: "Every new HTTP endpoint must declare a rate limit."
+  #     paths: ["src/api/**/*.py"]
+  #     mode: "warning"
+  #     version: "1"
+
+  # Three layers: this block, then the organisation, then the repository.
+  # `modes` merge key by key; lists replace (so `[]` means "none here"); tools
+  # merge by name.
+  # organizations:
+  #   acme:
+  #     modes: { native.docs: "error" }
+  # repositories:
+  #   acme/legacy-service:
+  #     modes: { native.tests: "off" }
+  #     tools:
+  #       - name: "ruff"
+  #         enabled: false

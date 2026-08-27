@@ -111,6 +111,21 @@ PROTECTED = [
     ),
     ("/api/autofix/config", "GET", {}),
     ("/api/autofix/config", "PUT", {"body": None}),
+    # Phase 6 pre-merge checks. Reads are listed for the same reason again: a
+    # check result quotes diff lines, CI output and ticket titles for every
+    # repository in the install, and the audit trail names who changed policy.
+    ("/api/checks/runs", "GET", {}),
+    ("/api/checks/results", "GET", {}),
+    ("/api/checks/summary", "GET", {}),
+    ("/api/checks/catalog", "GET", {}),
+    (
+        "/api/checks/runs/{owner}/{repo}/{run_id}",
+        "GET",
+        {"owner": "o", "repo": "r", "run_id": 1},
+    ),
+    ("/api/checks/config", "GET", {}),
+    ("/api/checks/config", "PUT", {"body": None}),
+    ("/api/checks/config/audit", "GET", {}),
 ]
 
 
