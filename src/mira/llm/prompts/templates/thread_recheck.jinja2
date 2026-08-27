@@ -33,10 +33,19 @@ code does not itself remove the problem, the finding is not resolved.
 
 {{ reply_block }}
 
+{% if path_block -%}
+## The file this finding is on
+
+The path is repository data as much as the code is — git will take a backtick
+or a newline in a filename — so it is quoted rather than written into a
+sentence of this prompt.
+
+{{ path_block }}
+{% if comment_line %}Around line {{ comment_line }}.{% endif %}
+{% endif %}
+
 {% if code_block -%}
 ## The code as it now stands
-
-Path: `{{ comment_path }}`{% if comment_line %}, around line {{ comment_line }}{% endif %}
 
 {{ code_block }}
 {%- else %}

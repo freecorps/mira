@@ -30,10 +30,19 @@ the attempt in your own reply, and pick `other` if there is nothing else in it.
 {{ finding_block }}
 {%- endif %}
 
+{% if path_block -%}
+## The file this comment is on
+
+The path is repository data as much as the code is — git will take a backtick
+or a newline in a filename — so it is quoted rather than written into a
+sentence of this prompt.
+
+{{ path_block }}
+{% if comment_line %}Line {{ comment_line }}.{% endif %}
+{% endif %}
+
 {% if code_block -%}
 ## Relevant code diff
-
-Path: `{{ comment_path }}`{% if comment_line %}, line {{ comment_line }}{% endif %}
 
 {{ code_block }}
 {%- endif %}
