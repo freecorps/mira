@@ -66,6 +66,51 @@ class TestDBRoundTrip:
         in_memory_db.set_global_review_overrides({})
         assert in_memory_db.get_global_review_overrides() == {}
 
+    def test_a_section_update_touches_only_that_section(self, in_memory_db: AppDatabase):
+        """The gate and autofix panels write sibling keys in one JSON row."""
+        in_memory_db.set_global_review_overrides(
+            {"review": {"walkthrough": False}, "gate": {"mode": "shadow"}}
+        )
+        result = in_memory_db.update_global_review_overrides_section("autofix", {"mode": "suggest"})
+        assert result == {
+            "review": {"walkthrough": False},
+            "gate": {"mode": "shadow"},
+            "autofix": {"mode": "suggest"},
+        }
+        assert in_memory_db.get_global_review_overrides() == result
+
+    def test_a_section_update_replaces_rather_than_merges(self, in_memory_db: AppDatabase):
+        """Wholesale replacement is what makes an empty list expressible."""
+        in_memory_db.update_global_review_overrides_section(
+            "autofix", {"mode": "on", "allowed_requesters": ["alice"]}
+        )
+        result = in_memory_db.update_global_review_overrides_section(
+            "autofix", {"mode": "on", "allowed_requesters": []}
+        )
+        assert result["autofix"] == {"mode": "on", "allowed_requesters": []}
+
+    def test_a_section_update_on_an_empty_row_creates_the_blob(self, in_memory_db: AppDatabase):
+        result = in_memory_db.update_global_review_overrides_section("gate", {"mode": "enforce"})
+        assert result == {"gate": {"mode": "enforce"}}
+
+    def test_passing_none_removes_the_section(self, in_memory_db: AppDatabase):
+        in_memory_db.set_global_review_overrides(
+            {"gate": {"mode": "enforce"}, "filter": {"max_comments": 3}}
+        )
+        result = in_memory_db.update_global_review_overrides_section("gate", None)
+        assert result == {"filter": {"max_comments": 3}}
+
+    def test_a_section_update_survives_a_malformed_row(self, in_memory_db: AppDatabase):
+        """An older build could have left `''` in the value column."""
+        in_memory_db.set_setting(AppDatabase._GLOBAL_OVERRIDES_KEY, "not json")
+        result = in_memory_db.update_global_review_overrides_section("gate", {"mode": "shadow"})
+        assert result == {"gate": {"mode": "shadow"}}
+
+    def test_an_unknown_section_name_is_refused(self, in_memory_db: AppDatabase):
+        """The section becomes a JSON path, so the set of names is closed."""
+        with pytest.raises(ValueError):
+            in_memory_db.update_global_review_overrides_section("$.x", {"a": 1})
+
     def test_malformed_json_returns_empty(self, in_memory_db: AppDatabase):
         # Stuff a non-JSON string directly into the underlying setting and
         # confirm the typed accessor degrades to empty rather than raising.

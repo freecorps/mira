@@ -204,6 +204,53 @@ def test_the_active_count_backs_the_concurrency_ceiling(store: IndexStore) -> No
     assert store.count_active_autofix_jobs(owner="acme", repo="app") == 1
 
 
+def test_the_ceiling_is_enforced_by_the_insert_not_by_the_caller(store: IndexStore) -> None:
+    """Count-then-insert leaves a window several `await` points wide.
+
+    Two `fix all` requests arriving together would each read the same free
+    capacity and each fill it, so the ceiling travels with the statement that
+    fills it rather than with a number somebody read earlier.
+    """
+    first, created = store.enqueue_autofix_job(_job(finding="f1", head="a"), max_active=2)
+    assert created and first.id
+    second, created = store.enqueue_autofix_job(_job(finding="f2", head="a"), max_active=2)
+    assert created and second.id
+
+    third, created = store.enqueue_autofix_job(_job(finding="f3", head="a"), max_active=2)
+    assert created is False
+    # `id == 0` is the "no room" signal: nothing was persisted, as opposed to a
+    # duplicate key where the existing row comes back.
+    assert third.id == 0
+    assert store.get_autofix_job(third.job_key) is None
+    assert store.count_active_autofix_jobs(owner="acme", repo="app") == 2
+
+
+def test_room_frees_up_when_a_job_finishes(store: IndexStore) -> None:
+    store.enqueue_autofix_job(_job(finding="f1", head="a"), max_active=1)
+    _blocked, created = store.enqueue_autofix_job(_job(finding="f2", head="a"), max_active=1)
+    assert created is False
+    store.update_autofix_job(_job(finding="f1", head="a").job_key, state="opened")
+    stored, created = store.enqueue_autofix_job(_job(finding="f2", head="a"), max_active=1)
+    assert created and stored.id
+
+
+def test_a_duplicate_key_still_returns_the_existing_row_under_a_ceiling(
+    store: IndexStore,
+) -> None:
+    """ "Already queued" and "no room" are different answers to the same call."""
+    store.enqueue_autofix_job(_job(finding="f1", head="a"), max_active=5)
+    stored, created = store.enqueue_autofix_job(_job(finding="f1", head="a"), max_active=5)
+    assert created is False
+    assert stored.id and stored.job_key == _job(finding="f1", head="a").job_key
+
+
+def test_zero_means_no_ceiling(store: IndexStore) -> None:
+    for index in range(4):
+        _stored, created = store.enqueue_autofix_job(_job(finding=f"f{index}", head="a"))
+        assert created
+    assert store.count_active_autofix_jobs(owner="acme", repo="app") == 4
+
+
 def test_a_ci_retry_grants_the_attempt_it_needs(store: IndexStore) -> None:
     """Requeuing without raising the ceiling would strand the job forever."""
     store.enqueue_autofix_job(_job(max_attempts=1))
@@ -355,6 +402,18 @@ def test_the_queue_behaves_identically_on_both_backends(
 
     _again, created_again = handle.enqueue_autofix_job(_job(max_attempts=2))
     assert created_again is False
+
+    # The conditional insert is hand-written SQL that differs per backend, so
+    # it is exercised on both rather than only on the one the tests default to.
+    blocked, created_blocked = handle.enqueue_autofix_job(
+        _job(finding="ceiling", max_attempts=2), max_active=1
+    )
+    assert created_blocked is False and blocked.id == 0
+    admitted, created_admitted = handle.enqueue_autofix_job(
+        _job(finding="ceiling", max_attempts=2), max_active=5
+    )
+    assert created_admitted is True and admitted.id
+    handle.update_autofix_job(admitted.job_key, state="opened")
 
     leased = handle.claim_autofix_job(worker="w1", lease_seconds=60)
     assert leased is not None and leased.lease_owner == "w1" and leased.attempts == 1

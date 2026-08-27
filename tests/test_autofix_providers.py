@@ -117,7 +117,7 @@ def test_each_provider_declares_what_it_can_write() -> None:
         assert capabilities.can_merge is False
 
     assert any("Developer" in note for note in gitlab.notes)
-    assert any("one file per call" in note for note in forgejo.notes)
+    assert any("one commit" in note for note in forgejo.notes)
 
 
 def test_a_provider_that_declares_nothing_gets_nothing() -> None:
@@ -357,6 +357,8 @@ async def test_gitlab_commits_with_the_right_verb_per_file() -> None:
 
     def handler(method, url, **kw):
         calls.append((method, url, kw.get("json") or {}))
+        if "/repository/branches/" in url:
+            return _FakeResp(status=200, json_data={"commit": {"id": "tip123"}})
         if "/repository/files/" in url:
             # `a.py` exists on the branch; `new.py` does not.
             return _FakeResp(status=200 if "a.py" in url else 404, json_data={})
@@ -372,6 +374,23 @@ async def test_gitlab_commits_with_the_right_verb_per_file() -> None:
         "a.py": "update",
         "new.py": "create",
     }
+
+
+async def test_gitlab_binds_the_commit_to_the_branch_tip_it_read() -> None:
+    """Without `last_commit_id` a whole-file write silently eats a racing push."""
+    calls: list[tuple[str, str, dict]] = []
+
+    def handler(method, url, **kw):
+        calls.append((method, url, kw.get("json") or {}))
+        if "/repository/branches/" in url:
+            return _FakeResp(status=200, json_data={"commit": {"id": "tip123"}})
+        if "/repository/files/" in url:
+            return _FakeResp(status=200, json_data={})
+        return _FakeResp(status=201, json_data={"id": "newsha"})
+
+    with _patch_gitlab(handler):
+        await _gitlab().commit_files(_pr("gitlab"), "b", {"a.py": "x"}, "fix: guard")
+    assert calls[-1][2]["last_commit_id"] == "tip123"
 
 
 async def test_gitlab_opens_a_merge_request() -> None:
@@ -487,10 +506,44 @@ async def test_forgejo_commits_each_file_with_its_previous_blob_sha() -> None:
     with _patch_forgejo(handler):
         sha = await _forgejo().commit_files(_pr("forgejo"), "b", {"a.py": "new"}, "fix: guard")
     assert sha == "newsha"
-    writes = [call for call in calls if call[0] in ("PUT", "POST")]
-    assert writes[0][0] == "PUT"
-    assert writes[0][2]["sha"] == "blob1"
-    assert base64.b64decode(writes[0][2]["content"]).decode() == "new"
+    writes = [call for call in calls if call[0] == "POST"]
+    assert len(writes) == 1
+    entry = writes[0][2]["files"][0]
+    assert entry["operation"] == "update"
+    assert entry["sha"] == "blob1"
+    assert base64.b64decode(entry["content"]).decode() == "new"
+
+
+async def test_forgejo_publishes_a_multi_file_patch_as_one_commit() -> None:
+    """A validated patch is one unit; a sequence of per-file commits is not.
+
+    Committing file by file means a call that fails halfway leaves the earlier
+    files on the branch in a state nothing ever validated -- and in `pr_branch`
+    mode that branch belongs to a contributor.
+    """
+    calls: list[tuple[str, str, dict]] = []
+
+    def handler(method, url, **kw):
+        calls.append((method, url, kw.get("json") or {}))
+        if method == "GET":
+            return _FakeResp(status=404, json_data={})
+        return _FakeResp(status=201, json_data={"commit": {"sha": "newsha"}})
+
+    with _patch_forgejo(handler):
+        sha = await _forgejo().commit_files(
+            _pr("forgejo"), "b", {"a.py": "x", "b.py": "y", "c.py": "z"}, "fix: guard"
+        )
+    assert sha == "newsha"
+    writes = [call for call in calls if call[0] == "POST"]
+    assert len(writes) == 1
+    assert [entry["path"] for entry in writes[0][2]["files"]] == ["a.py", "b.py", "c.py"]
+    assert {entry["operation"] for entry in writes[0][2]["files"]} == {"create"}
+
+
+async def test_forgejo_will_not_call_an_unreadable_file_a_match() -> None:
+    """`_file_sha` answers ("", "") for both "absent" and "the read failed"."""
+    with _patch_forgejo(lambda *a, **k: _FakeResp(status=404, json_data={})):
+        assert await _forgejo().files_match(_pr("forgejo"), "b", {"a.py": ""}) is False
 
 
 async def test_forgejo_creates_a_file_that_does_not_exist_yet() -> None:

@@ -133,6 +133,7 @@ class ReasonCode:
     VALIDATION_FAILED = "validation_failed"
     VALIDATION_ERROR = "validation_error"
     VALIDATION_TIMEOUT = "validation_timeout"
+    VALIDATION_NOT_RUN = "validation_not_run"
     COMMAND_NOT_ALLOWED = "command_not_allowed"
     SYNTAX_BROKEN = "syntax_broken"
 
@@ -141,6 +142,7 @@ class ReasonCode:
     FORK_HEAD_REFUSED = "fork_head_refused"
     PUBLISH_FAILED = "publish_failed"
     BRANCH_CONFLICT = "branch_conflict"
+    STATE_UNREADABLE = "state_unreadable"
 
     # Outcomes.
     PATCH_READY = "patch_ready"
@@ -176,6 +178,7 @@ NON_RETRYABLE_CODES: frozenset[str] = frozenset(
         ReasonCode.DEFAULT_BRANCH_REFUSED,
         ReasonCode.FORK_HEAD_REFUSED,
         ReasonCode.COMMAND_NOT_ALLOWED,
+        ReasonCode.VALIDATION_NOT_RUN,
         ReasonCode.CANCELLED_BY_ADMIN,
         ReasonCode.CI_RETRY_LIMIT,
     }
@@ -317,7 +320,16 @@ class ValidationResult:
 
     @property
     def ok(self) -> bool:
-        return not any(check.blocking for check in self.checks)
+        """Whether the patch may be published on this evidence.
+
+        ``executed`` is part of the answer, not a label beside it. An install
+        with the syntax check off and no commands configured produces an empty
+        check list, and "nothing objected" is not the same claim as "something
+        looked". Publishing on the first would mean writing a model's output to
+        a repository having verified nothing about it, which is the one thing
+        the validation phase exists to prevent.
+        """
+        return self.executed and not any(check.blocking for check in self.checks)
 
     @property
     def failures(self) -> list[CheckResult]:

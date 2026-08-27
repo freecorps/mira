@@ -135,8 +135,9 @@ FORGEJO_CAPABILITIES = AutofixCapabilities(
     can_find_pull_request=True,
     can_read_ci=True,
     notes=(
-        "Forgejo's contents API commits one file per call, so a multi-file "
-        "patch lands as several commits on the fix branch.",
+        "Forgejo commits through the batch contents endpoint, so a multi-file "
+        "patch is one commit. Forgejo older than 1.20 does not have it and "
+        "refuses the request before writing anything.",
     ),
 )
 

@@ -8,6 +8,8 @@ pipeline.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -136,6 +138,45 @@ def test_creating_a_file_is_refused_by_default() -> None:
             changed={"src/new.py"},
         )
     assert caught.value.reason.code == ReasonCode.NEW_FILE_REFUSED
+
+
+def test_allowing_new_files_actually_creates_one() -> None:
+    """The option has to be able to succeed, or it is a setting that does nothing.
+
+    A path with no entry in `sources` has empty content, so there is nothing an
+    edit could quote — an empty `find` is the only way to express "this file is
+    new", and it is accepted only for a path that is genuinely absent.
+    """
+    policy = _policy(allow_new_files=True)
+    patch = apply_patch(
+        [FileEdit(path="src/new.py", find="", replace="value = 1\n")],
+        sources={},
+        policy=policy,
+        changed_paths={"src/new.py"},
+    )
+    assert patch.files == {"src/new.py": "value = 1\n"}
+    assert "/dev/null" in patch.diff
+
+
+def test_an_empty_quote_against_an_existing_file_is_still_refused() -> None:
+    """ "Replace nothing" is not an edit anybody meant to make."""
+    with pytest.raises(PatchRefused) as caught:
+        _apply([_edit(find="", replace="x")])
+    assert caught.value.reason.code == ReasonCode.PATCH_INVALID
+
+
+def test_a_second_edit_to_a_file_this_patch_created_needs_an_exact_quote() -> None:
+    policy = _policy(allow_new_files=True)
+    patch = apply_patch(
+        [
+            FileEdit(path="src/new.py", find="", replace="value = 1\n"),
+            FileEdit(path="src/new.py", find="value = 1", replace="value = 2"),
+        ],
+        sources={},
+        policy=policy,
+        changed_paths={"src/new.py"},
+    )
+    assert patch.files == {"src/new.py": "value = 2\n"}
 
 
 # ── applying ─────────────────────────────────────────────────────────────────
@@ -470,6 +511,38 @@ async def test_a_command_that_hangs_is_killed_and_blocks() -> None:
     assert result.failures[0].outcome == "timeout"
 
 
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="POSIX process groups only")
+async def test_a_timeout_kills_the_children_the_command_started(tmp_path: Path) -> None:
+    """`subprocess.run` kills the child it launched. A validator forks workers.
+
+    `os.setsid()` puts the command in its own session so one `killpg` reaches
+    every descendant; without it a formatter's worker pool outlives the check
+    that was supposed to bound it, holding the scratch directory and the CPU.
+    """
+    marker = tmp_path / "child-still-running"
+    # A parent that spawns a detached grandchild, then sleeps past the timeout.
+    # The grandchild writes the marker only if it is still alive afterwards.
+    grandchild = (
+        f"import time,sys,pathlib;time.sleep(4);pathlib.Path({str(marker)!r}).write_text('alive')"
+    )
+    parent = (
+        "import subprocess,sys,time;"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]);"
+        "time.sleep(30)"
+    )
+    policy = _policy(
+        validation=AutofixValidationConfig(
+            commands=[{"name": "forks", "command": [sys.executable, "-c", parent]}],
+            command_timeout_seconds=1.0,
+            total_timeout_seconds=8.0,
+        )
+    )
+    result = await validate(FixPatch(files={"a.py": "x = 1\n"}), policy)
+    assert result.failures[0].outcome == "timeout"
+    await asyncio.sleep(5)
+    assert not marker.exists(), "a grandchild survived the timeout"
+
+
 async def test_a_missing_binary_blocks_rather_than_silently_passing() -> None:
     policy = _policy(
         validation=AutofixValidationConfig(
@@ -515,11 +588,29 @@ def test_a_check_that_could_not_run_never_reads_as_a_pass() -> None:
     assert CheckResult(name="c", outcome="passed").blocking is False
 
 
-def test_no_checks_at_all_is_recorded_as_not_executed() -> None:
-    """ "Nothing ran" and "everything passed" must not be the same value."""
+async def test_validation_that_ran_nothing_is_not_evidence() -> None:
+    """Turning every check off must refuse, not publish on an empty check list."""
+    policy = _policy(validation=AutofixValidationConfig(syntax_check=False, commands=[]))
+    result = await validate(FixPatch(files={"a.py": "x = 1\n"}), policy)
+    # The secrets check still runs — it always does — but it answers "would
+    # this commit a credential", not "is this patch sound", so it is not the
+    # evidence publication needs.
+    assert [check.name for check in result.checks] == ["secrets"]
+    assert result.executed is False
+    assert result.ok is False
+
+
+def test_no_checks_at_all_is_not_a_pass() -> None:
+    """ "Nothing ran" and "everything passed" must not be the same value.
+
+    They used to be: `ok` read the check list, an empty list had nothing
+    blocking in it, and an install with the syntax check off and no commands
+    configured published a model's output having verified nothing about it.
+    """
     empty = ValidationResult()
-    assert empty.ok is True
     assert empty.executed is False
+    assert empty.ok is False
+    assert ValidationResult(executed=True).ok is True
 
 
 def test_a_malformed_command_allowlist_fails_at_config_load() -> None:

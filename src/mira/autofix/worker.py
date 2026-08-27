@@ -241,11 +241,26 @@ class AutofixWorker:
             store.release_autofix_lease(job.job_key, worker=self._identity)
             return
 
-        running = asyncio.create_task(run_job(provider, job, config=config, store=store))
+        # No `config=`: pinning one would freeze the policy for the whole run,
+        # and a run is long enough for the kill switch to be thrown inside it.
+        # `run_job` loads its own and re-reads it immediately before writing.
+        running = asyncio.create_task(run_job(provider, job, store=store))
         heartbeat = asyncio.create_task(self._heartbeat(job, store, policy.lease_seconds, running))
         try:
             await running
         except asyncio.CancelledError:
+            # Two different things arrive here, and only one of them is ours.
+            #
+            # Awaiting a task means a cancellation aimed at *this* coroutine —
+            # a shutdown, a `TaskGroup` unwinding — is delivered here too, after
+            # being forwarded to `running`. Swallowing that would turn "stop the
+            # worker" into "one more successful poll", and the loop would carry
+            # on. `cancelling()` is how asyncio distinguishes the two: it counts
+            # cancellations requested on the current task, and the heartbeat
+            # requested none.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
             # The heartbeat stopped it: an admin cancelled, or another worker
             # took the lease. Either way this process no longer owns the job,
             # and `run_job` re-reads the row before it writes anything, so the

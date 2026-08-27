@@ -42,10 +42,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
+import signal
 import subprocess  # noqa: S404 - argv-only, no shell; see module docstring
 import sys
 import tempfile
@@ -101,6 +103,38 @@ def _rlimit_preexec(policy_memory_mb: int, cpu_seconds: int) -> Any:
         os.setsid()
 
     return _apply
+
+
+# Seconds allowed for a killed command's pipes to close before the check gives
+# up waiting for it. Short on purpose: the process has already had SIGKILL.
+_REAP_SECONDS = 5.0
+
+
+def _kill_group(process: subprocess.Popen, *, grouped: bool) -> None:
+    """Kill the command and everything it started.
+
+    ``os.setsid()`` in the preexec hook put the command in its own session, so
+    its pid is also its process-group id and one ``killpg`` reaches every
+    descendant. Without that hook — Windows, or a platform with no ``resource``
+    module — only the direct child can be reached, which is why the hook and
+    this function are described together rather than apart.
+    """
+    if grouped and hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            logger.debug("Could not kill the process group for pid %s: %s", process.pid, exc)
+    if sys.platform == "win32":  # pragma: no cover - Windows only
+        with contextlib.suppress(Exception):
+            subprocess.run(  # noqa: S603, S607 - fixed argv, no shell
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                check=False,
+                timeout=_REAP_SECONDS,
+            )
+    with contextlib.suppress(Exception):
+        process.kill()
 
 
 # ── Static checks ───────────────────────────────────────────────────────────
@@ -301,24 +335,20 @@ def _run_one(
     elif sys.platform == "win32":  # pragma: no cover - Windows only
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
+    # `Popen` rather than `run`, because a timeout has to kill the process
+    # *group* and `run` only kills the child it started. A formatter that
+    # forked workers would otherwise leave them behind holding the scratch
+    # directory open and burning the CPU this check was supposed to bound.
     try:
-        completed = subprocess.run(  # noqa: S603 - argv from config, shell=False
+        process = subprocess.Popen(  # noqa: S603 - argv from config, shell=False
             expanded,
             cwd=str(workspace),
             env=_child_env(),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             shell=False,
-            check=False,
             **kwargs,
-        )
-    except subprocess.TimeoutExpired:
-        return CheckResult(
-            name=name,
-            outcome="timeout",
-            detail=f"{name} did not finish within {timeout:g}s{note}",
-            duration_seconds=time.monotonic() - started,
         )
     except OSError as exc:
         return CheckResult(
@@ -327,6 +357,32 @@ def _run_one(
             detail=f"{name} could not be started: {exc}",
             duration_seconds=time.monotonic() - started,
         )
+
+    grouped = preexec is not None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(process, grouped=grouped)
+        # Reap it, so the pipes close and no zombie outlives the check. The
+        # output is deliberately discarded: a killed command proved nothing,
+        # and its half-written stderr is not evidence of anything either.
+        with contextlib.suppress(Exception):
+            process.communicate(timeout=_REAP_SECONDS)
+        return CheckResult(
+            name=name,
+            outcome="timeout",
+            detail=f"{name} did not finish within {timeout:g}s{note}",
+            duration_seconds=time.monotonic() - started,
+        )
+    except OSError as exc:
+        _kill_group(process, grouped=grouped)
+        return CheckResult(
+            name=name,
+            outcome="error",
+            detail=f"{name} could not be run: {exc}",
+            duration_seconds=time.monotonic() - started,
+        )
+    completed = subprocess.CompletedProcess(expanded, process.returncode, stdout, stderr)
 
     # Output is untrusted data: it goes through redaction on the way into an
     # audit record and, later, into a model prompt.
@@ -407,5 +463,10 @@ async def validate(patch: FixPatch, policy: EffectivePolicy) -> ValidationResult
             ]
         checks.extend(command_results)
 
+    # `secret_check` is deliberately not counted. It always runs and it always
+    # will, but it answers "would this commit a credential" — not "is this
+    # patch sound". An install with the syntax check off and no commands has
+    # nothing that looked at the change itself, and `ValidationResult.ok` is
+    # what turns that into a refusal rather than a publication.
     executed = bool(policy.validation.commands) or policy.validation.syntax_check
     return ValidationResult(checks=checks, executed=executed)

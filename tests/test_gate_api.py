@@ -32,6 +32,24 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
 
+def _section_writer(stored: dict):
+    """Stand-in for `AppDatabase.update_global_review_overrides_section`.
+
+    The real one replaces a section in one statement so two panels saving at
+    once cannot carry each other's old section back; the stub only has to have
+    the same observable effect.
+    """
+
+    def _update(section: str, value: dict | None) -> dict:
+        if value is None:
+            stored.pop(section, None)
+        else:
+            stored[section] = value
+        return dict(stored)
+
+    return _update
+
+
 def _request(username: str = "admin", is_admin: bool = True) -> SimpleNamespace:
     user = SimpleNamespace(id=1, username=username, is_admin=is_admin)
     return SimpleNamespace(state=SimpleNamespace(user=user))
@@ -76,6 +94,7 @@ def known_repo(monkeypatch: pytest.MonkeyPatch) -> None:
         get_repo_any_platform=lambda owner, repo: [SimpleNamespace(platform="github")],
         get_global_review_overrides=dict,
         set_global_review_overrides=lambda overrides: None,
+        update_global_review_overrides_section=lambda section, value: {},
     )
     import mira.dashboard.api as api
 
@@ -293,6 +312,7 @@ def test_a_policy_edit_is_validated_before_it_is_stored(monkeypatch) -> None:
     registry = SimpleNamespace(
         get_global_review_overrides=lambda: {"review": {"walkthrough": False}},
         set_global_review_overrides=lambda overrides: written.update(overrides),
+        update_global_review_overrides_section=_section_writer(written),
     )
     import mira.dashboard.api as api
 
@@ -307,10 +327,10 @@ def test_a_policy_edit_is_validated_before_it_is_stored(monkeypatch) -> None:
 
 
 def test_a_policy_edit_leaves_the_other_sections_alone(monkeypatch) -> None:
-    written: dict = {}
+    written: dict = {"review": {"walkthrough": False}}
     registry = SimpleNamespace(
-        get_global_review_overrides=lambda: {"review": {"walkthrough": False}},
-        set_global_review_overrides=lambda overrides: written.update(overrides),
+        get_global_review_overrides=lambda: dict(written),
+        update_global_review_overrides_section=_section_writer(written),
     )
     import mira.dashboard.api as api
 
@@ -329,6 +349,7 @@ def test_an_unreadable_protected_path_pattern_fails_the_edit(monkeypatch) -> Non
     registry = SimpleNamespace(
         get_global_review_overrides=dict,
         set_global_review_overrides=lambda overrides: None,
+        update_global_review_overrides_section=lambda section, value: {},
     )
     import mira.dashboard.api as api
 
@@ -414,13 +435,16 @@ def test_a_policy_edit_preserves_gate_keys_the_caller_resent(monkeypatch) -> Non
     values. This asserts the server half: everything sent is stored, and only
     the `gate` section is touched.
     """
-    written: dict = {}
+    # One dict standing in for the stored blob: the route replaces its `gate`
+    # key without reading the rest, so the rest has to already be in there for
+    # "only the gate section moved" to mean anything.
+    written: dict = {
+        "review": {"walkthrough": False},
+        "gate": {"mode": "shadow", "repositories": {"acme/app": {"mode": "off"}}},
+    }
     registry = SimpleNamespace(
-        get_global_review_overrides=lambda: {
-            "review": {"walkthrough": False},
-            "gate": {"mode": "shadow", "repositories": {"acme/app": {"mode": "off"}}},
-        },
-        set_global_review_overrides=lambda overrides: written.update(overrides),
+        get_global_review_overrides=lambda: dict(written),
+        update_global_review_overrides_section=_section_writer(written),
     )
     import mira.dashboard.api as api
 
@@ -444,10 +468,10 @@ def test_a_policy_edit_preserves_gate_keys_the_caller_resent(monkeypatch) -> Non
 
 
 def test_an_empty_gate_edit_clears_the_section(monkeypatch) -> None:
-    written: dict = {}
+    written: dict = {"gate": {"mode": "enforce"}, "filter": {}}
     registry = SimpleNamespace(
-        get_global_review_overrides=lambda: {"gate": {"mode": "enforce"}, "filter": {}},
-        set_global_review_overrides=lambda overrides: written.update(overrides),
+        get_global_review_overrides=lambda: dict(written),
+        update_global_review_overrides_section=_section_writer(written),
     )
     import mira.dashboard.api as api
 

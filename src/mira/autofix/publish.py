@@ -424,9 +424,16 @@ async def _find_open_pr(
         return None
     try:
         found = await provider.find_open_pull_request(pr_info, branch)
-    except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
-        logger.warning("Could not look for an existing pull request from %s: %s", branch, exc)
-        return None
+    except Exception as exc:  # noqa: BLE001
+        # A lookup that failed is not evidence that no pull request exists, and
+        # by this point the branch and the commit are already on the platform.
+        # Opening one anyway is how a retry turns one fix into two open pull
+        # requests, so the attempt fails here and comes back to the same
+        # branch — where the answer will be the existing pull request.
+        raise _refuse(
+            ReasonCode.PUBLISH_FAILED,
+            f"Could not check whether a pull request from {branch} already exists: {exc}",
+        ) from exc
     if not found:
         return None
     number, url = found
