@@ -594,9 +594,12 @@ function RunHistory() {
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
                         {run.counts.violation ?? 0} found ·{" "}
-                        {(run.counts.infrastructure_error ?? 0) +
-                          (run.counts.timeout ?? 0)}{" "}
-                        unanswered · {run.counts.pass ?? 0} passed
+                        {/* The persisted `incomplete` count, not a sum of
+                            states: an unanswered skip — a missing linter, a
+                            CI run still in flight — keeps a blocking gate
+                            closed and would be invisible here otherwise. */}
+                        {run.counts.incomplete ?? 0} unanswered ·{" "}
+                        {run.counts.pass ?? 0} passed
                       </TableCell>
                       <TableCell className="text-right text-xs tabular-nums">
                         {formatDuration(run.duration_seconds)}

@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from mira.autofix.persistence import AutofixStoreMixin
@@ -2841,8 +2842,30 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
 
     def _checks_exec(self, sql: str, params: tuple = ()) -> int:
         cursor = self._conn.execute(sql, params)
-        self._conn.commit()
+        if not self._checks_in_transaction:
+            self._conn.commit()
         return int(cursor.rowcount or 0)
+
+    # Set while `_checks_atomic` is open, so the writes inside it commit
+    # together. A gate reading a run mid-write would otherwise compute a
+    # verdict from whichever of its results had landed.
+    _checks_in_transaction = False
+
+    @contextmanager
+    def _checks_atomic(self):  # type: ignore[no-untyped-def]
+        if self._checks_in_transaction:  # pragma: no cover - not nested today
+            yield
+            return
+        self._checks_in_transaction = True
+        try:
+            yield
+        except Exception:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+        finally:
+            self._checks_in_transaction = False
 
     def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
         """Persist rule exposures idempotently; return how many were new.

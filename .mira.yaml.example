@@ -215,6 +215,13 @@ checks:
     # Extra shapes for project-specific keys. Compiled at config load.
     # reference_patterns: ["(?P<key>ACME-\d+)"]
     exempt_labels: ["no-ticket", "chore", "dependencies"]
+    # A reference names a repository, and a reference is text a contributor
+    # wrote. Following one outside this pull request's own repository means
+    # Mira asking its privileged token about a repository somebody else chose,
+    # which can confirm a private issue exists and quote its title back. Off,
+    # and the allowlist is the deliberate opt-in.
+    allow_cross_repository: false
+    # cross_repository_allowlist: ["acme/tracker"]
 
   # What CI said, quoted rather than paraphrased. Every limit here is a
   # security control: a CI log is written by whoever can open a pull request.

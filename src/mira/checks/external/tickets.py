@@ -234,6 +234,51 @@ class TicketAdapter(Protocol):
         ...
 
 
+class CrossRepositoryRefused(Exception):
+    """The reference names a repository this deployment will not follow.
+
+    Deliberately *not* a :class:`TicketLookupError`. That one means "nobody
+    could ask", which is an infrastructure error; this means "Mira declined to
+    ask", which is a policy decision and says nothing about whether the tracker
+    is reachable. Reporting the second as the first would put an operator's own
+    setting in the column that tracks outages.
+    """
+
+
+def permitted_repository(ref: TicketRef, pr_info: Any, settings: Any) -> bool:
+    """Whether a platform reference may be resolved with Mira's own token.
+
+    A reference is text a contributor wrote, and both ``owner/repo#1`` and an
+    issue URL name a repository. Following one means Mira asking its privileged
+    installation token about a repository the *contributor* chose — which can
+    confirm that an issue exists in a private repository the token happens to
+    reach, and put its title in evidence on a pull request the contributor can
+    read. So the pull request's own repository is the default answer, and
+    anything else has to be a decision the deployment made.
+
+    Applies to issue URLs for the same reason and by the same rule. Matching a
+    URL's *hostname* against the provider would be the obvious guard and is a
+    worse one: the web host and the API host differ on github.com, self-hosted
+    instances are reachable under several names, and an attacker only has to
+    find one spelling that matches. Comparing the repository the URL names is
+    the same question with a reliable answer.
+    """
+    if not ref.owner and not ref.repo:
+        return True
+    owner = str(getattr(pr_info, "owner", "") or "").lower()
+    repo = str(getattr(pr_info, "repo", "") or "").lower()
+    if (ref.owner.lower(), ref.repo.lower()) == (owner, repo):
+        return True
+    if not getattr(settings, "allow_cross_repository", False):
+        return False
+    allowed = {
+        entry.strip().lower()
+        for entry in getattr(settings, "cross_repository_allowlist", []) or []
+        if entry.strip()
+    }
+    return f"{ref.owner}/{ref.repo}".lower() in allowed
+
+
 class PlatformTicketAdapter:
     """Asks the hosting platform Mira is already talking to.
 
@@ -241,6 +286,10 @@ class PlatformTicketAdapter:
     reads the pull request can usually read the issue next to it. It answers
     only for platform-shaped references — a Jira key has no meaning to GitHub,
     and pretending otherwise would turn every ``ACME-12`` into a missing issue.
+
+    And it answers only for repositories the deployment permits. The reference
+    is pull-request text; the credential is Mira's. Keeping those apart is
+    :func:`permitted_repository`'s job.
     """
 
     name = "auto"
@@ -254,6 +303,12 @@ class PlatformTicketAdapter:
         pr_info = getattr(ctx, "pr_info", None)
         if provider is None or pr_info is None:
             raise TicketLookupError("no provider is attached to this run")
+        settings = getattr(getattr(ctx, "policy", None), "ticket", None)
+        if not permitted_repository(ref, pr_info, settings):
+            raise CrossRepositoryRefused(
+                f"{ref.label} points outside this repository, and this deployment does "
+                "not follow cross-repository references"
+            )
         getter = getattr(provider, "get_issue", None)
         if getter is None:
             raise TicketLookupError("this provider cannot read issues")

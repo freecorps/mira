@@ -28,6 +28,8 @@ resolved once it is retried successfully rather than staying wrong forever.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from mira.checks.models import (
@@ -180,6 +182,16 @@ class ChecksStoreMixin:
     def _checks_exec(self, sql: str, params: tuple = ()) -> int:
         raise NotImplementedError  # pragma: no cover - backends implement this
 
+    @contextmanager
+    def _checks_atomic(self) -> Iterator[None]:
+        """Make everything written inside visible at once, or not at all.
+
+        Overridden by both backends. The default is a no-op so a store that has
+        not implemented it still works — less safely, but correctly enough to
+        read back what it wrote.
+        """
+        yield
+
     # ------------------------------------------------------------------ util
 
     def _cph(self, sql: str) -> str:
@@ -220,16 +232,21 @@ class ChecksStoreMixin:
         check instead of stacking a second set. ``attempts`` on the run row
         records that it happened more than once.
 
-        **Results are written before the run row, and that ordering is load
-        bearing.** Neither backend gives this method a transaction — each write
-        commits on its own — so a reader can arrive mid-write. A verdict is not
-        stored; it is computed from the results that are present. Writing the
-        run first would therefore expose a row whose results were still
-        arriving, and a gate reading it would compute a verdict from *some* of
-        the checks — quite possibly `pass`, from the half that happened to be
-        written. Writing the results first means a reader either finds no run
-        (which an active policy treats as incomplete, and refuses on) or finds
-        one with everything it needs.
+        **The whole write is one transaction, and the results go in before the
+        run row.** A verdict is not stored — it is computed from the results
+        that are present — so a reader arriving mid-write would compute one
+        from *some* of the checks, quite possibly `pass` from the half that
+        happened to be written. Both halves of the guard are needed and neither
+        is sufficient alone: the transaction stops a *retry* being read while
+        it rewrites rows the run already had, and the ordering means that on a
+        first write a reader finds no run at all rather than an empty one —
+        which an active policy treats as incomplete and refuses on.
+
+        Results that the newest attempt did not produce are deleted. That set
+        is normally empty, because the policy version is part of the run key
+        and the same policy yields the same check ids; it is not empty across a
+        Mira upgrade that removed a check, and a stale row left behind would go
+        on contributing to the verdict of a run that no longer contains it.
         """
         now = time.time()
         inputs = run.inputs
@@ -237,42 +254,44 @@ class ChecksStoreMixin:
         repo = self._checks_repo() or inputs.repo
         created_at = run.created_at or now
 
-        for result in run.results:
-            self._record_check_result(result, run=run, owner=owner, repo=repo)
+        with self._checks_atomic():
+            self._prune_check_results(run)
+            for result in run.results:
+                self._record_check_result(result, run=run, owner=owner, repo=repo)
 
-        self._checks_exec(
-            self._cph(
-                "INSERT INTO check_runs "
-                "(run_key, platform, owner, repo, pr_number, pr_url, pr_author, base_branch, "
-                "head_sha, review_id, policy_version, verdict, inputs_json, counts_json, "
-                "duration_seconds, error, attempts, created_at, updated_at) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?) "
-                "ON CONFLICT (run_key) DO UPDATE SET "
-                "verdict = EXCLUDED.verdict, counts_json = EXCLUDED.counts_json, "
-                "duration_seconds = EXCLUDED.duration_seconds, error = EXCLUDED.error, "
-                "attempts = check_runs.attempts + 1, updated_at = EXCLUDED.updated_at"
-            ),
-            (
-                run.run_key,
-                inputs.platform,
-                owner,
-                repo,
-                int(inputs.pr_number),
-                inputs.pr_url,
-                inputs.pr_author,
-                inputs.base_branch,
-                inputs.head_sha,
-                int(inputs.review_id),
-                run.policy_version,
-                run.verdict,
-                dumps(inputs.as_dict()),
-                dumps(run.counts()),
-                float(run.duration_seconds),
-                run.error,
-                created_at,
-                now,
-            ),
-        )
+            self._checks_exec(
+                self._cph(
+                    "INSERT INTO check_runs "
+                    "(run_key, platform, owner, repo, pr_number, pr_url, pr_author, "
+                    "base_branch, head_sha, review_id, policy_version, verdict, inputs_json, "
+                    "counts_json, duration_seconds, error, attempts, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?) "
+                    "ON CONFLICT (run_key) DO UPDATE SET "
+                    "verdict = EXCLUDED.verdict, counts_json = EXCLUDED.counts_json, "
+                    "duration_seconds = EXCLUDED.duration_seconds, error = EXCLUDED.error, "
+                    "attempts = check_runs.attempts + 1, updated_at = EXCLUDED.updated_at"
+                ),
+                (
+                    run.run_key,
+                    inputs.platform,
+                    owner,
+                    repo,
+                    int(inputs.pr_number),
+                    inputs.pr_url,
+                    inputs.pr_author,
+                    inputs.base_branch,
+                    inputs.head_sha,
+                    int(inputs.review_id),
+                    run.policy_version,
+                    run.verdict,
+                    dumps(inputs.as_dict()),
+                    dumps(run.counts()),
+                    float(run.duration_seconds),
+                    run.error,
+                    created_at,
+                    now,
+                ),
+            )
 
         stored = self.get_check_run(run.run_key)
         if stored is None:  # pragma: no cover - only a vanished row
@@ -286,6 +305,32 @@ class ChecksStoreMixin:
         # rowcount that both backends report differently for an upsert.
         created = self._check_run_attempts(run.run_key) <= 1
         return stored, created
+
+    def _prune_check_results(self, run: CheckRun) -> None:
+        """Remove result rows this attempt did not produce.
+
+        Normally a no-op: the policy version is part of the run key, and the
+        same policy yields the same check ids, so a retry writes the same set
+        of result keys. It stops being a no-op across a Mira upgrade that
+        removed a check — and a row left behind would keep contributing to the
+        verdict of a run that no longer contains it.
+        """
+        keys = [result.result_key for result in run.results if result.result_key]
+        clause, scope_params = self._checks_scope()
+        if not keys:
+            self._checks_exec(
+                self._cph(f"DELETE FROM check_results WHERE run_key = ?{clause}"),
+                (run.run_key, *scope_params),
+            )
+            return
+        placeholders = ", ".join("?" for _ in keys)
+        self._checks_exec(
+            self._cph(
+                "DELETE FROM check_results WHERE run_key = ? "
+                f"AND result_key NOT IN ({placeholders}){clause}"
+            ),
+            (run.run_key, *keys, *scope_params),
+        )
 
     def _backfill_result_run_ids(self, run_key: str, run_id: int) -> None:
         if not run_id:  # pragma: no cover - only a vanished row
