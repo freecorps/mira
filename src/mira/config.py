@@ -872,6 +872,56 @@ class AutofixConfig(BaseModel):
         return v
 
 
+class McpConfig(BaseModel):
+    """The read-only MCP surface: off by default, and empty when it is on.
+
+    Two fields carry this surface's security and neither has a permissive
+    default. `enabled` is the feature flag. `repositories` is the ceiling: an
+    MCP session can read the repositories named here and no others, and a
+    server that is enabled with an empty list answers every content request
+    with a refusal. Deny-by-default is the point — "the operator has not said
+    yet" and "the operator said everything" must not be the same state.
+
+    The list is read from the configuration the *server* was launched with,
+    never from a repository being read. A repository that could name itself
+    here would be granting itself access.
+    """
+
+    enabled: bool = False
+    # `[platform:]owner/repo`, platform defaulting to github. Validated on the
+    # way in so a typo is a startup error rather than a silent empty grant.
+    repositories: list[str] = Field(default_factory=list)
+    # Page ceiling. A client asking for more gets this many, not an error: the
+    # limit is Mira's to enforce and the client has no way to know it up front.
+    max_page_size: int = Field(default=50, ge=1, le=200)
+    # Per-field truncation for free text. A finding body is written by a model
+    # and a file summary by another; neither has a bounded length.
+    max_text_chars: int = Field(default=4_000, ge=200, le=100_000)
+    # Ceiling on one response, after framing. Reached only by a page of long
+    # bodies; the page is trimmed rather than the response truncated, so what
+    # comes back is always a whole answer to a smaller question.
+    max_response_bytes: int = Field(default=256 * 1024, ge=4_096, le=4 * 1024 * 1024)
+    # Every call is recorded. Switchable because an operator may already have
+    # the process's stderr going somewhere durable, not because it is optional
+    # in the sense of "usually off".
+    audit: bool = True
+
+    @field_validator("repositories")
+    @classmethod
+    def _validate_repositories(cls, value: list[str]) -> list[str]:
+        from mira.mcp.authz import InvalidRepository, parse_repository
+
+        seen: list[str] = []
+        for entry in value:
+            try:
+                repository = parse_repository(entry)
+            except InvalidRepository as exc:
+                raise ValueError(f"mcp.repositories: {exc}") from exc
+            if repository.key not in seen:
+                seen.append(repository.key)
+        return seen
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -883,6 +933,7 @@ class MiraConfig(BaseModel):
     gate: GateConfig = Field(default_factory=GateConfig)
     autofix: AutofixConfig = Field(default_factory=AutofixConfig)
     checks: ChecksConfig = Field(default_factory=ChecksConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
 
 def find_config_file(start_dir: Path | None = None) -> Path | None:

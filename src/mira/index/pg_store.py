@@ -15,6 +15,7 @@ from typing import Any
 
 from mira.autofix.persistence import AutofixStoreMixin
 from mira.checks.persistence import ChecksStoreMixin
+from mira.db.sqltext import like_prefix
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -1146,6 +1147,33 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
             (self._owner, self._repo),
         )
         return {r[0] for r in rows}
+
+    def list_indexed_files(
+        self, *, path_prefix: str = "", limit: int = 50, offset: int = 0
+    ) -> list[FileSummary]:
+        """A page of indexed files, by path. Scoped, because the table is shared."""
+        clauses = ""
+        params: list[object] = [self._owner, self._repo]
+        if path_prefix:
+            clauses = "AND path LIKE %s ESCAPE '\\' "
+            params.append(like_prefix(path_prefix))
+        rows = self._fetchall(
+            "SELECT path, language, summary, content_hash, loc, updated_at "
+            f"FROM files WHERE owner=%s AND repo=%s {clauses}"
+            "ORDER BY path LIMIT %s OFFSET %s",
+            (*params, max(1, int(limit)), max(0, int(offset))),
+        )
+        return [
+            FileSummary(
+                path=row[0],
+                language=row[1] or "",
+                summary=row[2] or "",
+                content_hash=row[3] or "",
+                loc=row[4] or 0,
+                updated_at=row[5] or 0.0,
+            )
+            for row in rows
+        ]
 
     # ── Directories ──
 

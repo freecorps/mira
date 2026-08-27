@@ -41,6 +41,10 @@ LABELS = (
     "CI",
     "REPLY",
     "COMMENT",
+    # Everything the read-only MCP server hands back. Its consumer is another
+    # model, reading data that came out of a repository, so the same line has
+    # to be drawn there.
+    "MCP",
 )
 
 
