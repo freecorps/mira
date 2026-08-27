@@ -219,6 +219,12 @@ Every path a model proposes goes through one function, and it is the only door:
 The last two are on by default because a fix that wanders into an untouched file
 is a change nobody asked for.
 
+When `allow_new_files` is on, a file is created by an edit with an **empty**
+`find` — there is nothing in a file that does not exist for the model to quote.
+An empty `find` on a file that *does* exist stays a refusal: it would mean
+"replace nothing", which is not an edit anybody meant to make. So does creating
+an empty file, and so does creating a protected path.
+
 ## How a patch is produced
 
 The model fills in a tool schema whose only shape is a list of
@@ -518,8 +524,21 @@ flips it during an incident means "no more writes", and a queue that drained
 itself afterwards would make that switch a suggestion.
 
 **Cancellation.** Admin, plus membership of `autofix.cancel_admins` when one is
-set. It reaches a running job the same way a crash does: the state changes and
-the lease is cleared, so the worker's next heartbeat fails and it stops.
+set. `cancelled` is **final**, and it is made final in three places at once
+because a heartbeat runs on a timer and a publish does not wait for one:
+
+1. The state changes and the lease is cleared, so the worker's next heartbeat
+   fails — and that heartbeat *cancels the running job* rather than merely
+   returning. A heartbeat that only stopped renewing would leave the work
+   running to completion.
+2. Every other write to a job row carries `AND state <> 'cancelled'`, so a
+   worker that was already generating cannot record its progress over the
+   cancellation. This is in SQL rather than in the worker, because a
+   read-then-write in the worker cannot win that race and an update that
+   matches no row can.
+3. The job's own row is re-read immediately before the first platform write. It
+   is the last read before anything becomes irreversible, and it is what turns
+   "the worker will stop soon" into "nothing was written".
 
 It does **not** reach through to the platform. A job that already opened a pull
 request stays `opened` and its pull request stays open — closing somebody's pull
@@ -558,9 +577,17 @@ walks the registered repositories and polls each — the same walk the Phase 3
 analytics and the Phase 4 gate history already do.
 
 **What a poll costs when nothing is queued.** One indexed `SELECT` per
-repository, capped at 200 repositories per poll. The CI sweep runs at most every
-three minutes and only when there was no job to claim, so a busy queue never
-delays real work to go looking for something to retry.
+repository, over a window of at most 200 repositories. The window **rotates**:
+a fixed prefix would be a starvation bug rather than a cap, since an install
+with more repositories than that would poll the same slice forever and never
+claim a job in any of the others. The cap only decides how long a full cycle
+takes.
+
+The CI sweep runs at most every three minutes *per queue* — one clock for the
+worker would let whichever repository is polled first spend the whole interval,
+and the poll order is stable, so the same repositories would never be swept. It
+also runs only where there was no job to claim, so a busy queue never delays
+real work to go looking for something to retry.
 
 **Concurrency.** One job at a time per worker, deliberately. Concurrency here
 would multiply model spend and platform writes on a machine that has one core,

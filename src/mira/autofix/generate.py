@@ -71,7 +71,9 @@ SUBMIT_FIX_TOOL = {
                                 "description": (
                                     "Verbatim copy of the code to replace, character for "
                                     "character including indentation. It must appear "
-                                    "exactly once in the file."
+                                    "exactly once in the file. Leave it empty ONLY to "
+                                    "create a file that does not exist yet, in which case "
+                                    "`replace` is the whole of its contents."
                                 ),
                             },
                             "replace": {

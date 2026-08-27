@@ -148,18 +148,31 @@ def check_path(
     return resolved
 
 
-def _apply_edit(content: str, edit: FileEdit) -> str:
+def _apply_edit(content: str, edit: FileEdit, *, exists: bool) -> str:
     """Replace exactly one occurrence of ``edit.find``, or refuse.
 
-    "Exactly one" is the contract. Zero means the model quoted code that is not
-    there. More than one means it quoted something ambiguous, and picking the
-    first would be a coin flip on which call site gets changed.
+    "Exactly one" is the contract for an edit to a file that is already there.
+    Zero means the model quoted code that is not there; more than one means it
+    quoted something ambiguous, and picking the first would be a coin flip on
+    which call site gets changed.
+
+    A file that does *not* exist has nothing to quote, so an empty ``find`` is
+    how a new file is written — and only then. An empty ``find`` on an existing
+    file is still a refusal: it would mean "replace nothing", which is not an
+    edit anybody meant to make.
     """
     if not edit.find:
-        raise _refuse(
-            ReasonCode.PATCH_INVALID,
-            f"An edit to {edit.path} quoted no existing code to replace",
-        )
+        if exists:
+            raise _refuse(
+                ReasonCode.PATCH_INVALID,
+                f"An edit to {edit.path} quoted no existing code to replace",
+            )
+        if not edit.replace:
+            raise _refuse(
+                ReasonCode.PATCH_EMPTY,
+                f"An edit would create {edit.path} with no content",
+            )
+        return edit.replace
     occurrences = content.count(edit.find)
     if occurrences == 0:
         raise _refuse(
@@ -275,6 +288,7 @@ def apply_patch(
             changed_paths=changed_paths,
             known=edit.path in sources or gate_paths.normalize(edit.path) in sources,
         )
+        known = resolved in sources or edit.path in sources
         original = sources.get(resolved, sources.get(edit.path, ""))
         if resolved not in before:
             before[resolved] = original
@@ -285,7 +299,12 @@ def apply_patch(
             replace=edit.replace,
             rationale=edit.rationale,
         )
-        after[resolved] = _apply_edit(after[resolved], normalised)
+        # A second edit to a path this patch just created is editing a file
+        # that exists as far as the patch is concerned, so it goes back to
+        # needing an exact quote.
+        after[resolved] = _apply_edit(
+            after[resolved], normalised, exists=known or bool(after[resolved])
+        )
         checked.append(normalised)
 
     changed = {path: content for path, content in after.items() if content != before.get(path, "")}

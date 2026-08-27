@@ -555,3 +555,32 @@ def test_the_gate_stores_a_gitlab_decision_the_same_way(pg_gitlab: PgIndexStore)
     assert pg_gitlab.get_gate_decision("d1") is not None
     _again, created_again = pg_gitlab.record_gate_decision(decision)
     assert created_again is False
+
+
+def test_cancelled_is_final_in_sql_not_by_convention(store: IndexStore) -> None:
+    """A worker that was already running will still try to record its progress,
+    and a read-then-write in the worker cannot win that race. An update that
+    matches no row can."""
+    store.enqueue_autofix_job(_job())
+    key = _job().job_key
+    store.claim_autofix_job(worker="w1", lease_seconds=600)
+    store.cancel_autofix_job(key, actor="root", reason="stop")
+
+    for state in ("validating", "publishing", "opened", "failed", "queued"):
+        store.update_autofix_job(key, state=state, branch_name="mira/fix/pr-7/abc")
+        assert store.get_autofix_job(key).state == "cancelled"
+    assert store.get_autofix_job(key).branch_name == ""
+
+    # Dead-lettering cannot overwrite it either.
+    store.dead_letter_autofix_job(key, reasons=[], error="gave up")
+    assert store.get_autofix_job(key).state == "cancelled"
+
+
+def test_a_ci_retry_still_moves_an_opened_job(store: IndexStore) -> None:
+    """The invariant is `cancelled`, not "terminal": a published fix whose CI
+    went red is deliberately moved back to the queue."""
+    store.enqueue_autofix_job(_job(max_attempts=1))
+    key = _job().job_key
+    store.update_autofix_job(key, state="opened")
+    store.update_autofix_job(key, state="queued", extra_attempts=1, available_at=0)
+    assert store.get_autofix_job(key).state == "queued"
