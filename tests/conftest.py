@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -125,3 +127,77 @@ def sample_walkthrough_result() -> WalkthroughResult:
             ),
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Real git repositories, for the local review surface (Phase 7A)
+# ---------------------------------------------------------------------------
+
+
+class GitRepo:
+    """A throwaway git repository a test can shape.
+
+    A real repository rather than a fake: the whole point of the local surface
+    is that git decides what a rename, a binary file and a submodule pointer
+    look like, and a hand-written fixture would be asserting on our idea of
+    git's output rather than on git's.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        result = subprocess.run(  # noqa: S603 - argv only, test-controlled
+            ["git", *args],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if check and result.returncode != 0:
+            raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
+        return result
+
+    def write(self, relative: str, content: str) -> Path:
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="\n")
+        return target
+
+    def write_bytes(self, relative: str, content: bytes) -> Path:
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        return target
+
+    def commit(self, message: str, *paths: str) -> str:
+        self.git("add", *(paths or ("-A",)))
+        self.git("commit", "-m", message)
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def status(self) -> str:
+        return self.git("status", "--porcelain=v1", "--untracked-files=all").stdout
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> GitRepo:
+    """An initialised repository with one commit and an `origin` remote."""
+    if shutil.which("git") is None:  # pragma: no cover - CI always has git
+        pytest.skip("git is not installed")
+    root = tmp_path / "repo"
+    root.mkdir()
+    repo = GitRepo(root)
+    repo.git("init", "-b", "main")
+    repo.git("config", "user.email", "dev@example.com")
+    repo.git("config", "user.name", "Dev")
+    repo.git("config", "commit.gpgsign", "false")
+    # Line endings are part of a diff. Leaving these to the host's git would
+    # make the same test assert on different bytes on Windows.
+    repo.git("config", "core.autocrlf", "false")
+    repo.git("config", "core.safecrlf", "false")
+    repo.git("remote", "add", "origin", "https://github.com/acme/widgets.git")
+    repo.write("README.md", "# widgets\n")
+    repo.write("src/app.py", "def start():\n    return 1\n")
+    repo.commit("initial commit")
+    return repo

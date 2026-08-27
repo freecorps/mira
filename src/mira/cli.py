@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -16,104 +17,25 @@ from mira.core.engine import ReviewEngine
 from mira.exceptions import MiraError
 from mira.llm import create_llm
 from mira.models import ReviewResult, Severity
+from mira.report import review_result_dict, review_result_text
 
 
 def _format_text(result: ReviewResult) -> str:
-    """Format review result as human-readable text."""
-    lines: list[str] = []
+    """Format review result as human-readable text.
 
-    if result.thread_decisions:
-        from mira.llm.prompts.verify_fixes import _extract_issue_description
-
-        lines.append("Thread resolution:")
-        for d in result.thread_decisions:
-            status = "RESOLVE" if d.fixed else "KEEP"
-            desc = _extract_issue_description(d.body)
-            if len(desc) > 80:
-                desc = desc[:77] + "..."
-            lines.append(f"  [{status}] {d.path}:{d.line} — {desc}")
-        fixed = sum(1 for d in result.thread_decisions if d.fixed)
-        lines.append(f"  {fixed}/{len(result.thread_decisions)} thread(s) would be resolved.")
-        lines.append("")
-
-    if result.walkthrough:
-        lines.append(result.walkthrough.to_markdown())
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
-    if result.summary:
-        lines.append(result.summary)
-        lines.append("")
-
-    if not result.comments:
-        lines.append("No issues found.")
-        return "\n".join(lines)
-
-    for i, c in enumerate(result.comments, 1):
-        lines.append(f"{i}. [{c.severity.name}] {c.path}:{c.line} — {c.title}")
-        lines.append(f"   {c.body}")
-        if c.suggestion:
-            lines.append(f"   Suggestion: {c.suggestion}")
-        lines.append("")
-
-    lines.append(f"Reviewed {result.reviewed_files} files, {len(result.comments)} comments.")
-    if result.token_usage:
-        lines.append(f"Tokens used: {result.token_usage.get('total_tokens', 0)}")
-
-    return "\n".join(lines)
+    Delegates to `mira.report`, which the local CLI renders with too.
+    """
+    return review_result_text(result)
 
 
 def _format_json(result: ReviewResult) -> str:
-    """Format review result as JSON."""
-    walkthrough_data = None
-    if result.walkthrough:
-        # Group file changes by their group label for JSON output
-        groups: dict[str, list[dict[str, str]]] = {}
-        for fc in result.walkthrough.file_changes:
-            label = fc.group or "Other"
-            groups.setdefault(label, []).append(
-                {
-                    "path": fc.path,
-                    "change_type": fc.change_type.value,
-                    "description": fc.description,
-                }
-            )
-        effort_data = None
-        if result.walkthrough.effort:
-            effort_data = {
-                "level": result.walkthrough.effort.level,
-                "label": result.walkthrough.effort.label,
-                "minutes": result.walkthrough.effort.minutes,
-            }
-        walkthrough_data = {
-            "summary": result.walkthrough.summary,
-            "change_groups": [{"label": label, "files": files} for label, files in groups.items()],
-            "effort": effort_data,
-            "sequence_diagram": result.walkthrough.sequence_diagram,
-        }
+    """Format review result as JSON.
 
-    data = {
-        "summary": result.summary,
-        "walkthrough": walkthrough_data,
-        "comments": [
-            {
-                "path": c.path,
-                "line": c.line,
-                "end_line": c.end_line,
-                "severity": c.severity.name.lower(),
-                "category": c.category,
-                "title": c.title,
-                "body": c.body,
-                "confidence": c.confidence,
-                "suggestion": c.suggestion,
-            }
-            for c in result.comments
-        ],
-        "reviewed_files": result.reviewed_files,
-        "token_usage": result.token_usage,
-    }
-    return json.dumps(data, indent=2)
+    Delegates to `mira.report`, which is also what the local CLI emits: two
+    formatters for one object would drift, and a CI job written against one
+    would misparse the other.
+    """
+    return json.dumps(review_result_dict(result), indent=2)
 
 
 @click.group()
@@ -616,3 +538,211 @@ def autofix_worker(
         asyncio.run(worker.run_forever())
     except KeyboardInterrupt:
         click.echo("Stopped.")
+
+
+@main.group("local")
+def local_group() -> None:
+    """Review a change in this checkout, without a pull request.
+
+    The same engine, configuration, retrieval and pre-merge checks the server
+    runs — reading the working tree, the index or a commit range instead of a
+    pull request. Read-only: nothing is staged, committed, posted or recorded.
+    """
+
+
+def _print_exit_codes(ctx: click.Context, _param: object, value: bool) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    from mira.local.output import exit_code_table
+
+    click.echo(exit_code_table())
+    ctx.exit(0)
+
+
+@local_group.command("review")
+@click.option(
+    "--path",
+    "repo_path",
+    default=".",
+    type=click.Path(file_okay=False),
+    help="Directory inside the repository to review. Defaults to the current one.",
+)
+@click.option(
+    "--staged",
+    "staged",
+    is_flag=True,
+    help="Review what is staged (the index) rather than the whole working tree.",
+)
+@click.option(
+    "--range",
+    "range_spec",
+    default=None,
+    metavar="<base>..<head>",
+    help=(
+        "Review a commit range. `a..b` compares the two commits; `a...b` compares "
+        "b against their merge base, which is what a pull request shows."
+    ),
+)
+@click.option(
+    "--include-untracked",
+    is_flag=True,
+    help=(
+        "Also review files git does not track yet. Off by default: an untracked "
+        "file has never been through a commit and may be anything."
+    ),
+)
+@click.option(
+    "--repo",
+    "stated_slug",
+    default=None,
+    metavar="OWNER/REPO",
+    help=(
+        "Name the repository explicitly, when the remote does not say. Decides "
+        "which index, learned rules and per-repository policy apply."
+    ),
+)
+@click.option(
+    "--platform",
+    "stated_platform",
+    type=click.Choice(["github", "gitlab", "forgejo"]),
+    default=None,
+    help="Platform for --repo, when the remote's host does not imply one.",
+)
+@click.option(
+    "--remote",
+    default=None,
+    help="Which git remote names this repository. Defaults to origin, then the first one.",
+)
+@click.option("--model", envvar="MIRA_MODEL", default=None, help="LLM model to use")
+@click.option("--max-comments", envvar="MIRA_MAX_COMMENTS", type=int, default=None)
+@click.option("--confidence", envvar="MIRA_CONFIDENCE_THRESHOLD", type=float, default=None)
+@click.option("--no-walkthrough", is_flag=True, help="Skip the walkthrough, saving one LLM call.")
+@click.option("--no-checks", is_flag=True, help="Skip the pre-merge checks for this run.")
+@click.option(
+    "--fail-on",
+    type=click.Choice(["blocker", "warning", "suggestion", "nitpick", "never"]),
+    default="blocker",
+    show_default=True,
+    help="Lowest severity that makes the command exit 1.",
+)
+@click.option(
+    "--fail-on-incomplete-checks",
+    is_flag=True,
+    help=(
+        "Also exit 1 when a blocking check could not answer. Off by default: "
+        "locally that usually means an analyser is not installed on this machine."
+    ),
+)
+@click.option("--output", "output_format", type=click.Choice(["text", "json"]), default="text")
+@click.option(
+    "--config",
+    "config_path",
+    envvar="MIRA_CONFIG",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Deployment-wide defaults, as `mira serve --config` takes them. The "
+        "repository's own .mira.yaml still deep-merges over these."
+    ),
+)
+@click.option(
+    "--explain-exit-codes",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_print_exit_codes,
+    help="Print the exit-code table and exit.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logging (on stderr)")
+def local_review(
+    repo_path: str,
+    staged: bool,
+    range_spec: str | None,
+    include_untracked: bool,
+    stated_slug: str | None,
+    stated_platform: str | None,
+    remote: str | None,
+    model: str | None,
+    max_comments: int | None,
+    confidence: float | None,
+    no_walkthrough: bool,
+    no_checks: bool,
+    fail_on: str,
+    fail_on_incomplete_checks: bool,
+    output_format: str,
+    config_path: str | None,
+    verbose: bool,
+) -> None:
+    """Review the working tree, the index, or a commit range."""
+    from mira.local import output as local_output
+    from mira.local import run as local_run
+    from mira.local.repo import MODE_RANGE, MODE_STAGED, MODE_WORKING_TREE
+
+    # A review body is model output and can contain any character. On a console
+    # whose encoding is not UTF-8 - the default on Windows - writing one raises
+    # UnicodeEncodeError, and a tool that crashes while printing its own report
+    # is worse than one that prints a substitution character. JSON output is
+    # unaffected either way: it is escaped to ASCII before it gets here.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):  # pragma: no cover
+                reconfigure(errors="replace")
+
+    # Logging goes to stderr, always. `--output json` writes one document to
+    # stdout and a caller pipes it into a parser; a log line in the middle of it
+    # would be a parse error that looks like a Mira bug.
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    if staged and range_spec:
+        raise click.UsageError("--staged and --range review different things; pick one.")
+    mode = MODE_RANGE if range_spec else (MODE_STAGED if staged else MODE_WORKING_TREE)
+    if include_untracked and mode != MODE_WORKING_TREE:
+        raise click.UsageError(
+            "--include-untracked only applies to a working-tree review: an "
+            "untracked file is neither staged nor in any commit."
+        )
+    if stated_platform and not stated_slug:
+        raise click.UsageError("--platform needs --repo, which is what it describes.")
+
+    overrides: dict[str, object] = {}
+    if model:
+        overrides["llm.model"] = model
+    if max_comments is not None:
+        overrides["filter.max_comments"] = max_comments
+    if confidence is not None:
+        overrides["filter.confidence_threshold"] = confidence
+    if no_walkthrough:
+        overrides["review.walkthrough"] = False
+
+    try:
+        review = local_run.prepare(
+            path=repo_path,
+            mode=mode,
+            range_spec=range_spec or "",
+            include_untracked=include_untracked,
+            deployment_config=config_path,
+            overrides=overrides,
+            remote=remote or "",
+            stated_slug=stated_slug or "",
+            stated_platform=stated_platform or "",
+        )
+        review.fail_on = fail_on
+        review.fail_on_incomplete_checks = fail_on_incomplete_checks
+        review = asyncio.run(local_run.execute(review, run_checks_too=not no_checks))
+    except local_run.LocalReviewError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(int(exc.code))
+    except KeyboardInterrupt:  # pragma: no cover - depends on a real signal
+        click.echo("Interrupted.", err=True)
+        sys.exit(int(local_run.ExitCode.INTERRUPTED))
+
+    if output_format == "json":
+        click.echo(local_output.to_json(review))
+    else:
+        click.echo(local_output.to_text(review))
+    sys.exit(int(review.exit_code()))

@@ -115,6 +115,20 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Idempotent runs: a redelivered webhook converges on one row, and a retry that succeeds replaces the error it recorded
 - Dashboard panel for runs, per-check history, coverage catalog, policy and a policy-change audit trail
 
+## Local review
+
+- `mira local review` reviews the working tree, the index (`--staged`) or a commit range (`--range main...HEAD`) without a pull request
+- The same engine, configuration, retrieval, pre-merge checks and output as the server — nothing about a finding is decided twice
+- Read-only by construction: a git allowlist that refuses every write subcommand, `--no-optional-locks` on every call, no platform client, and nothing recorded — no review row, no findings, no check run
+- Refuses to send the repository's code to any endpoint, credential, protocol or model vendor other than the one the repository is configured for, on all three tiers that see content; there is no flag to disable it
+- `.mira.yaml` is read from the repository root rather than by walking up from the current directory, so reviewing a sibling checkout applies that checkout's rules
+- Submodule pointers, binaries and filtered files are listed with the reason they were not reviewed; renames stay renames
+- Untracked files are opt-in (`--include-untracked`) and are turned into patches in memory, never through `git add --intent-to-add`
+- Documented exit codes for CI, where only `1` is a statement about the code, printable with `--explain-exit-codes`
+- Deterministic, ASCII-safe JSON (`--output json`) with a `schema_version`, sharing its finding shape with `mira review`
+- Needs no forge credentials and contacts no forge — it works offline
+- See [docs/local-cli.md](docs/local-cli.md)
+
 ## Platform integrations
 
 - GitHub App with webhook support — works against github.com and GitHub Enterprise Server (set `MIRA_GITHUB_API_URL`)
