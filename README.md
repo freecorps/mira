@@ -111,6 +111,24 @@ docker run -p 8000:8000 --env-file .env \
 
 → Full walkthrough: [creating the GitHub App & quickstart](https://docs.miracode.ai/quickstart) · [GitLab setup](https://docs.miracode.ai/gitlab) · [deploy options](https://docs.miracode.ai/deployment) · [choosing models, custom endpoints & AWS Bedrock](https://docs.miracode.ai/configuration/models)
 
+## Review before you push
+
+The same review, against a change that is not a pull request yet:
+
+```bash
+pip install mira-reviewer
+
+mira local review                      # everything uncommitted
+mira local review --staged             # what a commit would contain
+mira local review --range main...HEAD  # what a pull request would show
+```
+
+Read-only, needs no forge credentials, and refuses to send your code to any
+model endpoint other than the one your `.mira.yaml` configures. Exit codes are
+documented for CI (`--explain-exit-codes`) and `--output json` is stable.
+
+→ [docs/local-cli.md](docs/local-cli.md)
+
 ## Configuration
 
 `mira.yaml` (loaded via `--config`) holds deployment-wide defaults. Drop a `.mira.yaml` in any repo — or use the dashboard — to override per-repo; both deep-merge over `mira.yaml` for that repo only:

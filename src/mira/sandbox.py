@@ -151,6 +151,8 @@ def run_argv(
     cpu_seconds: int = 120,
     max_output_bytes: int = 200_000,
     env: dict[str, str] | None = None,
+    encoding: str | None = None,
+    errors: str | None = None,
 ) -> ProcessOutcome:
     """Run one command to completion or to its deadline. Never raises.
 
@@ -158,6 +160,13 @@ def run_argv(
     *group* and ``run`` only kills the child it started. A linter that forked
     workers would otherwise leave them behind holding the scratch directory
     open and burning the CPU this call was supposed to bound.
+
+    ``encoding`` and ``errors`` are passed through to the pipes. The default
+    locale decoding is fine for a linter that prints ASCII diagnostics, but a
+    caller reading repository *content* — a diff, a file listing — has to name
+    an encoding and a lenient error handler, because a Latin-1 source file
+    would otherwise raise ``UnicodeDecodeError`` out of ``communicate`` and
+    turn a readable diff into a crash this function promises never to raise.
     """
     import shutil
 
@@ -189,6 +198,8 @@ def run_argv(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding=encoding,
+            errors=errors,
             shell=False,
             **kwargs,
         )

@@ -1296,9 +1296,26 @@ class ReviewEngine:
         except Exception as exc:
             logger.warning("Merge gate failed for %s: %s", pr_info.url, exc)
 
-    async def review_diff(self, diff_text: str) -> ReviewResult:
-        """Review a diff from stdin — no provider needed."""
-        return await self._review_diff_internal(diff_text)
+    async def review_diff(
+        self, diff_text: str, *, repo_scope: PRInfo | None = None, title: str = ""
+    ) -> ReviewResult:
+        """Review a diff with no provider attached.
+
+        ``repo_scope`` names the repository the diff belongs to. Retrieval is
+        keyed by ``(platform, owner, repo)`` — indexed code context, learned
+        rules and the repository's review context all resolve against it — so a
+        caller that has a repository in hand passes it and gets the same
+        retrieval the server would have done. Without it the review still runs,
+        on the diff alone: that is the ``--stdin`` case, where a diff arrives
+        with no repository to name.
+
+        Nothing here is written back. The scope only opens the index for
+        reading; recording a review, its findings and its rule exposures
+        happens in :meth:`review_pr`, after a real pull request has been posted
+        to.
+        """
+        self._pr_info = repo_scope
+        return await self._review_diff_internal(diff_text, pr_title=title)
 
     async def _review_diff_internal(
         self,

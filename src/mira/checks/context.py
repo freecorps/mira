@@ -134,6 +134,12 @@ class CheckContext:
     # read-only helpers below; nothing in this package calls a write method.
     provider: Any = None
     pr_info: Any = None
+    # Where file bodies come from when there is no provider to ask. Set by the
+    # local CLI, which has the files on disk and would otherwise hand every
+    # check an empty string — and a linter shown an empty file reports nothing,
+    # which reads as a pass. Left None on the server, where the provider is the
+    # only source and "" correctly means "could not read it".
+    content_reader: Callable[[str], Awaitable[str]] | None = None
     # Factory returning an LLM client, or None when the deployment has none.
     # A factory rather than a client so a run that uses no language rule never
     # constructs one.
@@ -214,7 +220,7 @@ class CheckContext:
         cached = self._file_cache.get(path)
         if cached is not None:
             return await cached
-        if self.provider is None or self.pr_info is None:
+        if self.content_reader is None and (self.provider is None or self.pr_info is None):
             return ""
         if self._file_lock is None:
             self._file_lock = asyncio.Lock()
@@ -229,9 +235,12 @@ class CheckContext:
 
     async def _fetch_file(self, path: str) -> str:
         try:
-            content = await self.provider.get_file_content(
-                self.pr_info, path, self.head_sha or self.head_branch
-            )
+            if self.content_reader is not None:
+                content = await self.content_reader(path)
+            else:
+                content = await self.provider.get_file_content(
+                    self.pr_info, path, self.head_sha or self.head_branch
+                )
         except Exception as exc:  # noqa: BLE001 - unreadable is not fatal
             logger.debug("Check could not read %s at %s: %s", path, self.head_sha, exc)
             return ""

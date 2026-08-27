@@ -104,6 +104,80 @@ verify_checks() {
   docker run --rm     --platform linux/arm64     --volume "${data_dir}:/data"     --env MIRA_INDEX_DIR=/data/indexes     --entrypoint python     "$image"     -c 'from mira.checks.models import CheckResult, CheckRun, CheckRunInputs; from mira.index.store import IndexStore; store = IndexStore.open("phase-zero", "canary"); inputs = CheckRunInputs(owner="phase-zero", repo="canary", pr_number=1, head_sha="smoke"); run = CheckRun(run_key="smoke-run", policy_version="checks-v1+smoke", inputs=inputs, results=[CheckResult(check_id="native.tests", mode="warning", state="pass", result_key="smoke-result")]); store.record_check_run(run); store.record_check_run(run); assert store.count_check_runs({}) == 1, "a retried run must converge on one row"; assert store.latest_check_run(pr_number=1, head_sha="smoke").verdict == "pass"; store.close()'
 }
 
+# Phase 7A's local review surface. Two halves, because they need different
+# things from the environment.
+#
+# The first half needs no git: the exit-code table and the failure a caller
+# gets when there is no work tree are a published contract, and a contract that
+# holds on amd64 and prints a traceback on aarch64 is not one. The bounded
+# subprocess the surface runs git through is checked here too, because rlimits
+# are the part of `mira.sandbox` most likely to behave differently per
+# architecture, and one that silently stopped applying would remove the only
+# ceiling on a linter the check framework starts.
+verify_local_cli_without_git() {
+  local image=$1
+  local table
+  # Captured rather than piped into grep: `grep -q` closes the pipe on its
+  # first match, and under `pipefail` a docker run killed by SIGPIPE would
+  # fail a check that had just passed.
+  table="$(docker run --rm --platform linux/arm64 --entrypoint mira \
+    "$image" local review --explain-exit-codes)"
+  case "$table" in
+    *findings*) ;;
+    *)
+      echo "local review --explain-exit-codes printed no table: ${table}" >&2
+      exit 1
+      ;;
+  esac
+
+  local output status
+  set +e
+  output="$(docker run --rm --platform linux/arm64 --entrypoint mira \
+    "$image" local review --path /app 2>&1)"
+  status=$?
+  set -e
+  if [[ "$status" -ne 3 ]]; then
+    echo "local review exited ${status} with no repository; expected 3" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  case "$output" in
+    *Traceback*)
+      echo "local review leaked a traceback instead of an exit code: ${output}" >&2
+      exit 1
+      ;;
+  esac
+
+  docker run --rm --platform linux/arm64 --entrypoint python \
+    "$image" \
+    -c 'from mira.sandbox import run_argv; o = run_argv(["python", "-c", "print(1)"], cwd="/app", timeout_seconds=30); assert o.status == "ok", o.detail; assert not o.unbounded, "rlimits did not apply on aarch64"; assert o.stdout.strip() == "1", o.stdout'
+}
+
+# The second half needs git, which the runtime image does not carry: the local
+# CLI is a developer-machine tool and the server has no checkout to review, so
+# putting git in the published image would grow every deployment for a command
+# no deployment runs. A throwaway layer on top of the candidate gives the real
+# path -- git subprocess, diff parsing, configuration, destination guard -- on
+# aarch64 without changing what ships.
+verify_local_cli_with_git() {
+  local image=$1
+  local helper="mira:ci-arm64-local-cli"
+  local context
+  context="$(mktemp -d)"
+  cat >"${context}/Dockerfile" <<DOCKERFILE
+FROM ${image}
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends git \\
+ && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+  docker build --platform linux/arm64 --tag "$helper" "$context" >/dev/null
+  rm -rf "$context"
+  docker run --rm --platform linux/arm64 \
+    --volume "$(pwd)/scripts/ci:/ci:ro" \
+    --entrypoint sh "$helper" /ci/arm64_local_cli_check.sh
+  docker rmi "$helper" >/dev/null 2>&1 || true
+}
+
 echo "Pulling deployed ARM64 baseline: ${baseline_image}"
 docker pull --platform linux/arm64 "$baseline_image"
 
@@ -125,6 +199,9 @@ start_server "$candidate_image" candidate
 verify_canary "$candidate_image"
 echo "Confirming the candidate creates and uses its check tables on ARM64"
 verify_checks "$candidate_image"
+echo "Confirming the local review surface on ARM64"
+verify_local_cli_without_git "$candidate_image"
+verify_local_cli_with_git "$candidate_image"
 
 echo "Starting the deployed image against the candidate-opened database"
 start_server "$baseline_image" rollback
