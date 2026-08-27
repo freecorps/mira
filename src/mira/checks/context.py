@@ -143,7 +143,8 @@ class CheckContext:
     # work consults `remaining`; the runner enforces it regardless.
     deadline: float = 0.0
 
-    _file_cache: dict[str, str] = field(default_factory=dict, repr=False)
+    # path -> the one in-flight or finished fetch for it.
+    _file_cache: dict[str, asyncio.Future[str]] = field(default_factory=dict, repr=False)
     _file_lock: asyncio.Lock | None = field(default=None, repr=False)
     _shared: dict[str, Any] = field(default_factory=dict, repr=False)
     _shared_lock: asyncio.Lock | None = field(default=None, repr=False)
@@ -202,23 +203,36 @@ class CheckContext:
         not exist" mean the same thing to a check that wanted to look at it —
         and a check that needs to tell them apart should not be inferring it
         from an exception type.
+
+        The cache holds a *task* per path rather than a string behind one lock.
+        A single lock would be correct and would also serialise every file read
+        in the run: two checks fetching two different files would queue behind
+        each other over the network for no reason. Per path, two checks asking
+        for the same file share one fetch and two checks asking for different
+        files do not wait.
         """
-        if path in self._file_cache:
-            return self._file_cache[path]
+        cached = self._file_cache.get(path)
+        if cached is not None:
+            return await cached
         if self.provider is None or self.pr_info is None:
             return ""
         if self._file_lock is None:
             self._file_lock = asyncio.Lock()
         async with self._file_lock:
-            if path in self._file_cache:
-                return self._file_cache[path]
-            try:
-                content = await self.provider.get_file_content(
-                    self.pr_info, path, self.head_sha or self.head_branch
-                )
-            except Exception as exc:  # noqa: BLE001 - unreadable is not fatal
-                logger.debug("Check could not read %s at %s: %s", path, self.head_sha, exc)
-                content = ""
-            content = (content or "")[:MAX_FILE_BYTES]
-            self._file_cache[path] = content
-            return content
+            # Re-checked inside: two callers can both miss above, and only one
+            # of them may create the task.
+            cached = self._file_cache.get(path)
+            if cached is None:
+                cached = asyncio.ensure_future(self._fetch_file(path))
+                self._file_cache[path] = cached
+        return await cached
+
+    async def _fetch_file(self, path: str) -> str:
+        try:
+            content = await self.provider.get_file_content(
+                self.pr_info, path, self.head_sha or self.head_branch
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is not fatal
+            logger.debug("Check could not read %s at %s: %s", path, self.head_sha, exc)
+            return ""
+        return (content or "")[:MAX_FILE_BYTES]
