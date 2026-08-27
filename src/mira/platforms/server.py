@@ -110,7 +110,22 @@ def create_app(
             )
         )
 
+        # The autofix queue's worker, in this process. `start` returns None —
+        # and costs nothing — unless the deployment turned autofix on and asked
+        # for the inline worker, which is why it is called unconditionally
+        # rather than behind another check that could drift from that one.
+        from mira.autofix import runtime as autofix_runtime
+
+        autofix_runtime.start(
+            {
+                "github": app_auth,
+                "gitlab": gitlab_auth,
+                "forgejo": forgejo_auth,
+            }
+        )
+
         yield
+        await autofix_runtime.stop()
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()
         if forgejo_auth is not None and not fj_task.done():

@@ -793,3 +793,152 @@ export interface GateConfigResponse {
   // What a pull request will actually meet, per repository.
   effective: Record<string, unknown>
 }
+
+// ── Phase 5: assisted correction ─────────────────────────────────────────
+//
+// `opened` is the only success, and it means *a reviewable change exists* —
+// a stacked pull request, a commit on the pull request's branch, or a handoff
+// that was delivered. It never means anything was merged: Mira opens changes
+// and humans dispose of them.
+export type AutofixJobState =
+  | "queued"
+  | "running"
+  | "validating"
+  | "publishing"
+  | "opened"
+  | "failed"
+  | "dead_letter"
+  | "cancelled"
+
+export type AutofixMode = "branch_pr" | "pr_branch" | "handoff"
+
+export type AutofixRequestKind = "single" | "all"
+
+export interface AutofixReason {
+  code: string
+  message: string
+  // "refused" — the request will not proceed; "info" — context only.
+  kind: "refused" | "info"
+}
+
+export interface AutofixCheck {
+  name: string
+  // "passed" | "failed" | "skipped" | "error" | "timeout"
+  outcome: string
+  detail: string
+  duration_seconds: number
+  exit_code: number | null
+}
+
+export interface AutofixValidation {
+  ok: boolean
+  // False means nothing ran. Rendered differently from "everything passed",
+  // because only one of the two is evidence.
+  executed: boolean
+  checks: AutofixCheck[]
+}
+
+export interface AutofixJobModel {
+  id: number
+  job_key: string
+  state: AutofixJobState
+  mode: AutofixMode
+  request_kind: AutofixRequestKind
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  pr_url: string
+  base_branch: string
+  head_branch: string
+  head_sha: string
+  finding_id: string
+  finding_title: string
+  requested_by: string
+  request_id: string
+  policy_version: string
+  attempts: number
+  max_attempts: number
+  ci_attempts: number
+  max_ci_attempts: number
+  available_at: number
+  lease_owner: string
+  lease_expires_at: number
+  branch_name: string
+  commit_sha: string
+  child_pr_url: string
+  child_pr_number: number
+  model: string
+  patch_digest: string
+  diff: string
+  reasons: AutofixReason[]
+  validation: AutofixValidation
+  handoff_ref: string
+  cancelled_by: string
+  error: string
+  created_at: number
+  updated_at: number
+  terminal: boolean
+}
+
+export interface AutofixAttemptModel {
+  id: number
+  job_id: number
+  job_key: string
+  attempt: number
+  phase: string
+  outcome: string
+  model: string
+  prompt_digest: string
+  patch_digest: string
+  diff: string
+  reasons: AutofixReason[]
+  validation: AutofixValidation
+  detail: string
+  duration_seconds: number
+  created_at: number
+}
+
+export interface AutofixJobPage {
+  jobs: AutofixJobModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface AutofixSummaryBucket {
+  state: AutofixJobState
+  mode: AutofixMode
+  count: number
+  attempts: number
+  opened: number
+}
+
+export interface AutofixSummary {
+  buckets: AutofixSummaryBucket[]
+  totals: Record<string, number>
+}
+
+export interface AutofixJobDetail {
+  job: AutofixJobModel
+  attempts: AutofixAttemptModel[]
+  policy: Record<string, unknown>
+  capabilities: Record<string, unknown>
+}
+
+export interface AutofixCancelResult {
+  ok: boolean
+  cancelled: boolean
+  job: AutofixJobModel
+}
+
+export interface AutofixConfigResponse {
+  // The full autofix config as the server resolved it (defaults + mira.yaml + DB).
+  config: Record<string, unknown>
+  // Just the admin-editable override blob, which is what the panel writes back.
+  overrides: Record<string, unknown>
+  // What a `fix` request will actually meet, per repository.
+  effective: Record<string, unknown>
+  // Handoff adapters this deployment has registered. Empty is the default.
+  handoff_adapters: string[]
+}

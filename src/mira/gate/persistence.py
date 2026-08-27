@@ -193,6 +193,17 @@ class GateStoreMixin:
         return "", ()
 
     def _gate_owner(self) -> str:
+        """The owner this store scopes its reads on.
+
+        It **wins** over the owner carried on a decision, and that ordering is
+        load-bearing on Postgres: `IndexStore.open` namespaces a non-GitHub
+        owner as ``_{platform}/{owner}`` and hands that spelling to the store,
+        while a decision's inputs carry the plain one. Writing the plain owner
+        and reading with the namespaced scope means the row is invisible to the
+        store that wrote it — no idempotency, no delivery bookkeeping, no
+        history. SQLite is unaffected either way: it gets the plain owner and
+        its file already scopes the rows.
+        """
         return str(getattr(self, "_owner", "") or "")
 
     def _gate_repo(self) -> str:
@@ -270,8 +281,8 @@ class GateStoreMixin:
         params = (
             decision.decision_key,
             inputs.platform,
-            inputs.owner or self._gate_owner(),
-            inputs.repo or self._gate_repo(),
+            self._gate_owner() or inputs.owner,
+            self._gate_repo() or inputs.repo,
             inputs.pr_number,
             inputs.pr_url,
             inputs.pr_author,
@@ -502,8 +513,8 @@ class GateStoreMixin:
                 delivery_key,
                 decision_key,
                 platform,
-                owner or self._gate_owner(),
-                repo or self._gate_repo(),
+                self._gate_owner() or owner,
+                self._gate_repo() or repo,
                 int(pr_number),
                 head_sha,
                 kind,
@@ -594,8 +605,8 @@ class GateStoreMixin:
                 int(decision.id),
                 decision.decision_key,
                 decision.inputs.platform,
-                decision.inputs.owner or self._gate_owner(),
-                decision.inputs.repo or self._gate_repo(),
+                self._gate_owner() or decision.inputs.owner,
+                self._gate_repo() or decision.inputs.repo,
                 int(decision.inputs.pr_number),
                 decision.inputs.head_sha,
                 actor,

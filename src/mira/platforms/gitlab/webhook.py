@@ -197,6 +197,7 @@ async def handle_gitlab_merge(payload: dict[str, Any], auth: PlatformAuth, bot_n
 
 async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """An @-mention in an MR note: command, pause/resume, or thread reject."""
+    from mira.autofix.commands import handle_fix_command, parse_fix_command
     from mira.platforms.handlers import (
         _PAUSE_KEYWORDS,
         _REJECT_KEYWORDS,
@@ -241,6 +242,34 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
 
         discussion_id = attrs.get("discussion_id")
         position = attrs.get("position")
+
+        # `fix` is handled before the reject and free-form paths: it is the one
+        # command that writes, so it must not fall through to the classifier
+        # that treats an unrecognised reply as conversation.
+        parsed = parse_fix_command(question)
+        if parsed is not None:
+            kind, mode = parsed
+            root = ""
+            if discussion_id:
+                root = await provider.get_discussion_root_body(pr_info, str(discussion_id))
+                if not isinstance(root, str):
+                    root = ""
+            if kind == "single" and not root:
+                await provider.post_comment(
+                    pr_info,
+                    f"> @{actor}: reply to one of my review comments with `fix`, "
+                    "or use `fix all` here.",
+                )
+                return
+            await handle_fix_command(
+                provider,
+                pr_info,
+                actor=actor,
+                kind=kind,
+                mode=mode,
+                original_body=root,
+            )
+            return
 
         original = ""
         if discussion_id and position:

@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import BackgroundTasks
 
+from mira.autofix.commands import FIX_KEYWORDS as _FIX_KEYWORDS
 from mira.config import load_config
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
@@ -575,6 +576,11 @@ async def dispatch_github_event(
                     handle_pause_resume, payload, app_auth, bot_name, cmd_word
                 )
                 return "processing"
+            if cmd_word in _FIX_KEYWORDS:
+                background_tasks.add_task(
+                    handle_fix_request, payload, app_auth, bot_name, inline=False
+                )
+                return "processing"
             background_tasks.add_task(handle_comment, payload, app_auth, bot_name)
             return "processing"
 
@@ -587,6 +593,15 @@ async def dispatch_github_event(
             return "ignored"
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         if has_mention(rc_body, names):
+            # `fix` is checked before the reject/free-form path: it is the one
+            # command on a review comment that writes, so it must not fall
+            # through to the classifier that treats an unrecognised reply as
+            # conversation.
+            if command_after_mention(rc_body, names) in _FIX_KEYWORDS:
+                background_tasks.add_task(
+                    handle_fix_request, payload, app_auth, bot_name, inline=True
+                )
+                return "processing"
             background_tasks.add_task(handle_thread_reject, payload, app_auth, bot_name)
             return "processing"
         if payload.get("comment", {}).get("in_reply_to_id"):
@@ -815,6 +830,81 @@ async def handle_comment(
         )
     except Exception:
         logger.exception("Error handling comment event")
+
+
+async def handle_fix_request(
+    payload: dict[str, Any],
+    app_auth: GitHubAppAuth,
+    bot_name: str,
+    *,
+    inline: bool,
+) -> None:
+    """Handle ``@mira fix`` — on a review comment (``inline``) or on the PR.
+
+    The two entry points differ only in where the finding comes from and where
+    the answer goes. On a review comment the finding is read from the hidden
+    marker in the comment being replied to; on the pull request there is no
+    single finding, so only ``fix all`` is meaningful there.
+    """
+    installation_id: int = payload.get("installation", {}).get("id", 0)
+    try:
+        from mira.autofix.commands import handle_fix_command, parse_fix_command
+
+        comment = payload.get("comment", {})
+        names = mention_names(bot_name, await app_auth.get_bot_identity())
+        parsed = parse_fix_command(strip_mentions(comment.get("body", ""), names))
+        if parsed is None:
+            return
+        kind, mode = parsed
+
+        owner = payload["repository"]["owner"]["login"]
+        repo = payload["repository"]["name"]
+        number = (payload.get("pull_request") or payload.get("issue") or {}).get("number", 0)
+        pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
+
+        token = await app_auth.get_installation_token(installation_id)
+        provider = create_provider("github", token)
+        # The real PR metadata, not a stub: the head branch and head sha are
+        # what a fix is anchored to, and a stub carrying "" for both would
+        # produce a job keyed on nothing.
+        pr_info = await provider.get_pr_info(pr_url)
+
+        original = ""
+        reply = None
+        if inline:
+            parent = comment.get("in_reply_to_id", 0) or 0
+            original = await provider.get_comment_body(pr_info, parent) if parent else ""
+            if not original:
+                # A reply to nothing, or a top-level review comment. The
+                # comment's own body may still carry the marker when somebody
+                # quotes Mira's comment back at it.
+                original = comment.get("body", "")
+            comment_id = comment.get("id", 0)
+
+            async def reply(body: str, _id: int = comment_id) -> None:
+                await provider.reply_to_review_comment(pr_info, _id, body)
+
+        elif kind == "single":
+            # `@mira fix` on the pull request itself names no finding. Say so
+            # rather than silently fixing something nobody pointed at.
+            await provider.post_comment(
+                pr_info,
+                f"> @{comment.get('user', {}).get('login', '')}: reply to one of my review "
+                "comments with `fix`, or use `fix all` here.",
+            )
+            return
+
+        await handle_fix_command(
+            provider,
+            pr_info,
+            actor=comment.get("user", {}).get("login", ""),
+            kind=kind,
+            mode=mode,
+            original_body=original,
+            reply=reply,
+        )
+    except Exception:
+        logger.exception("Error handling fix request")
 
 
 async def handle_thread_reject(

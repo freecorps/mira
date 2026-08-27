@@ -239,6 +239,7 @@ async def handle_forgejo_push(payload: dict[str, Any], auth: PlatformAuth, bot_n
 
 async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """An @-mention in a PR comment: command, pause/resume, or thread reject."""
+    from mira.autofix.commands import handle_fix_command, parse_fix_command
     from mira.platforms.handlers import (
         _PAUSE_KEYWORDS,
         _REJECT_KEYWORDS,
@@ -320,6 +321,37 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             )
             if not is_mira_finding and not has_mention(comment_body, names):
                 return
+
+        # `fix` is handled before the reject and free-form paths: it is the one
+        # command that writes, so it must not fall through to the classifier
+        # that treats an unrecognised reply as conversation.
+        parsed = parse_fix_command(question)
+        if parsed is not None:
+            kind, mode = parsed
+            if kind == "single" and not original:
+                await provider.post_comment(
+                    pr_info,
+                    f"> @{actor}: reply to one of my review comments with `fix`, "
+                    "or use `fix all` here.",
+                )
+                return
+
+            async def _reply(body: str, _id: int = int(comment.get("id", 0) or 0)) -> None:
+                if _id:
+                    await provider.reply_to_review_comment(pr_info, _id, body)
+                else:
+                    await provider.post_comment(pr_info, body)
+
+            await handle_fix_command(
+                provider,
+                pr_info,
+                actor=actor,
+                kind=kind,
+                mode=mode,
+                original_body=original,
+                reply=_reply if original else None,
+            )
+            return
 
         # Explicit reject on an inline (diff) comment → record feedback.
         if first_word in _REJECT_KEYWORDS and (comment_path or parent_comment_id):

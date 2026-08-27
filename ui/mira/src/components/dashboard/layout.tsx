@@ -18,6 +18,7 @@ import {
   Sun,
   Users,
   Users2,
+  Wrench,
 } from "lucide-react"
 import { useEffect, useState } from "react"
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router"
@@ -88,6 +89,7 @@ const navItems = [
     adminOnly: true,
   },
   { to: "/merge-gate", icon: Gavel, label: "Merge gate", adminOnly: true },
+  { to: "/autofix", icon: Wrench, label: "Autofix", adminOnly: true },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
 
@@ -109,6 +111,7 @@ const PAGE_LABELS: Record<string, string> = {
   rules: "Rules",
   learnings: "Learnings",
   "merge-gate": "Merge gate",
+  autofix: "Autofix",
   analytics: "Rule analytics",
   settings: "Settings",
   users: "Users",

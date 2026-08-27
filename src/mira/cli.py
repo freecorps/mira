@@ -522,3 +522,97 @@ def backfill_contributors(
             backfill_all_repos(app_auth, since=since_epoch, include_commits=include_commits)
         )
         click.echo(f"Backfill complete: {totals}")
+
+
+@main.command("autofix-worker")
+@click.option("--app-id", envvar="MIRA_GITHUB_APP_ID", default=None, help="GitHub App ID")
+@click.option(
+    "--private-key",
+    envvar="MIRA_GITHUB_PRIVATE_KEY",
+    default=None,
+    help="PEM contents or @path/to/key.pem",
+)
+@click.option("--gitlab-token", envvar="MIRA_GITLAB_TOKEN", default=None)
+@click.option("--gitlab-base-url", envvar="MIRA_GITLAB_BASE_URL", default=None)
+@click.option("--forgejo-token", envvar="MIRA_FORGEJO_TOKEN", default=None)
+@click.option("--forgejo-base-url", envvar="MIRA_FORGEJO_BASE_URL", default=None)
+@click.option("--config", "config_path", default=None, help="Path to .mira.yaml")
+@click.option(
+    "--once",
+    is_flag=True,
+    help="Run a single poll and exit. For cron-style scheduling and for smoke tests.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+def autofix_worker(
+    app_id: str | None,
+    private_key: str | None,
+    gitlab_token: str | None,
+    gitlab_base_url: str | None,
+    forgejo_token: str | None,
+    forgejo_base_url: str | None,
+    config_path: str | None,
+    once: bool,
+    verbose: bool,
+) -> None:
+    """Run the autofix queue's worker as its own process.
+
+    Only needed when `autofix.inline_worker` is false. The default deployment
+    runs this loop inside `mira serve`, because one container is the profile
+    this project targets and a second process is a second thing to supervise.
+
+    Safe to run alongside the inline worker and alongside other copies of
+    itself: jobs are handed out by a database lease, so two workers cannot take
+    the same one and a worker that dies simply lets its lease expire.
+    """
+    import asyncio
+
+    from mira.autofix.runtime import provider_factory
+    from mira.autofix.worker import AutofixWorker
+    from mira.platforms.auth import ForgejoTokenAuth, GitLabTokenAuth
+    from mira.platforms.github.auth import GitHubAppAuth
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stdout,
+    )
+
+    config = load_config(config_path)
+    if config.autofix.mode == "off":
+        raise click.ClickException("autofix.mode is 'off' — nothing would ever be claimed")
+    if config.autofix.kill_switch:
+        raise click.ClickException("autofix.kill_switch is on — the worker would claim nothing")
+
+    auths: dict[str, object] = {}
+    if app_id and private_key:
+        if private_key.startswith("@"):
+            key_path = private_key[1:]
+            try:
+                with open(key_path) as handle:
+                    private_key = handle.read()
+            except FileNotFoundError:
+                raise click.ClickException(f"Private key file not found: {key_path}") from None
+        auths["github"] = GitHubAppAuth(app_id=app_id, private_key=private_key)
+    if gitlab_token:
+        auths["gitlab"] = GitLabTokenAuth(
+            gitlab_token, gitlab_base_url or "https://gitlab.com/api/v4"
+        )
+    if forgejo_token:
+        auths["forgejo"] = ForgejoTokenAuth(
+            forgejo_token, forgejo_base_url or "https://codeberg.org/api/v1"
+        )
+    if not auths:
+        raise click.ClickException(
+            "No platform credentials were supplied; the worker would claim jobs it cannot run"
+        )
+
+    worker = AutofixWorker(provider_factory=provider_factory(auths), config=config)
+    click.echo(f"Autofix worker {worker.identity} starting ({', '.join(sorted(auths))})")
+    if once:
+        ran = asyncio.run(worker.poll_once(config=config))
+        click.echo("Ran one job." if ran else "Nothing to run.")
+        return
+    try:
+        asyncio.run(worker.run_forever())
+    except KeyboardInterrupt:
+        click.echo("Stopped.")

@@ -90,7 +90,7 @@ Legenda: **forte** = já competitivo; **parcial** = existe, mas falta fechar o f
 | Aprovação e lifecycle de regras | **parcial/forte** | Cursor, CodeRabbit | P0 |
 | Medição de eficácia de regras | **ausente** | Greptile, Graphite, Cursor | P0 |
 | Approval/gate orientado a risco | **parcial** | Macroscope, Greptile, Cursor | P1 |
-| Autofix / handoff para agente | **ausente** | CodeRabbit, Macroscope, Greptile, Cursor | P1 |
+| Autofix / handoff para agente | **entregue (Fase 5)** | CodeRabbit, Macroscope, Greptile, Cursor | P1 |
 | Checks customizados de pré-merge | **ausente** | CodeRabbit, Macroscope, Qodo | P1 |
 | Leitura de logs/estado de CI | **ausente** | CodeRabbit, Graphite, Macroscope | P1 |
 | Validação de ticket/issue | **ausente** | CodeRabbit, Bito, Graphite | P1 |
@@ -466,6 +466,42 @@ padrão, kill switch global e nenhuma aprovação real habilitada por padrão.
 - Botão de handoff para agente externo como integração opcional antes de construir um agente completo.
 
 **Aceite:** usuário consegue corrigir um finding em um clique/comando; toda mudança é revisável/reversível; secrets não entram no contexto; falha de teste impede automerge.
+
+**Entregue.** Notas de implementação:
+
+- Geração, aplicação do patch, validação e publicação são quatro passos
+  separados nessa ordem, e só o quarto toca um repositório. Uma falha em
+  qualquer um dos três primeiros deixa o repositório byte a byte como estava,
+  porque ele ainda não foi alcançado — não porque um handler pegou o caso ruim.
+- A default branch é comparada antes de criar branch, antes de commitar e antes
+  de abrir PR; um provider que não consegue *dizer* qual é ela é recusado por
+  completo. Nenhum método de provider aceita `force`, e `can_merge` é `False`
+  em todos eles — um valor numa tabela, não uma ausência que alguém precisa
+  notar.
+- O finding é resolvido só por `finding_id`. Caminho e linha se movem num
+  rebase, e um fix preso ao que entrou naquela linha é exatamente a falha que
+  esta fase existe para não ter.
+- Autorização é permissão de escrita no repositório, lida da plataforma. A
+  blocklist é consultada antes da chamada, então uma conta bloqueada não
+  consegue usar `@mira fix` para fazer a Mira consultar a API por ela.
+- `fix all` é limitado por piso de severidade e teto por requisição, e nomeia
+  cada finding que deixou de fora.
+- Saída estruturada sem nenhum campo capaz de carregar um comando; conteúdo do
+  repositório, saída de validação e resultado de CI entram como dados não
+  confiáveis em blocos delimitados; o feedback de CI são *nomes* de checks, não
+  corpos de log.
+- Comandos de validação vêm só de configuração de deploy, como listas de
+  argumentos, sem shell, com timeout, rlimits POSIX e allowlist de ambiente. Um
+  check que não conseguiu rodar nunca conta como aprovado.
+- A fila é uma tabela com lease, `available_at`, tentativas limitadas e
+  dead-letter, em SQLite e PostgreSQL com as consultas escritas uma vez. Sem
+  Redis e sem segundo serviço: um worker morto simplesmente deixa o lease
+  vencer.
+- Retry é idempotente: uma branch (adotada, nunca resetada), um commit por
+  conteúdo distinto, um PR.
+- Kill switch global para o deploy inteiro — inclusive para trabalho já na fila
+  — e opt-in por repositório.
+- Detalhes em [docs/autofix.md](autofix.md).
 
 ### Fase 6 — checks e contexto operacional (10–18 dias)
 

@@ -17,6 +17,12 @@ from urllib.parse import quote
 
 import httpx
 
+from mira.autofix.capabilities import (
+    GITLAB_CAPABILITIES as GITLAB_AUTOFIX_CAPABILITIES,
+)
+from mira.autofix.capabilities import (
+    AutofixCapabilities,
+)
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITLAB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
@@ -691,6 +697,178 @@ class GitLabProvider(BaseProvider):
         the merge request; the dashboard always has it.
         """
         return ""
+
+    # ── Assisted correction (Phase 5) ──
+
+    def autofix_capabilities(self) -> AutofixCapabilities:
+        return GITLAB_AUTOFIX_CAPABILITIES
+
+    async def get_actor_permission(self, pr_info: PRInfo, login: str) -> str:
+        """Project membership mapped onto GitHub's permission vocabulary.
+
+        GitLab access levels are numeric. Below Developer (30) an account
+        cannot push, so it is reported as `read` and never clears the write
+        requirement. `members/all` rather than `members` on purpose: it
+        includes inherited group membership, which is how most organisations
+        actually grant access.
+        """
+        if not login:
+            return "unknown"
+        url = f"{self._project(pr_info)}/members/all?query={quote(login, safe='')}"
+        try:
+            resp = await self._request("GET", url)
+        except Exception as exc:  # noqa: BLE001 - unreadable is a refusal
+            logger.warning("Could not read %s's access level on %s: %s", login, pr_info.url, exc)
+            return "unknown"
+        level = 0
+        for member in resp.json() or []:
+            if str((member or {}).get("username", "")).lower() == login.lower():
+                level = max(level, int((member or {}).get("access_level", 0) or 0))
+        if level >= 50:
+            return "admin"
+        if level >= 40:
+            return "maintain"
+        if level >= 30:
+            return "write"
+        if level > 0:
+            return "read"
+        return "none"
+
+    async def get_default_branch(self, pr_info: PRInfo) -> str:
+        try:
+            resp = await self._request("GET", self._project(pr_info))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read the default branch of %s: %s", pr_info.url, exc)
+            return ""
+        return str((resp.json() or {}).get("default_branch") or "")
+
+    async def get_branch_head(self, pr_info: PRInfo, branch: str) -> str:
+        url = f"{self._project(pr_info)}/repository/branches/{quote(branch, safe='')}"
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except Exception as e:
+            raise ProviderError(f"Failed to read branch {branch}: {e}") from e
+        if resp.status_code == 404:
+            return ""
+        return str(((resp.json() or {}).get("commit") or {}).get("id") or "")
+
+    async def create_branch(self, pr_info: PRInfo, branch: str, from_sha: str) -> None:
+        """Create a branch at ``from_sha``. Creation only — GitLab's branches
+        API has no update, which is exactly the surface Mira wants."""
+        url = f"{self._project(pr_info)}/repository/branches"
+        try:
+            await self._request(
+                "POST", url, json={"branch": branch, "ref": from_sha or pr_info.head_sha}
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to create branch {branch}: {e}") from e
+
+    async def files_match(self, pr_info: PRInfo, branch: str, files: dict[str, str]) -> bool:
+        for path, content in files.items():
+            url = (
+                f"{self._project(pr_info)}/repository/files/"
+                f"{quote(path, safe='')}/raw?ref={quote(branch, safe='')}"
+            )
+            try:
+                resp = await self._request("GET", url, ok=(200, 404))
+            except Exception:  # noqa: BLE001 - any doubt means "commit it"
+                return False
+            if resp.status_code != 200 or resp.text != content:
+                return False
+        return True
+
+    async def commit_files(
+        self, pr_info: PRInfo, branch: str, files: dict[str, str], message: str
+    ) -> str:
+        """One commit for every changed file, through the commits API.
+
+        Each action is `update` or `create` depending on whether the path
+        already exists on the branch, because GitLab rejects the wrong verb
+        rather than doing the obvious thing. There is no force option on this
+        endpoint, which is why it is the one used.
+        """
+        actions = []
+        for path, content in sorted(files.items()):
+            exists = await self._file_exists(pr_info, branch, path)
+            actions.append(
+                {
+                    "action": "update" if exists else "create",
+                    "file_path": path,
+                    "content": content,
+                }
+            )
+        try:
+            resp = await self._request(
+                "POST",
+                f"{self._project(pr_info)}/repository/commits",
+                json={"branch": branch, "commit_message": message, "actions": actions},
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to commit to {branch}: {e}") from e
+        return str((resp.json() or {}).get("id") or "")
+
+    async def _file_exists(self, pr_info: PRInfo, ref: str, path: str) -> bool:
+        url = (
+            f"{self._project(pr_info)}/repository/files/"
+            f"{quote(path, safe='')}?ref={quote(ref, safe='')}"
+        )
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except Exception:  # noqa: BLE001
+            return False
+        return resp.status_code == 200
+
+    async def create_pull_request(
+        self, pr_info: PRInfo, *, head: str, base: str, title: str, body: str
+    ) -> tuple[int, str]:
+        try:
+            resp = await self._request(
+                "POST",
+                f"{self._project(pr_info)}/merge_requests",
+                json={
+                    "source_branch": head,
+                    "target_branch": base,
+                    "title": title,
+                    "description": body,
+                },
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to open a merge request from {head}: {e}") from e
+        data = resp.json() or {}
+        return int(data.get("iid") or 0), str(data.get("web_url") or "")
+
+    async def find_open_pull_request(self, pr_info: PRInfo, head: str) -> tuple[int, str] | None:
+        url = (
+            f"{self._project(pr_info)}/merge_requests"
+            f"?state=opened&source_branch={quote(head, safe='')}"
+        )
+        try:
+            resp = await self._request("GET", url)
+        except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
+            logger.debug("Could not look for an open merge request from %s: %s", head, exc)
+            return None
+        for item in resp.json() or []:
+            return int((item or {}).get("iid") or 0), str((item or {}).get("web_url") or "")
+        return None
+
+    async def pr_head_is_fork(self, pr_info: PRInfo) -> bool:
+        """Whether the source branch lives in a different project.
+
+        On GitLab a fork is a different `source_project_id`. Anything that
+        cannot be determined answers True, because a commit into somebody
+        else's project is not a call to make on a guess.
+        """
+        try:
+            resp = await self._request("GET", self._mr(pr_info))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not tell whether %s comes from a fork: %s", pr_info.url, exc)
+            return True
+        data = resp.json() or {}
+        source = data.get("source_project_id")
+        target = data.get("target_project_id")
+        if source is None or target is None:
+            return True
+        return int(source) != int(target)
 
 
 def _next_link(link_header: str) -> str | None:

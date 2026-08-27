@@ -601,6 +601,258 @@ def _validate_path_patterns(patterns: list[str], label: str) -> None:
             raise ValueError(f"{label}: {exc}") from exc
 
 
+class AutofixValidationConfig(BaseModel):
+    """What Mira runs against a generated patch before publishing it.
+
+    The command list is an allowlist and it comes from deployment
+    configuration only. Nothing in a pull request — its title, body, diff,
+    comments or CI logs — can add a command, change a command, or change an
+    argument. That is the entire security model of this section, and it is why
+    the commands are stored as argument *lists* rather than shell strings:
+    there is no shell, so there is nothing to inject into.
+    """
+
+    # Built-in, in-process, no subprocess: parse every edited file Mira knows
+    # how to parse (Python, JSON, YAML, TOML) and refuse a patch that broke
+    # one. Cheap enough to leave on everywhere, including the Orange Pi.
+    syntax_check: bool = True
+
+    # Commands to run in a scratch workspace holding the edited files. Empty by
+    # default: a deployment that wants formatters or tests names them, and one
+    # that names none gets static validation only. Each entry is
+    # ``{name, command: [argv...], optional: bool}``.
+    commands: list[dict[str, Any]] = Field(default_factory=list)
+
+    # Wall-clock ceiling per command. Exceeding it fails the check, which
+    # blocks publication — a validator that was killed proved nothing.
+    command_timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
+    # Ceiling for the whole validation phase, so a long allowlist cannot
+    # outlive the job lease and get the job stolen mid-check.
+    total_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    # Address-space and CPU-second ceilings applied to each command via POSIX
+    # rlimits. Ignored with an explicit note on platforms without them.
+    memory_limit_mb: int = Field(default=1024, ge=64, le=65536)
+    cpu_seconds: int = Field(default=120, ge=1, le=3600)
+    # Bytes of a command's output kept as evidence. Output is untrusted data.
+    max_output_bytes: int = Field(default=16_000, ge=1_000, le=1_000_000)
+
+    @field_validator("commands")
+    @classmethod
+    def _valid_commands(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reject a malformed allowlist at config load, never at run time.
+
+        A command Mira cannot read has no safe runtime interpretation: skipping
+        it silently removes a check the operator believes is running, and
+        failing every patch takes autofix down on a typo. Failing the config
+        load is the only honest reading, so it happens here.
+        """
+        for index, entry in enumerate(v):
+            label = f"autofix.validation.commands[{index}]"
+            if not isinstance(entry, dict):
+                raise ValueError(f"{label} must be a mapping")
+            argv = entry.get("command")
+            if not isinstance(argv, list) or not argv:
+                raise ValueError(f"{label}.command must be a non-empty list of arguments")
+            if not all(isinstance(part, str) and part for part in argv):
+                raise ValueError(f"{label}.command must contain only non-empty strings")
+            if not isinstance(entry.get("name", ""), str):
+                raise ValueError(f"{label}.name must be a string")
+        return v
+
+
+class AutofixHandoffConfig(BaseModel):
+    """Handing a fix to an external agent instead of writing it here.
+
+    Optional in the strongest sense: the adapter name is empty by default, no
+    adapter is imported until one is named, and every other autofix path works
+    with none configured. An install that never wants a third party in its
+    review loop never gets one.
+    """
+
+    # Registered adapter name. "" disables handoff entirely.
+    adapter: str = ""
+    # Adapter-specific settings, passed through untouched.
+    options: dict[str, Any] = Field(default_factory=dict)
+    # Offer handoff as the outcome when Mira itself is not allowed to write.
+    # Off by default: falling back to a third party because permission was
+    # refused is a decision, not a recovery.
+    fallback_when_refused: bool = False
+
+
+class AutofixRepoPolicy(BaseModel):
+    """Per-repository overrides, keyed ``owner/repo`` under ``autofix.repositories``.
+
+    Set only what differs. ``None`` means "inherit"; a list set to ``[]`` means
+    "explicitly empty", which is how a repository opts out of an inherited
+    requirement rather than inheriting it forever.
+    """
+
+    enabled: bool | None = None
+    mode: str | None = None
+    allow_commit_to_pr_branch: bool | None = None
+    allowed_requesters: list[str] | None = None
+    max_files: int | None = Field(default=None, ge=1)
+    max_lines: int | None = Field(default=None, ge=1)
+    max_fixes_per_request: int | None = Field(default=None, ge=1)
+    protected_paths: list[str] | None = None
+    extra_protected_paths: list[str] = Field(default_factory=list)
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"off", "suggest", "on"}:
+            raise ValueError("autofix.repositories[].mode must be off, suggest or on")
+        return v
+
+    @field_validator("protected_paths", "extra_protected_paths")
+    @classmethod
+    def _valid_patterns(cls, v: list[str] | None) -> list[str] | None:
+        if v:
+            _validate_path_patterns(v, "autofix.repositories[].protected_paths")
+        return v
+
+
+class AutofixConfig(BaseModel):
+    """Assisted, safe correction (Phase 5).
+
+    Off by default, and never anything else by default. Autofix is the first
+    thing Mira does that writes to a repository, so turning it on is a decision
+    a deployment makes deliberately — and the recommended first step is
+    ``suggest``, which generates and validates a patch and renders it without
+    creating a branch, a commit or a pull request.
+
+      "off"      — no fix is generated and no request is accepted.
+      "suggest"  — generate, validate and show the diff. Writes nothing.
+      "on"       — the same, plus a branch, a commit and a pull request.
+
+    Everything in here is deployment configuration. Nothing in a pull request
+    can reach any of it — not the command allowlist, not the limits, not the
+    requester allowlist, not the branch prefix.
+    """
+
+    mode: str = "off"
+    # Hard global disable, independent of `mode` and of every per-repo
+    # override. Exists so an operator can stop autofix everywhere in one edit
+    # during an incident without reconstructing the policy afterwards.
+    kill_switch: bool = False
+    # Recorded with every job. Bump it when changing policy semantics so old
+    # jobs stay attributable to the policy that produced them.
+    policy_version: str = "autofix-v1"
+
+    # ── Who may ask ──────────────────────────────────────────────────────
+    # Write permission on the repository is required, always. The allowlist
+    # narrows further; empty means "anyone who can already write here".
+    require_write_permission: bool = True
+    allowed_requesters: list[str] = Field(default_factory=list)
+    blocked_requesters: list[str] = Field(default_factory=list)
+    # Accept `@mira fix` from an account whose permission the provider cannot
+    # report. Off, and there is no good reason to turn it on: an unreadable
+    # permission is not a permission.
+    allow_unknown_permission: bool = False
+
+    # ── What may be written ──────────────────────────────────────────────
+    # Committing onto the pull request's own branch. Opt-in, and still refused
+    # when the head branch is the default branch or belongs to a fork.
+    allow_commit_to_pr_branch: bool = False
+    branch_prefix: str = "mira/fix"
+    # Never touched, whatever else is configured. Replaces the built-in list
+    # when set; `extra_protected_paths` adds to whichever list is in effect.
+    protected_paths: list[str] | None = None
+    extra_protected_paths: list[str] = Field(default_factory=list)
+    # Only files the pull request already touches may be edited. On by default:
+    # a fix that wanders into an untouched file is a change nobody asked for.
+    restrict_to_changed_files: bool = True
+    # Creating a file the pull request does not contain. Off by default for the
+    # same reason.
+    allow_new_files: bool = False
+
+    # ── Limits ───────────────────────────────────────────────────────────
+    max_files: int = Field(default=3, ge=1, le=50)
+    max_lines: int = Field(default=120, ge=1, le=5_000)
+    max_patch_bytes: int = Field(default=40_000, ge=500, le=1_000_000)
+    # `fix all` never means "everything". This is the ceiling on one request,
+    # and whatever it excludes is named in the reply rather than dropped.
+    max_fixes_per_request: int = Field(default=3, ge=1, le=25)
+    # Jobs in flight for one repository. Keeps a `fix all` on a 40-finding pull
+    # request from occupying every worker in the install.
+    max_concurrent_jobs: int = Field(default=2, ge=1, le=50)
+    # Minimum severity a finding must carry to be selected by `fix all`. A
+    # single `fix` on a named finding is not filtered by it — the maintainer
+    # already picked that one.
+    min_severity_for_fix_all: str = "warning"
+    # Tries per job before it is parked in the dead-letter state.
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    # Regenerations driven by a red CI run on the fix's own pull request.
+    # Conservative on purpose: each one costs a model call and a force-free
+    # commit, and a fix that CI rejects twice is a fix a human should read.
+    max_ci_retries: int = Field(default=1, ge=0, le=5)
+    # Wall-clock ceiling for one attempt, lease included.
+    job_timeout_seconds: float = Field(default=900.0, gt=0, le=7200)
+    # Model context ceiling for the file bodies handed to the generator.
+    max_context_bytes: int = Field(default=60_000, ge=2_000, le=1_000_000)
+
+    # ── Administration ───────────────────────────────────────────────────
+    # Admin usernames permitted to cancel a job. Empty = every admin.
+    # Separates "can administer Mira" from "can stop a maintainer's fix",
+    # exactly as `gate.override_admins` does for merge decisions.
+    cancel_admins: list[str] = Field(default_factory=list)
+
+    # ── Queue ────────────────────────────────────────────────────────────
+    # Run the worker inside the web process. True is the single-container
+    # default; a larger install sets it False and runs `mira autofix-worker`.
+    inline_worker: bool = True
+    worker_poll_seconds: float = Field(default=5.0, gt=0, le=300)
+    lease_seconds: float = Field(default=900.0, gt=0, le=7200)
+    retry_backoff_seconds: float = Field(default=60.0, ge=0, le=86_400)
+
+    # ── Sub-sections ─────────────────────────────────────────────────────
+    validation: AutofixValidationConfig = Field(default_factory=AutofixValidationConfig)
+    handoff: AutofixHandoffConfig = Field(default_factory=AutofixHandoffConfig)
+    repositories: dict[str, AutofixRepoPolicy] = Field(default_factory=dict)
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        allowed = {"off", "suggest", "on"}
+        if v not in allowed:
+            raise ValueError(f"autofix.mode must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("min_severity_for_fix_all")
+    @classmethod
+    def _valid_severity(cls, v: str) -> str:
+        allowed = {"blocker", "warning", "suggestion", "nitpick"}
+        if v not in allowed:
+            raise ValueError(
+                f"autofix.min_severity_for_fix_all must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def _valid_prefix(cls, v: str) -> str:
+        from mira.autofix.models import branch_name
+
+        cleaned = v.strip().strip("/")
+        if not cleaned:
+            raise ValueError("autofix.branch_prefix must not be empty")
+        # The prefix is the one branch-name component that is not derived from
+        # a sanitized slug, so it is proven git-legal here rather than at the
+        # first push. `branch_name` falls back to a safe prefix on nonsense,
+        # and a fallback nobody asked for is a config error, not a feature.
+        probe = branch_name(prefix=cleaned, pr_number=1, finding_id="a" * 32)
+        if not probe.startswith(f"{cleaned}/"):
+            raise ValueError(f"autofix.branch_prefix {v!r} is not a valid git ref prefix")
+        return cleaned
+
+    @field_validator("protected_paths", "extra_protected_paths")
+    @classmethod
+    def _valid_patterns(cls, v: list[str] | None) -> list[str] | None:
+        if v:
+            _validate_path_patterns(v, "autofix path pattern")
+        return v
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -610,6 +862,7 @@ class MiraConfig(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     learning: LearningConfig = Field(default_factory=LearningConfig)
     gate: GateConfig = Field(default_factory=GateConfig)
+    autofix: AutofixConfig = Field(default_factory=AutofixConfig)
 
 
 def find_config_file(start_dir: Path | None = None) -> Path | None:

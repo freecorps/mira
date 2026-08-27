@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import abc
 
+from mira.autofix.capabilities import (
+    NO_CAPABILITIES as NO_AUTOFIX_CAPABILITIES,
+)
+from mira.autofix.capabilities import (
+    AutofixCapabilities,
+)
 from mira.gate.capabilities import NO_CAPABILITIES, GateCapabilities
 from mira.gate.models import CIState
 from mira.models import (
@@ -248,3 +254,93 @@ class BaseProvider(abc.ABC):
         Returns a provider reference for the audit trail, or "" if unsupported.
         """
         return ""
+
+    # ── Assisted correction (Phase 5) ──
+    #
+    # The only write surface in the provider interface. Every default below
+    # either reports ignorance or does nothing, so a provider that does not
+    # implement these makes autofix *refuse*, never makes it improvise: the
+    # capability table says what is missing and the job records why it stopped.
+    #
+    # There is deliberately no `merge`, no `force` parameter and no
+    # `delete_branch`. Mira opens changes and humans dispose of them.
+
+    def autofix_capabilities(self) -> AutofixCapabilities:
+        """What this provider can do for assisted correction.
+
+        Declared, not probed, for the same reasons as the gate's table: a probe
+        costs a round trip per request and a transient failure would silently
+        downgrade a working install.
+        """
+        return NO_AUTOFIX_CAPABILITIES
+
+    async def get_actor_permission(self, pr_info: PRInfo, login: str) -> str:
+        """What ``login`` may do in this repository.
+
+        Lowercase, GitHub's vocabulary (``admin``, ``maintain``, ``write``,
+        ``triage``, ``read``, ``none``), which the other providers map onto.
+        ``"unknown"`` when it could not be determined — and unknown is never
+        treated as permission.
+        """
+        return "unknown"
+
+    async def get_default_branch(self, pr_info: PRInfo) -> str:
+        """The repository's default branch. ``""`` when it cannot be read.
+
+        A provider that returns ``""`` makes autofix refuse to write at all:
+        "never touch the default branch" cannot be enforced against a name
+        nobody knows.
+        """
+        return ""
+
+    async def get_branch_head(self, pr_info: PRInfo, branch: str) -> str:
+        """Commit sha at the tip of ``branch``, or ``""`` if it does not exist."""
+        return ""
+
+    async def create_branch(self, pr_info: PRInfo, branch: str, from_sha: str) -> None:
+        """Create ``branch`` pointing at ``from_sha``.
+
+        Creation only. There is no update path and no force: a branch that
+        already exists is adopted by the caller, never reset.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot create branches")
+
+    async def files_match(self, pr_info: PRInfo, branch: str, files: dict[str, str]) -> bool:
+        """Whether ``branch`` already carries exactly this content.
+
+        What makes a retried publish idempotent: a worker that committed and
+        then died before recording the sha comes back, sees its own work, and
+        does not commit it twice. False on any doubt — committing the same
+        content again is untidy, and skipping a commit that never happened is
+        a fix that silently did nothing.
+        """
+        return False
+
+    async def commit_files(
+        self, pr_info: PRInfo, branch: str, files: dict[str, str], message: str
+    ) -> str:
+        """Commit ``files`` (path → content) onto ``branch``. Returns the sha.
+
+        Fast-forward only, from the branch's current head. No force, no
+        history rewriting, no amend.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot create commits")
+
+    async def create_pull_request(
+        self, pr_info: PRInfo, *, head: str, base: str, title: str, body: str
+    ) -> tuple[int, str]:
+        """Open a pull request from ``head`` into ``base``. Returns ``(number, url)``."""
+        raise NotImplementedError(f"{type(self).__name__} cannot open pull requests")
+
+    async def find_open_pull_request(self, pr_info: PRInfo, head: str) -> tuple[int, str] | None:
+        """An already-open pull request from ``head``, or None."""
+        return None
+
+    async def pr_head_is_fork(self, pr_info: PRInfo) -> bool:
+        """Whether this pull request's head branch lives in another repository.
+
+        True is the safe answer and the default an implementation should
+        degrade to: committing onto a fork's branch is a cross-repository write
+        that nobody authorized.
+        """
+        return True

@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
+from mira.autofix.persistence import AutofixStoreMixin
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -389,6 +390,83 @@ CREATE INDEX IF NOT EXISTS idx_pg_gate_overrides_decision
     ON gate_overrides(decision_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_pg_gate_overrides_created
     ON gate_overrides(created_at);
+
+-- Phase 5 assisted correction. Same columns as the SQLite schema, so the
+-- queries in `mira.autofix.persistence` run verbatim on both backends. The
+-- table is also the queue; see the SQLite schema for why there is no broker.
+CREATE TABLE IF NOT EXISTS autofix_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    job_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL DEFAULT 'queued',
+    mode TEXT NOT NULL DEFAULT 'branch_pr',
+    request_kind TEXT NOT NULL DEFAULT 'single',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT '',
+    head_branch TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    finding_id TEXT NOT NULL DEFAULT '',
+    finding_title TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 2,
+    ci_attempts INTEGER NOT NULL DEFAULT 0,
+    max_ci_attempts INTEGER NOT NULL DEFAULT 1,
+    available_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    branch_name TEXT NOT NULL DEFAULT '',
+    commit_sha TEXT NOT NULL DEFAULT '',
+    child_pr_url TEXT NOT NULL DEFAULT '',
+    child_pr_number INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    patch_digest TEXT NOT NULL DEFAULT '',
+    diff TEXT NOT NULL DEFAULT '',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    handoff_ref TEXT NOT NULL DEFAULT '',
+    cancelled_by TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_autofix_jobs_claim
+    ON autofix_jobs(state, available_at);
+CREATE INDEX IF NOT EXISTS idx_pg_autofix_jobs_lease
+    ON autofix_jobs(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_pg_autofix_jobs_pr
+    ON autofix_jobs(owner, repo, pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_autofix_jobs_finding
+    ON autofix_jobs(owner, repo, finding_id);
+CREATE INDEX IF NOT EXISTS idx_pg_autofix_jobs_created
+    ON autofix_jobs(created_at);
+
+CREATE TABLE IF NOT EXISTS autofix_attempts (
+    id BIGSERIAL PRIMARY KEY,
+    job_id BIGINT NOT NULL DEFAULT 0,
+    job_key TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    phase TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_digest TEXT NOT NULL DEFAULT '',
+    patch_digest TEXT NOT NULL DEFAULT '',
+    diff TEXT NOT NULL DEFAULT '',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    detail TEXT NOT NULL DEFAULT '',
+    duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_autofix_attempts_job
+    ON autofix_attempts(job_key, created_at);
 
 CREATE TABLE IF NOT EXISTS package_manifests (
     id SERIAL PRIMARY KEY,
@@ -789,7 +867,7 @@ def search_packages_org_wide(
     ]
 
 
-class PgIndexStore(_StoreSharedMixin, GateStoreMixin):
+class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
     """PostgreSQL-backed index store with owner/repo scoping.
 
     Implements the same public interface as IndexStore. Shares a single
@@ -2878,6 +2956,63 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin):
         One table holds every repository here, so an unscoped read would return
         another repo's decisions to a caller that asked about this one. The
         org-wide handle (empty owner/repo) is the deliberate exception.
+        """
+        clauses = []
+        params: list[Any] = []
+        if self._owner:
+            clauses.append(" AND owner = %s")
+            params.append(self._owner)
+        if self._repo:
+            clauses.append(" AND repo = %s")
+            params.append(self._repo)
+        return "".join(clauses), tuple(params)
+
+    # ── Phase 5 ──
+    #
+    # The autofix mixin's primitives. The claim query is the one statement the
+    # two engines cannot share: without `FOR UPDATE SKIP LOCKED` two Postgres
+    # workers polling at the same moment would read the same id, and one of
+    # them would spend a round trip losing the race on every single poll.
+
+    _autofix_placeholder = "%s"
+    _autofix_insert_ignore = "INSERT INTO"
+
+    def _autofix_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return list(self._fetchall(sql, params))
+
+    def _autofix_exec(self, sql: str, params: tuple = ()) -> int:
+        # `INSERT INTO` alone would raise on a duplicate key. Postgres spells
+        # the SQLite `INSERT OR IGNORE` as a conflict clause, which has to sit
+        # after the VALUES list rather than in the verb, so it is appended here
+        # instead of being baked into every shared statement.
+        if sql.lstrip().upper().startswith("INSERT INTO") and "ON CONFLICT" not in sql.upper():
+            sql = f"{sql} ON CONFLICT DO NOTHING"
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            rowcount = int(cur.rowcount or 0)
+        self._commit()
+        return rowcount
+
+    def _autofix_claim_ids(self, sql: str, params: tuple) -> list[int]:
+        """Rows no other worker is already looking at.
+
+        `SKIP LOCKED` rather than a plain read: the conditional UPDATE that
+        follows is still the arbiter, but skipping locked rows means a busy
+        install's workers pick *different* jobs instead of all queueing behind
+        the oldest one.
+        """
+        with self._transaction_cursor() as cur:
+            cur.execute(f"{sql} FOR UPDATE SKIP LOCKED", params)
+            return [int(row[0]) for row in cur.fetchall()]
+
+    def _autofix_scope(self) -> tuple[str, tuple[Any, ...]]:
+        """Pin autofix reads to this store's repository.
+
+        One table holds every repository here, so an unscoped read would return
+        another repo's jobs to a caller that asked about this one — and, worse,
+        would let a worker scoped to one repository take a lease on another's
+        work. The org-wide handle (empty owner/repo) is the deliberate
+        exception, and is what the shared worker runs as.
         """
         clauses = []
         params: list[Any] = []
