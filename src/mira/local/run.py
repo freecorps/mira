@@ -101,22 +101,39 @@ class LocalReview:
         return [result for result in self.checks.blocking_results if result.is_violation]
 
     @property
-    def incomplete_blocking_checks(self) -> list:
+    def unanswered_checks(self) -> list[str]:
+        """Every way this run failed to produce an answer it was asked for.
+
+        Two of them, and the second is the one that is easy to lose. A blocking
+        check that ran and could not conclude is the obvious case. A run that
+        never *started* — an unreadable diff, a broken policy — is the other,
+        and it has no results at all, so a check that only walked
+        ``blocking_results`` would report an empty list and let the strictest
+        flag in the tool pass precisely when the checks were least able to
+        answer.
+        """
         if self.checks is None:
             return []
-        return [result for result in self.checks.blocking_results if result.incomplete]
+        reasons = [
+            f"{result.check_id}: {result.state}"
+            for result in self.checks.blocking_results
+            if result.incomplete
+        ]
+        if self.checks.error:
+            reasons.append(f"the run did not start: {self.checks.error}")
+        return reasons
 
     def exit_code(self) -> ExitCode:
         """What the process should exit with.
 
         Only findings and check *violations* produce
-        :data:`~mira.local.exit_codes.ExitCode.FINDINGS`. A blocking check that
-        could not answer does not, unless the caller asked for it: locally, the
-        usual reason a check cannot answer is that the deployment's analyser is
-        not installed on this machine, and failing a developer's pre-commit hook
-        for that would teach them to pass ``--no-verify``. The merge gate, which
-        is the thing that actually protects the branch, still fails closed on
-        the same condition — that is its job and this is not it.
+        :data:`~mira.local.exit_codes.ExitCode.FINDINGS`. A check that could not
+        answer does not, unless the caller asked for it: locally, the usual
+        reason a check cannot answer is that the deployment's analyser is not
+        installed on this machine, and failing a developer's pre-commit hook for
+        that would teach them to pass ``--no-verify``. The merge gate, which is
+        the thing that actually protects the branch, still fails closed on the
+        same condition — that is its job and this is not it.
         """
         if self.fail_on != FAIL_ON_NEVER:
             threshold = Severity.from_str(self.fail_on)
@@ -124,7 +141,7 @@ class LocalReview:
                 return ExitCode.FINDINGS
         if self.blocking_check_violations:
             return ExitCode.FINDINGS
-        if self.fail_on_incomplete_checks and self.incomplete_blocking_checks:
+        if self.fail_on_incomplete_checks and self.unanswered_checks:
             return ExitCode.FINDINGS
         return ExitCode.OK
 
@@ -194,10 +211,17 @@ def prepare(
     stated_slug: str = "",
     stated_platform: str = "",
 ) -> LocalReview:
-    """Resolve the repository, the configuration, the destination and the diff.
+    """Resolve the repository, the configuration, the diff and the destination.
 
-    Everything before a single byte of source is sent anywhere. Raises
-    :class:`LocalReviewError` carrying the exit code the failure deserves.
+    Everything before a single byte of source is *sent* anywhere. The diff is
+    resolved before the destination is checked, and in that order on purpose:
+    the trusted destination lives in ``.mira.yaml`` as committed at the base of
+    the review, so the guard needs the base the diff resolution worked out.
+    Reading a diff into this process sends nothing; the guard still runs before
+    a client is constructed.
+
+    Raises :class:`LocalReviewError` carrying the exit code the failure
+    deserves.
     """
     try:
         repo_root = find_repo_root(path)
@@ -213,11 +237,6 @@ def prepare(
     try:
         config = load_repo_config(repo_root, overrides)
     except MiraError as exc:
-        raise LocalReviewError(str(exc), ExitCode.CONFIG) from exc
-
-    try:
-        destinations = check_destinations(repo_root, effective=config)
-    except DestinationRefused as exc:
         raise LocalReviewError(str(exc), ExitCode.CONFIG) from exc
 
     try:
@@ -242,6 +261,19 @@ def prepare(
         raise LocalReviewError(str(exc), ExitCode.USAGE) from exc
     except GitError as exc:
         raise LocalReviewError(str(exc), ExitCode.GIT) from exc
+
+    try:
+        destinations = check_destinations(repo_root, effective=config, base_rev=diff.base_sha)
+    except DestinationRefused as exc:
+        raise LocalReviewError(str(exc), ExitCode.CONFIG) from exc
+    except MiraError as exc:
+        # An unusable baseline is not a reason to fall back to the working
+        # tree's answer: with no trusted destination there is nothing to
+        # compare against, and the whole point is to not send the code then.
+        raise LocalReviewError(
+            f"The destination configured at the base of this review could not be read: {exc}",
+            ExitCode.CONFIG,
+        ) from exc
 
     review = LocalReview(identity=identity, diff=diff, config=config, destinations=destinations)
     review.notes.extend(diff.notes)

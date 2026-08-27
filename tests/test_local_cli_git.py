@@ -443,7 +443,19 @@ class TestRepoIdentity:
             ("git@github.com:acme/widgets.git", ("github.com", "acme", "widgets")),
             ("ssh://git@gitlab.com/group/sub/proj.git", ("gitlab.com", "group/sub", "proj")),
             ("https://codeberg.org/acme/widgets.git", ("codeberg.org", "acme", "widgets")),
-            ("/srv/git/widgets.git", ("", "srv/git", "widgets")),
+            # A local-path remote names no forge and no namespace. `/srv/git`
+            # is a directory, not an owner, and returning it as one would key
+            # retrieval and per-repository policy on a path that happens to be
+            # on this disk — an index that is always empty and a policy that is
+            # never the repository's, reported as though both were found.
+            ("/srv/git/widgets.git", ("", "", "")),
+            ("../sibling-checkout", ("", "", "")),
+            ("file:///srv/git/widgets.git", ("", "", "")),
+            # A drive letter has the same shape as an scp-like remote. Git
+            # resolves it the same way: one character then a separator is a
+            # drive, not a host called `c`.
+            ("C:/repos/widgets.git", ("", "", "")),
+            ("C:\\repos\\widgets.git", ("", "", "")),
             ("", ("", "", "")),
         ],
     )
@@ -512,3 +524,51 @@ class TestRepoRoot:
         outside.mkdir()
         with pytest.raises(GitError, match="not inside a git work tree"):
             gitcmd.find_repo_root(outside)
+
+
+class TestUntrackedSynthesisLimits:
+    def test_a_path_git_would_quote_is_skipped_and_named(self, git_repo: GitRepo) -> None:
+        # Interpolating a path with a newline in it into a `diff --git` header
+        # would end that line and let the rest of the name forge the next one,
+        # so the parser downstream attributes content to a path nobody wrote.
+        # Asserted on the helper: a filename with a newline cannot be created
+        # on every platform this test runs on, and the guarantee is in what the
+        # synthesiser refuses, not in which filenames the OS permits.
+        notes: list[str] = []
+        crafted = "evil\ndiff --git a/passwd b/passwd"
+
+        text, included = repo_module._untracked_diff(git_repo.root, [crafted], notes)
+
+        assert text == ""
+        assert included == []
+        assert any("git would have to quote" in note for note in notes)
+
+    @pytest.mark.parametrize(
+        ("name", "quoted"),
+        [
+            ("src/app.py", False),
+            ("café.py", False),
+            ("with space.py", False),
+            ("new\nline.py", True),
+            ("tab\there.py", True),
+            ('quote".py', True),
+            (r"back\slash.py", True),
+        ],
+    )
+    def test_which_paths_need_quoting(self, name: str, quoted: bool) -> None:
+        assert repo_module._needs_quoting(name) is quoted
+
+    def test_an_aggregate_ceiling_stops_the_loop_and_names_what_it_dropped(
+        self, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The per-file limit bounds one file. A scratch directory holding
+        # hundreds of them is bounded by nothing without this.
+        monkeypatch.setattr(repo_module, "MAX_UNTRACKED_TOTAL_BYTES", 300)
+        for index in range(6):
+            git_repo.write(f"scratch{index}.py", "x = 1\n" * 40)
+
+        diff = resolve_diff(git_repo.root, mode=MODE_WORKING_TREE, include_untracked=True)
+
+        assert any("were not reviewed" in note for note in diff.notes)
+        included = [entry.path for entry in diff.entries if entry.path.startswith("scratch")]
+        assert 0 < len(included) < 6

@@ -54,6 +54,24 @@ _SUBMODULE_MODE = "160000"
 #: into memory in the first place.
 MAX_UNTRACKED_BYTES = 512 * 1024
 
+#: Ceiling on everything synthesised from untracked files in one run. The
+#: per-file limit bounds one file; a scratch directory holding four thousand of
+#: them is bounded by nothing without this. What the ceiling excluded is named
+#: in the report rather than dropped quietly.
+MAX_UNTRACKED_TOTAL_BYTES = 4 * 1024 * 1024
+
+#: Characters git escapes when it writes a path into a patch header. A path
+#: holding one of these is skipped rather than interpolated: a newline in a
+#: filename would end the header line it appears in and let the rest of the
+#: name forge the next one.
+_UNQUOTABLE = frozenset('"\\') | {chr(code) for code in range(0x20)} | {chr(0x7F)}
+
+
+def _needs_quoting(path: str) -> bool:
+    """Whether git would have to quote this path in a diff header."""
+    return any(character in _UNQUOTABLE for character in path)
+
+
 #: Hosts whose platform is not in doubt. Anything else falls back to the
 #: configured provider type, or to whatever the caller stated.
 _KNOWN_HOSTS = {
@@ -65,6 +83,18 @@ _KNOWN_HOSTS = {
 }
 
 _SCP_LIKE = re.compile(r"^(?:(?P<user>[^@/]+)@)?(?P<host>[^:/]+):(?P<path>.+)$")
+
+
+def _is_windows_drive(host: str, path: str) -> bool:
+    """Whether ``host:path`` is a drive letter rather than an scp-like remote.
+
+    ``C:/repos/widgets.git`` and ``git@github.com:acme/widgets.git`` have the
+    same shape, and git resolves the ambiguity the same way: one character
+    before the colon, followed by a separator, is a drive. Without this a local
+    Windows checkout reports its remote's host as ``c`` and its owner as the
+    directory the repository happens to sit in.
+    """
+    return len(host) == 1 and host.isalpha() and path[:1] in ("/", "\\")
 
 
 @dataclass(frozen=True)
@@ -180,7 +210,7 @@ def split_remote_url(url: str) -> tuple[str, str, str]:
         path = parts.path
     else:
         match = _SCP_LIKE.match(raw)
-        if match:
+        if match and not _is_windows_drive(match.group("host"), match.group("path")):
             host = match.group("host").lower()
             path = match.group("path")
         else:
@@ -189,6 +219,14 @@ def split_remote_url(url: str) -> tuple[str, str, str]:
             path = raw
 
     path = _strip_git_suffix(path.strip("/"))
+    if not host:
+        # A local-path remote (`/srv/git/repo.git`, `../other`, a `file://`
+        # URL). There is a directory name in it and no namespace: `/srv/git`
+        # is not an owner, and returning it as one would key retrieval and
+        # per-repository policy on a path that happens to be on this disk.
+        # An unidentified checkout is reported and asks for `--repo`; a
+        # confidently wrong one silently reads an empty index.
+        return "", "", ""
     if not path:
         return host, "", ""
     segments = [segment for segment in path.split("/") if segment]
@@ -429,10 +467,31 @@ def _untracked_diff(repo_root: Path, paths: list[str], notes: list[str]) -> tupl
     temporary file rather than the repository path, which then has to be
     rewritten anyway. Building the patch is a dozen lines and is the only
     version that is both read-only and correct.
+
+    Two things it refuses rather than attempts.
+
+    A path git would have to *quote* in a header — one holding a newline, a
+    tab, a quote or a backslash — is skipped and named. Interpolating one
+    verbatim would let a filename split the header it appears in and forge
+    another, and the parser downstream would then attribute a file's contents
+    to a path nobody wrote. Git's own answer is C-style quoting, but a quoted
+    header only helps a reader that unquotes it, and the point of synthesising
+    this patch at all is that it is read by the same parser as git's output.
+
+    An aggregate byte ceiling stops the loop, because a per-file limit bounds
+    nothing when a directory holds four thousand files. What was dropped is
+    named: a silent cap reads as "there was nothing else".
     """
     sections: list[str] = []
     included: list[str] = []
-    for rel in paths:
+    budget = MAX_UNTRACKED_TOTAL_BYTES
+    for index, rel in enumerate(paths):
+        if _needs_quoting(rel):
+            notes.append(
+                f"An untracked file was not reviewed: its name contains a character "
+                f"git would have to quote in a diff header ({rel!r})."
+            )
+            continue
         target = repo_root / rel
         try:
             if not target.is_file() or target.is_symlink():
@@ -444,6 +503,15 @@ def _untracked_diff(repo_root: Path, paths: list[str], notes: list[str]) -> tupl
                     f"{MAX_UNTRACKED_BYTES // 1024} KiB."
                 )
                 continue
+            if size > budget:
+                remaining = len(paths) - index
+                notes.append(
+                    f"{remaining} untracked file(s) were not reviewed: the total "
+                    f"synthesised from them would have passed "
+                    f"{MAX_UNTRACKED_TOTAL_BYTES // 1024} KiB."
+                )
+                break
+            budget -= size
             data = target.read_bytes()
         except OSError as exc:
             notes.append(f"Untracked file {rel} could not be read: {exc}")
