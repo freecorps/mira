@@ -29,7 +29,7 @@ from mira.feedback.synthesis import synthesize_candidate
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
-from mira.llm.tool_schemas import SUBMIT_THREAD_REPLY_TOOL
+from mira.llm.tool_schemas import SUBMIT_FINDING_RECHECK_TOOL, SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ _THREAD_REPLY_ENV = Environment(
 )
 
 _THREAD_REPLY_TEMPLATE = _THREAD_REPLY_ENV.get_template("thread_reply.jinja2")
+_THREAD_RECHECK_TEMPLATE = _THREAD_REPLY_ENV.get_template("thread_recheck.jinja2")
 
 PAUSE_LABEL = "mira-paused"
 
@@ -89,6 +90,46 @@ async def _thread_code_context(
     except Exception as exc:
         logger.debug("Could not load thread code context for %s: %s", path, exc)
         return ""
+
+
+async def _recheck_finding(
+    llm: Any,
+    *,
+    original_suggestion: str,
+    user_reply: str,
+    comment_path: str,
+    comment_line: int,
+    code_context: str,
+) -> tuple[bool | None, str]:
+    """Look at the code again after the author says they fixed something.
+
+    Returns ``(resolved, reply)`` where ``resolved`` is ``None`` when the check
+    could not be made at all. Three answers rather than two, because "I looked
+    and it is fixed", "I looked and it is not" and "I could not look" lead to
+    three different things happening to the thread — and collapsing the third
+    into either of the others is how a thread gets closed on a fix nobody
+    verified, or reopened on one that landed.
+    """
+    prompt = _THREAD_RECHECK_TEMPLATE.render(
+        original_suggestion=original_suggestion,
+        user_reply=user_reply or "(empty)",
+        comment_path=comment_path,
+        comment_line=comment_line,
+        code_context=code_context,
+    )
+    try:
+        raw = await llm.complete_with_tools(
+            messages=[{"role": "user", "content": prompt}],
+            tools=[SUBMIT_FINDING_RECHECK_TOOL],
+            temperature=0.0,
+        )
+        data = json.loads(strip_think_blocks(strip_code_fences(raw))) if raw else {}
+    except Exception as exc:
+        logger.warning("Finding recheck failed: %s", exc)
+        return None, ""
+    if "resolved" not in data:
+        return None, ""
+    return bool(data.get("resolved")), str(data.get("reply", "")).strip()
 
 
 def _open_store(owner: str, repo: str, platform: str = "github") -> IndexStore:
@@ -363,9 +404,22 @@ async def run_thread_reply(
     """Platform-neutral free-form thread reply with intent classification.
 
     The LLM classifies the human's message and we respond accordingly:
-    ``disagreement`` → reply + resolve the thread + record a ``rejected``
-    feedback signal (same learning signal as an explicit reject); ``question``
-    → answer, leave open; ``agreement`` / ``other`` → acknowledge, leave open.
+
+    ``disagreement``
+        The human says the finding is *wrong*. Reply, resolve the thread,
+        record a ``rejected`` signal and propose a learning rule.
+    ``fixed``
+        The human says the finding is *right* and they have changed the code.
+        Opposite meaning, opposite outcome — so it must not be classified as
+        disagreement, which is what used to happen to most replies and which
+        both dismissed a real finding and taught Mira not to raise it again.
+        Their word triggers a second look rather than settling the matter: the
+        code is rechecked, and only a recheck that comes back resolved closes
+        the thread, as ``fixed`` rather than ``dismissed``.
+    ``question``
+        Answer, leave open.
+    ``agreement`` / ``other``
+        Acknowledge, leave open.
     """
     config = load_config()
     llm = create_llm(llm_config_for("indexing", config.llm))
@@ -396,6 +450,11 @@ async def run_thread_reply(
     reply_text = str(data.get("reply", "")).strip()
     kind_by_intent = {
         "disagreement": "reply_disagree",
+        # A human saying "fixed" has agreed with the finding, and that is all
+        # this event records. Whether it is actually fixed is a separate signal
+        # with a separate provenance, recorded below only if a recheck says so
+        # — the claim and the verification are different facts.
+        "fixed": "reply_agree",
         "agreement": "reply_agree",
         "question": "reply_question",
         "other": "reply_other",
@@ -433,6 +492,7 @@ async def run_thread_reply(
         await provider.reply_to_review_comment(pr_info, comment_id, reply_text)
         return
 
+    resolved: bool | None = None
     if intent == "disagreement":
         proposal = data.get("learning")
         candidate, _candidate_created = create_learning_candidate_for_feedback(
@@ -444,6 +504,25 @@ async def run_thread_reply(
             config=config.learning,
         )
         reply_text = feedback_ack(candidate, pr_info.owner, pr_info.repo)
+    elif intent == "fixed":
+        # Look, rather than take their word for it. The reply the classifier
+        # wrote is a holding sentence; what gets posted is the result of the
+        # check, so the author learns whether the thread actually closed.
+        resolved, verdict = await _recheck_finding(
+            llm,
+            original_suggestion=original_suggestion,
+            user_reply=human_reply,
+            comment_path=comment_path,
+            comment_line=comment_line,
+            code_context=code_context,
+        )
+        if verdict:
+            reply_text = verdict
+        elif resolved is None:
+            reply_text = (
+                "Thanks — I could not re-read the code just now, so I have left "
+                "this thread open rather than closing it on an unverified fix."
+            )
     elif not reply_text:
         logger.warning("Free-form thread reply: empty reply (intent=%s). Recorded only.", intent)
         return
@@ -455,20 +534,79 @@ async def run_thread_reply(
         return
 
     if intent == "disagreement":
-        try:
-            tid = thread_id
-            if tid is None and comment_node_id:
-                tid = await provider.get_thread_id_for_comment(comment_node_id, pr_info)
-            if tid:
-                await provider.resolve_threads(pr_info, [tid])
-        except Exception as exc:
-            logger.warning("Failed to resolve disagreement thread: %s", exc)
-        try:
-            set_finding_state(pr_info, finding.id, "dismissed", platform)
-        except Exception as fb_err:
-            logger.debug("Failed to update disagreement state: %s", fb_err)
+        await _close_thread(
+            provider,
+            pr_info,
+            finding,
+            thread_id=thread_id,
+            comment_node_id=comment_node_id,
+            state="dismissed",
+            platform=platform,
+        )
+    elif intent == "fixed" and resolved:
+        # A second event, under its own provenance: the first records that the
+        # author claimed a fix, this one records that Mira went and confirmed
+        # it. `fixed` is the kind evaluation counts as addressed, and it is
+        # earned by the recheck rather than by the claim.
+        record_finding_feedback(
+            pr_info,
+            kind="fixed",
+            source_event_id=f"recheck:{source_id}",
+            actor=actor,
+            actor_role=actor_role,
+            raw_text=human_reply,
+            rationale=reply_text,
+            original_body=original_suggestion,
+            platform_comment_id=parent_comment_id,
+            platform_thread_id=thread_id or "",
+            path=comment_path,
+            line=comment_line,
+            thread_state="resolved",
+            platform=platform,
+        )
+        await _close_thread(
+            provider,
+            pr_info,
+            finding,
+            thread_id=thread_id,
+            comment_node_id=comment_node_id,
+            state="fixed",
+            platform=platform,
+        )
 
     logger.info("Thread reply (%s) on %s: %s", intent, pr_info.url, reply_text[:80])
+
+
+async def _close_thread(
+    provider: Any,
+    pr_info: Any,
+    finding: Any,
+    *,
+    thread_id: str | None,
+    comment_node_id: str | None,
+    state: str,
+    platform: str,
+) -> None:
+    """Resolve the platform thread and record the finding's new state.
+
+    Both halves are best-effort and independent: a platform without thread
+    resolution should still record that the finding was settled, and a store
+    that refused the write should not stop the thread from closing. Neither is
+    allowed to raise, because by this point the reply has already been posted
+    and failing here would only produce a duplicate on the retry.
+    """
+    try:
+        tid = thread_id
+        if tid is None and comment_node_id:
+            tid = await provider.get_thread_id_for_comment(comment_node_id, pr_info)
+        if tid:
+            await provider.resolve_threads(pr_info, [tid])
+    except Exception as exc:
+        logger.warning("Failed to resolve %s thread: %s", state, exc)
+    try:
+        set_finding_state(pr_info, finding.id, state, platform)
+    except Exception as exc:
+        logger.debug("Failed to record %s state: %s", state, exc)
 
 
 async def run_pr_merged_learning(

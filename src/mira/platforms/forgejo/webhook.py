@@ -354,7 +354,17 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             return
 
         # Explicit reject on an inline (diff) comment → record feedback.
-        if first_word in _REJECT_KEYWORDS and (comment_path or parent_comment_id):
+        #
+        # "Explicit" means addressed to Mira. An inline reply reaches this
+        # handler with no mention at all, so without the check the first word
+        # of any reply is read as a command — and "Resolved in 1a2b3c", which
+        # agrees with the finding, dismissed it and taught Mira not to raise it
+        # again. Un-mentioned replies are conversation for the classifier.
+        if (
+            first_word in _REJECT_KEYWORDS
+            and has_mention(comment_body, names)
+            and (comment_path or parent_comment_id)
+        ):
             finding, feedback_event, created = record_finding_feedback(
                 pr_info,
                 kind="dismissed",

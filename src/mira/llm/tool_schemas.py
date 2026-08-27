@@ -171,11 +171,17 @@ SUBMIT_THREAD_REPLY_TOOL = {
             "properties": {
                 "intent": {
                     "type": "string",
-                    "enum": ["disagreement", "question", "agreement", "other"],
+                    "enum": ["disagreement", "fixed", "question", "agreement", "other"],
                     "description": (
-                        "disagreement = human refutes the suggestion / says it doesn't apply. "
-                        "question = human is asking for clarification. "
-                        "agreement = human is acknowledging or thanking. "
+                        "disagreement = the human says the finding is WRONG: it does not "
+                        "apply, the premise is mistaken, the code already handles it. "
+                        "Only when they are refuting the finding itself. "
+                        "fixed = the human accepts the finding and says they have changed "
+                        'the code ("fixed", "done", "good catch, addressed below", '
+                        '"corrigido"). They are agreeing with it, not refuting it. '
+                        "question = the human is asking for clarification. "
+                        "agreement = the human accepts the point but has not said they "
+                        "changed anything yet. "
                         "other = anything else (off-topic, unclear)."
                     ),
                 },
@@ -227,6 +233,44 @@ SUBMIT_THREAD_REPLY_TOOL = {
                 },
             },
             "required": ["intent", "reply", "learning"],
+        },
+    },
+}
+
+
+# Used only when a human says they have fixed a finding. Their word is the
+# trigger for looking, not the answer: this is the second, cheap call that
+# reads the code as it stands now and decides whether the thread may close.
+SUBMIT_FINDING_RECHECK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_finding_recheck",
+        "description": (
+            "Decide whether a previous review finding is still present in the "
+            "code as it now stands, after the author said they addressed it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "resolved": {
+                    "type": "boolean",
+                    "description": (
+                        "True only if the code shown clearly no longer has the problem "
+                        "the finding described. If the relevant code is not visible, or "
+                        "the change is unrelated to the finding, answer false — an "
+                        "unverified claim is not a resolution."
+                    ),
+                },
+                "reply": {
+                    "type": "string",
+                    "description": (
+                        "1-2 short sentences, plain text, no markdown, no emojis. If "
+                        "resolved, confirm what changed. If not, say plainly what still "
+                        "looks unaddressed so the author can push again."
+                    ),
+                },
+            },
+            "required": ["resolved", "reply"],
         },
     },
 }

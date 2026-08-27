@@ -187,6 +187,81 @@ async def test_inline_mention_routes_to_thread_reply(gitlab_auth):
 
 
 @pytest.mark.asyncio
+async def test_an_unmentioned_reply_is_not_read_as_a_reject_command(gitlab_auth):
+    """ "Resolve — I pushed the guard" agrees with the finding. It is not a command.
+
+    An inline reply reaches this handler with no mention, so matching the
+    first word against the reject keywords turned an agreement into a
+    dismissal — and fed the learning loop a rejection nobody wrote.
+    """
+    from mira.platforms.gitlab import webhook as gw
+
+    payload = {
+        "object_attributes": {
+            "note": "Resolve — I pushed the guard in 1a2b3c.",
+            "noteable_type": "MergeRequest",
+            "id": 99,
+            "discussion_id": "abc123",
+            "position": {"new_path": "a.py", "new_line": 4},
+        },
+        "merge_request": {"iid": 7, "url": "https://gitlab.com/g/p/-/merge_requests/7"},
+        "project": {"path_with_namespace": "g/p", "web_url": "https://gitlab.com/g/p"},
+        "user": {"username": "alice"},
+    }
+    prov = AsyncMock()
+    prov.get_pr_info = AsyncMock(return_value=object())
+    prov.get_discussion_root_body = AsyncMock(
+        return_value="<!-- mira:finding:00000000-0000-4000-8000-000000000001 -->"
+    )
+    with (
+        patch("mira.platforms.gitlab.webhook.create_provider", return_value=prov),
+        patch("mira.platforms.handlers.run_thread_reply", new=AsyncMock()) as rtr,
+        patch(
+            "mira.platforms.gitlab.webhook.record_finding_feedback",
+            return_value=(None, None, True),
+        ) as rec,
+    ):
+        await gw.handle_gitlab_note(payload, gitlab_auth, "mira-bot")
+    rec.assert_not_called()
+    rtr.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_mentioned_reject_is_still_an_explicit_command(gitlab_auth):
+    from mira.platforms.gitlab import webhook as gw
+
+    payload = {
+        "object_attributes": {
+            "note": "@mira-bot reject",
+            "noteable_type": "MergeRequest",
+            "id": 99,
+            "discussion_id": "abc123",
+            "position": {"new_path": "a.py", "new_line": 4},
+        },
+        "merge_request": {"iid": 7, "url": "https://gitlab.com/g/p/-/merge_requests/7"},
+        "project": {"path_with_namespace": "g/p", "web_url": "https://gitlab.com/g/p"},
+        "user": {"username": "alice"},
+    }
+    prov = AsyncMock()
+    prov.get_pr_info = AsyncMock(return_value=object())
+    prov.get_discussion_root_body = AsyncMock(
+        return_value="<!-- mira:finding:00000000-0000-4000-8000-000000000001 -->"
+    )
+    with (
+        patch("mira.platforms.gitlab.webhook.create_provider", return_value=prov),
+        patch("mira.platforms.handlers.run_thread_reply", new=AsyncMock()) as rtr,
+        patch(
+            "mira.platforms.gitlab.webhook.record_finding_feedback",
+            return_value=(None, None, True),
+        ) as rec,
+    ):
+        await gw.handle_gitlab_note(payload, gitlab_auth, "mira-bot")
+    rec.assert_called_once()
+    assert rec.call_args.kwargs["kind"] == "dismissed"
+    rtr.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_paused_label_skips_review(gitlab_auth):
     from mira.platforms.gitlab import webhook as gw
 

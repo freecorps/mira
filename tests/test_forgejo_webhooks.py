@@ -140,6 +140,70 @@ async def test_pr_opened_allowlist_filters_off_list(client):
     h.assert_not_called()
 
 
+def _inline_reply_payload(body: str, login: str = "alice"):
+    """An inline reply on a diff comment, which carries no mention."""
+    return {
+        "action": "created",
+        "is_pull": True,
+        "comment": {
+            "body": body,
+            "id": 99,
+            "in_reply_to_id": 42,
+            "path": "a.py",
+            "line": 4,
+            "user": {"username": login},
+        },
+        "repository": {
+            "full_name": "acme/app",
+            "html_url": "https://forge.example/acme/app",
+        },
+        "issue": {"number": 7},
+        "sender": {"login": login},
+    }
+
+
+async def _run_forgejo_reply(forgejo_auth, body: str):
+    """Run one inline reply and report what the handler did with it."""
+    from mira.platforms.forgejo import webhook as fw
+
+    prov = AsyncMock()
+    prov.get_pr_info = AsyncMock(return_value=object())
+    prov.get_comment_body = AsyncMock(
+        return_value="<!-- mira:finding:00000000-0000-4000-8000-000000000001 -->"
+    )
+    with (
+        patch("mira.platforms.forgejo.webhook.create_provider", return_value=prov),
+        patch("mira.platforms.handlers.run_thread_reply", new=AsyncMock()) as rtr,
+        patch(
+            "mira.platforms.forgejo.webhook.record_finding_feedback",
+            return_value=(None, None, True),
+        ) as rec,
+    ):
+        await fw.handle_forgejo_note(_inline_reply_payload(body), forgejo_auth, BOT)
+    return rtr, rec
+
+
+@pytest.mark.asyncio
+async def test_an_unmentioned_reply_is_not_read_as_a_reject_command(forgejo_auth):
+    """ "Resolve — I pushed the guard" agrees with the finding. It is not a command.
+
+    An inline reply reaches this handler with no mention, so matching its
+    first word against the reject keywords turned an agreement into a
+    dismissal — and fed the learning loop a rejection nobody wrote.
+    """
+    rtr, rec = await _run_forgejo_reply(forgejo_auth, "Resolve — I pushed the guard in 1a2b3c.")
+    rec.assert_not_called()
+    rtr.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_mentioned_reject_is_still_an_explicit_command(forgejo_auth):
+    rtr, rec = await _run_forgejo_reply(forgejo_auth, "@mira-bot reject")
+    rec.assert_called_once()
+    assert rec.call_args.kwargs["kind"] == "dismissed"
+    rtr.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_comment_review_bypass(client):
     """Manual @mira-bot review comment bypasses the author filter."""

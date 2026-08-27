@@ -301,6 +301,180 @@ async def test_disagreement_reply_records_once_and_uses_safe_ack(tmp_path, monke
     store.close()
 
 
+def _reply_fixture(tmp_path, monkeypatch, finding_id: str):
+    """A PR, a posted finding and a provider, ready for one thread reply."""
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    monkeypatch.setenv("MIRA_DASHBOARD_URL", "https://mira.example")
+    pr_info = PRInfo(
+        title="PR",
+        description="",
+        base_branch="main",
+        head_branch="feature",
+        url="https://github.com/acme/app/pull/7",
+        number=7,
+        owner="acme",
+        repo="app",
+        base_sha="base123",
+        head_sha="head123",
+    )
+    finding = _finding(finding_id=finding_id)
+    store = IndexStore.open("acme", "app")
+    store.save_review_finding(finding)
+    store.update_review_finding_posted(finding.id, 123)
+    store.close()
+
+    provider = AsyncMock()
+    provider.get_pr_diff = AsyncMock(
+        return_value=(
+            "diff --git a/src/app.py b/src/app.py\n"
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -9,1 +9,1 @@\n"
+            "-return fallback\n"
+            "+return expected\n"
+        )
+    )
+    provider.reply_to_review_comment = AsyncMock()
+    provider.resolve_threads = AsyncMock(return_value=1)
+    kwargs = {
+        "original_suggestion": finding_marker(finding.id),
+        "thread_id": "thread-1",
+        "comment_path": finding.path,
+        "comment_line": finding.start_line,
+        "actor": "alice",
+        "parent_comment_id": 123,
+        "source_event_id": "review-comment:456",
+    }
+    return pr_info, finding, provider, kwargs
+
+
+def _scripted_llm(*payloads: dict):
+    llm = AsyncMock()
+    llm.complete_with_tools = AsyncMock(side_effect=[json.dumps(item) for item in payloads])
+    return llm
+
+
+@pytest.mark.asyncio
+async def test_saying_a_finding_is_valid_and_fixed_is_not_a_rejection(
+    tmp_path, monkeypatch
+) -> None:
+    """The bug this exists for: every reply used to read as a refusal.
+
+    "Valid finding, fixed below" agrees with the finding. Classifying it as
+    disagreement dismissed a real finding *and* taught Mira not to raise it
+    again, from a reply that said the opposite.
+    """
+    pr_info, finding, provider, kwargs = _reply_fixture(
+        tmp_path, monkeypatch, "00000000-0000-4000-8000-00000000001a"
+    )
+    llm = _scripted_llm(
+        {"intent": "fixed", "reply": "Thanks, checking."},
+        {"resolved": True, "reply": "Confirmed: the divisor is guarded now."},
+    )
+    with (
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
+    ):
+        await run_thread_reply(provider, pr_info, "Valid finding, fixed below.", 456, **kwargs)
+
+    reply = provider.reply_to_review_comment.await_args.args[2]
+    assert "Confirmed" in reply
+    provider.resolve_threads.assert_awaited_once_with(pr_info, ["thread-1"])
+
+    store = IndexStore.open("acme", "app")
+    kinds = [event.kind for event in store.list_feedback_v2(finding_id=finding.id)]
+    # The claim and the verification are separate facts, and neither is a
+    # rejection: nothing here should produce a learning candidate.
+    assert "reply_disagree" not in kinds
+    assert sorted(kinds) == ["fixed", "reply_agree"]
+    assert store.get_review_finding(finding.id).state == "fixed"
+    assert store.list_learning_candidates(status="pending") == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_fix_that_is_not_there_leaves_the_thread_open(
+    tmp_path, monkeypatch
+) -> None:
+    """Their word is why Mira looks. It is not the answer."""
+    pr_info, finding, provider, kwargs = _reply_fixture(
+        tmp_path, monkeypatch, "00000000-0000-4000-8000-00000000001b"
+    )
+    llm = _scripted_llm(
+        {"intent": "fixed", "reply": "Thanks, checking."},
+        {"resolved": False, "reply": "The divisor is still unchecked on the early return."},
+    )
+    with (
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
+    ):
+        await run_thread_reply(provider, pr_info, "fixed it", 456, **kwargs)
+
+    assert "still unchecked" in provider.reply_to_review_comment.await_args.args[2]
+    provider.resolve_threads.assert_not_awaited()
+
+    store = IndexStore.open("acme", "app")
+    kinds = [event.kind for event in store.list_feedback_v2(finding_id=finding.id)]
+    assert kinds == ["reply_agree"]
+    assert store.get_review_finding(finding.id).state == finding.state
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_that_could_not_run_does_not_close_the_thread(
+    tmp_path, monkeypatch
+) -> None:
+    """ "I could not look" must not collapse into either "fixed" or "not fixed"."""
+    pr_info, finding, provider, kwargs = _reply_fixture(
+        tmp_path, monkeypatch, "00000000-0000-4000-8000-00000000001c"
+    )
+    llm = AsyncMock()
+    llm.complete_with_tools = AsyncMock(
+        side_effect=[
+            json.dumps({"intent": "fixed", "reply": "Thanks, checking."}),
+            RuntimeError("the model is unreachable"),
+        ]
+    )
+    with (
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
+    ):
+        await run_thread_reply(provider, pr_info, "done", 456, **kwargs)
+
+    assert "could not re-read" in provider.reply_to_review_comment.await_args.args[2]
+    provider.resolve_threads.assert_not_awaited()
+    store = IndexStore.open("acme", "app")
+    assert store.get_review_finding(finding.id).state == finding.state
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_the_recheck_reads_the_code_as_it_now_stands(tmp_path, monkeypatch) -> None:
+    """The second call has to see the diff, or it is guessing from the reply."""
+    pr_info, _finding_row, provider, kwargs = _reply_fixture(
+        tmp_path, monkeypatch, "00000000-0000-4000-8000-00000000001d"
+    )
+    llm = _scripted_llm(
+        {"intent": "fixed", "reply": "Thanks."},
+        {"resolved": True, "reply": "Confirmed."},
+    )
+    with (
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
+    ):
+        await run_thread_reply(provider, pr_info, "addressed", 456, **kwargs)
+
+    recheck_prompt = llm.complete_with_tools.await_args_list[1].kwargs["messages"][0]["content"]
+    assert "+return expected" in recheck_prompt
+    assert "untrusted data" in recheck_prompt
+    tools = llm.complete_with_tools.await_args_list[1].kwargs["tools"]
+    assert tools[0]["function"]["name"] == "submit_finding_recheck"
+
+
 @pytest.mark.asyncio
 async def test_synthesis_failure_still_acknowledges_and_resolves_thread(
     tmp_path, monkeypatch
