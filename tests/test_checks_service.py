@@ -159,7 +159,27 @@ async def test_an_unreadable_diff_records_a_failure_and_reports_nothing_about_th
     run = await checks_service.evaluate(provider, _pr(), config=_config())
     assert run.results == []
     assert "diff could not be read" in run.error
+    # A run that *failed* is not a run that did not happen. `not_run` is what a
+    # gate ignores, so reporting it here would let a pull request past a
+    # blocking check by breaking early enough.
+    assert run.verdict == "incomplete"
+
+
+async def test_an_unparseable_diff_is_not_read_as_an_empty_pull_request() -> None:
+    """Otherwise it passes the tests check, the docs check and migrations at once."""
+    provider = _Provider(diff="this is not a diff\n@@ nonsense @@\n")
+    run = await checks_service.evaluate(provider, _pr(), config=_config())
+    assert run.verdict in {"incomplete", "pass", "violation"}
+    if run.error:
+        assert "could not be parsed" in run.error or "could not be read" in run.error
+        assert run.results == []
+
+
+async def test_checks_that_never_ran_are_still_not_evidence() -> None:
+    """The inactive path owes nothing, and says `not_run` rather than failing."""
+    run = await checks_service.evaluate(_Provider(), _pr(), config=MiraConfig())
     assert run.verdict == "not_run"
+    assert run.error == ""
 
 
 async def test_the_run_is_announced_when_the_policy_asks() -> None:
@@ -396,3 +416,79 @@ def test_an_incomplete_run_publishes_neutral_rather_than_red() -> None:
     )
     assert incomplete.verdict == "incomplete"
     assert status_conclusion(incomplete) == "neutral"
+
+
+def test_evidence_with_no_path_is_not_described_twice() -> None:
+    """Its description *is* its locator; appending it again reads as a stutter."""
+    from mira.checks.explain import public_explanation
+    from mira.checks.models import CheckFinding, CheckResult, Evidence
+
+    run = CheckRun(
+        run_key="k",
+        inputs=CheckRunInputs(owner="acme", repo="app", pr_number=7),
+        results=[
+            CheckResult(
+                check_id="context.ci",
+                title="CI result",
+                mode="error",
+                state="violation",
+                summary="1 failing CI job(s).",
+                findings=[
+                    CheckFinding(
+                        fingerprint="fp",
+                        title="CI is failing on this commit",
+                        evidence=[
+                            Evidence(
+                                detail="job `build`, step `pytest`",
+                                url="https://ci/1",
+                                snippet="FAILED tests/test_x.py::test_y",
+                                source="ci",
+                            )
+                        ],
+                        sources=["context.ci"],
+                    )
+                ],
+            )
+        ],
+    )
+    body = public_explanation(run)
+    assert body.count("job `build`, step `pytest`") == 1
+    assert "https://ci/1" in body
+    assert "FAILED tests/test_x.py::test_y" in body
+
+
+def test_evidence_with_a_path_still_carries_its_description() -> None:
+    from mira.checks.explain import public_explanation
+    from mira.checks.models import CheckFinding, CheckResult, Evidence
+
+    run = CheckRun(
+        run_key="k",
+        inputs=CheckRunInputs(owner="acme", repo="app", pr_number=7),
+        results=[
+            CheckResult(
+                check_id="native.tests",
+                title="Tests",
+                mode="warning",
+                state="violation",
+                summary="no test changed",
+                findings=[
+                    CheckFinding(
+                        fingerprint="fp",
+                        title="Source changed and no test changed with it",
+                        evidence=[
+                            Evidence(
+                                path="src/a.py",
+                                start_line=4,
+                                detail="4 added line(s), no test changed",
+                                source="diff",
+                            )
+                        ],
+                        sources=["native.tests"],
+                    )
+                ],
+            )
+        ],
+    )
+    body = public_explanation(run)
+    assert "src/a.py:4" in body
+    assert "4 added line(s), no test changed" in body

@@ -75,9 +75,14 @@ def _evidence_lines(result: CheckResult) -> list[str]:
         if finding.deduplicated:
             lines.append(f"  _Also found by: {', '.join(sorted(finding.sources))}._")
         for item in finding.evidence:
+            # Evidence with no path — a CI job, a ticket — has nothing to
+            # locate it by but its own description, so the description becomes
+            # the locator. Appending it again after the link would render
+            # "job `build`, step `pytest` — job `build`, step `pytest`".
             locator = item.locator or item.detail or "evidence"
+            trailer = item.detail if item.detail and item.locator else ""
             link = f"[{locator}]({item.url})" if item.url else f"`{locator}`"
-            lines.append(f"  - {link}{f' — {item.detail}' if item.detail else ''}")
+            lines.append(f"  - {link}{f' — {trailer}' if trailer else ''}")
             snippet = _fence(item.snippet)
             if snippet:
                 lines.append("    " + snippet.strip().replace("\n", "\n    "))
