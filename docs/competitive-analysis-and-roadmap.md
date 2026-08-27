@@ -91,10 +91,10 @@ Legenda: **forte** = já competitivo; **parcial** = existe, mas falta fechar o f
 | Medição de eficácia de regras | **ausente** | Greptile, Graphite, Cursor | P0 |
 | Approval/gate orientado a risco | **parcial** | Macroscope, Greptile, Cursor | P1 |
 | Autofix / handoff para agente | **entregue (Fase 5)** | CodeRabbit, Macroscope, Greptile, Cursor | P1 |
-| Checks customizados de pré-merge | **ausente** | CodeRabbit, Macroscope, Qodo | P1 |
-| Leitura de logs/estado de CI | **ausente** | CodeRabbit, Graphite, Macroscope | P1 |
-| Validação de ticket/issue | **ausente** | CodeRabbit, Bito, Graphite | P1 |
-| Ferramentas estáticas amplas | **parcial** | CodeRabbit, Bito | P1 |
+| Checks customizados de pré-merge | **entregue (Fase 6)** | CodeRabbit, Macroscope, Qodo | P1 |
+| Leitura de logs/estado de CI | **entregue (Fase 6)** | CodeRabbit, Graphite, Macroscope | P1 |
+| Validação de ticket/issue | **entregue (Fase 6)** | CodeRabbit, Bito, Graphite | P1 |
+| Ferramentas estáticas amplas | **entregue (Fase 6)** | CodeRabbit, Bito | P1 |
 | Review local/CLI/IDE | **ausente** | Cursor, Bito, Qodo, CodeRabbit | P2 |
 | Validação dinâmica em sandbox | **ausente** | Greptile | P2 |
 | MCP e contexto externo | **ausente** | Greptile, Macroscope, Bito | P2 |
@@ -517,6 +517,46 @@ padrão, kill switch global e nenhuma aprovação real habilitada por padrão.
 
 **Aceite:** cada check é independente, reproduzível e mostra evidência; falha do check distingue erro de infraestrutura de violação real; ferramentas determinísticas e LLM deduplicam o mesmo achado.
 
+**Entregue.** Notas de implementação:
+
+- Cinco estados, e só um deles fala sobre a PR. `violation` é uma afirmação
+  sobre a mudança; `infrastructure_error`, `timeout` e `skipped` são
+  afirmações sobre a Mira, renderizadas em seção própria, com esse nome. Um
+  linter ausente é `skipped: tool_missing` com o binário nomeado — nunca um
+  pass e nunca um finding.
+- Fail closed é uma pergunta *separada* do que se exibe. Um `skipped` cujo
+  motivo é "faltou algo" conta como não respondido, então um check em `error`
+  não pode ser satisfeito deixando de rodar, e continua sendo mostrado como o
+  skip que é.
+- Uma violação sem evidência não é registrada como violação: o runner a
+  rebaixa para `skipped: no_evidence`, guarda as palavras do próprio check, e
+  o rebaixamento também conta como não respondido — uma afirmação sem prova
+  não vira finding nem vira caminho para o merge.
+- O contrato do adapter de ticket devolve `None` para "não existe" e *levanta*
+  para "não deu para perguntar". Um status HTTP de diferença e sentido oposto:
+  confundir os dois transformaria uma indisponibilidade em uma onda de
+  violações em toda a instalação.
+- A instrução do check em linguagem natural é política e fica no system
+  prompt; diff, título, corpo e arquivos vão em blocos não confiáveis. O
+  schema de saída tem três campos e nenhum capaz de nomear check, modo ou
+  comando, então o raio de alcance de uma injeção é o veredito de uma regra.
+  Toda citação é verificada contra o arquivo e o diff antes de virar
+  evidência.
+- Ferramentas vêm de allowlist fechada, como listas de argumentos, sem shell,
+  com timeout, rlimits e pin de versão opcional. O OSV chama a mesma
+  `scan_manifest_changes` do review em vez de reimplementá-la — a análise
+  existente não muda.
+- Um problema achado por analisador e por modelo aparece uma vez, com as duas
+  evidências preservadas e as duas fontes nomeadas, sob precedência fixa para
+  que duas execuções idênticas nunca atribuam diferente.
+- Configuração em três camadas — global, organização, repositório — validada
+  no load, com kill switch registrado na run em vez de inferido.
+- O gate lê o veredito sob dois códigos distintos: `checks_violation` e
+  `checks_incomplete`, e só o segundo é veto duro. Ele lê a run mais recente
+  *do head commit*, então uma run limpa do push anterior não vale como prova
+  sobre este.
+- Detalhes em [docs/pre-merge-checks.md](pre-merge-checks.md).
+
 ### Fase 7 — expansão de superfície (posterior, por demanda)
 
 - CLI para review de diff local/staged/commit range usando o mesmo engine.
@@ -550,9 +590,9 @@ Esses itens têm valor, mas não devem atrasar o ciclo de aprendizado e o autofi
 | GT-002 | Protected paths/CODEOWNERS/dry-run | P1 ✅ | GT-001 |
 | FX-001 | Fix de um finding em branch | P1 | FB-002 |
 | FX-002 | Fix All + testes + CI loop limitado | P1 | FX-001 |
-| CK-001 | Framework de pre-merge checks | P1 | GT-001 |
-| CK-002 | Ticket e CI context adapters | P1 | CK-001 |
-| TL-001 | Semgrep/Ruff/ESLint/Gitleaks adapters | P1 | CK-001 |
+| CK-001 | Framework de pre-merge checks | P1 ✅ | GT-001 |
+| CK-002 | Ticket e CI context adapters | P1 ✅ | CK-001 |
+| TL-001 | Semgrep/Ruff/ESLint/Gitleaks adapters | P1 ✅ | CK-001 |
 | DX-001 | CLI de review local | P2 | Engine estabilizado |
 | MCP-001 | MCP read-only | P2 | LR-003 |
 | SB-001 | Sandbox validation | P2 | FX-001 |

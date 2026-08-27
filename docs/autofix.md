@@ -705,7 +705,8 @@ merging into it, which is what makes `allowed_requesters: []` expressible at all
 
 ## Not in this phase
 
-Pre-merge checks and CI log summarisation are Phase 6. A runtime sandbox for
+Pre-merge checks and CI log summarisation landed in Phase 6 — see
+[docs/pre-merge-checks.md](pre-merge-checks.md). A runtime sandbox for
 high-uncertainty findings is Phase 7. Autofix writes a change and shows you the
 evidence; it does not decide whether the change is good enough to merge, and it
 does not merge it.

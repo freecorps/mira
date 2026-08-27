@@ -58,6 +58,7 @@ class EffectivePolicy:
     require_all_files_reviewed: bool = True
     require_index_ready: bool = True
     approve_max_severity: str = "suggestion"
+    require_checks_pass: bool = True
 
     risk_threshold: int = 25
     risk_medium_at: int = 20
@@ -113,6 +114,7 @@ class EffectivePolicy:
             "require_all_files_reviewed": self.require_all_files_reviewed,
             "require_index_ready": self.require_index_ready,
             "approve_max_severity": self.approve_max_severity,
+            "require_checks_pass": self.require_checks_pass,
             "risk_threshold": self.risk_threshold,
             "risk_medium_at": self.risk_medium_at,
             "risk_high_at": self.risk_high_at,
@@ -230,6 +232,7 @@ def resolve_policy(config: GateConfig, owner: str = "", repo: str = "") -> Effec
         require_all_files_reviewed=config.require_all_files_reviewed,
         require_index_ready=config.require_index_ready,
         approve_max_severity=config.approve_max_severity,
+        require_checks_pass=bool(_pick(entry.require_checks_pass, config.require_checks_pass)),
         risk_threshold=int(_pick(entry.risk_threshold, config.risk_threshold)),
         risk_medium_at=config.risk_medium_at,
         risk_high_at=config.risk_high_at,

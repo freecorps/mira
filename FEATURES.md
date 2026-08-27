@@ -94,6 +94,27 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Global kill switch that also stops queued work, plus per-repository opt-in and an admin cancel permission
 - Dashboard panel for jobs, patches, validations and failures
 
+## Pre-merge checks
+
+- Five explicit states per check — `pass`, `violation`, `infrastructure_error`, `skipped`, `timeout` — where only `violation` is ever a statement about the pull request
+- A missing linter, an unreachable tracker and a model that would not answer are reported as Mira's problem, in those words, in their own section
+- Fail closed regardless: a blocking check that could not answer refuses a gate approval just as a violation does, under its own reason code
+- Every result carries a check id, a check version, a digest of the configuration it ran under, its duration and its evidence
+- Evidence points at files, lines and quoted snippets — a violation with none is downgraded rather than recorded
+- Native checks: title and description, documentation, tests, possible breaking change, and migration reversibility
+- Ticket validation against GitHub/GitLab/Forgejo issues, with acceptance-criteria parsing and an adapter interface for any other tracker — no external service required
+- CI status and failing-job output summarised with the job, the step, a link and the quoted lines, redacted and truncated before storage
+- Natural-language checks per path glob, with the rule as policy in the system prompt and every quote verified against the code before it is recorded
+- "Not sure" is an answer: an ambiguous model verdict becomes a skip, never an invented finding
+- Deterministic analysers behind a closed allowlist — Semgrep, Ruff, ESLint, Gitleaks and OSV — with argument lists, no shell, version pinning and rlimits
+- OSV reuses the review's existing scan rather than repeating it, so nothing about the current analysis changes
+- Deduplication across producers: a problem found by an analyser and by a model appears once, with both evidences kept and both sources named
+- Modes per check (`off`, `warning`, `error`) with three-layer inheritance: global, organisation, repository
+- Per-check timeouts and a whole-run budget, with concurrency capped for the Orange Pi profile
+- Off by default, plus a kill switch that beats every per-scope override
+- Idempotent runs: a redelivered webhook converges on one row, and a retry that succeeds replaces the error it recorded
+- Dashboard panel for runs, per-check history, coverage catalog, policy and a policy-change audit trail
+
 ## Platform integrations
 
 - GitHub App with webhook support — works against github.com and GitHub Enterprise Server (set `MIRA_GITHUB_API_URL`)
@@ -139,6 +160,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - `context_lines`, `max_concurrent_chunks`, and `index.max_file_size` tuning knobs
 - Merge gate policy (`gate`): mode, kill switch, protected paths, eligibility limits, risk threshold, and per-repository overrides
 - Autofix policy (`autofix`): mode, kill switch, requester permissions, protected paths, size/attempt limits, the validation command allowlist, queue tuning, and per-repository overrides
+- Pre-merge check policy (`checks`): per-check modes, kill switch, budgets and concurrency, the analyser allowlist, natural-language rules, ticket and CI settings, and per-organisation and per-repository overrides
 
 ## Storage and deployment
 

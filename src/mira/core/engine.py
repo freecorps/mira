@@ -1171,6 +1171,12 @@ class ReviewEngine:
             except Exception as exc:
                 logger.debug("Failed to record last reviewed SHA: %s", exc)
 
+        # Phase 6: pre-merge checks. Before the gate, deliberately: the gate
+        # reads the newest check run for this head commit, and a gate that ran
+        # first would score the pull request against the previous push's answer
+        # or against no answer at all.
+        await self._run_pre_merge_checks(pr_info, full_diff_text)
+
         # Phase 4: the merge gate. Runs last, after the review has been posted
         # and recorded, and never raises — a gate failure must not discard a
         # review that already landed, and an unfinished gate never approves.
@@ -1180,6 +1186,44 @@ class ReviewEngine:
         await self._run_merge_gate(pr_info, result, full_diff_text)
 
         return result
+
+    async def _run_pre_merge_checks(self, pr_info: PRInfo, full_diff_text: str) -> None:
+        """Run the pre-merge checks for this pull request.
+
+        The diff is already in hand, so it is handed over rather than fetched
+        again — on the Orange Pi profile a second diff fetch per review is a
+        cost with nothing to show for it.
+
+        ``full_diff_text``, never the incremental one: a check that only saw
+        the newest commits would stop objecting to a migration added two pushes
+        ago, which is the same mistake the gate takes the full diff to avoid.
+
+        Never raises. A check framework that failed must not discard a review
+        that already landed, and a run that did not happen reports `not_run` —
+        which the gate reads as "no evidence", not as a pass.
+        """
+        from mira.checks import service as checks_service
+        from mira.checks.policy import resolve_policy as resolve_checks_policy
+
+        if self.provider is None:
+            return
+        if not resolve_checks_policy(self.config.checks, pr_info.owner, pr_info.repo).active:
+            return
+        try:
+            await checks_service.evaluate(
+                self.provider,
+                pr_info,
+                config=self.config,
+                signal=checks_service.ReviewSignal(
+                    diff_text=full_diff_text or "",
+                    review_id=self._review_event_id,
+                ),
+                # A dry-run review must not touch the platform at all, so the
+                # checks still run and record but announce nothing.
+                announce_result=not self.dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pre-merge checks failed for %s: %s", pr_info.url, exc)
 
     async def _run_merge_gate(
         self, pr_info: PRInfo, result: ReviewResult, full_diff_text: str

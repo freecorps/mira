@@ -279,7 +279,7 @@ async def run_gate_evaluation(
     bot_name: str,
     platform: str = "github",
 ) -> None:
-    """Re-evaluate the merge gate for a PR without re-running the review.
+    """Re-evaluate the pre-merge checks and the merge gate without re-reviewing.
 
     A gate decision is only as current as the facts behind it, and the two that
     move without a new commit are CI and labels. Re-evaluating on those events
@@ -287,20 +287,46 @@ async def run_gate_evaluation(
     a permanent state — and it costs no LLM call, which is why it can afford to
     happen on every check-suite completion.
 
-    Cheap to call when the gate is off: the policy is resolved first, and an
-    inactive gate returns before anything is fetched.
+    The pre-merge checks move on exactly the same events, and the CI check most
+    of all: it is the one whose answer *is* the event. So both are re-run here,
+    checks first, and the function is named for the gate only because that is
+    what it was before Phase 6 and every webhook layer calls it by that name.
+
+    Cheap to call when both are off: the policies are resolved first, and an
+    inactive pair returns before anything is fetched.
     """
+    from mira.checks import service as checks_service
+    from mira.checks.policy import resolve_policy as resolve_checks_policy
     from mira.gate import service as gate_service
     from mira.gate.policy import resolve_policy
 
     config = load_config()
-    if not resolve_policy(config.gate, owner, repo).active:
+    gate_active = resolve_policy(config.gate, owner, repo).active
+    checks_active = resolve_checks_policy(config.checks, owner, repo).active
+    if not gate_active and not checks_active:
         return
     try:
         pr_info = await provider.get_pr_info(pr_url)
-        await gate_service.evaluate(provider, pr_info, config=config, bot_name=bot_name)
     except Exception as exc:
-        logger.warning("Merge gate re-evaluation failed for %s: %s", pr_url, exc)
+        logger.warning("Could not read %s to re-evaluate it: %s", pr_url, exc)
+        return
+
+    if checks_active:
+        # Before the gate, and for the same reason the review runs them first:
+        # the gate reads the newest check run for this commit, and the event
+        # that woke this handler is usually the CI completion the CI check is
+        # waiting on. Re-running the gate over a stale `pending` would leave a
+        # pull request blocked on an answer that has since arrived.
+        try:
+            await checks_service.evaluate(provider, pr_info, config=config)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pre-merge check re-run failed for %s: %s", pr_url, exc)
+
+    if gate_active:
+        try:
+            await gate_service.evaluate(provider, pr_info, config=config, bot_name=bot_name)
+        except Exception as exc:
+            logger.warning("Merge gate re-evaluation failed for %s: %s", pr_url, exc)
 
 
 async def run_pr_command(

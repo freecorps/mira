@@ -590,3 +590,49 @@ class LearnedRule:
     active: bool = True
     created_at: float = 0.0
     updated_at: float = 0.0
+
+
+@dataclass
+class IssueInfo:
+    """An issue or ticket a pull request claims to be about.
+
+    Returned by a provider's ``get_issue``. The distinction that matters to the
+    check reading it is between ``None`` — the platform answered and there is
+    no such issue — and an exception, which means nobody could ask. Only the
+    first is a statement about the pull request.
+    """
+
+    number: int
+    title: str
+    body: str
+    state: str  # "open" | "closed" | "" when the platform does not say
+    url: str
+    labels: list[str] = field(default_factory=list)
+    # Where it lives, for a cross-repository reference.
+    owner: str = ""
+    repo: str = ""
+
+
+@dataclass
+class CIJobFailure:
+    """One failing CI job, with enough of its output to be evidence.
+
+    ``step`` and ``excerpt`` are what turn "the build is red" into something a
+    reader can act on without leaving the pull request. Both are text written
+    by whatever ran in CI, which is to say by anyone who can open a pull
+    request — so both are redacted and framed as untrusted data before they go
+    anywhere near a model, and neither is ever parsed.
+    """
+
+    name: str
+    # Provider's own id, for a follow-up fetch. Empty when it has none.
+    job_id: str = ""
+    conclusion: str = "failure"
+    url: str = ""
+    # The step or stage that failed, when the platform reports one.
+    step: str = ""
+    # Tail of the job's output. Already truncated by the provider to the
+    # caller's budget; redaction happens at the check boundary.
+    excerpt: str = ""
+    # True when the provider could name the job but not read its output.
+    log_unavailable: bool = False

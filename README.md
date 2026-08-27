@@ -178,6 +178,32 @@ transcripts live at `/autofix` (admin only).
 
 → [Autofix docs](docs/autofix.md)
 
+**Pre-merge checks** cover what the diff alone does not prove: whether the pull
+request says what it does, whether tests and docs moved with the code, whether
+a migration can be undone, whether the linked issue exists, and what CI
+actually printed when it went red. Each check reports its own state, its own
+duration and the file and line it is talking about:
+
+```yaml
+checks:
+  enabled: true
+  default_mode: "warning"   # off | warning | error
+  modes:
+    native.tests: "error"
+```
+
+The distinction the whole framework is built around: **a violation is a
+statement about your pull request, and everything else is a statement about
+Mira.** A linter that is not installed, a model that timed out and a tracker
+that could not be reached are reported as exactly that — never as a problem
+with your change — and the merge gate still refuses to approve on any of them,
+because not knowing is not permission. Deterministic analysers (Semgrep, Ruff,
+ESLint, Gitleaks, OSV) come from a closed allowlist, and a finding two of them
+share appears once with both sources named. Runs, evidence and policy history
+live at `/checks` (admin only).
+
+→ [Pre-merge check docs](docs/pre-merge-checks.md)
+
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 
 ## Development

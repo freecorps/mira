@@ -45,9 +45,7 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import shutil
-import signal
 import subprocess  # noqa: S404 - argv-only, no shell; see module docstring
 import sys
 import tempfile
@@ -55,86 +53,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mira import sandbox
 from mira.autofix.models import CheckResult, FixPatch, ValidationResult
 from mira.autofix.policy import EffectivePolicy
 from mira.autofix.redact import contains_secret, redact
 
 logger = logging.getLogger(__name__)
 
-# Environment handed to a validation command. An allowlist, not the operator's
-# environment minus a few names: a formatter has no business inheriting the
-# platform token, the database URL or the model API key, and enumerating what
-# to *remove* means every new secret added to the deployment is leaked until
-# somebody remembers to add it to the list.
-_ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "SYSTEMROOT", "TEMP", "TMP")
-
-
-def _child_env() -> dict[str, str]:
-    env = {name: os.environ[name] for name in _ENV_KEEP if name in os.environ}
-    # Node and Python both write caches into the working directory otherwise,
-    # which would leave debris in the scratch tree and slow every run.
-    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env.setdefault("NO_COLOR", "1")
-    env.setdefault("CI", "1")
-    return env
-
-
-def _rlimit_preexec(policy_memory_mb: int, cpu_seconds: int) -> Any:
-    """A preexec hook applying address-space and CPU ceilings, or None.
-
-    Returns None where `resource` does not exist (Windows). The caller records
-    that as a note on the check rather than pretending the limits applied —
-    a self-hosted Windows runner should know its formatter is unbounded.
-    """
-    try:
-        import resource
-    except ImportError:  # pragma: no cover - Windows
-        return None
-
-    limit_bytes = max(64, int(policy_memory_mb)) * 1024 * 1024
-    cpu = max(1, int(cpu_seconds))
-
-    def _apply() -> None:  # pragma: no cover - runs in the forked child
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024, 256 * 1024 * 1024))
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        os.setsid()
-
-    return _apply
-
-
-# Seconds allowed for a killed command's pipes to close before the check gives
-# up waiting for it. Short on purpose: the process has already had SIGKILL.
-_REAP_SECONDS = 5.0
-
-
-def _kill_group(process: subprocess.Popen, *, grouped: bool) -> None:
-    """Kill the command and everything it started.
-
-    ``os.setsid()`` in the preexec hook put the command in its own session, so
-    its pid is also its process-group id and one ``killpg`` reaches every
-    descendant. Without that hook — Windows, or a platform with no ``resource``
-    module — only the direct child can be reached, which is why the hook and
-    this function are described together rather than apart.
-    """
-    if grouped and hasattr(os, "killpg"):
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            return
-        except (ProcessLookupError, PermissionError, OSError) as exc:
-            logger.debug("Could not kill the process group for pid %s: %s", process.pid, exc)
-    if sys.platform == "win32":  # pragma: no cover - Windows only
-        with contextlib.suppress(Exception):
-            subprocess.run(  # noqa: S603, S607 - fixed argv, no shell
-                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                capture_output=True,
-                check=False,
-                timeout=_REAP_SECONDS,
-            )
-    with contextlib.suppress(Exception):
-        process.kill()
+# The process primitives — the environment allowlist, the rlimit hook and the
+# group kill — live in `mira.sandbox` and are shared with the pre-merge check
+# framework, which runs deterministic analysers under exactly the same
+# constraints. Two copies of "kill the whole process group on timeout" would
+# eventually be two different copies, and the one that got it wrong would be
+# the one leaving a runaway formatter holding four cores on an Orange Pi.
+_child_env = sandbox.child_env
+_rlimit_preexec = sandbox.rlimit_preexec
+_kill_group = sandbox.kill_group
+_ENV_KEEP = sandbox.ENV_KEEP
+_REAP_SECONDS = sandbox.REAP_SECONDS
 
 
 # ── Static checks ───────────────────────────────────────────────────────────

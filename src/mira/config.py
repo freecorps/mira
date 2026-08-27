@@ -12,6 +12,18 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+# The check framework's configuration is large and obeys one rule that is
+# easier to audit with a file boundary around it — nothing in a pull request
+# reaches any value in it — so it lives in its own module and is re-exported
+# here, where every other section is declared.
+from mira.checks.config_models import (  # noqa: F401
+    ChecksConfig,
+    ChecksScopePolicy,
+    CheckToolConfig,
+    CIContextConfig,
+    NaturalLanguageCheck,
+    TicketContextConfig,
+)
 from mira.exceptions import ConfigError
 
 logger = logging.getLogger(__name__)
@@ -422,6 +434,7 @@ class GateRepoPolicy(BaseModel):
     risk_threshold: int | None = Field(default=None, ge=0, le=100)
     codeowners: str | None = None
     request_changes_on_blockers: bool | None = None
+    require_checks_pass: bool | None = None
 
     @field_validator("mode")
     @classmethod
@@ -515,6 +528,12 @@ class GateConfig(BaseModel):
     require_all_files_reviewed: bool = True
     require_index_ready: bool = True
     approve_max_severity: str = "suggestion"
+    # Refuse to approve when a blocking pre-merge check objected, and — the
+    # half that matters — when one could not answer. Harmless with checks off:
+    # a run that never happened reports `not_run`, which this rule ignores, so
+    # the setting only ever costs something once an install has deliberately
+    # put a check into `error` mode.
+    require_checks_pass: bool = True
 
     # ── Risk ─────────────────────────────────────────────────────────────
     risk_threshold: int = Field(default=25, ge=0, le=100)
@@ -863,6 +882,7 @@ class MiraConfig(BaseModel):
     learning: LearningConfig = Field(default_factory=LearningConfig)
     gate: GateConfig = Field(default_factory=GateConfig)
     autofix: AutofixConfig = Field(default_factory=AutofixConfig)
+    checks: ChecksConfig = Field(default_factory=ChecksConfig)
 
 
 def find_config_file(start_dir: Path | None = None) -> Path | None:

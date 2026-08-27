@@ -41,6 +41,12 @@ class _FakeCursor:
     def fetchall(self):
         return self._cur.fetchall()
 
+    @property
+    def rowcount(self):
+        # psycopg exposes it and some store primitives read it back to tell an
+        # insert from a no-op; sqlite3 exposes the same attribute.
+        return self._cur.rowcount
+
     def close(self):
         self._cur.close()
 
@@ -511,3 +517,137 @@ def test_postgres_org_wide_aggregate_keeps_rule_metadata(fake_conn):
     assert rows[0].active is True
     assert rows[0].owner == "acme"
     assert rows[0].repo == "widgets"
+
+
+# ── Phase 6 pre-merge checks ────────────────────────────────────────────────
+#
+# The queries live in `ChecksStoreMixin` and are shared verbatim with SQLite,
+# so what is worth asserting here is the half that is *not* shared: the
+# Postgres schema carries the same columns, the upsert clause both engines
+# spell identically really does update, and one table holding every repository
+# stays scoped to the one that asked.
+
+
+def _check_run(pr_number=7, *, head_sha="head123", state="violation", owner="acme", repo="widgets"):
+    from mira.checks.models import (
+        CheckFinding,
+        CheckResult,
+        CheckRun,
+        CheckRunInputs,
+        Evidence,
+        result_key,
+        run_key,
+    )
+
+    inputs = CheckRunInputs(
+        platform="github",
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        pr_url=f"https://github.com/{owner}/{repo}/pull/{pr_number}",
+        pr_author="alice",
+        head_sha=head_sha,
+        changed_paths=["src/a.py"],
+        changed_files=1,
+        added_lines=3,
+    )
+    key = run_key(
+        platform="github",
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        policy_version="checks-v1+abc",
+        inputs_digest=inputs.digest,
+    )
+    result = CheckResult(
+        check_id="native.tests",
+        title="Tests",
+        origin="native",
+        mode="error",
+        state=state,
+        summary="source changed with no test",
+        evidence=[Evidence(path="src/a.py", detail="3 added lines", source="diff")],
+        findings=(
+            [
+                CheckFinding(
+                    fingerprint="fp1",
+                    title="Source changed and no test changed with it",
+                    evidence=[Evidence(path="src/a.py", start_line=3, source="diff")],
+                    sources=["native.tests"],
+                )
+            ]
+            if state == "violation"
+            else []
+        ),
+        duration_seconds=0.25,
+        config_digest="cfg1",
+        result_key=result_key(run_key_value=key, check_id="native.tests"),
+        sources=["native.tests"],
+    )
+    return CheckRun(
+        run_key=key,
+        policy_version="checks-v1+abc",
+        inputs=inputs,
+        results=[result],
+        duration_seconds=0.5,
+        created_at=time.time(),
+    )
+
+
+def test_postgres_check_run_round_trips_with_its_evidence(store):
+    run = _check_run()
+    stored, created = store.record_check_run(run)
+    assert created is True
+    assert stored.verdict == "violation"
+
+    read = store.get_check_run(run.run_key)
+    result = read.results[0]
+    assert result.state == "violation"
+    assert result.mode == "error"
+    assert result.config_digest == "cfg1"
+    assert result.evidence[0].path == "src/a.py"
+    assert result.findings[0].evidence[0].start_line == 3
+
+
+def test_postgres_check_retry_is_idempotent_and_refreshes(store):
+    failed = _check_run(state="infrastructure_error")
+    store.record_check_run(failed)
+    recovered = _check_run(state="pass")
+    _, created = store.record_check_run(recovered)
+
+    assert created is False
+    assert store.count_check_runs({"pr_number": 7}) == 1
+    assert store.get_check_run(failed.run_key).verdict == "pass"
+
+
+def test_postgres_check_rows_are_scoped_by_repository(fake_conn):
+    """One table holds every repository, so an unscoped read would leak."""
+    a = PgIndexStore("acme", "alpha", "postgresql://fake")
+    b = PgIndexStore("acme", "beta", "postgresql://fake")
+    a.record_check_run(_check_run(pr_number=1, repo="alpha"))
+    b.record_check_run(_check_run(pr_number=2, repo="beta"))
+
+    assert a.count_check_runs({}) == 1
+    assert b.count_check_runs({}) == 1
+    assert a.list_check_runs({})[0].inputs.pr_number == 1
+    # The org-wide handle is the deliberate exception.
+    assert PgIndexStore("", "", "postgresql://fake").count_check_runs({}) == 2
+
+
+def test_postgres_and_sqlite_agree_on_a_check_run(store, tmp_path, monkeypatch):
+    """Identical inputs must produce identical rows on both backends."""
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    run = _check_run()
+    store.record_check_run(run)
+    pg_result = store.get_check_run(run.run_key).results[0].as_dict()
+
+    sqlite_store = IndexStore.open("acme", "widgets")
+    try:
+        sqlite_store.record_check_run(_check_run())
+        sqlite_result = sqlite_store.get_check_run(run.run_key).results[0].as_dict()
+    finally:
+        sqlite_store.close()
+
+    for field in ("state", "mode", "origin", "summary", "config_digest", "findings", "evidence"):
+        assert pg_result[field] == sqlite_result[field]

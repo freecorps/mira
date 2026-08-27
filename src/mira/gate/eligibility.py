@@ -277,6 +277,28 @@ def blocking_reasons(inputs: GateInputs, policy: EffectivePolicy) -> list[Reason
             )
         )
 
+    # Pre-merge checks. Only ever consulted for what it *refuses*: a run whose
+    # verdict is `pass` or `not_run` adds nothing here, so turning checks on
+    # can never make the gate more willing to approve than it was before.
+    if policy.require_checks_pass and inputs.checks_verdict == "violation":
+        named = ", ".join(sorted(inputs.checks_blocking)[:5]) or "a pre-merge check"
+        reasons.append(
+            Reason(
+                ReasonCode.CHECKS_VIOLATION,
+                f"A blocking pre-merge check found a problem: {named}",
+            )
+        )
+    elif policy.require_checks_pass and inputs.checks_verdict == "incomplete":
+        named = ", ".join(sorted(inputs.checks_blocking)[:5]) or "a pre-merge check"
+        reasons.append(
+            Reason(
+                ReasonCode.CHECKS_INCOMPLETE,
+                # Worded so nobody reads it as a finding against the change.
+                f"A blocking pre-merge check could not reach a conclusion ({named}), "
+                "so the gate does not know whether it would pass",
+            )
+        )
+
     if inputs.open_blockers:
         reasons.append(
             Reason(

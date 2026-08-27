@@ -14,6 +14,7 @@ from contextlib import contextmanager, suppress
 from typing import Any
 
 from mira.autofix.persistence import AutofixStoreMixin
+from mira.checks.persistence import ChecksStoreMixin
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -468,6 +469,80 @@ CREATE TABLE IF NOT EXISTS autofix_attempts (
 CREATE INDEX IF NOT EXISTS idx_pg_autofix_attempts_job
     ON autofix_attempts(job_key, created_at);
 
+-- Phase 6 pre-merge checks. Same columns as the SQLite schema, so the queries
+-- in `mira.checks.persistence` run verbatim on both backends. The upsert they
+-- use is `ON CONFLICT ... DO UPDATE`, which both engines spell identically, so
+-- unlike the gate's insert-or-ignore there is no dialect hook for these.
+CREATE TABLE IF NOT EXISTS check_runs (
+    id BIGSERIAL PRIMARY KEY,
+    run_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    review_id INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL DEFAULT 'not_run',
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    counts_json TEXT NOT NULL DEFAULT '{}',
+    duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_check_runs_pr
+    ON check_runs(owner, repo, pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_check_runs_head
+    ON check_runs(owner, repo, pr_number, head_sha);
+CREATE INDEX IF NOT EXISTS idx_pg_check_runs_verdict
+    ON check_runs(verdict, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_check_runs_created
+    ON check_runs(created_at);
+
+CREATE TABLE IF NOT EXISTS check_results (
+    id BIGSERIAL PRIMARY KEY,
+    result_key TEXT NOT NULL UNIQUE,
+    run_id BIGINT NOT NULL DEFAULT 0,
+    run_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    check_id TEXT NOT NULL DEFAULT '',
+    check_version TEXT NOT NULL DEFAULT '1',
+    title TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT 'native',
+    mode TEXT NOT NULL DEFAULT 'off',
+    state TEXT NOT NULL DEFAULT 'skipped',
+    summary TEXT NOT NULL DEFAULT '',
+    skip_reason TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    config_digest TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    findings_json TEXT NOT NULL DEFAULT '[]',
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    incomplete INTEGER NOT NULL DEFAULT 0,
+    blocking INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_check_results_run
+    ON check_results(run_key, check_id);
+CREATE INDEX IF NOT EXISTS idx_pg_check_results_check
+    ON check_results(owner, repo, check_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_check_results_state
+    ON check_results(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_check_results_pr
+    ON check_results(owner, repo, pr_number, created_at);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id SERIAL PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -867,7 +942,7 @@ def search_packages_org_wide(
     ]
 
 
-class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
+class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksStoreMixin):
     """PostgreSQL-backed index store with owner/repo scoping.
 
     Implements the same public interface as IndexStore. Shares a single
@@ -2955,6 +3030,41 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
 
         One table holds every repository here, so an unscoped read would return
         another repo's decisions to a caller that asked about this one. The
+        org-wide handle (empty owner/repo) is the deliberate exception.
+        """
+        clauses = []
+        params: list[Any] = []
+        if self._owner:
+            clauses.append(" AND owner = %s")
+            params.append(self._owner)
+        if self._repo:
+            clauses.append(" AND repo = %s")
+            params.append(self._repo)
+        return "".join(clauses), tuple(params)
+
+    # ---------------------------------------------------------------- Phase 6
+    # The check mixin's primitives. No conflict hook here, unlike the two
+    # above: `ChecksStoreMixin` writes `ON CONFLICT ... DO UPDATE` explicitly
+    # because a repeated run must refresh its answer rather than be dropped,
+    # and that clause is spelled identically by both engines.
+
+    _checks_placeholder = "%s"
+
+    def _checks_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return list(self._fetchall(sql, params))
+
+    def _checks_exec(self, sql: str, params: tuple = ()) -> int:
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            rowcount = int(cur.rowcount or 0)
+        self._commit()
+        return rowcount
+
+    def _checks_scope(self) -> tuple[str, tuple[Any, ...]]:
+        """Pin check reads to this store's repository.
+
+        One table holds every repository here, so an unscoped read would return
+        another repo's results to a caller that asked about this one. The
         org-wide handle (empty owner/repo) is the deliberate exception.
         """
         clauses = []
