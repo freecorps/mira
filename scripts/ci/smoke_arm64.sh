@@ -77,6 +77,17 @@ verify_canary() {
     -c 'from mira.dashboard.db import AppDatabase; db = AppDatabase(url="sqlite:////data/app.db", admin_password="phase-zero-smoke-password"); repo = db.get_repo("phase-zero", "canary"); assert repo is not None and repo.installation_id == 4242; db.close()'
 }
 
+# Phase 6 pre-merge checks keep their two tables in the per-repository index
+# database, which the deployed image created without them. Writing and reading
+# a run through the candidate proves the upgrade is `CREATE TABLE IF NOT
+# EXISTS` on connection rather than a migration step somebody has to sequence —
+# and the rollback below then runs the deployed image against the same volume,
+# which is the other half of the claim.
+verify_checks() {
+  local image="$1"
+  docker run --rm     --platform linux/arm64     --volume "${data_dir}:/data"     --env MIRA_INDEX_DIR=/data/indexes     --entrypoint python     "$image"     -c 'from mira.checks.models import CheckResult, CheckRun, CheckRunInputs; from mira.index.store import IndexStore; store = IndexStore.open("phase-zero", "canary"); inputs = CheckRunInputs(owner="phase-zero", repo="canary", pr_number=1, head_sha="smoke"); run = CheckRun(run_key="smoke-run", policy_version="checks-v1+smoke", inputs=inputs, results=[CheckResult(check_id="native.tests", mode="warning", state="pass", result_key="smoke-result")]); store.record_check_run(run); store.record_check_run(run); assert store.count_check_runs({}) == 1, "a retried run must converge on one row"; assert store.latest_check_run(pr_number=1, head_sha="smoke").verdict == "pass"; store.close()'
+}
+
 echo "Pulling deployed ARM64 baseline: ${baseline_image}"
 docker pull --platform linux/arm64 "$baseline_image"
 
@@ -96,6 +107,8 @@ cp "${data_dir}/app.db" "${data_dir}/app.db.pre-upgrade"
 echo "Starting the candidate against the existing SQLite database"
 start_server "$candidate_image" candidate
 verify_canary "$candidate_image"
+echo "Confirming the candidate creates and uses its check tables on ARM64"
+verify_checks "$candidate_image"
 
 echo "Starting the deployed image against the candidate-opened database"
 start_server "$baseline_image" rollback

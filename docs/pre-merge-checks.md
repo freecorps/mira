@@ -477,8 +477,12 @@ setting and the two new reason codes degrade the same way: an older gate simply
 does not consult them.
 
 Both properties have tests (`tests/test_checks_store.py`), and the ARM64 smoke
-job in CI exercises the same upgrade-then-downgrade sequence against a real
-SQLite database on a real `linux/arm64` image.
+job in CI exercises the same sequence for real: it creates a SQLite database
+with the *deployed* image, starts the candidate against it, writes and re-reads
+a check run through the new tables (asserting the retry converges on one row),
+then runs the deployed image against the same volume again and checks it still
+answers. Migration and rollback on `linux/arm64`, on the actual images, rather
+than a claim in this file.
 
 ---
 

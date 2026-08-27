@@ -73,10 +73,18 @@ def _skipped(
     )
 
 
+# Findings kept from one check. Every producer already caps itself, and this
+# is the cap that does not depend on all of them remembering to: a result row
+# is an audit record, not a second copy of the diff, and a check that returned
+# four hundred findings has found one pattern.
+MAX_FINDINGS_PER_CHECK = 25
+
+
 def _trim(findings: list[CheckFinding], limit: int) -> list[CheckFinding]:
-    for finding in findings:
+    kept = findings[:MAX_FINDINGS_PER_CHECK]
+    for finding in kept:
         finding.evidence = finding.evidence[:limit]
-    return findings
+    return kept
 
 
 def _result_from(
