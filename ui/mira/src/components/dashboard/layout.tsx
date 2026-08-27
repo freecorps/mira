@@ -6,6 +6,7 @@ import {
   ChevronRight,
   ChevronsUpDown,
   Database,
+  ClipboardCheck,
   Gavel,
   GitFork,
   KeyRound,
@@ -89,6 +90,12 @@ const navItems = [
     adminOnly: true,
   },
   { to: "/merge-gate", icon: Gavel, label: "Merge gate", adminOnly: true },
+  {
+    to: "/checks",
+    icon: ClipboardCheck,
+    label: "Pre-merge checks",
+    adminOnly: true,
+  },
   { to: "/autofix", icon: Wrench, label: "Autofix", adminOnly: true },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
@@ -111,6 +118,7 @@ const PAGE_LABELS: Record<string, string> = {
   rules: "Rules",
   learnings: "Learnings",
   "merge-gate": "Merge gate",
+  checks: "Pre-merge checks",
   autofix: "Autofix",
   analytics: "Rule analytics",
   settings: "Settings",

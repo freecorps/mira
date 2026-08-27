@@ -639,11 +639,7 @@ export interface LearningAuditEvent {
 // the same conclusion it would have acted on, and deliberately did not act:
 // shadow mode, or a platform that cannot record one.
 export type GateState =
-  | "approved"
-  | "would_approve"
-  | "not_approved"
-  | "skipped"
-  | "error"
+  "approved" | "would_approve" | "not_approved" | "skipped" | "error"
 
 export type GateMode = "off" | "shadow" | "enforce"
 
@@ -941,4 +937,162 @@ export interface AutofixConfigResponse {
   effective: Record<string, unknown>
   // Handoff adapters this deployment has registered. Empty is the default.
   handoff_adapters: string[]
+}
+
+// ── Pre-merge checks (Phase 6) ──────────────────────────────────────────
+//
+// Five states, and only one of them says anything about the pull request.
+// `violation` is a finding; `infrastructure_error`, `timeout` and `skipped`
+// are statements about Mira. The UI never renders them in the same list, so
+// the union is kept explicit rather than widened to `string`.
+export type CheckState =
+  "pass" | "violation" | "infrastructure_error" | "skipped" | "timeout"
+
+export type CheckMode = "off" | "warning" | "error"
+
+export type CheckOrigin = "native" | "natural_language" | "tool" | "context"
+
+export type CheckRunVerdict = "pass" | "violation" | "incomplete" | "not_run"
+
+export interface CheckEvidence {
+  path: string
+  start_line: number
+  end_line: number
+  snippet: string
+  detail: string
+  url: string
+  source: string
+}
+
+export interface CheckFinding {
+  fingerprint: string
+  title: string
+  detail: string
+  severity: string
+  evidence: CheckEvidence[]
+  // Every producer that reported this. Two entries after deduplication.
+  sources: string[]
+}
+
+export interface CheckResultModel {
+  id: number
+  result_key: string
+  check_id: string
+  check_version: string
+  title: string
+  origin: CheckOrigin
+  mode: CheckMode
+  state: CheckState
+  summary: string
+  evidence: CheckEvidence[]
+  findings: CheckFinding[]
+  skip_reason: string
+  error: string
+  duration_seconds: number
+  config_digest: string
+  sources: string[]
+  fingerprint: string
+  // Whether the check reached no conclusion. Deliberately separate from
+  // `state`: a skip for a missing linter shows as a skip and still counts.
+  incomplete: boolean
+  blocking: boolean
+  created_at: number
+}
+
+export interface CheckRunModel {
+  id: number
+  run_key: string
+  policy_version: string
+  verdict: CheckRunVerdict
+  inputs: Record<string, unknown>
+  results: CheckResultModel[]
+  counts: Record<string, number>
+  duration_seconds: number
+  error: string
+  created_at: number
+  updated_at: number
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  pr_url: string
+  pr_author: string
+  head_sha: string
+}
+
+export interface CheckRunPage {
+  runs: CheckRunModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface CheckResultPage {
+  results: CheckResultModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface CheckRunDetail {
+  run: CheckRunModel
+  public_explanation: string
+  admin_explanation: string
+  policy: Record<string, unknown>
+}
+
+export interface CheckSummaryBucket {
+  check_id: string
+  origin: CheckOrigin
+  state: CheckState
+  mode: CheckMode
+  count: number
+  average_duration: number
+}
+
+export interface CheckSummary {
+  buckets: CheckSummaryBucket[]
+  // Per state, plus `total` and `inconclusive` — the framework's own health
+  // number, which no per-check violation count would surface.
+  totals: Record<string, number>
+}
+
+export interface CheckCatalogEntry {
+  check_id: string
+  title: string
+  origin: CheckOrigin
+  version: string
+  description: string
+  mode: CheckMode
+  config_digest: string
+}
+
+export interface CheckCatalogResponse {
+  checks: CheckCatalogEntry[]
+  policy: Record<string, unknown>
+}
+
+export interface ChecksConfigResponse {
+  // The full checks config as the server resolved it.
+  config: Record<string, unknown>
+  // Just the admin-editable override blob, which is what the panel writes back.
+  overrides: Record<string, unknown>
+  // What a pull request will actually meet, per repository.
+  effective: Record<string, unknown>
+}
+
+export interface ChecksAuditEntry {
+  id: number
+  section: string
+  actor: string
+  action: string
+  previous: Record<string, unknown>
+  new: Record<string, unknown>
+  created_at: number
+}
+
+export interface ChecksAuditPage {
+  entries: ChecksAuditEntry[]
+  limit: number
+  offset: number
 }
