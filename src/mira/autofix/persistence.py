@@ -190,6 +190,20 @@ class AutofixStoreMixin:
     def _autofix_exec(self, sql: str, params: tuple = ()) -> int:
         raise NotImplementedError  # pragma: no cover - backends implement this
 
+    def _autofix_exec_guarded(self, sql: str, params: tuple = (), *, lock_key: str) -> int:
+        """Run an admission-control write with writers for one repository serialised.
+
+        SQLite needs nothing extra: a write takes the database lock, so the
+        capacity subquery and the insert that depends on it cannot interleave
+        with another writer's. Postgres overrides this, because there a
+        statement takes a snapshot rather than a lock — two `INSERT … SELECT …
+        WHERE (SELECT COUNT(*)) < n` running at once would both read the same
+        free capacity and both fill it, which is exactly the ceiling not
+        holding. ``lock_key`` names the repository the write belongs to, so
+        contention is between requests for the same repository and nowhere else.
+        """
+        return self._autofix_exec(sql, params)
+
     def _autofix_claim_ids(self, sql: str, params: tuple) -> list[int]:
         """Pick one claimable job id, in whatever way this engine keeps two
         workers off the same row.
@@ -338,18 +352,22 @@ class AutofixStoreMixin:
         )
         values = ", ".join("?" for _ in params)
         if max_active > 0:
-            room_sql, room_params = self._autofix_room_clause(
-                owner=self._autofix_owner() or job.owner,
-                repo=self._autofix_repo() or job.repo,
+            owner = self._autofix_owner() or job.owner
+            repo = self._autofix_repo() or job.repo
+            room_sql, room_params = self._autofix_room_clause(owner=owner, repo=repo)
+            inserted = self._autofix_exec_guarded(
+                self._ph(
+                    f"{self._autofix_insert_ignore} autofix_jobs {columns} "
+                    f"SELECT {values} WHERE ({room_sql}) < ?"
+                ),
+                (*params, *room_params, int(max_active)),
+                lock_key=f"autofix:{job.platform}:{owner}/{repo}",
             )
-            sql = (
-                f"{self._autofix_insert_ignore} autofix_jobs {columns} "
-                f"SELECT {values} WHERE ({room_sql}) < ?"
-            )
-            params = (*params, *room_params, int(max_active))
         else:
-            sql = f"{self._autofix_insert_ignore} autofix_jobs {columns} VALUES ({values})"
-        inserted = self._autofix_exec(self._ph(sql), params)
+            inserted = self._autofix_exec(
+                self._ph(f"{self._autofix_insert_ignore} autofix_jobs {columns} VALUES ({values})"),
+                params,
+            )
         stored = self.get_autofix_job(job.job_key)
         if stored is None:
             # No row and no conflict: the ceiling refused the insert. The job

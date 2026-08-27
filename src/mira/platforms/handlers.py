@@ -12,6 +12,7 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 
+from mira.autofix.redact import redact
 from mira.config import load_config
 from mira.core.diff_parser import parse_diff
 from mira.core.engine import ReviewEngine
@@ -27,7 +28,7 @@ from mira.feedback.service import (
 )
 from mira.feedback.synthesis import synthesize_candidate
 from mira.index.store import IndexStore
-from mira.llm import create_llm
+from mira.llm import create_llm, untrusted
 from mira.llm.prompts.review import build_conversation_prompt
 from mira.llm.tool_schemas import SUBMIT_FINDING_RECHECK_TOOL, SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
@@ -111,11 +112,11 @@ async def _recheck_finding(
     verified, or reopened on one that landed.
     """
     prompt = _THREAD_RECHECK_TEMPLATE.render(
-        original_suggestion=original_suggestion,
-        user_reply=user_reply or "(empty)",
+        finding_block=untrusted.block("FINDING", original_suggestion or "(none)", redactor=redact),
+        reply_block=untrusted.block("REPLY", user_reply or "(empty)", redactor=redact),
+        code_block=untrusted.block("DIFF", code_context, redactor=redact) if code_context else "",
         comment_path=comment_path,
         comment_line=comment_line,
-        code_context=code_context,
     )
     try:
         raw = await llm.complete_with_tools(
@@ -425,11 +426,15 @@ async def run_thread_reply(
     llm = create_llm(llm_config_for("indexing", config.llm))
     code_context = await _thread_code_context(provider, pr_info, comment_path, comment_line)
     prompt = _THREAD_REPLY_TEMPLATE.render(
-        user_reply=human_reply or "(empty)",
-        original_suggestion=original_suggestion,
+        reply_block=untrusted.block("REPLY", human_reply or "(empty)", redactor=redact),
+        finding_block=(
+            untrusted.block("FINDING", original_suggestion, redactor=redact)
+            if original_suggestion
+            else ""
+        ),
+        code_block=untrusted.block("DIFF", code_context, redactor=redact) if code_context else "",
         comment_path=comment_path,
         comment_line=comment_line,
-        code_context=code_context,
     )
     # Tool calling forces a schema-valid result — more reliable than parsing
     # free-form JSON. The provider's tenacity decorator retries transient fails.

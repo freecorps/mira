@@ -2993,6 +2993,38 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
         self._commit()
         return rowcount
 
+    # Namespace for the autofix advisory locks, so a key collision would have
+    # to come from another autofix lock rather than from anything else in the
+    # install that reaches for `pg_advisory_xact_lock`. The bytes spell "mira".
+    _AUTOFIX_LOCK_NAMESPACE = 0x6D697261
+
+    def _autofix_exec_guarded(self, sql: str, params: tuple = (), *, lock_key: str) -> int:
+        """Serialise admission-control writes for one repository.
+
+        The SQLite version of this needs no lock, because a write there holds
+        the database. Postgres gives each statement a snapshot instead, so
+        `INSERT … SELECT … WHERE (SELECT COUNT(*)) < n` is a count-then-create
+        race dressed as one statement: two of them running together both see
+        the same free capacity and both take it, and the per-repository ceiling
+        is not a ceiling. `pg_advisory_xact_lock` blocks the second until the
+        first commits, so the count the insert depends on is the count after
+        every earlier insert.
+
+        Transaction-scoped, so the lock is released by the commit and cannot
+        outlive a crashed request. Its own connection, because the shared one
+        is in autocommit — where there is no transaction for the lock to be
+        scoped to, and it would be released the instant it was taken.
+        """
+        if sql.lstrip().upper().startswith("INSERT INTO") and "ON CONFLICT" not in sql.upper():
+            sql = f"{sql} ON CONFLICT DO NOTHING"
+        with self._transaction_cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (self._AUTOFIX_LOCK_NAMESPACE, lock_key),
+            )
+            cur.execute(sql, params)
+            return int(cur.rowcount or 0)
+
     def _autofix_claim_ids(self, sql: str, params: tuple) -> list[int]:
         """Rows no other worker is already looking at.
 

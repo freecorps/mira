@@ -31,6 +31,7 @@ from typing import Any
 from mira.autofix.models import CheckResult, FileEdit, Reason, ReasonCode
 from mira.autofix.policy import EffectivePolicy
 from mira.autofix.redact import redact
+from mira.llm import untrusted
 from mira.llm.response_parser import loads_lenient
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 
@@ -117,10 +118,10 @@ SUBMIT_FIX_TOOL = {
     },
 }
 
-# Delimiters for untrusted content. Long and unlikely on purpose: a block that
-# a file's own contents could close is not a boundary.
-_OPEN = "<<<MIRA-UNTRUSTED-{label}>>>"
-_CLOSE = "<<<END-MIRA-UNTRUSTED-{label}>>>"
+# Delimiters for untrusted content, re-exported from the shared module so the
+# tests that assert on the exact markers keep reading them from one place.
+_OPEN = untrusted._OPEN
+_CLOSE = untrusted._CLOSE
 
 _SYSTEM_PROMPT = """\
 You produce small, surgical code fixes for one specific review finding.
@@ -156,14 +157,13 @@ You have exactly one way to answer: call `submit_fix`.\
 def _block(label: str, body: str) -> str:
     """Wrap untrusted content in a delimited, redacted block.
 
-    The closing delimiter is stripped out of the body first. A file that
-    happens to contain the terminator — or was written to contain it — must not
-    be able to end its own block and continue as prose.
+    The delimiters are stripped out of the body first, so content that
+    contains the terminator — because somebody guessed the format, or read the
+    source — cannot end its own block and continue as prose. Shared with the
+    thread-reply prompts through :mod:`mira.llm.untrusted`, because two
+    spellings of this would be two things to get right.
     """
-    cleaned = redact(body or "").replace(_CLOSE.format(label=label), "")
-    for other in ("FINDING", "FILE", "DIFF", "VALIDATION", "CI"):
-        cleaned = cleaned.replace(_CLOSE.format(label=other), "")
-    return f"{_OPEN.format(label=label)}\n{cleaned}\n{_CLOSE.format(label=label)}"
+    return untrusted.block(label, body, redactor=redact)
 
 
 @dataclass

@@ -317,16 +317,26 @@ def test_findings_are_listed_open_first_and_never_closed_ones(store: IndexStore)
 
 
 class _FakeCursor:
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    """SQLite standing in for a Postgres cursor. Records what it was asked to run."""
+
+    def __init__(self, conn: sqlite3.Connection, log: list[str] | None = None) -> None:
         self._cur = conn.cursor()
+        self._log = log if log is not None else []
 
     def execute(self, sql, params=()):  # noqa: ANN001
+        self._log.append(sql)
         # SQLite has neither `FOR UPDATE` nor `SKIP LOCKED`; dropping them is
         # exactly what the SQLite backend does for real, so the stand-in stays
         # honest about what it is testing.
         sqlite_sql = (
             sql.replace("%s", "?").replace(" FOR UPDATE SKIP LOCKED", "").replace(" FOR UPDATE", "")
         )
+        # Advisory locks have no SQLite equivalent, and a stand-in cannot prove
+        # anything about a lock anyway — only a real Postgres with two
+        # connections can. What is checked here is that the statement is
+        # *issued*, and in the right transaction; see the test below.
+        if "pg_advisory_xact_lock" in sqlite_sql:
+            return self
         self._cur.execute(sqlite_sql, params)
         return self
 
@@ -352,13 +362,14 @@ class _FakeCursor:
 
 class _FakeConn:
     def __init__(self) -> None:
+        self.statements: list[str] = []
         self._conn = sqlite3.connect(":memory:")
         schema = _PG_SCHEMA.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY")
         schema = schema.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY")
         self._conn.executescript(schema)
 
     def cursor(self):
-        return _FakeCursor(self._conn)
+        return _FakeCursor(self._conn, self.statements)
 
     @contextmanager
     def transaction(self):
@@ -473,6 +484,57 @@ def test_a_stored_job_round_trips_identically(
     assert got.validation.executed is True
     assert got.reason_codes() == [ReasonCode.PR_OPENED]
     assert got.as_dict()["terminal"] is True
+
+
+def test_postgres_locks_the_repository_before_admitting_a_job(pg: PgIndexStore) -> None:
+    """The ceiling is admission control, and one statement is not enough there.
+
+    Postgres gives each statement a snapshot rather than a lock, so two
+    `INSERT ... SELECT ... WHERE (SELECT COUNT(*)) < n` running together both
+    read the same free capacity and both take it. A transaction-scoped advisory
+    lock keyed on the repository makes the second wait for the first to commit,
+    so the count the insert depends on is the count after every earlier insert.
+
+    A stand-in cannot prove a lock holds — only a real Postgres with two
+    connections can. What is asserted here is what this code is responsible
+    for: the lock is taken, it is taken *before* the insert, and it is scoped
+    to one repository rather than to the whole install.
+    """
+    conn = pg_store._get_conn("postgresql://fake")
+    conn.statements.clear()
+    pg.enqueue_autofix_job(_job(finding="f1", head="a"), max_active=2)
+
+    locks = [sql for sql in conn.statements if "pg_advisory_xact_lock" in sql]
+    inserts = [sql for sql in conn.statements if sql.lstrip().upper().startswith("INSERT INTO")]
+    assert len(locks) == 1
+    assert conn.statements.index(locks[0]) < conn.statements.index(inserts[0])
+    # Transaction-scoped, not session-scoped: a crashed request must not leave
+    # the repository locked for everybody else.
+    assert "pg_advisory_lock(" not in locks[0]
+
+
+def test_postgres_does_not_lock_when_there_is_no_ceiling(pg: PgIndexStore) -> None:
+    """Nothing to serialise, so nothing waits. Enqueue stays on the shared connection."""
+    conn = pg_store._get_conn("postgresql://fake")
+    conn.statements.clear()
+    pg.enqueue_autofix_job(_job(finding="f1", head="a"))
+    assert not [sql for sql in conn.statements if "pg_advisory_xact_lock" in sql]
+
+
+def test_the_lock_key_names_one_repository(pg: PgIndexStore) -> None:
+    """Contention is between requests for the same repository and nowhere else."""
+    conn = pg_store._get_conn("postgresql://fake")
+    conn.statements.clear()
+    calls: list[tuple] = []
+    original = pg._autofix_exec_guarded
+
+    def _spy(sql, params=(), *, lock_key):  # noqa: ANN001, ANN202
+        calls.append(lock_key)
+        return original(sql, params, lock_key=lock_key)
+
+    pg._autofix_exec_guarded = _spy  # type: ignore[method-assign]
+    pg.enqueue_autofix_job(_job(finding="f1", head="a"), max_active=2)
+    assert calls == ["autofix:github:acme/app"]
 
 
 def test_postgres_scopes_reads_to_one_repository(pg: PgIndexStore, monkeypatch) -> None:
