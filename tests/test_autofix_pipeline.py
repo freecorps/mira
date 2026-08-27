@@ -928,3 +928,100 @@ async def test_a_protected_path_is_refused_without_burning_the_retry_budget() ->
     assert result.job.state == "dead_letter"  # not `failed`, on the first try
     assert result.job.attempts == 1
     assert ReasonCode.PATH_PROTECTED in result.job.reason_codes()
+
+
+# ── handoff as a delivery mode ───────────────────────────────────────────────
+
+
+async def test_a_handoff_writes_nothing_and_records_what_it_handed_over() -> None:
+    _save(_finding())
+    provider = FakeProvider()
+    config = _config(handoff={"adapter": "comment"})
+    outcome = await request_fix(
+        provider,
+        _pr(),
+        FixRequest(actor="alice", finding_id=_finding().id, mode="handoff"),
+        config=config,
+    )
+    assert outcome.ok
+    assert outcome.mode == "handoff"
+
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=60)
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+        attempts = store.list_autofix_attempts(job_key=job.job_key)
+    finally:
+        store.close()
+
+    assert result.job.state == "opened"
+    assert ReasonCode.HANDED_OFF in result.job.reason_codes()
+    assert result.job.handoff_ref.startswith("comment:")
+    # The work was described, not done.
+    assert provider.commits == []
+    assert provider.pulls == []
+    assert provider.comments and "fix handoff" in provider.comments[0]
+    assert [attempt.phase for attempt in attempts] == ["handoff"]
+
+
+async def test_a_failed_handoff_is_a_failure_not_a_silent_success() -> None:
+    _save(_finding())
+
+    class Mute(FakeProvider):
+        async def post_comment(self, pr_info, body: str) -> None:
+            raise RuntimeError("comments are down")
+
+    provider = Mute()
+    config = _config(max_attempts=1, handoff={"adapter": "comment"})
+    await request_fix(
+        provider,
+        _pr(),
+        FixRequest(actor="alice", finding_id=_finding().id, mode="handoff"),
+        config=config,
+    )
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=60)
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+    finally:
+        store.close()
+    assert result.job.state == "dead_letter"
+
+
+async def test_a_handoff_fallback_is_opt_in_and_says_it_happened() -> None:
+    """Falling back to a third party because permission was refused is a
+    decision, not a recovery."""
+    _save(_finding())
+    # Can say who the requester is, cannot write. Anything less and the
+    # *authorization* fails first, which is a different refusal and correctly
+    # is not something a handoff rescues.
+    provider = FakeProvider(
+        capabilities=AutofixCapabilities(provider="github", can_read_permission=True)
+    )
+
+    refused = await _accept(provider, _config(), finding_id=_finding().id)
+    assert not refused.ok
+    assert refused.reasons[0].code == ReasonCode.PROVIDER_CANNOT_WRITE
+
+    opted_in = _config(
+        handoff={"adapter": "comment", "fallback_when_refused": True},
+    )
+    outcome = await _accept(provider, opted_in, finding_id=_finding().id)
+    assert outcome.ok
+    assert outcome.mode == "handoff"
+    assert any(reason.code == ReasonCode.HANDED_OFF for reason in outcome.reasons)
+
+
+async def test_a_handoff_cannot_rescue_an_unauthorized_requester() -> None:
+    """The fallback covers "Mira cannot write", not "you may not ask".
+
+    Describing the work to a third party on behalf of somebody who has no
+    business asking is the same permission failure wearing a different hat.
+    """
+    _save(_finding())
+    provider = FakeProvider(permission="read")
+    config = _config(handoff={"adapter": "comment", "fallback_when_refused": True})
+    outcome = await _accept(provider, config, finding_id=_finding().id)
+    assert not outcome.ok
+    assert ReasonCode.ACTOR_LACKS_WRITE in [reason.code for reason in outcome.reasons]
+    assert provider.comments == []

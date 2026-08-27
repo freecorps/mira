@@ -189,9 +189,7 @@ async def test_github_an_existing_branch_reports_its_tip() -> None:
 async def test_github_creates_a_branch_and_never_updates_one() -> None:
     provider, repo = _github_provider()
     await provider.create_branch(_pr(), "mira/fix/pr-7/abc", "head123")
-    repo.create_git_ref.assert_called_once_with(
-        ref="refs/heads/mira/fix/pr-7/abc", sha="head123"
-    )
+    repo.create_git_ref.assert_called_once_with(ref="refs/heads/mira/fix/pr-7/abc", sha="head123")
     # There is no update/reset call in the adapter at all.
     repo.get_git_ref.return_value.edit.assert_not_called()
 
@@ -242,9 +240,7 @@ async def test_github_finds_an_existing_pull_request_for_a_branch() -> None:
 
 async def test_github_files_match_only_when_every_byte_agrees() -> None:
     provider, repo = _github_provider()
-    repo.get_contents.return_value = SimpleNamespace(
-        content=base64.b64encode(b"x = 1\n").decode()
-    )
+    repo.get_contents.return_value = SimpleNamespace(content=base64.b64encode(b"x = 1\n").decode())
     assert await provider.files_match(_pr(), "b", {"a.py": "x = 1\n"}) is True
     assert await provider.files_match(_pr(), "b", {"a.py": "x = 2\n"}) is False
 
