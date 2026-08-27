@@ -219,6 +219,17 @@ class ChecksStoreMixin:
         manual re-run over identical facts converges on one run and one row per
         check instead of stacking a second set. ``attempts`` on the run row
         records that it happened more than once.
+
+        **Results are written before the run row, and that ordering is load
+        bearing.** Neither backend gives this method a transaction — each write
+        commits on its own — so a reader can arrive mid-write. A verdict is not
+        stored; it is computed from the results that are present. Writing the
+        run first would therefore expose a row whose results were still
+        arriving, and a gate reading it would compute a verdict from *some* of
+        the checks — quite possibly `pass`, from the half that happened to be
+        written. Writing the results first means a reader either finds no run
+        (which an active policy treats as incomplete, and refuses on) or finds
+        one with everything it needs.
         """
         now = time.time()
         inputs = run.inputs
@@ -226,7 +237,10 @@ class ChecksStoreMixin:
         repo = self._checks_repo() or inputs.repo
         created_at = run.created_at or now
 
-        inserted = self._checks_exec(
+        for result in run.results:
+            self._record_check_result(result, run=run, owner=owner, repo=repo)
+
+        self._checks_exec(
             self._cph(
                 "INSERT INTO check_runs "
                 "(run_key, platform, owner, repo, pr_number, pr_url, pr_author, base_branch, "
@@ -261,17 +275,25 @@ class ChecksStoreMixin:
         )
 
         stored = self.get_check_run(run.run_key)
-        run_id = stored.id if stored else 0
-        for result in run.results:
-            self._record_check_result(result, run=run, run_id=run_id, owner=owner, repo=repo)
-        stored = self.get_check_run(run.run_key)
         if stored is None:  # pragma: no cover - only a vanished row
-            return run, bool(inserted)
+            return run, True
+        # Results were written before the run row existed, so they carry no
+        # `run_id` yet. Backfilled here rather than threaded through: it is a
+        # convenience column for joins, and nothing reads a result by it.
+        self._backfill_result_run_ids(run.run_key, stored.id)
         # `attempts` is 1 on the row that was just inserted and higher on one
         # that already existed, which is a more reliable "was this new" than a
         # rowcount that both backends report differently for an upsert.
         created = self._check_run_attempts(run.run_key) <= 1
         return stored, created
+
+    def _backfill_result_run_ids(self, run_key: str, run_id: int) -> None:
+        if not run_id:  # pragma: no cover - only a vanished row
+            return
+        self._checks_exec(
+            self._cph("UPDATE check_results SET run_id = ? WHERE run_key = ? AND run_id <> ?"),
+            (int(run_id), run_key, int(run_id)),
+        )
 
     def _check_run_attempts(self, run_key: str) -> int:
         clause, scope_params = self._checks_scope()
@@ -282,7 +304,7 @@ class ChecksStoreMixin:
         return int(rows[0][0] or 0) if rows else 0
 
     def _record_check_result(
-        self, result: CheckResult, *, run: CheckRun, run_id: int, owner: str, repo: str
+        self, result: CheckResult, *, run: CheckRun, owner: str, repo: str
     ) -> None:
         now = time.time()
         self._checks_exec(
@@ -303,7 +325,9 @@ class ChecksStoreMixin:
             ),
             (
                 result.result_key,
-                int(run_id),
+                # Zero until the run row exists; `_backfill_result_run_ids`
+                # fills it in afterwards. Nothing reads a result by it.
+                0,
                 run.run_key,
                 run.inputs.platform,
                 owner,
@@ -525,7 +549,13 @@ class ChecksStoreMixin:
         where, params = self._result_filters(filters)
         rows = self._checks_query(
             self._cph(
-                "SELECT check_id, origin, state, mode, COUNT(*), AVG(duration_seconds) "
+                "SELECT check_id, origin, state, mode, COUNT(*), AVG(duration_seconds), "
+                # Summed rather than grouped on: `incomplete` is what a gate
+                # reads, and it covers unanswered *skips* — a missing linter, a
+                # pending CI run — as well as errors and timeouts. A caller
+                # deriving the health number from states alone would undercount
+                # it by exactly the cases this phase added.
+                "SUM(incomplete) "
                 f"FROM check_results WHERE {where} "
                 "GROUP BY check_id, origin, state, mode ORDER BY check_id, state"
             ),
@@ -539,6 +569,7 @@ class ChecksStoreMixin:
                 "mode": row[3],
                 "count": int(row[4] or 0),
                 "average_duration": round(float(row[5] or 0.0), 4),
+                "incomplete": int(row[6] or 0),
             }
             for row in rows
         ]

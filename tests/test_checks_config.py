@@ -275,10 +275,57 @@ def test_the_catalog_reports_every_check_with_its_mode_and_version() -> None:
     assert all(entry["version"] for entry in entries.values())
 
 
-def test_a_disabled_tool_is_not_registered_as_a_check() -> None:
+def test_a_disabled_tool_is_recorded_as_off_rather_than_dropped() -> None:
+    """ "Switched off" and "not in this version" are different facts."""
     config = ChecksConfig(enabled=True, tools=[CheckToolConfig(name="ruff", enabled=False)])
-    ids = {spec.check_id for spec in specs_for(_resolve(config))}
-    assert "tool.ruff" not in ids
+    policy = _resolve(config)
+    ids = {spec.check_id for spec in specs_for(policy)}
+    assert "tool.ruff" in ids
+    assert policy.mode_for("tool.ruff") == "off"
+    assert {entry["check_id"]: entry["mode"] for entry in catalog(policy)}["tool.ruff"] == "off"
+
+
+def test_a_tools_own_mode_is_honoured() -> None:
+    """A field that exists and is silently ignored is worse than no field."""
+    config = ChecksConfig(
+        enabled=True,
+        default_mode="warning",
+        tools=[CheckToolConfig(name="gitleaks", mode="error")],
+    )
+    assert _resolve(config).mode_for("tool.gitleaks") == "error"
+
+
+def test_a_rules_own_mode_is_honoured() -> None:
+    config = ChecksConfig(
+        enabled=True,
+        default_mode="warning",
+        natural_language=[NaturalLanguageCheck(id="r", instruction="a rule", mode="error")],
+    )
+    assert _resolve(config).mode_for("nl.r") == "error"
+
+
+def test_the_modes_table_wins_over_an_entrys_own_mode() -> None:
+    """It is what an operator reaches for to change one check in place."""
+    config = ChecksConfig(
+        enabled=True,
+        modes={"tool.gitleaks": "warning"},
+        tools=[CheckToolConfig(name="gitleaks", mode="error")],
+    )
+    assert _resolve(config).mode_for("tool.gitleaks") == "warning"
+
+
+def test_an_error_mode_tool_cannot_vanish_by_being_disabled() -> None:
+    """The one direction a fail-closed framework must not move by accident."""
+    config = ChecksConfig(
+        enabled=True,
+        modes={"tool.ruff": "error"},
+        tools=[CheckToolConfig(name="ruff", enabled=False)],
+    )
+    policy = _resolve(config)
+    # The explicit table still wins, so an operator who wrote `error` gets it —
+    # and the check is in the run to say so rather than absent from it.
+    assert "tool.ruff" in {spec.check_id for spec in specs_for(policy)}
+    assert policy.mode_for("tool.ruff") == "error"
 
 
 def test_the_spec_order_is_stable() -> None:

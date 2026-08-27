@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from mira.checks.policy import resolve_policy as resolve_checks_policy
 from mira.config import MiraConfig, load_config
 from mira.gate import capabilities as caps
 from mira.gate.codeowners import CodeownersFile
@@ -169,8 +170,16 @@ async def gather_inputs(
     bot_name: str = "",
     signal: ReviewSignal | None = None,
     capabilities: caps.GateCapabilities | None = None,
+    checks_active: bool = False,
 ) -> GateInputs:
-    """Collect every fact the decision needs. Raises on anything unreadable."""
+    """Collect every fact the decision needs. Raises on anything unreadable.
+
+    ``checks_active`` is passed in rather than resolved here, so this function
+    keeps loading no configuration of its own. The gate needs it to tell two
+    things apart that both arrive as "no check run": the framework is off for
+    this repository and owes nothing, or it is on and nothing was recorded for
+    this commit. Only the second is a reason to refuse.
+    """
     signal = signal or ReviewSignal()
     capability = capabilities or caps.for_provider(provider)
 
@@ -276,6 +285,7 @@ async def gather_inputs(
         # `latest_check_run` is asked for this head sha, so a pull request that
         # was pushed to since its last check run reports `not_run` — which the
         # gate ignores rather than treating as a pass.
+        checks_active=checks_active,
         checks_verdict=check_run.verdict if check_run else "not_run",
         checks_blocking=(
             sorted(result.check_id for result in check_run.blocking_results) if check_run else []
@@ -369,6 +379,9 @@ async def evaluate(
                 bot_name=bot_name,
                 signal=signal,
                 capabilities=capability,
+                checks_active=resolve_checks_policy(
+                    config.checks, pr_info.owner, pr_info.repo
+                ).active,
             ),
             timeout=policy.timeout_seconds,
         )

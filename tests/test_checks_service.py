@@ -267,14 +267,19 @@ def _clean_gate_inputs(**overrides) -> GateInputs:
         "added_lines": 10,
         "ci": CIState(state="success", total=2),
         "human_states": {"bob": "COMMENTED"},
+        # Most of these cases are about what an *active* framework does; the
+        # ones that are not say so explicitly.
+        "checks_active": True,
     }
     base.update(overrides)
     return GateInputs(**base)
 
 
 def test_a_gate_ignores_checks_that_never_ran() -> None:
-    """Turning checks on must be what changes the gate, not installing Mira."""
-    decision = decide(_clean_gate_inputs(checks_verdict="not_run"), _gate_policy())
+    """Installing Mira must not change the gate; turning checks on may."""
+    decision = decide(
+        _clean_gate_inputs(checks_active=False, checks_verdict="not_run"), _gate_policy()
+    )
     assert decision.state == "would_approve"
 
 
@@ -492,3 +497,34 @@ def test_evidence_with_a_path_still_carries_its_description() -> None:
     body = public_explanation(run)
     assert "src/a.py:4" in body
     assert "4 added line(s), no test changed" in body
+
+
+def test_a_repository_with_checks_on_and_no_run_is_not_approved() -> None:
+    """The absence of evidence is not evidence of a clean run."""
+    decision = decide(
+        _clean_gate_inputs(checks_active=True, checks_verdict="not_run"), _gate_policy()
+    )
+    assert decision.state == "not_approved"
+    assert ReasonCode.CHECKS_INCOMPLETE in decision.reason_codes()
+    assert "no run recorded" in next(
+        r.message for r in decision.reasons if r.code == ReasonCode.CHECKS_INCOMPLETE
+    )
+
+
+def test_a_repository_with_checks_off_owes_nothing() -> None:
+    decision = decide(
+        _clean_gate_inputs(checks_active=False, checks_verdict="not_run"), _gate_policy()
+    )
+    assert decision.state == "would_approve"
+
+
+def test_an_active_repository_whose_checks_passed_is_approved() -> None:
+    decision = decide(_clean_gate_inputs(checks_active=True, checks_verdict="pass"), _gate_policy())
+    assert decision.state == "would_approve"
+
+
+def test_whether_checks_are_active_is_part_of_the_decision_inputs() -> None:
+    """Turning the framework on is a different world to decide about."""
+    off = _clean_gate_inputs(checks_active=False)
+    on = _clean_gate_inputs(checks_active=True)
+    assert off.digest != on.digest

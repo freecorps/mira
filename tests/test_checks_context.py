@@ -532,3 +532,41 @@ async def test_the_ci_log_reaches_the_model_inside_an_untrusted_block() -> None:
     # And the injected instruction changed nothing: the state came from the CI
     # status, which the model never sees and cannot reach.
     assert outcome.state == "violation"
+
+
+async def test_a_partially_resolved_set_of_references_does_not_pass() -> None:
+    """The half nobody could reach is the half a check exists to be sure about."""
+
+    class _Flaky:
+        async def get_issue(self, _pr_info, number, *, owner="", repo=""):
+            if int(number) == 1:
+                return _issue(1)
+            raise RuntimeError("502 Bad Gateway")
+
+    outcome = await ticket.run(
+        _ctx(provider=_Flaky(), pr_title="Fix #1 and #2", pr_body="Closes #1 and #2.")
+    )
+    assert outcome.state == "infrastructure_error"
+    assert outcome.findings == []
+    assert "Mira problem" in outcome.summary
+
+
+async def test_a_definite_missing_issue_outranks_an_unreachable_one() -> None:
+    """It is a fact about the pull request, and it is actionable."""
+
+    class _Mixed:
+        async def get_issue(self, _pr_info, number, *, owner="", repo=""):
+            if int(number) == 1:
+                # Explicit, and not a lint slip: `None` is the adapter
+                # contract's "the tracker says there is no such issue", which
+                # is the whole point of this stub.
+                return None  # noqa: RET501
+            raise RuntimeError("502 Bad Gateway")
+
+    outcome = await ticket.run(
+        _ctx(provider=_Mixed(), pr_title="Fix #1 and #2", pr_body="Closes #1 and #2.")
+    )
+    assert outcome.state == "violation"
+    assert any("#1" in f.title for f in outcome.findings)
+    # And the reader is told the answer is not the whole picture.
+    assert "could not be checked" in outcome.summary

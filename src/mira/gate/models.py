@@ -277,6 +277,11 @@ class GateInputs:
     # gate woken by a finished CI run scores the same pull request the same way
     # a gate woken by the review does.
     checks_verdict: str = "not_run"
+    # Whether the check framework is switched on for this repository. The gate
+    # needs it to tell two things apart that both arrive as "no run": checks
+    # are off here and owe nothing, or checks are on and something stopped one
+    # being recorded. Only the second is a reason to refuse.
+    checks_active: bool = False
     # Check ids that blocked, for the reason's own message. A decision that
     # said "a check objected" without naming it would be unactionable.
     checks_blocking: list[str] = field(default_factory=list)

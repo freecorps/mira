@@ -101,7 +101,10 @@ class OsvTool(ToolAdapter):
                 SkipReason.NOT_APPLICABLE,
             )
 
-        timeout = config.timeout_seconds or min(30.0, max(5.0, ctx.remaining))
+        # No cancellation margin here: this is an in-process HTTP call on the
+        # event loop, so the runner's `wait_for` can actually stop it. The
+        # subprocess adapters need the margin; this one does not.
+        timeout = min(config.timeout_seconds or 30.0, max(5.0, ctx.remaining))
         try:
             comments = await scan_manifest_changes(
                 manifests, _ContextFetcher(ctx), timeout_s=timeout

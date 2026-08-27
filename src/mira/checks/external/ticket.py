@@ -88,6 +88,10 @@ async def run(ctx: CheckContext) -> CheckOutcome:
         )
 
     if resolution.missing:
+        # A definite absence outranks an unreachable tracker: it is a fact
+        # about the pull request and it is actionable, where the other is
+        # neither. Anything unresolved is named in the summary so the reader
+        # knows the answer is not the whole picture.
         findings = [
             CheckFinding(
                 fingerprint=fingerprint(path="", signature=f"ticket {ref.label} does not exist"),
@@ -102,9 +106,31 @@ async def run(ctx: CheckContext) -> CheckOutcome:
             )
             for ref in resolution.missing
         ]
-        return CheckOutcome.violation(
-            summary=f"{len(findings)} referenced issue(s) do not exist.",
-            findings=findings,
+        summary = f"{len(findings)} referenced issue(s) do not exist."
+        if resolution.unresolved:
+            summary += (
+                f" {len(resolution.unresolved)} more could not be checked at all: "
+                + ", ".join(sorted(resolution.unresolved))
+                + "."
+            )
+        return CheckOutcome.violation(summary=summary, findings=findings)
+
+    if resolution.found and resolution.unresolved:
+        # Some references resolved and some could not be asked about. Passing
+        # on the ones that worked would let a partially checked pull request
+        # satisfy the gate — and the half nobody could reach is exactly the
+        # half a check exists to be sure about.
+        reasons = "; ".join(
+            f"{label}: {why}" for label, why in sorted(resolution.unresolved.items())
+        )
+        return CheckOutcome.failed(
+            error=reasons,
+            summary=(
+                f"{len(resolution.found)} of this pull request's references resolved and "
+                f"{len(resolution.unresolved)} could not be checked, so Mira cannot say "
+                "whether they all exist. This is a Mira problem, not a problem with the "
+                "change."
+            ),
         )
 
     if resolution.found:

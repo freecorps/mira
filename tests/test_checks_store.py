@@ -356,3 +356,43 @@ def test_rolling_back_leaves_the_older_code_working(tmp_path: Path) -> None:
         assert older.count_check_runs({}) == 1
     finally:
         older.close()
+
+
+def test_the_summary_carries_the_persisted_incomplete_count(store) -> None:
+    """The dashboard's health number, and states alone would undercount it."""
+    store.record_check_run(_run("violation", inputs=_inputs(head_sha="a")))
+    store.record_check_run(
+        _run("skipped", inputs=_inputs(head_sha="b"), skip_reason=SkipReason.TOOL_MISSING)
+    )
+    store.record_check_run(_run("infrastructure_error", inputs=_inputs(head_sha="c"), error="x"))
+
+    total_incomplete = sum(row["incomplete"] for row in store.summarize_check_results())
+    # A missing linter and an error both count; the violation does not.
+    assert total_incomplete == 2
+
+
+def test_a_run_is_never_visible_before_its_results(store, monkeypatch) -> None:
+    """A reader mid-write would otherwise compute a verdict from half a run.
+
+    Neither backend gives `record_check_run` a transaction, so the ordering is
+    the guarantee. Asserted by watching what the store *does*: every result
+    write happens before the run row exists.
+    """
+    seen: list[str] = []
+    original = store._checks_exec
+
+    def _record(sql, params=()):
+        head = " ".join(sql.split())[:40]
+        if "INSERT INTO check_results" in sql:
+            seen.append("result")
+        elif "INSERT INTO check_runs" in sql:
+            seen.append("run")
+        return original(sql, params)
+
+    monkeypatch.setattr(store, "_checks_exec", _record)
+    store.record_check_run(_run())
+
+    assert "run" in seen and "result" in seen
+    assert seen.index("result") < seen.index("run"), (
+        "results must be written before the run row a gate reads"
+    )

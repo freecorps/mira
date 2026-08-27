@@ -506,3 +506,33 @@ async def test_a_tool_finding_and_a_model_finding_merge_into_one(
     assert len(findings) == 1
     assert sorted(findings[0].sources) == ["nl.no-secrets", "tool.gitleaks"]
     assert {item.source for item in findings[0].evidence} == {"tool:gitleaks", "llm"}
+
+
+async def test_an_analyser_is_given_less_time_than_its_own_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread cannot be cancelled, so the tool's timeout must fire first.
+
+    If the runner's `wait_for` won the race, the coroutine would be cancelled
+    while the subprocess was still running: the scratch directory would be
+    removed from under it and the process would live on to its own deadline.
+    """
+    from mira.checks.tools.base import CANCELLATION_MARGIN_SECONDS
+
+    seen: dict = {}
+    _stub_run(monkeypatch, ProcessOutcome(status="ok", stdout="[]", exit_code=0), seen)
+    ctx = _ctx()
+    await RuffTool().analyse(ctx, CheckToolConfig(name="ruff"))
+    assert seen["timeout"] < ctx.policy.check_timeout_seconds
+    assert seen["timeout"] <= ctx.policy.check_timeout_seconds - CANCELLATION_MARGIN_SECONDS
+
+
+async def test_a_configured_tool_timeout_is_clamped_under_the_check_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool allowed to outlive its check is one the runner cannot stop."""
+    seen: dict = {}
+    _stub_run(monkeypatch, ProcessOutcome(status="ok", stdout="[]", exit_code=0), seen)
+    ctx = _ctx()
+    await RuffTool().analyse(ctx, CheckToolConfig(name="ruff", timeout_seconds=1800))
+    assert seen["timeout"] < ctx.policy.check_timeout_seconds

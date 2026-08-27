@@ -16,6 +16,19 @@ updater_log="${data_dir}/updater.log"
 updater_script="$(pwd)/deploy/orangepi/mira-update.sh"
 
 cleanup() {
+  # Everything the containers wrote to the shared volume is owned by root
+  # inside them, and the runner is not. A file at the top of `$data_dir` is
+  # still removable — the runner owns the directory holding it — but a file
+  # inside a directory the container created is not, and `verify_checks` puts
+  # one under `indexes/<owner>/`. Hand the tree back before removing it, using
+  # the image already on this machine so no extra pull is needed. Best effort:
+  # a cleanup that failed must not fail a job whose assertions passed.
+  if [[ -n "${candidate_image:-}" ]]; then
+    docker run --rm --platform linux/arm64 \
+      --volume "${data_dir}:/data" \
+      --entrypoint chown "$candidate_image" \
+      -R "$(id -u):$(id -g)" /data >/dev/null 2>&1 || true
+  fi
   if [[ -f "${update_stack_dir}/compose.yaml" ]]; then
     MIRA_IMAGE="$registry_image" \
       MIRA_SMOKE_CONTAINER_NAME="$container_name" \
@@ -26,7 +39,10 @@ cleanup() {
   fi
   docker rm -f "$container_name" "$candidate_seed_name" "$registry_name" \
     >/dev/null 2>&1 || true
-  rm -rf "$data_dir"
+  # `|| true` for the same reason as the chown above: this runs from an EXIT
+  # trap, so a failure here would overwrite the exit status of the assertions
+  # and fail a job that passed.
+  rm -rf "$data_dir" || true
 }
 trap cleanup EXIT
 
