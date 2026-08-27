@@ -115,6 +115,41 @@ async def run(ctx: CheckContext) -> CheckOutcome:
             )
         return CheckOutcome.violation(summary=summary, findings=findings)
 
+    # A reference the deployment declined to follow is *present* — the pull
+    # request named something — and simply not verified. That is a pass with a
+    # note, not an error: nothing failed, and an operator's own setting has no
+    # business appearing in the column that tracks outages.
+    if resolution.refused and not resolution.unresolved and not resolution.missing:
+        refused = ", ".join(sorted(resolution.refused))
+        if resolution.found:
+            return CheckOutcome.passed(
+                summary=(
+                    f"References {', '.join(sorted(resolution.found))}. "
+                    f"{refused} points outside this repository, which this deployment "
+                    "does not follow, so its existence was not checked."
+                ),
+                evidence=[
+                    Evidence(
+                        snippet=found.title[:200],
+                        detail=f"{label} ({found.state or 'state unknown'})",
+                        url=found.url,
+                        source="ticket",
+                    )
+                    for label, found in sorted(resolution.found.items())
+                ],
+            )
+        return CheckOutcome.passed(
+            summary=(
+                f"References {refused}, which points outside this repository. This "
+                "deployment does not follow cross-repository references, so Mira "
+                "confirmed the reference is there and not that the issue exists."
+            ),
+            evidence=[
+                _reference_evidence(ref, "reference to another repository, not followed")
+                for ref in resolution.refs
+            ],
+        )
+
     if resolution.found and resolution.unresolved:
         # Some references resolved and some could not be asked about. Passing
         # on the ones that worked would let a partially checked pull request

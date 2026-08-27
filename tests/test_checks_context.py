@@ -570,3 +570,109 @@ async def test_a_definite_missing_issue_outranks_an_unreachable_one() -> None:
     assert any("#1" in f.title for f in outcome.findings)
     # And the reader is told the answer is not the whole picture.
     assert "could not be checked" in outcome.summary
+
+
+# ────────────────────────────────────────── cross-repository references ──
+
+
+class _AnyIssue:
+    """A provider that answers about any repository it is asked about."""
+
+    def __init__(self) -> None:
+        self.asked: list[tuple[str, str, int]] = []
+
+    async def get_issue(self, _pr_info, number, *, owner="", repo=""):
+        self.asked.append((owner, repo, int(number)))
+        return _issue(int(number), title="a private issue")
+
+
+def _pr_info():
+    from mira.models import PRInfo
+
+    return PRInfo(
+        title="",
+        description="",
+        base_branch="main",
+        head_branch="f",
+        url="https://github.com/acme/app/pull/7",
+        number=7,
+        owner="acme",
+        repo="app",
+    )
+
+
+async def test_a_reference_to_another_repository_is_not_followed_by_default() -> None:
+    """The reference is the contributor's text; the credential is Mira's.
+
+    Following one lets a contributor confirm that an issue exists in a private
+    repository the installation token happens to reach — and puts its title in
+    evidence on a pull request they can read.
+    """
+    provider = _AnyIssue()
+    ctx = _ctx(provider=provider, pr_body="Closes secret-org/secret-repo#1.")
+    ctx.pr_info = _pr_info()
+    outcome = await ticket.run(ctx)
+
+    assert provider.asked == [], "Mira must not have asked about another repository"
+    # Present but unverified: nothing failed, so this is not an error.
+    assert outcome.state == "pass"
+    assert "does not follow" in outcome.summary
+    assert "secret-org/secret-repo#1" in outcome.summary
+
+
+async def test_an_issue_url_naming_another_repository_is_refused_too() -> None:
+    """The URL extractor's hostname is not a guard; the repository it names is."""
+    provider = _AnyIssue()
+    ctx = _ctx(
+        provider=provider,
+        pr_body="See https://evil.example.com/secret-org/secret-repo/issues/9",
+    )
+    ctx.pr_info = _pr_info()
+    await ticket.run(ctx)
+    assert provider.asked == []
+
+
+async def test_a_reference_to_this_repository_is_followed() -> None:
+    provider = _AnyIssue()
+    ctx = _ctx(provider=provider, pr_body="Closes acme/app#12.")
+    ctx.pr_info = _pr_info()
+    outcome = await ticket.run(ctx)
+    assert provider.asked == [("acme", "app", 12)]
+    assert outcome.state == "pass"
+
+
+async def test_a_bare_reference_is_this_repository_and_is_followed() -> None:
+    provider = _AnyIssue()
+    ctx = _ctx(provider=provider, pr_body="Closes #12.")
+    ctx.pr_info = _pr_info()
+    await ticket.run(ctx)
+    assert provider.asked == [("", "", 12)]
+
+
+async def test_a_deployment_can_allowlist_a_cross_repository_reference() -> None:
+    provider = _AnyIssue()
+    policy = _policy(allow_cross_repository=True, cross_repository_allowlist=["acme/tracker"])
+    ctx = _ctx(policy=policy, provider=provider, pr_body="Closes acme/tracker#3.")
+    ctx.pr_info = _pr_info()
+    outcome = await ticket.run(ctx)
+    assert provider.asked == [("acme", "tracker", 3)]
+    assert outcome.state == "pass"
+
+
+async def test_an_allowlist_does_not_open_every_other_repository() -> None:
+    provider = _AnyIssue()
+    policy = _policy(allow_cross_repository=True, cross_repository_allowlist=["acme/tracker"])
+    ctx = _ctx(policy=policy, provider=provider, pr_body="Closes secret-org/secret#1.")
+    ctx.pr_info = _pr_info()
+    await ticket.run(ctx)
+    assert provider.asked == []
+
+
+async def test_a_refusal_is_not_reported_as_an_infrastructure_error() -> None:
+    """An operator's own setting has no business in the outage column."""
+    provider = _AnyIssue()
+    ctx = _ctx(provider=provider, pr_body="Closes other/repo#1.")
+    ctx.pr_info = _pr_info()
+    outcome = await ticket.run(ctx)
+    assert outcome.state != "infrastructure_error"
+    assert outcome.error == ""

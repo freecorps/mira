@@ -235,15 +235,61 @@ def _parse(raw: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _diff_for(ctx: CheckContext, path: str) -> str:
+    """The hunk bodies belonging to one file, and no other.
+
+    Needed because a quote may legitimately be a *removed* line, which is in
+    the diff and not in the file at the head commit. Searching the whole diff
+    for it would accept a quote lifted from a different file entirely — the
+    model names path B and quotes text from file A, and Mira records
+    navigable-looking evidence against the wrong place.
+    """
+    for file_diff in ctx.patch_set.files:
+        if file_diff.path != path:
+            continue
+        return "\n".join(hunk.content for hunk in file_diff.hunks)
+    return ""
+
+
+def _locate(quote: str, content: str) -> int:
+    """The 1-based line ``quote`` starts on in ``content``, or 0.
+
+    Derived rather than taken from the model. A line number is the thing a
+    reader clicks, and a model that quoted the right code and guessed the wrong
+    line produces evidence that opens at nothing — which is indistinguishable,
+    to the reader, from evidence that was invented.
+    """
+    needle = _normalize(quote)
+    if not needle:
+        return 0
+    lines = content.splitlines()
+    first = needle.split(" ")[0]
+    for index, line in enumerate(lines, start=1):
+        normalized = _normalize(line)
+        if not normalized or first not in normalized:
+            continue
+        # Match against a window, so a quote spanning several lines still
+        # anchors to the line it starts on.
+        window = _normalize(" ".join(lines[index - 1 : index + 10]))
+        if needle in window:
+            return index
+    return 0
+
+
 async def _verify(
     ctx: CheckContext, entries: Any, scope: set[str], sources: dict[str, str]
 ) -> list[Evidence]:
-    """Keep only the evidence that can actually be found.
+    """Keep only the evidence that can actually be found, where it claims to be.
 
-    Three ways an entry is discarded, and each of them is a way a model can be
+    Four ways an entry is discarded, and each of them is a way a model can be
     confidently wrong: a path the pull request never touched, a path outside
-    the rule's own scope, and a quote that appears nowhere in the file or the
-    diff. What survives is evidence a reader can open and see.
+    the rule's own scope, a quote that appears nowhere, and — the one that
+    reads worst — a quote that exists but not in the file it was attributed to.
+    The search is therefore scoped to the claimed path's own content and its
+    own hunks, never to the whole diff.
+
+    The line number is derived from that content rather than believed. What
+    survives is evidence a reader can open and see, at the place it says.
     """
     if not isinstance(entries, list):
         return []
@@ -258,15 +304,27 @@ async def _verify(
         if path not in scope:
             logger.debug("Discarding evidence for %s: not in this rule's scope", path)
             continue
-        haystack = sources.get(path) or await ctx.file_content(path)
+
+        body = sources.get(path) or await ctx.file_content(path)
+        hunks = _diff_for(ctx, path)
         needle = _normalize(quote)
-        if needle not in _normalize(haystack) and needle not in _normalize(ctx.diff_text):
-            logger.debug("Discarding evidence for %s: the quote is not in the file", path)
+        in_body = needle in _normalize(body)
+        if not in_body and needle not in _normalize(hunks):
+            logger.debug(
+                "Discarding evidence for %s: the quote is not in that file or its diff", path
+            )
             continue
+
+        # From the file when the quote is still there, because that is the
+        # numbering a reader's editor uses. A removed line has no line in the
+        # file, so the model's number is kept as a hint and the reader has the
+        # snippet either way.
+        located = _locate(quote, body) if in_body else 0
+        claimed = max(0, int(entry.get("line") or 0))
         verified.append(
             Evidence(
                 path=path,
-                start_line=max(0, int(entry.get("line") or 0)),
+                start_line=located or (0 if in_body else claimed),
                 snippet=redact(quote)[:400],
                 detail=redact(str(entry.get("why") or ""))[:300],
                 source="llm",

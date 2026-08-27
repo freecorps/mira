@@ -137,8 +137,28 @@ Checks that read something the diff does not contain.
 
 **Tickets.** References are extracted offline from the title, the body and the
 branch name: `#123`, `owner/repo#123`, issue URLs (GitHub, GitLab, Forgejo),
-and any extra regex an operator configures. Resolution is a separate step with
-three outcomes, not two:
+and any extra regex an operator configures.
+
+**A reference names a repository, and a reference is text a contributor wrote.**
+Following `secret-org/secret-repo#1` would mean Mira asking its own privileged
+installation token about a repository the contributor chose — which can confirm
+that an issue exists in a private repository the token happens to reach, and
+puts its title in evidence on a pull request the contributor can read. So the
+pull request's own repository is the only one followed by default;
+`checks.ticket.allow_cross_repository` plus an explicit
+`cross_repository_allowlist` is the opt-in. A refused reference is still
+*recorded* — the pull request did name something — and reported as present and
+unverified, not as an error: an operator's own setting has no business in the
+column that tracks outages.
+
+The same rule covers issue URLs, and deliberately not a hostname check.
+Matching the URL's host against the provider is the obvious guard and a worse
+one — the web host and the API host differ on github.com, self-hosted instances
+answer to several names, and an attacker only needs one spelling that matches.
+Comparing the repository the URL *names* is the same question with a reliable
+answer.
+
+Resolution is a separate step with three outcomes, not two:
 
 * every reference resolved → `pass`;
 * the tracker says one does not exist → `violation`;
@@ -207,11 +227,15 @@ Four properties make this safe, layered so no single one has to hold alone:
    There is no field that names a check, a mode, a path glob or a command, so
    the strongest thing an injected instruction can do is make one rule's
    verdict wrong.
-3. **Every quote is verified.** Evidence is checked against the file at the
-   head commit and against the diff before anything is recorded, and evidence
-   from a path outside the rule's own scope is discarded. A violation with no
-   surviving evidence becomes `skipped: no_evidence` — a model that invents a
-   line produces silence, not an accusation.
+3. **Every quote is verified, against the file it names.** Evidence is checked
+   against the claimed path's own content and that path's own diff hunks —
+   never against the whole diff, which would accept a quote lifted from a
+   different file and record navigable-looking evidence in the wrong place.
+   Evidence from a path outside the rule's scope is discarded, and the line
+   number is *derived* from the file rather than believed: a model that quotes
+   the right code and guesses the wrong line points a reader at nothing. A
+   violation with no surviving evidence becomes `skipped: no_evidence` — a
+   model that invents a line produces silence, not an accusation.
 4. **"Not sure" is an answer.** The schema has an `uncertain` verdict and the
    prompt says to use it. It becomes `skipped: ambiguous`, which for a rule in
    `error` mode still fails a gate closed — so saying "I do not know" is never
@@ -486,12 +510,16 @@ and Postgres. The queries are written once in `mira.checks.persistence` and
 mixed into both stores, so parity is a property of the code rather than a
 promise in a docstring.
 
-**Ordering.** Results are written before the run row. Neither backend gives the
-write a transaction, and a verdict is computed from the results that are
-present — so writing the run first would expose a row whose results were still
-arriving, and a gate reading it would compute a verdict from *some* of the
-checks. Written this way, a reader either finds no run (which an active policy
-treats as incomplete and refuses on) or finds one with everything it needs.
+**Atomicity and ordering.** The whole write is one transaction on both
+backends, and the results go in before the run row. A verdict is not stored —
+it is computed from the results that are present — so a reader arriving
+mid-write would compute one from *some* of the checks, quite possibly `pass`
+from the half that had landed. Both halves are needed: the transaction stops a
+*retry* being read while it rewrites rows the run already had, and the ordering
+means that on a first write a reader finds no run at all rather than an empty
+one, which an active policy treats as incomplete and refuses on. Results the
+newest attempt did not produce are deleted in the same transaction, so a check
+removed by a Mira upgrade stops contributing to a verdict.
 
 **Identity.** A run is keyed on the pull request, the head commit, the resolved
 policy *and* the facts it was run over — the complete changed-path list, not the

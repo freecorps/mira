@@ -74,21 +74,40 @@ function draftFrom(config: Record<string, unknown>): Draft {
   }
 }
 
-function payloadFrom(draft: Draft): Record<string, unknown> {
-  return {
-    enabled: draft.enabled,
-    kill_switch: draft.kill_switch,
-    default_mode: draft.default_mode,
-    // Only the checks an admin moved away from the default. Writing every id
-    // would freeze today's default into the policy, so a later change to
-    // `default_mode` would quietly apply to nothing.
-    modes: draft.modes,
-    max_concurrency: Number(draft.max_concurrency),
-    check_timeout_seconds: Number(draft.check_timeout_seconds),
-    total_timeout_seconds: Number(draft.total_timeout_seconds),
-    publish_status: draft.publish_status,
-    comment: draft.comment,
+// The override blob is a *layer*, not a copy of the resolved policy. Writing
+// every scalar the form shows would freeze whatever `mira.yaml` currently says
+// into the database — and a later edit to that file would then stop taking
+// effect on any field this panel happens to render. So a field is written only
+// when it actually differs from the value that was resolved without it.
+//
+// `modes` is the exception and is written whole: it is a mapping an admin
+// edits as one thing, and a per-key diff would make "I removed that entry"
+// indistinguishable from "I did not touch it".
+function payloadFrom(draft: Draft, resolved: Draft): Record<string, unknown> {
+  const payload: Record<string, unknown> = {}
+  const put = <K extends keyof Draft>(key: K) => {
+    if (draft[key] !== resolved[key]) payload[key] = draft[key]
   }
+  put("enabled")
+  put("kill_switch")
+  put("default_mode")
+  put("publish_status")
+  put("comment")
+  for (const key of [
+    "max_concurrency",
+    "check_timeout_seconds",
+    "total_timeout_seconds",
+  ] as const) {
+    if (Number(draft[key]) !== Number(resolved[key]))
+      payload[key] = Number(draft[key])
+  }
+  // Only the checks an admin moved away from the default. Writing every id
+  // would freeze today's default into the policy, so a later change to
+  // `default_mode` would quietly apply to nothing.
+  if (Object.keys(draft.modes).length || Object.keys(resolved.modes).length) {
+    payload.modes = draft.modes
+  }
+  return payload
 }
 
 function Toggle({
@@ -214,6 +233,10 @@ function PolicyForm({ config: data }: { config: ChecksConfigResponse }) {
   // is what the form shows; `data.overrides` is only what an admin typed, and
   // is what gets written back.
   const [draft, setDraft] = useState<Draft>(() => draftFrom(data.config))
+  // What the server resolved *before* this save. Anything the admin leaves
+  // equal to it is not written, so an inherited `mira.yaml` value stays
+  // inherited instead of being copied into the database.
+  const [resolved] = useState<Draft>(() => draftFrom(data.config))
   const [saving, setSaving] = useState(false)
 
   const catalog = useAsync<CheckCatalogResponse>(
@@ -243,8 +266,13 @@ function PolicyForm({ config: data }: { config: ChecksConfigResponse }) {
       // an empty list is expressible. Keys this form does not render (the
       // analyser list, natural-language rules, ticket and CI settings,
       // per-organisation and per-repository entries) are carried over from
-      // what was loaded, or saving would silently delete them.
-      await api.setChecksConfig({ ...data.overrides, ...payloadFrom(draft) })
+      // what was loaded, or saving would silently delete them. Fields the
+      // admin did not change are omitted by `payloadFrom`, so an inherited
+      // value stays inherited rather than being frozen into the override.
+      await api.setChecksConfig({
+        ...data.overrides,
+        ...payloadFrom(draft, resolved),
+      })
       toast.success("Check policy saved")
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "The policy was refused")

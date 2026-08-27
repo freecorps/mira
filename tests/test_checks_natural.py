@@ -311,3 +311,109 @@ async def test_evidence_from_the_model_is_redacted_before_it_is_stored() -> None
     )
     assert "ghp_AAAAAAAAAAAAAAAAAAAA" not in rendered
     assert "REDACTED" in rendered
+
+
+OTHER_FILE = "src/api/other.py"
+
+TWO_FILE_DIFF = DIFF + (
+    f"diff --git a/{OTHER_FILE} b/{OTHER_FILE}\n"
+    f"--- a/{OTHER_FILE}\n"
+    f"+++ b/{OTHER_FILE}\n"
+    "@@ -1,0 +1,2 @@\n"
+    "+SECRET_TOKEN = 'hunter2'\n"
+    "+def helper(): pass\n"
+)
+
+
+async def test_a_quote_from_one_file_cannot_be_attributed_to_another() -> None:
+    """Otherwise Mira records navigable-looking evidence against the wrong file.
+
+    The text really is in the diff — just not in the file the model named — so
+    a whole-diff search would accept it and point a reader at a line that says
+    something else entirely.
+    """
+    llm = _LLM(
+        {
+            "verdict": "violation",
+            "explanation": "There is a secret here.",
+            "evidence": [
+                # The quote lives in `other.py`; the path claims `ingest.py`.
+                {
+                    "path": "src/api/ingest.py",
+                    "line": 1,
+                    "quote": "SECRET_TOKEN = 'hunter2'",
+                }
+            ],
+        }
+    )
+    ctx = _ctx(
+        llm,
+        files={"src/api/ingest.py": FILE_BODY, OTHER_FILE: "SECRET_TOKEN = 'hunter2'\n"},
+        changed=("src/api/ingest.py", OTHER_FILE),
+        diff=TWO_FILE_DIFF,
+    )
+    outcome = await evaluate(ctx, RULE)
+    assert outcome.state == "skipped"
+    assert outcome.skip_reason == SkipReason.NO_EVIDENCE
+
+
+async def test_the_same_quote_against_its_own_file_is_accepted() -> None:
+    """The rule is "in the file it names", not "nowhere in the diff"."""
+    llm = _LLM(
+        {
+            "verdict": "violation",
+            "explanation": "There is a secret here.",
+            "evidence": [{"path": OTHER_FILE, "line": 1, "quote": "SECRET_TOKEN = 'hunter2'"}],
+        }
+    )
+    ctx = _ctx(
+        llm,
+        files={"src/api/ingest.py": FILE_BODY, OTHER_FILE: "SECRET_TOKEN = 'hunter2'\n"},
+        changed=("src/api/ingest.py", OTHER_FILE),
+        diff=TWO_FILE_DIFF,
+    )
+    outcome = await evaluate(ctx, RULE)
+    assert outcome.state == "violation"
+    assert outcome.findings[0].evidence[0].path == OTHER_FILE
+
+
+async def test_the_line_number_is_derived_rather_than_believed() -> None:
+    """A model that quotes the right code and guesses the wrong line points at nothing."""
+    llm = _LLM(
+        {
+            "verdict": "violation",
+            "explanation": "No limiter.",
+            "evidence": [
+                # The decorator is on line 5; the model says 99.
+                {"path": "src/api/ingest.py", "line": 99, "quote": '@router.get("/ingest")'}
+            ],
+        }
+    )
+    outcome = await evaluate(_ctx(llm), RULE)
+    assert outcome.state == "violation"
+    assert outcome.findings[0].evidence[0].start_line == 5
+
+
+async def test_a_quote_of_a_removed_line_is_still_accepted() -> None:
+    """It is in that file's own hunks, which is where a removed line lives."""
+    removal_diff = (
+        "diff --git a/src/api/ingest.py b/src/api/ingest.py\n"
+        "--- a/src/api/ingest.py\n"
+        "+++ b/src/api/ingest.py\n"
+        "@@ -1,2 +1,1 @@\n"
+        "-@limiter.limit('10/s')\n"
+        ' @router.get("/ingest")\n'
+    )
+    llm = _LLM(
+        {
+            "verdict": "violation",
+            "explanation": "The limiter was removed.",
+            "evidence": [
+                {"path": "src/api/ingest.py", "line": 1, "quote": "@limiter.limit('10/s')"}
+            ],
+        }
+    )
+    ctx = _ctx(llm, files={"src/api/ingest.py": FILE_BODY}, diff=removal_diff)
+    outcome = await evaluate(ctx, RULE)
+    assert outcome.state == "violation"
+    assert outcome.findings[0].evidence[0].snippet == "@limiter.limit('10/s')"

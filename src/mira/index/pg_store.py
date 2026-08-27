@@ -3057,8 +3057,34 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         with self._cursor() as cur:
             cur.execute(sql, params)
             rowcount = int(cur.rowcount or 0)
-        self._commit()
+        if not self._checks_in_transaction:
+            self._commit()
         return rowcount
+
+    # Set while `_checks_atomic` is open, so the writes inside it commit
+    # together. A gate reading a run mid-write would otherwise compute a
+    # verdict from whichever of its results had landed.
+    _checks_in_transaction = False
+
+    @contextmanager
+    def _checks_atomic(self):  # type: ignore[no-untyped-def]
+        if self._checks_in_transaction:  # pragma: no cover - not nested today
+            yield
+            return
+        self._checks_in_transaction = True
+        try:
+            yield
+        except Exception:
+            # The same shared handle `_commit` uses, for the same reason: a
+            # reconnect closes the old one, so a cached handle would roll back
+            # a connection nobody is on.
+            with suppress(Exception):
+                _get_conn(self._url).rollback()
+            raise
+        else:
+            self._commit()
+        finally:
+            self._checks_in_transaction = False
 
     def _checks_scope(self) -> tuple[str, tuple[Any, ...]]:
         """Pin check reads to this store's repository.

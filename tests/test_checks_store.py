@@ -396,3 +396,79 @@ def test_a_run_is_never_visible_before_its_results(store, monkeypatch) -> None:
     assert seen.index("result") < seen.index("run"), (
         "results must be written before the run row a gate reads"
     )
+
+
+def test_a_retry_replaces_the_whole_result_set(store) -> None:
+    """A row the newest attempt did not produce must stop counting.
+
+    Normally there is none — the policy version is in the run key, so a retry
+    writes the same check ids. It stops being true across an upgrade that
+    removed a check, and a stale row would go on contributing to the verdict of
+    a run that no longer contains it.
+    """
+    inputs = _inputs()
+    first = _run("violation", inputs=inputs)
+    extra = CheckResult(
+        check_id="tool.retired",
+        mode="error",
+        state="violation",
+        summary="a check that no longer exists",
+        findings=[
+            CheckFinding(
+                fingerprint="gone",
+                title="gone",
+                evidence=[Evidence(path="src/a.py", start_line=1, source="diff")],
+            )
+        ],
+        result_key=result_key(run_key_value=first.run_key, check_id="tool.retired"),
+    )
+    first.results.append(extra)
+    store.record_check_run(first)
+    assert store.count_check_results({"run_key": first.run_key}) == 2
+
+    second = _run("pass", inputs=inputs)
+    store.record_check_run(second)
+
+    read = store.get_check_run(second.run_key)
+    assert [r.check_id for r in read.results] == ["native.tests"]
+    assert read.verdict == "pass"
+
+
+def test_the_whole_write_commits_together(store, monkeypatch) -> None:
+    """A reader must never see a run whose results are still arriving.
+
+    Asserted by making the run-row write fail: nothing from the attempt may be
+    visible afterwards, which is only true if the results were in the same
+    transaction.
+    """
+    inputs = _inputs()
+    store.record_check_run(_run("pass", inputs=inputs))
+    before = store.get_check_run(_run("pass", inputs=inputs).run_key)
+    assert before.results[0].state == "pass"
+
+    original = store._checks_exec
+
+    def _fail_on_the_run_row(sql, params=()):
+        if "INSERT INTO check_runs" in sql:
+            raise RuntimeError("the disk went away")
+        return original(sql, params)
+
+    monkeypatch.setattr(store, "_checks_exec", _fail_on_the_run_row)
+    with pytest.raises(RuntimeError):
+        store.record_check_run(_run("violation", inputs=inputs))
+
+    monkeypatch.undo()
+    after = store.get_check_run(before.run_key)
+    # The half-written attempt left nothing behind: the previous answer stands.
+    assert after.results[0].state == "pass"
+    assert after.verdict == "pass"
+
+
+def test_counts_report_incomplete_as_its_own_number(store) -> None:
+    """It cannot be derived from the states beside it."""
+    run = _run("skipped", skip_reason=SkipReason.TOOL_MISSING)
+    store.record_check_run(run)
+    read = store.get_check_run(run.run_key)
+    assert read.counts()["skipped"] == 1
+    assert read.counts()["incomplete"] == 1
+    assert read.counts()["infrastructure_error"] == 0

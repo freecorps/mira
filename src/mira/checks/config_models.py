@@ -215,6 +215,25 @@ class TicketContextConfig(BaseModel):
     reference_patterns: list[str] = Field(default_factory=list)
     # Labels that excuse a pull request from needing a ticket at all.
     exempt_labels: list[str] = Field(default_factory=lambda: ["no-ticket", "chore", "dependencies"])
+    # Whether a reference may point *outside* this pull request's own
+    # repository. Off by default, and this is a security boundary rather than a
+    # convenience.
+    #
+    # A reference is text a contributor wrote. `owner/repo#1` and an issue URL
+    # both name a repository, and following one means Mira asking its own
+    # privileged token about a repository the contributor chose — a confused
+    # deputy. It can confirm that an issue exists in a private repository the
+    # token happens to be able to read, and the issue's title is then quoted
+    # back as evidence on a pull request the contributor can see.
+    #
+    # A reference outside the permitted set is still *recorded* — the pull
+    # request did name something — but it is not looked up, and the result says
+    # that rather than claiming the issue exists.
+    allow_cross_repository: bool = False
+    # ``owner/repo`` entries a reference may point at even so. Deployment
+    # configuration, so it is a decision an operator made rather than one a
+    # pull request can make. Ignored unless ``allow_cross_repository`` is on.
+    cross_repository_allowlist: list[str] = Field(default_factory=list)
     mode: str | None = None
     timeout_seconds: float = Field(default=15.0, gt=0, le=120)
 

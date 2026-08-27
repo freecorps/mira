@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from mira.checks.context import CheckContext
 from mira.checks.external.tickets import (
+    CrossRepositoryRefused,
     TicketLookupError,
     TicketRef,
     adapter_for,
@@ -40,6 +41,11 @@ class Resolution:
     unresolved: dict[str, str] = field(default_factory=dict)
     # Set when lookups are switched off by configuration rather than broken.
     lookups_disabled: bool = False
+    # References the deployment declined to follow because they name another
+    # repository. Kept apart from `unresolved` on purpose: that one means
+    # nobody could ask, which is an infrastructure error, and this means Mira
+    # chose not to, which is a policy decision and not a fault of anything.
+    refused: dict[str, str] = field(default_factory=dict)
 
     @property
     def any_found(self) -> bool:
@@ -75,6 +81,9 @@ async def _resolve(ctx: CheckContext) -> Resolution:
     for ref in refs:
         try:
             issue = await adapter.fetch(ref, ctx)
+        except CrossRepositoryRefused as exc:
+            resolution.refused[ref.label] = str(exc)
+            continue
         except TicketLookupError as exc:
             resolution.unresolved[ref.label] = str(exc)
             continue

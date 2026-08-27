@@ -490,12 +490,20 @@ class CheckRun:
         return "pass"
 
     def counts(self) -> dict[str, int]:
-        """One count per state, plus the two totals a summary line needs."""
+        """One count per state, plus the totals a summary line needs.
+
+        ``incomplete`` is its own number and cannot be derived from the states
+        beside it: an unanswered *skip* — a missing linter, a CI run still in
+        flight — is a check that did not answer and keeps a blocking gate
+        closed, and a caller adding up `infrastructure_error` and `timeout`
+        would miss exactly the cases this phase added.
+        """
         tally: dict[str, int] = dict.fromkeys(CHECK_STATES, 0)
         for result in self.results:
             tally[result.state] = tally.get(result.state, 0) + 1
         tally["total"] = len(self.results)
         tally["blocking"] = len(self.blocking_results)
+        tally["incomplete"] = len(self.incomplete_results)
         return tally
 
     def as_dict(self) -> dict[str, Any]:
