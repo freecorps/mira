@@ -131,7 +131,13 @@ async def gather_context(
         except Exception as exc:  # noqa: BLE001 - re-raised as one failure mode
             raise ChecksUnavailable(f"the diff could not be read: {exc}") from exc
 
-    patch_set: PatchSet = parse_diff(diff_text or "")
+    try:
+        patch_set: PatchSet = parse_diff(diff_text or "")
+    except Exception as exc:  # noqa: BLE001 - re-raised as one failure mode
+        # An unparseable diff must not degrade to "this pull request changes
+        # nothing", which would pass the tests check, the docs check and the
+        # migrations check at once.
+        raise ChecksUnavailable(f"the diff could not be parsed: {exc}") from exc
 
     changes = list(signal.changes) if signal.changes is not None else []
     if not changes:

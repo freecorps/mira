@@ -453,7 +453,13 @@ class CheckRun:
         were incomplete" would be the least useful of the two true statements.
         """
         if not self.results:
-            return "not_run"
+            # A run that *failed* is not a run that did not happen. `not_run`
+            # is what a gate ignores, so an unreadable diff or an unavailable
+            # store would otherwise let a pull request past a blocking check by
+            # breaking early enough. The inactive-policy path leaves `error`
+            # empty and does still report `not_run`, which is correct: nothing
+            # was asked, so nothing is owed.
+            return "incomplete" if self.error else "not_run"
         # Every check switched off is not a pass. The run happened, but nothing
         # looked at anything, and a dashboard row reading "Passed — 0 passed"
         # is the sort of small lie this phase is written to avoid. A check that
