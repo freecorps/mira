@@ -1104,3 +1104,25 @@ async def test_an_unreadable_store_does_not_cancel_a_validated_fix() -> None:
             raise RuntimeError("the database went away")
 
     assert _stopped_by_admin(Broken(), AutofixJob(job_key="k")) is None
+
+
+async def test_a_cancelled_handoff_posts_nothing() -> None:
+    """A handoff writes too — the built-in adapter posts on the pull request."""
+    _save(_finding())
+    provider = FakeProvider()
+    config = _config(handoff={"adapter": "comment"})
+    await request_fix(
+        provider,
+        _pr(),
+        FixRequest(actor="alice", finding_id=_finding().id, mode="handoff"),
+        config=config,
+    )
+    store = IndexStore.open("acme", "app")
+    try:
+        job = store.claim_autofix_job(worker="w1", lease_seconds=600)
+        store.cancel_autofix_job(job.job_key, actor="root", reason="never mind")
+        result = await run_job(provider, job, config=config, llm=FakeLLM(), store=store)
+    finally:
+        store.close()
+    assert result.job.state == "cancelled"
+    assert provider.comments == []

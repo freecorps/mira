@@ -697,6 +697,13 @@ async def _run_handoff(
     store: Any,
     recorder: _Recorder,
 ) -> RunResult:
+    # A handoff writes too — the built-in adapter posts on the pull request —
+    # so it gets the same last read before the first write that publishing does.
+    stopped = _stopped_by_admin(store, job)
+    if stopped is not None:
+        recorder.record("handoff", "cancelled", reasons=[stopped])
+        return RunResult(job=store.get_autofix_job(job.job_key) or job, reasons=[stopped])
+
     context = handoff_module.HandoffContext(
         job=job,
         finding_title=finding.title,
