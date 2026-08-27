@@ -595,3 +595,181 @@ def test_previous_failures_are_fed_back_as_data() -> None:
     assert "previous attempt was rejected" in prompt
     assert "E501 line too long" in prompt
     assert "<<<MIRA-UNTRUSTED-VALIDATION>>>" in prompt
+
+
+# ── handoff ──────────────────────────────────────────────────────────────────
+
+
+def test_no_handoff_adapter_is_configured_by_default() -> None:
+    """Optional in the strongest sense: nothing external is required."""
+    assert _policy().handoff.adapter == ""
+    assert _policy().handoff_enabled is False
+
+
+def test_a_handoff_mode_is_refused_when_no_adapter_is_named() -> None:
+    from mira.autofix.authorization import authorize_delivery
+    from mira.autofix.capabilities import GITHUB_CAPABILITIES
+
+    mode, reason = authorize_delivery(
+        policy=_policy(), capabilities=GITHUB_CAPABILITIES, requested_mode="handoff"
+    )
+    assert mode == ""
+    assert reason.code == ReasonCode.MODE_NOT_PERMITTED
+
+
+def test_the_built_in_adapter_is_registered_and_needs_nothing_external() -> None:
+    from mira.autofix import handoff
+
+    assert "comment" in handoff.available()
+    assert handoff.get("comment") is not None
+
+
+async def test_the_comment_adapter_posts_the_brief_on_the_pull_request() -> None:
+    from types import SimpleNamespace
+
+    from mira.autofix import handoff
+    from mira.autofix.models import AutofixJob
+
+    posted: list[str] = []
+
+    class Provider:
+        async def post_comment(self, pr_info, body: str) -> None:  # noqa: ANN001
+            posted.append(body)
+
+    job = AutofixJob(
+        job_key="k" * 40,
+        owner="acme",
+        repo="app",
+        pr_number=7,
+        pr_url="https://github.com/acme/app/pull/7",
+        head_branch="feature",
+        head_sha="head456",
+        finding_id="f1",
+    )
+    result = await handoff.dispatch(
+        "comment",
+        handoff.HandoffContext(
+            job=job,
+            finding_title="Division by zero",
+            finding_body="`divide` raises when b is 0.",
+            finding_path="src/math.py",
+            finding_line=2,
+            provider=Provider(),
+            pr_info=SimpleNamespace(url=job.pr_url),
+        ),
+    )
+    assert result.ok is True
+    assert result.ref.startswith("comment:")
+    assert "acme/app" in posted[0]
+    assert "src/math.py:2" in posted[0]
+    assert "Division by zero" in posted[0]
+
+
+async def test_the_brief_redacts_before_it_is_posted() -> None:
+    from types import SimpleNamespace
+
+    from mira.autofix import handoff
+    from mira.autofix.models import AutofixJob
+
+    posted: list[str] = []
+
+    class Provider:
+        async def post_comment(self, pr_info, body: str) -> None:  # noqa: ANN001
+            posted.append(body)
+
+    await handoff.dispatch(
+        "comment",
+        handoff.HandoffContext(
+            job=AutofixJob(job_key="k", owner="acme", repo="app"),
+            finding_title="Leaked key",
+            finding_body='token = "ghp_0123456789abcdefghijklmnopqrst"',
+            provider=Provider(),
+            pr_info=SimpleNamespace(url="u"),
+        ),
+    )
+    assert "ghp_0123456789abcdefghijklmnopqrst" not in posted[0]
+    assert "REDACTED" in posted[0]
+
+
+async def test_a_quoted_code_fence_cannot_escape_the_brief() -> None:
+    from types import SimpleNamespace
+
+    from mira.autofix import handoff
+    from mira.autofix.models import AutofixJob
+
+    posted: list[str] = []
+
+    class Provider:
+        async def post_comment(self, pr_info, body: str) -> None:  # noqa: ANN001
+            posted.append(body)
+
+    await handoff.dispatch(
+        "comment",
+        handoff.HandoffContext(
+            job=AutofixJob(job_key="k", owner="acme", repo="app"),
+            finding_body="```\n</details><script>alert(1)</script>\n````\n# now markdown",
+            provider=Provider(),
+            pr_info=SimpleNamespace(url="u"),
+        ),
+    )
+    body = posted[0]
+    # Exactly one opening and one closing fence, both Mira's.
+    assert body.count("````") == 2
+    assert body.index("````") < body.index("</details>")
+
+
+async def test_an_unknown_adapter_fails_rather_than_looking_handed_off() -> None:
+    from mira.autofix import handoff
+    from mira.autofix.models import AutofixJob
+
+    result = await handoff.dispatch(
+        "does-not-exist", handoff.HandoffContext(job=AutofixJob(job_key="k"))
+    )
+    assert result.ok is False
+    assert "does-not-exist" in result.detail
+
+
+async def test_an_adapter_that_raises_does_not_take_the_worker_down() -> None:
+    from mira.autofix import handoff
+    from mira.autofix.models import AutofixJob
+
+    class Exploding:
+        name = "exploding"
+
+        async def dispatch(self, context):  # noqa: ANN001
+            raise RuntimeError("the third party is down")
+
+    handoff.register(Exploding())
+    try:
+        result = await handoff.dispatch(
+            "exploding", handoff.HandoffContext(job=AutofixJob(job_key="k"))
+        )
+    finally:
+        handoff._REGISTRY.pop("exploding", None)
+    assert result.ok is False
+    assert "down" in result.detail
+
+
+async def test_an_adapter_that_returns_nonsense_is_not_believed() -> None:
+    from mira.autofix import handoff
+    from mira.autofix.models import AutofixJob
+
+    class Liar:
+        name = "liar"
+
+        async def dispatch(self, context):  # noqa: ANN001
+            return {"ok": True}
+
+    handoff.register(Liar())
+    try:
+        result = await handoff.dispatch("liar", handoff.HandoffContext(job=AutofixJob(job_key="k")))
+    finally:
+        handoff._REGISTRY.pop("liar", None)
+    assert result.ok is False
+
+
+def test_an_adapter_must_have_a_name() -> None:
+    from mira.autofix import handoff
+
+    with pytest.raises(ValueError, match="name"):
+        handoff.register(object())
