@@ -9,6 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from mira.autofix.persistence import AutofixStoreMixin
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -434,6 +435,103 @@ CREATE INDEX IF NOT EXISTS idx_gate_overrides_decision
 CREATE INDEX IF NOT EXISTS idx_gate_overrides_created
     ON gate_overrides(created_at);
 
+-- Phase 5 assisted correction. One row per unit of work: `job_key` hashes the
+-- pull request, head commit, finding and delivery mode, so two maintainers
+-- typing `@mira fix` on the same finding converge on one job — and one branch
+-- — instead of racing each other.
+--
+-- This table is also the queue. `available_at` is when a worker may take it,
+-- `lease_owner`/`lease_expires_at` are who holds it and until when, and
+-- `attempts` against `max_attempts` is what eventually parks it in
+-- `dead_letter`. There is deliberately no broker: the deployment profile is
+-- one container on a small board, and a queue that needs a second service is a
+-- queue that will not be running when the fix is asked for.
+CREATE TABLE IF NOT EXISTS autofix_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_key TEXT NOT NULL UNIQUE,
+    -- 'queued' | 'running' | 'validating' | 'publishing' | 'opened'
+    -- | 'failed' | 'dead_letter' | 'cancelled'
+    state TEXT NOT NULL DEFAULT 'queued',
+    -- 'branch_pr' | 'pr_branch' | 'handoff'
+    mode TEXT NOT NULL DEFAULT 'branch_pr',
+    -- 'single' | 'all'
+    request_kind TEXT NOT NULL DEFAULT 'single',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT '',
+    head_branch TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    -- The durable provenance a fix is resolved by. Never a comment id, never a
+    -- path and a line: those move when the diff does.
+    finding_id TEXT NOT NULL DEFAULT '',
+    finding_title TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 2,
+    ci_attempts INTEGER NOT NULL DEFAULT 0,
+    max_ci_attempts INTEGER NOT NULL DEFAULT 1,
+    available_at REAL NOT NULL DEFAULT 0,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at REAL NOT NULL DEFAULT 0,
+    branch_name TEXT NOT NULL DEFAULT '',
+    commit_sha TEXT NOT NULL DEFAULT '',
+    child_pr_url TEXT NOT NULL DEFAULT '',
+    child_pr_number INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    patch_digest TEXT NOT NULL DEFAULT '',
+    diff TEXT NOT NULL DEFAULT '',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    handoff_ref TEXT NOT NULL DEFAULT '',
+    cancelled_by TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+-- The claim query's index: state and due-time first, because that is what
+-- every poll filters on and a worker polls far more often than anything reads.
+CREATE INDEX IF NOT EXISTS idx_autofix_jobs_claim
+    ON autofix_jobs(state, available_at);
+CREATE INDEX IF NOT EXISTS idx_autofix_jobs_lease
+    ON autofix_jobs(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_autofix_jobs_pr
+    ON autofix_jobs(pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_autofix_jobs_finding
+    ON autofix_jobs(finding_id);
+CREATE INDEX IF NOT EXISTS idx_autofix_jobs_created
+    ON autofix_jobs(created_at);
+
+-- Append-only trail. The job row carries the latest state; these carry the
+-- story, which is the only thing that makes "it opened a pull request on the
+-- third try" reviewable rather than merely true.
+CREATE TABLE IF NOT EXISTS autofix_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL DEFAULT 0,
+    job_key TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    -- 'generate' | 'apply' | 'validate' | 'publish' | 'handoff' | 'ci_retry'
+    phase TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_digest TEXT NOT NULL DEFAULT '',
+    patch_digest TEXT NOT NULL DEFAULT '',
+    diff TEXT NOT NULL DEFAULT '',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    detail TEXT NOT NULL DEFAULT '',
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_autofix_attempts_job
+    ON autofix_attempts(job_key, created_at);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -643,7 +741,7 @@ class BlastRadiusEntry:
     depth: int
 
 
-class IndexStore(_StoreSharedMixin, GateStoreMixin):
+class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin):
     """SQLite-backed index for a single repository."""
 
     def __init__(
@@ -2623,6 +2721,20 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin):
         return self._conn.execute(sql, params).fetchall()
 
     def _gate_exec(self, sql: str, params: tuple = ()) -> int:
+        cursor = self._conn.execute(sql, params)
+        self._conn.commit()
+        return int(cursor.rowcount or 0)
+
+    # ---------------------------------------------------------------- Phase 5
+    # The primitives `AutofixStoreMixin` needs. The claim query is plain here:
+    # SQLite serialises writers, so `SELECT ... FOR UPDATE SKIP LOCKED` has
+    # nothing to add and does not exist. Two workers that read the same id both
+    # try the conditional UPDATE, and exactly one of them changes a row.
+
+    def _autofix_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def _autofix_exec(self, sql: str, params: tuple = ()) -> int:
         cursor = self._conn.execute(sql, params)
         self._conn.commit()
         return int(cursor.rowcount or 0)

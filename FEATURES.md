@@ -72,6 +72,26 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Auditable overrides recording actor, reason, previous and new decision — and never touching the platform
 - Dashboard panel for the decision history and the policy
 
+## Assisted correction
+
+- `@mira fix` on a review comment and `@mira fix all` on the pull request, resolved by durable finding id rather than by path and line
+- Off by default; `suggest` mode generates and validates the patch and writes nothing
+- Requires write permission on the repository, read from the platform — an unreadable permission is never treated as one
+- Default delivery is Mira's own branch and a stacked pull request carrying the diff, the rationale, the model and the validation transcript
+- The default branch is never written to, nothing is ever force-pushed, and no provider declares that Mira may merge
+- Committing onto the pull request's own branch is a separate opt-in, refused outright for a fork or a default-branch head
+- Path safety, protected paths and file/line/byte limits enforced on the applied patch rather than on what the model sent
+- Structured model output with no field that could carry a command, and repository content framed as untrusted data
+- Secrets and personal data redacted before anything reaches a model, and a patch that would commit a credential is refused
+- Validation from a deployment-configured allowlist only, with no shell, wall-clock timeouts and POSIX CPU/memory ceilings
+- A durable in-database queue with leases, attempts, backoff and a dead-letter state — no Redis, no second service
+- Worker runs in the web process by default and separately (`mira autofix-worker`) for larger installs
+- Idempotent on retry: one branch, one commit per distinct content, one pull request
+- Bounded CI retry loop driven by the fix's own build, counted on the job row so a restart cannot reset it
+- Optional handoff to an external agent through a one-method adapter, with a zero-dependency built-in
+- Global kill switch that also stops queued work, plus per-repository opt-in and an admin cancel permission
+- Dashboard panel for jobs, patches, validations and failures
+
 ## Platform integrations
 
 - GitHub App with webhook support — works against github.com and GitHub Enterprise Server (set `MIRA_GITHUB_API_URL`)
@@ -116,6 +136,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Thread auto-resolution toggle (`review.auto_resolve_conversations`)
 - `context_lines`, `max_concurrent_chunks`, and `index.max_file_size` tuning knobs
 - Merge gate policy (`gate`): mode, kill switch, protected paths, eligibility limits, risk threshold, and per-repository overrides
+- Autofix policy (`autofix`): mode, kill switch, requester permissions, protected paths, size/attempt limits, the validation command allowlist, queue tuning, and per-repository overrides
 
 ## Storage and deployment
 

@@ -40,6 +40,16 @@ EXPECTED_ROUTES = {
     ("/api/gate/decisions/{owner}/{repo}/{decision_id}", "GET"),
     ("/api/gate/decisions/{owner}/{repo}/{decision_id}/override", "POST"),
     ("/api/gate/summary", "GET"),
+    # Phase 5 — assisted correction (all admin-only; the cancel route
+    # additionally requires the cancel permission). There is deliberately no
+    # route that *starts* a fix: that is a repository write permission, not a
+    # dashboard session.
+    ("/api/autofix/config", "GET"),
+    ("/api/autofix/config", "PUT"),
+    ("/api/autofix/jobs", "GET"),
+    ("/api/autofix/jobs/{owner}/{repo}/{job_id}", "GET"),
+    ("/api/autofix/jobs/{owner}/{repo}/{job_id}/cancel", "POST"),
+    ("/api/autofix/summary", "GET"),
     ("/api/contributors/summary", "GET"),
     ("/api/contributors/backfill/status", "GET"),
     ("/api/contributors/refresh", "POST"),

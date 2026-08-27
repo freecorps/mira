@@ -21,6 +21,12 @@ from urllib.parse import quote
 
 import httpx
 
+from mira.autofix.capabilities import (
+    FORGEJO_CAPABILITIES as FORGEJO_AUTOFIX_CAPABILITIES,
+)
+from mira.autofix.capabilities import (
+    AutofixCapabilities,
+)
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import FORGEJO_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
@@ -714,6 +720,182 @@ class ForgejoProvider(BaseProvider):
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(f"Failed to publish gate status: {exc}") from exc
         return str((resp.json() or {}).get("id", "") or "")
+
+    # ── Assisted correction (Phase 5) ──
+
+    def autofix_capabilities(self) -> AutofixCapabilities:
+        return FORGEJO_AUTOFIX_CAPABILITIES
+
+    async def get_actor_permission(self, pr_info: PRInfo, login: str) -> str:
+        """Collaborator permission, in Forgejo's own words.
+
+        A 404 is a real answer — the account is not a collaborator — and is
+        reported as `none`. Anything else is `unknown`, which never clears the
+        write requirement.
+        """
+        if not login:
+            return "unknown"
+        url = f"{self._repo(pr_info)}/collaborators/{quote(login, safe='')}/permission"
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read %s's permission on %s: %s", login, pr_info.url, exc)
+            return "unknown"
+        if resp.status_code == 404:
+            return "none"
+        permission = str((resp.json() or {}).get("permission") or "").lower()
+        if permission in {"owner", "admin"}:
+            return "admin"
+        if permission == "write":
+            return "write"
+        if permission == "read":
+            return "read"
+        return "none"
+
+    async def get_default_branch(self, pr_info: PRInfo) -> str:
+        try:
+            resp = await self._request("GET", self._repo(pr_info))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read the default branch of %s: %s", pr_info.url, exc)
+            return ""
+        return str((resp.json() or {}).get("default_branch") or "")
+
+    async def get_branch_head(self, pr_info: PRInfo, branch: str) -> str:
+        url = f"{self._repo(pr_info)}/branches/{quote(branch, safe='')}"
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except Exception as e:
+            raise ProviderError(f"Failed to read branch {branch}: {e}") from e
+        if resp.status_code == 404:
+            return ""
+        return str(((resp.json() or {}).get("commit") or {}).get("id") or "")
+
+    async def create_branch(self, pr_info: PRInfo, branch: str, from_sha: str) -> None:
+        try:
+            await self._request(
+                "POST",
+                f"{self._repo(pr_info)}/branches",
+                json={
+                    "new_branch_name": branch,
+                    "old_ref_name": from_sha or pr_info.head_sha or pr_info.head_branch,
+                },
+                ok=(200, 201),
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to create branch {branch}: {e}") from e
+
+    async def _file_sha(self, pr_info: PRInfo, ref: str, path: str) -> tuple[str, str]:
+        """``(blob sha, decoded content)`` at ``ref``, or ``("", "")``.
+
+        The sha is not decoration: Forgejo's contents API requires the previous
+        blob sha on an update, which is what makes the write a compare-and-swap
+        rather than a blind overwrite.
+        """
+        url = f"{self._repo(pr_info)}/contents/{quote(path, safe='')}?ref={quote(ref, safe='')}"
+        try:
+            resp = await self._request("GET", url, ok=(200, 404))
+        except Exception:  # noqa: BLE001
+            return "", ""
+        if resp.status_code != 200:
+            return "", ""
+        data = resp.json() or {}
+        if isinstance(data, list):
+            return "", ""
+        raw = str(data.get("content") or "")
+        try:
+            decoded = base64.b64decode(raw).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            decoded = ""
+        return str(data.get("sha") or ""), decoded
+
+    async def files_match(self, pr_info: PRInfo, branch: str, files: dict[str, str]) -> bool:
+        for path, content in files.items():
+            _sha, existing = await self._file_sha(pr_info, branch, path)
+            if existing != content:
+                return False
+        return True
+
+    async def commit_files(
+        self, pr_info: PRInfo, branch: str, files: dict[str, str], message: str
+    ) -> str:
+        """Commit each file through the contents API.
+
+        Forgejo's Gitea-compatible API has no multi-file commit endpoint, so a
+        multi-file patch lands as one commit per file on the fix branch. That
+        is declared in `FORGEJO_CAPABILITIES` rather than hidden: the branch is
+        Mira's own and nobody has reviewed it yet, so several commits are untidy
+        rather than harmful — and squashing them would mean a force push, which
+        is the one thing this phase does not do.
+
+        Each write carries the previous blob sha, so a concurrent change makes
+        the call fail instead of silently overwriting it.
+        """
+        last = ""
+        for path, content in sorted(files.items()):
+            sha, _existing = await self._file_sha(pr_info, branch, path)
+            payload: dict[str, Any] = {
+                "branch": branch,
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "message": message if not last else f"{message.splitlines()[0]} ({path})",
+            }
+            if sha:
+                payload["sha"] = sha
+            method = "PUT" if sha else "POST"
+            try:
+                resp = await self._request(
+                    method,
+                    f"{self._repo(pr_info)}/contents/{quote(path, safe='')}",
+                    json=payload,
+                    ok=(200, 201),
+                )
+            except Exception as e:
+                raise ProviderError(f"Failed to commit {path} to {branch} via {method}: {e}") from e
+            last = str(((resp.json() or {}).get("commit") or {}).get("sha") or "")
+        return last
+
+    async def create_pull_request(
+        self, pr_info: PRInfo, *, head: str, base: str, title: str, body: str
+    ) -> tuple[int, str]:
+        try:
+            resp = await self._request(
+                "POST",
+                f"{self._repo(pr_info)}/pulls",
+                json={"head": head, "base": base, "title": title, "body": body},
+                ok=(200, 201),
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to open a pull request from {head}: {e}") from e
+        data = resp.json() or {}
+        return int(data.get("number") or 0), str(data.get("html_url") or "")
+
+    async def find_open_pull_request(self, pr_info: PRInfo, head: str) -> tuple[int, str] | None:
+        try:
+            resp = await self._request("GET", f"{self._repo(pr_info)}/pulls?state=open&limit=100")
+        except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
+            logger.debug("Could not look for an open pull request from %s: %s", head, exc)
+            return None
+        for item in resp.json() or []:
+            if str(((item or {}).get("head") or {}).get("ref") or "") == head:
+                return int((item or {}).get("number") or 0), str((item or {}).get("html_url") or "")
+        return None
+
+    async def pr_head_is_fork(self, pr_info: PRInfo) -> bool:
+        """Whether the head branch lives in a different repository.
+
+        Anything that cannot be determined answers True: a commit into a fork
+        is a cross-repository write, and a guess is not authorization.
+        """
+        try:
+            resp = await self._request("GET", self._pr(pr_info))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not tell whether %s comes from a fork: %s", pr_info.url, exc)
+            return True
+        head = (resp.json() or {}).get("head") or {}
+        head_repo = head.get("repo") or {}
+        full_name = str(head_repo.get("full_name") or "")
+        if not full_name:
+            return True
+        return full_name.lower() != f"{pr_info.owner}/{pr_info.repo}".lower()
 
 
 def _next_link(link_header: str) -> str | None:

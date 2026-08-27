@@ -14,6 +14,12 @@ import httpx
 from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from mira.autofix.capabilities import (
+    GITHUB_CAPABILITIES as GITHUB_AUTOFIX_CAPABILITIES,
+)
+from mira.autofix.capabilities import (
+    AutofixCapabilities,
+)
 from mira.exceptions import ProviderError
 from mira.gate.capabilities import GITHUB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
@@ -1387,6 +1393,202 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             logger.warning("Could not publish gate status on %s: %s", pr_info.url, e)
             raise ProviderError(f"Failed to publish gate status: {e}") from e
+
+    # ── Assisted correction (Phase 5) ──
+
+    def autofix_capabilities(self) -> AutofixCapabilities:
+        return GITHUB_AUTOFIX_CAPABILITIES
+
+    async def get_actor_permission(self, pr_info: PRInfo, login: str) -> str:
+        """The account's permission on the repository, in GitHub's own words.
+
+        Raises nothing: an account with no relationship to the repository 404s,
+        which is `none`, and any other failure is `unknown`. Both refuse — the
+        distinction exists so the refusal can say which happened.
+        """
+
+        @_retry_transient
+        def _fetch() -> str:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            try:
+                level = gh_repo.get_collaborator_permission(login)
+            except GithubException as exc:
+                if exc.status == 404:
+                    return "none"
+                raise
+            return str(level or "none").lower()
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as exc:  # noqa: BLE001 - unreadable is a refusal, not a crash
+            logger.warning("Could not read %s's permission on %s: %s", login, pr_info.url, exc)
+            return "unknown"
+
+    async def get_default_branch(self, pr_info: PRInfo) -> str:
+        @_retry_transient
+        def _fetch() -> str:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            return str(gh_repo.default_branch or "")
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read the default branch of %s: %s", pr_info.url, exc)
+            return ""
+
+    async def get_branch_head(self, pr_info: PRInfo, branch: str) -> str:
+        """Tip sha of ``branch``, or "" when it does not exist.
+
+        A 404 is a real answer here — "no such branch" is what the caller is
+        asking about — so it is not raised.
+        """
+
+        @_retry_transient
+        def _fetch() -> str:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            try:
+                ref = gh_repo.get_git_ref(f"heads/{branch}")
+            except GithubException as exc:
+                if exc.status == 404:
+                    return ""
+                raise
+            return str(getattr(getattr(ref, "object", None), "sha", "") or "")
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            raise ProviderError(f"Failed to read branch {branch}: {e}") from e
+
+    async def create_branch(self, pr_info: PRInfo, branch: str, from_sha: str) -> None:
+        """Create ``refs/heads/<branch>`` at ``from_sha``.
+
+        `create_git_ref` only creates. There is no update call here and no
+        `force` argument anywhere in this class: a branch that already exists
+        makes this raise, and the caller adopts it rather than resetting it.
+        """
+
+        @_retry_transient
+        def _create() -> None:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            sha = from_sha or gh_repo.get_pull(pr_info.number).head.sha
+            gh_repo.create_git_ref(ref=f"refs/heads/{branch}", sha=sha)
+
+        try:
+            await asyncio.to_thread(_create)
+        except Exception as e:
+            raise ProviderError(f"Failed to create branch {branch}: {e}") from e
+
+    async def files_match(self, pr_info: PRInfo, branch: str, files: dict[str, str]) -> bool:
+        """Whether every path already holds exactly this content on ``branch``."""
+
+        def _check() -> bool:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            for path, content in files.items():
+                try:
+                    blob = gh_repo.get_contents(path, ref=branch)
+                except GithubException:
+                    return False
+                if isinstance(blob, list):
+                    return False
+                existing = base64.b64decode(blob.content or "").decode("utf-8", "replace")
+                if existing != content:
+                    return False
+            return True
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception as exc:  # noqa: BLE001 - any doubt means "commit it"
+            logger.debug("Could not compare %s against %s: %s", branch, pr_info.url, exc)
+            return False
+
+    async def commit_files(
+        self, pr_info: PRInfo, branch: str, files: dict[str, str], message: str
+    ) -> str:
+        """One commit carrying every changed file, fast-forward from the branch head.
+
+        Built through the git data API — blob, tree, commit, ref update — rather
+        than one contents-API call per file, so a multi-file fix is one commit
+        and one atomic ref move rather than a half-applied sequence somebody has
+        to reason about.
+
+        The ref update is a plain (non-forced) update from the branch's current
+        head, so a concurrent push makes it fail rather than lose that push.
+        """
+
+        @_retry_transient
+        def _commit() -> str:
+            from github.InputGitTreeElement import InputGitTreeElement
+
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            ref = gh_repo.get_git_ref(f"heads/{branch}")
+            parent = gh_repo.get_git_commit(ref.object.sha)
+            base_tree = gh_repo.get_git_tree(parent.tree.sha)
+            elements = [
+                InputGitTreeElement(path=path, mode="100644", type="blob", content=content)
+                for path, content in sorted(files.items())
+            ]
+            tree = gh_repo.create_git_tree(elements, base_tree)
+            commit = gh_repo.create_git_commit(message, tree, [parent])
+            # `force=False` is the default and is passed explicitly: this is the
+            # one call in Mira that could rewrite history, and a reader should
+            # not have to know the default to be sure it does not.
+            ref.edit(sha=commit.sha, force=False)
+            return str(commit.sha)
+
+        try:
+            return await asyncio.to_thread(_commit)
+        except Exception as e:
+            raise ProviderError(f"Failed to commit to {branch}: {e}") from e
+
+    async def create_pull_request(
+        self, pr_info: PRInfo, *, head: str, base: str, title: str, body: str
+    ) -> tuple[int, str]:
+        @_retry_transient
+        def _open() -> tuple[int, str]:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            created = gh_repo.create_pull(title=title, body=body, head=head, base=base)
+            return int(created.number), str(created.html_url or "")
+
+        try:
+            return await asyncio.to_thread(_open)
+        except Exception as e:
+            raise ProviderError(f"Failed to open a pull request from {head}: {e}") from e
+
+    async def find_open_pull_request(self, pr_info: PRInfo, head: str) -> tuple[int, str] | None:
+        def _find() -> tuple[int, str] | None:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            for candidate in gh_repo.get_pulls(state="open", head=f"{pr_info.owner}:{head}"):
+                return int(candidate.number), str(candidate.html_url or "")
+            return None
+
+        try:
+            return await asyncio.to_thread(_find)
+        except Exception as exc:  # noqa: BLE001 - not finding one is not a failure
+            logger.debug("Could not look for an open pull request from %s: %s", head, exc)
+            return None
+
+    async def pr_head_is_fork(self, pr_info: PRInfo) -> bool:
+        """Whether the head branch lives in a different repository.
+
+        Anything that cannot be determined answers True. A commit onto a fork's
+        branch is a cross-repository write nobody authorized, and "we could not
+        tell" is not a reason to make one.
+        """
+
+        def _check() -> bool:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            pull = gh_repo.get_pull(pr_info.number)
+            head_repo = getattr(pull.head, "repo", None)
+            if head_repo is None:
+                return True
+            full_name = str(head_repo.full_name or "").lower()
+            return full_name != f"{pr_info.owner}/{pr_info.repo}".lower()
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not tell whether %s comes from a fork: %s", pr_info.url, exc)
+            return True
 
     async def get_review_inline_comments(self, pr_info: PRInfo, review_id: int) -> list[str]:
         """Return the bodies of the inline comments that belong to one review

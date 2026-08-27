@@ -448,6 +448,13 @@ Migrations are additive. Both stores run `CREATE TABLE IF NOT EXISTS` on every
 connection, so an existing database picks the tables up on the next start with
 no migration step and no downtime.
 
+On Postgres, where one table holds every repository, rows carry the **namespaced**
+owner (`_{platform}/{owner}` for anything but GitHub) because that is the
+spelling every read scopes on. The store's own owner therefore wins over the one
+carried on the record — writing the plain owner and reading with the namespaced
+scope would make a row invisible to the store that wrote it. SQLite is handed the
+plain owner and its per-repository file already scopes the rows.
+
 ## Full configuration
 
 ```yaml
@@ -524,5 +531,6 @@ render survive a save.
 
 ## Not in this phase
 
-Autofix. `@mira fix` and the fix-and-verify loop are Phase 5; the gate decides
-whether a change may be approved, and does not change any code.
+Autofix. `@mira fix` and the fix-and-verify loop are Phase 5 — see
+[docs/autofix.md](autofix.md). The gate decides whether a change may be
+approved, and does not change any code.

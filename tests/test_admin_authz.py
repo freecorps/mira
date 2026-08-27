@@ -94,6 +94,23 @@ PROTECTED = [
     ),
     ("/api/gate/config", "GET", {}),
     ("/api/gate/config", "PUT", {"body": None}),
+    # Phase 5 assisted correction. Reads are listed for the same reason again:
+    # a job quotes a finding, a diff, a model's reasoning and a validation
+    # transcript for every repository in the install.
+    ("/api/autofix/jobs", "GET", {}),
+    ("/api/autofix/summary", "GET", {}),
+    (
+        "/api/autofix/jobs/{owner}/{repo}/{job_id}",
+        "GET",
+        {"owner": "o", "repo": "r", "job_id": 1},
+    ),
+    (
+        "/api/autofix/jobs/{owner}/{repo}/{job_id}/cancel",
+        "POST",
+        {"owner": "o", "repo": "r", "job_id": 1, "body": None},
+    ),
+    ("/api/autofix/config", "GET", {}),
+    ("/api/autofix/config", "PUT", {"body": None}),
 ]
 
 

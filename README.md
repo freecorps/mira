@@ -159,6 +159,25 @@ input never results in an approval. The history and policy panels live at
 
 → [Merge gate docs](docs/merge-gate.md)
 
+**Autofix** closes the loop. Reply `@mira fix` to one of Mira's review comments
+and it writes the change on a branch of its own and opens a stacked pull
+request with the diff, the rationale and the validation it passed:
+
+```yaml
+autofix:
+  mode: "suggest"         # off | suggest | on
+  max_files: 3
+  max_fixes_per_request: 3
+```
+
+It ships off, and `suggest` shows you the patch it would have written without
+writing anything. Asking requires **write permission on the repository**, read
+from the platform — not a dashboard login. Mira never writes to the default
+branch, never force pushes, and never merges. Jobs, patches and validation
+transcripts live at `/autofix` (admin only).
+
+→ [Autofix docs](docs/autofix.md)
+
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 
 ## Development

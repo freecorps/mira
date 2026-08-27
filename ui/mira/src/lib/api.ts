@@ -5,6 +5,7 @@
 
 import { activityApi } from "./api/activity"
 import { analyticsApi } from "./api/analytics"
+import { autofixApi } from "./api/autofix"
 import { contributorsApi } from "./api/contributors"
 import { gateApi } from "./api/gate"
 import { packagesApi } from "./api/packages"
@@ -37,4 +38,5 @@ export const api = {
   ...contributorsApi,
   ...reviewInsightsApi,
   ...gateApi,
+  ...autofixApi,
 }

@@ -8,6 +8,7 @@ import { UninstallModal } from "@/components/dashboard/uninstall-modal"
 import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import { ActivityPage } from "@/pages/activity"
+import { AutofixPage } from "@/pages/autofix"
 import { ContributorDetailPage } from "@/pages/contributor-detail"
 import { ContributorsPage } from "@/pages/contributors"
 import { DashboardPage } from "@/pages/dashboard"
@@ -219,6 +220,7 @@ export function App() {
           <Route path="learnings/new" element={<LearningFormPage />} />
           <Route path="learnings/edit" element={<LearningFormPage />} />
           <Route path="merge-gate" element={<MergeGatePage />} />
+          <Route path="autofix" element={<AutofixPage />} />
           <Route path="vulnerabilities" element={<VulnerabilitiesPage />} />
           <Route path="users" element={<UsersPage />} />
           <Route path="users/new" element={<UserFormPage />} />
