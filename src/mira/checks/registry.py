@@ -162,13 +162,19 @@ def context_specs() -> list[CheckSpec]:
 
 
 def tool_specs(policy: EffectiveChecksPolicy) -> list[CheckSpec]:
-    """One spec per configured analyser this deployment enabled."""
+    """One spec per configured analyser, enabled or not.
+
+    A disabled analyser keeps its spec and resolves to mode ``off``, so the
+    runner records it as `skipped: disabled` and the catalog still lists it.
+    Dropping it here instead would make "switched off" indistinguishable from
+    "not present in this version" — and would remove a check from the run that
+    an operator had put in `error` mode, which is the one direction a
+    fail-closed framework must never move in by accident.
+    """
     from mira.checks.tools import adapter_for
 
     specs: list[CheckSpec] = []
     for tool in policy.tools:
-        if not tool.enabled:
-            continue
         adapter = adapter_for(tool.name)
         if adapter is None:  # pragma: no cover - the allowlist is closed
             continue

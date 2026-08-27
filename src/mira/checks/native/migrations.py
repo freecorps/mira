@@ -10,9 +10,15 @@ decide whether an incident at 3am is recoverable.
 ``NOT NULL`` added to an existing column are all changes that the previous
 release cannot run against. Each one is reported with its own line.
 
-**Can it be undone?** An Alembic revision with no ``downgrade`` body, a
-``.sql`` migration with no paired ``down``/``rollback`` file — the migration
-went one way and there is no written path back.
+**Can it be undone?** In a language whose migrations *are* a pair of functions
+— Alembic, Django, Rails, Knex — a revision with no ``downgrade``, or one whose
+body is `pass`, went one way with no written path back, and that is reported.
+A plain ``.sql`` migration is different: its rollback is conventionally a
+second file under a naming scheme this check does not know, so it is recorded
+as *not assessed* rather than guessed at in either direction. When every
+migration in a pull request falls into that bucket and nothing destructive
+turned up, the result is a skip — Mira could not answer, and a pass would claim
+a reversibility nothing established.
 
 A pull request with no schema change at all is skipped: this check has no
 opinion about it, and saying "pass" would imply it looked at something it did
@@ -78,19 +84,46 @@ def _evidence(line: DiffLine, detail: str) -> Evidence:
     )
 
 
-async def _downgrade_is_empty(ctx: CheckContext, path: str) -> bool | None:
-    """Whether ``path``'s downgrade does nothing. ``None`` when unreadable.
+# What Mira was able to establish about one migration file.
+#
+# `reversible`    it declares a downgrade with something in it.
+# `irreversible`  it declares one that is empty, or — in a language whose
+#                 migrations *are* a pair of functions — declares none at all.
+# `unknown`       Mira has no convention to look for here. A plain `.sql`
+#                 migration's rollback is usually a second file under a naming
+#                 scheme this check does not know, so calling it irreversible
+#                 would be noise and calling it reversible would be a claim
+#                 nothing supports.
+# `unreadable`    the file could not be fetched. Mira's problem, not the
+#                 change's.
+_REVERSIBLE = "reversible"
+_IRREVERSIBLE = "irreversible"
+_UNKNOWN = "unknown"
+_UNREADABLE = "unreadable"
+
+# Languages where a migration is conventionally a pair of functions, so the
+# absence of a downgrade is itself the answer rather than a gap in Mira's
+# knowledge: Alembic and Django (Python), Rails (Ruby), Knex and TypeORM
+# (JS/TS).
+_PAIRED_SUFFIXES = frozenset({".py", ".rb", ".ts", ".js"})
+
+
+async def _reversibility(ctx: CheckContext, path: str) -> str:
+    """What can be established about ``path``'s rollback path.
 
     Reads the file at the head commit rather than the diff, because a revision
     edited in place shows only the changed lines and the ``downgrade`` that
-    matters may be untouched context. ``None`` — not ``True`` — when the file
-    cannot be read: an unreadable file is not evidence of an empty function,
-    and the caller turns it into an infrastructure error rather than a claim
-    about the pull request.
+    matters may be untouched context.
+
+    The four answers are kept apart on purpose. An earlier version of this
+    returned a bool, so "no downgrade declared at all" and "a downgrade with a
+    body" both came back as *not empty* — and a migration with no way back read
+    as reversible, which is the opposite of what this check exists to say.
     """
     content = await ctx.file_content(path)
     if not content:
-        return None
+        return _UNREADABLE
+
     lines = content.splitlines()
     for index, line in enumerate(lines):
         if not _DOWNGRADE.match(line):
@@ -98,9 +131,13 @@ async def _downgrade_is_empty(ctx: CheckContext, path: str) -> bool | None:
         for following in lines[index + 1 : index + 12]:
             if not following.strip() or following.lstrip().startswith("#"):
                 continue
-            return bool(_EMPTY_BODY.match(following))
-        return True
-    return False
+            return _IRREVERSIBLE if _EMPTY_BODY.match(following) else _REVERSIBLE
+        # A downgrade declared as the last thing in the file has no body.
+        return _IRREVERSIBLE
+
+    if native_paths.suffix(path) in _PAIRED_SUFFIXES:
+        return _IRREVERSIBLE
+    return _UNKNOWN
 
 
 async def run(ctx: CheckContext) -> CheckOutcome:
@@ -146,22 +183,26 @@ async def run(ctx: CheckContext) -> CheckOutcome:
             SkipReason.NOT_APPLICABLE,
         )
 
+    unknown: list[str] = []
+    assessed = 0
     for path in migration_paths:
-        if native_paths.suffix(path) not in {".py", ".sql", ".rb", ".ts", ".js"}:
-            continue
-        empty = await _downgrade_is_empty(ctx, path)
-        if empty is None:
+        verdict = await _reversibility(ctx, path)
+        if verdict == _UNREADABLE:
             unreadable.append(path)
             continue
-        if empty:
+        if verdict == _UNKNOWN:
+            unknown.append(path)
+            continue
+        assessed += 1
+        if verdict == _IRREVERSIBLE:
             findings.append(
                 CheckFinding(
                     fingerprint=fingerprint(path=path, signature="migration has no downgrade"),
                     title=f"`{path}` has no way back",
                     detail=(
-                        "The migration defines no downgrade, or defines one with an empty "
-                        "body. Undoing this release would leave the schema where the "
-                        "migration put it."
+                        "The migration declares no downgrade, or declares one with an "
+                        "empty body. Undoing this release would leave the schema where "
+                        "the migration put it."
                     ),
                     evidence=[
                         Evidence(
@@ -193,13 +234,35 @@ async def run(ctx: CheckContext) -> CheckOutcome:
         summary = f"{len(findings)} schema concern(s) in {len(migration_paths) or 1} file(s)."
         if extra:
             summary += f" Showing {len(trimmed)}; {extra} more were found and not listed."
+        if unknown:
+            summary += (
+                f" {len(unknown)} file(s) use no rollback convention Mira recognises and "
+                "were not assessed."
+            )
         return CheckOutcome.violation(summary=summary, findings=trimmed)
 
+    if unknown and not assessed:
+        # Every migration used a convention this check cannot read, and nothing
+        # destructive turned up in the statements themselves. Reporting a pass
+        # would claim a reversibility nothing established; this says what
+        # happened, and — being an unanswered skip — still keeps a blocking
+        # gate closed.
+        return CheckOutcome.skipped(
+            f"{len(unknown)} migration file(s) use no rollback convention Mira "
+            "recognises, so it could not establish whether they can be undone: "
+            + ", ".join(unknown[:5])
+            + ".",
+            SkipReason.UNSUPPORTED,
+        )
+
+    summary = f"{assessed} migration file(s) change the schema additively and define a way back."
+    if unknown:
+        summary += (
+            f" {len(unknown)} more use no rollback convention Mira recognises and were "
+            "not assessed."
+        )
     return CheckOutcome.passed(
-        summary=(
-            f"{len(migration_paths) or 'The'} migration file(s) change the schema additively "
-            "and define a way back."
-        ),
+        summary=summary,
         evidence=schema_evidence
         or [
             Evidence(path=path, detail="migration changed", source="diff")

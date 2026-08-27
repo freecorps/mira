@@ -321,11 +321,18 @@ def checks_summary(
         )
     totals: dict[str, Any] = dict.fromkeys(CHECK_STATES, 0)
     total = 0
+    inconclusive = 0
     for bucket in buckets:
         totals[bucket["state"]] = totals.get(bucket["state"], 0) + bucket["count"]
         total += bucket["count"]
+        # From the persisted `incomplete` flag, not from the state. A skip for
+        # a missing linter or a CI run still in flight is a check that did not
+        # answer and keeps a blocking gate closed; counting only errors and
+        # timeouts would understate this number by exactly the cases the phase
+        # was written to make visible.
+        inconclusive += int(bucket.get("incomplete") or 0)
     totals["total"] = total
-    totals["inconclusive"] = totals.get("infrastructure_error", 0) + totals.get("timeout", 0)
+    totals["inconclusive"] = inconclusive
     return CheckSummaryResponse(buckets=buckets, totals=totals)
 
 
@@ -357,7 +364,7 @@ def checks_catalog(request: Request, owner: str = "", repo: str = "") -> CheckCa
     """
     _require_admin(request)
     _validate_repo_filters(owner, repo)
-    policy = resolve_policy(load_config().checks, owner, repo)
+    policy = resolve_policy(load_config().checks, _public_owner(owner), repo)
     return CheckCatalogResponse(checks=catalog(policy), policy=policy.as_dict())
 
 
@@ -376,7 +383,12 @@ def get_checks_config(request: Request, owner: str = "", repo: str = "") -> Chec
 
     stored = (_app_db.get_global_review_overrides() or {}).get(_SECTION, {}) if _app_db else {}
     config = load_config()
-    policy = resolve_policy(config.checks, owner, repo)
+    # `_public_owner`, because a non-GitHub repository reaches these routes
+    # under the namespaced owner `IndexStore.open` uses (`_gitlab/acme`), while
+    # `checks.organizations` and `checks.repositories` are keyed on the plain
+    # one. Resolving with the namespaced spelling would miss every per-scope
+    # entry and report the global policy as the effective one.
+    policy = resolve_policy(config.checks, _public_owner(owner), repo)
     return ChecksConfigResponse(
         config=config.checks.model_dump(),
         overrides=stored,

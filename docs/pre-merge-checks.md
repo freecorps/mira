@@ -55,6 +55,12 @@ Each check also has a **mode**, from configuration and never from a check:
 | `warning` | yes | yes | no |
 | `error` | yes | yes | on a violation **or** on an unanswered result |
 
+A check's mode comes from three places, most specific first: the scope's
+`modes` mapping, the entry's own `mode` (a tool or a natural-language rule may
+carry one inline), then `default_mode`. A tool with `enabled: false` resolves to
+`off` and is still *recorded* as `skipped: disabled` — "switched off" and "not
+present in this version of Mira" are different facts.
+
 And a whole run has a **verdict** the merge gate reads: `pass`, `violation`,
 `incomplete` or `not_run`. A run in which every check was switched off reports
 `not_run` rather than `pass` — nothing looked at anything, and a row reading
@@ -104,6 +110,16 @@ every pull request on a four-core board.
 | `native.breaking_change` | Does this take away something callers depend on? | A public symbol or route removed and not re-added, a new *required* parameter on an existing function, or a key removed from `.env.example`. |
 | `native.migrations` | What does this do to the database, and can it be undone? | Destructive DDL (`DROP`, `RENAME`, a new `NOT NULL` on an existing column), or a migration whose downgrade is missing or empty. |
 
+`native.migrations` reads reversibility per file and reports one of four
+answers. A language whose migrations *are* a pair of functions — Alembic,
+Django, Rails, Knex — with no downgrade or an empty one is **irreversible** and
+is reported. A plain `.sql` migration is **not assessed**: its rollback is
+conventionally a second file under a naming scheme this check does not know, so
+claiming either answer would be a guess. When every migration in a pull request
+falls into that bucket and nothing destructive turned up, the result is a *skip*
+rather than a pass — and, being an unanswered skip, it still keeps a blocking
+gate closed.
+
 Each one points at a path and a line from the parsed diff. `native.migrations`
 reads the migration file at the head commit to judge reversibility; if it
 cannot read it, the result is an `infrastructure_error`, not a pass — the check
@@ -124,9 +140,16 @@ branch name: `#123`, `owner/repo#123`, issue URLs (GitHub, GitLab, Forgejo),
 and any extra regex an operator configures. Resolution is a separate step with
 three outcomes, not two:
 
-* the issue exists → `pass`;
-* the tracker says there is no such issue → `violation`;
-* nobody could ask → `infrastructure_error`.
+* every reference resolved → `pass`;
+* the tracker says one does not exist → `violation`;
+* nobody could ask about one → `infrastructure_error`.
+
+A pull request referencing two issues where one resolves and the other cannot
+be reached is an `infrastructure_error`, not a pass: the half nobody could reach
+is the half a check exists to be sure about. A definite *missing* issue outranks
+an unreachable one — it is a fact about the pull request and it is actionable —
+and the summary names what could not be checked so the reader knows the answer
+is not the whole picture.
 
 That third case is why the adapter contract makes a provider return `None` for
 "no such issue" and *raise* for everything else. A check that inferred absence
@@ -365,7 +388,10 @@ not a policy rewrite — made the framework inert.
   reference deployment is an Orange Pi also serving webhooks; a linter fan-out
   that saturates it turns every review into a timeout.
 * `check_timeout_seconds` (default 60) bounds one check. Exceeding it is a
-  `timeout` result.
+  `timeout` result. A subprocess analyser is given a timeout *below* this, so
+  that the tool's own deadline — which kills the process group — fires before
+  the runner's cancellation, which cannot stop a worker thread and would remove
+  the scratch directory from under a still-running process.
 * `total_timeout_seconds` (default 300) bounds the run. A check that never
   started because the budget was spent is `skipped: budget_exhausted` — which
   is unanswered, so it does not quietly satisfy a blocking gate.
@@ -382,12 +408,19 @@ The relationship is one-directional. Checks never approve, never request
 changes and never merge anything. They produce a verdict; the gate reads it as
 one input among several.
 
-| Run verdict | Gate |
-|---|---|
-| `pass` | adds nothing |
-| `not_run` | adds nothing |
-| `violation` | `not_approved`, reason `checks_violation`, naming the checks |
-| `incomplete` | `not_approved`, reason `checks_incomplete`, saying it does not know |
+| Run verdict | Checks off for this repo | Checks on |
+|---|---|---|
+| `pass` | adds nothing | adds nothing |
+| `not_run` | adds nothing | `not_approved`, reason `checks_incomplete` |
+| `violation` | adds nothing | `not_approved`, reason `checks_violation`, naming the checks |
+| `incomplete` | adds nothing | `not_approved`, reason `checks_incomplete` |
+
+The `not_run` column is the one worth reading twice. On a repository where the
+framework is **off**, no run is owed and the gate ignores it. On one where it is
+**on**, no recorded run for this commit means the run failed before it could
+record anything, or has not happened yet — and approving on the absence of
+evidence is the reading fail-closed rules out. The gate resolves the check
+policy itself to tell those two apart.
 
 Two reason codes rather than one, because the two facts are different and
 reporting the second as the first is the exact confusion this phase removes.
@@ -453,8 +486,16 @@ and Postgres. The queries are written once in `mira.checks.persistence` and
 mixed into both stores, so parity is a property of the code rather than a
 promise in a docstring.
 
+**Ordering.** Results are written before the run row. Neither backend gives the
+write a transaction, and a verdict is computed from the results that are
+present — so writing the run first would expose a row whose results were still
+arriving, and a gate reading it would compute a verdict from *some* of the
+checks. Written this way, a reader either finds no run (which an active policy
+treats as incomplete and refuses on) or finds one with everything it needs.
+
 **Identity.** A run is keyed on the pull request, the head commit, the resolved
-policy *and* the facts it was run over. A redelivered webhook, a manual re-run
+policy *and* the facts it was run over — the complete changed-path list, not the
+capped copy the audit row stores. A redelivered webhook, a manual re-run
 and a second worker converge on the same row; a push, a policy edit or a
 changed fact records the new run it is.
 

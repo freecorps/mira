@@ -333,6 +333,60 @@ async def test_a_reversible_additive_migration_passes() -> None:
     assert outcome.state == "pass"
 
 
+async def test_a_migration_that_declares_no_downgrade_at_all_has_no_way_back() -> None:
+    """Not "the downgrade is not empty" — there is no downgrade."""
+    diff = _diff("alembic/versions/0042_add.py", ["    op.add_column('users', sa.Column('x'))"])
+    ctx = _ctx(
+        diff,
+        provider=_Files(
+            {
+                "alembic/versions/0042_add.py": (
+                    "def upgrade():\n    op.add_column('users', sa.Column('x'))\n"
+                )
+            }
+        ),
+        pr_info=object(),
+    )
+    outcome = await migrations.run(ctx)
+    assert outcome.state == "violation"
+    assert any("no way back" in f.title for f in outcome.findings)
+
+
+async def test_a_sql_migration_with_no_rollback_convention_is_not_claimed_either_way() -> None:
+    """Its rollback is conventionally a second file this check does not know."""
+    diff = _diff("db/migrations/0042_add.sql", ["ALTER TABLE users ADD COLUMN nickname TEXT;"])
+    ctx = _ctx(
+        diff,
+        provider=_Files({"db/migrations/0042_add.sql": "ALTER TABLE users ADD COLUMN x TEXT;\n"}),
+        pr_info=object(),
+    )
+    outcome = await migrations.run(ctx)
+    # Not a pass: nothing established that it can be undone. Not a violation
+    # either: nothing established that it cannot.
+    assert outcome.state == "skipped"
+    assert outcome.skip_reason == SkipReason.UNSUPPORTED
+    assert "0042_add.sql" in outcome.summary
+
+
+async def test_an_unassessable_migration_still_keeps_a_blocking_gate_closed() -> None:
+    from mira.checks.models import UNANSWERED_SKIPS
+
+    assert SkipReason.UNSUPPORTED in UNANSWERED_SKIPS
+
+
+async def test_a_destructive_sql_migration_is_still_reported() -> None:
+    """The rollback convention being unknown does not excuse a DROP."""
+    diff = _diff("db/migrations/0042_drop.sql", ["ALTER TABLE users DROP COLUMN email;"])
+    ctx = _ctx(
+        diff,
+        provider=_Files({"db/migrations/0042_drop.sql": "ALTER TABLE users DROP COLUMN email;\n"}),
+        pr_info=object(),
+    )
+    outcome = await migrations.run(ctx)
+    assert outcome.state == "violation"
+    assert "not assessed" in outcome.summary
+
+
 async def test_an_unreadable_migration_is_an_infrastructure_error_not_a_pass() -> None:
     """The check never established reversibility, so it must not claim it."""
     diff = _diff("alembic/versions/0042_add.py", ["    op.add_column('users', sa.Column('x'))"])

@@ -277,27 +277,36 @@ def blocking_reasons(inputs: GateInputs, policy: EffectivePolicy) -> list[Reason
             )
         )
 
-    # Pre-merge checks. Only ever consulted for what it *refuses*: a run whose
-    # verdict is `pass` or `not_run` adds nothing here, so turning checks on
-    # can never make the gate more willing to approve than it was before.
-    if policy.require_checks_pass and inputs.checks_verdict == "violation":
+    # Pre-merge checks. Only ever consulted for what it *refuses*, and only
+    # when the framework is switched on for this repository — so turning checks
+    # on can never make the gate more willing to approve than it was before,
+    # and leaving them off costs nothing.
+    if policy.require_checks_pass and inputs.checks_active:
         named = ", ".join(sorted(inputs.checks_blocking)[:5]) or "a pre-merge check"
-        reasons.append(
-            Reason(
-                ReasonCode.CHECKS_VIOLATION,
-                f"A blocking pre-merge check found a problem: {named}",
+        if inputs.checks_verdict == "violation":
+            reasons.append(
+                Reason(
+                    ReasonCode.CHECKS_VIOLATION,
+                    f"A blocking pre-merge check found a problem: {named}",
+                )
             )
-        )
-    elif policy.require_checks_pass and inputs.checks_verdict == "incomplete":
-        named = ", ".join(sorted(inputs.checks_blocking)[:5]) or "a pre-merge check"
-        reasons.append(
-            Reason(
-                ReasonCode.CHECKS_INCOMPLETE,
-                # Worded so nobody reads it as a finding against the change.
-                f"A blocking pre-merge check could not reach a conclusion ({named}), "
-                "so the gate does not know whether it would pass",
+        elif inputs.checks_verdict != "pass":
+            # `incomplete` *and* `not_run`. A repository with checks switched on
+            # and no recorded run for this commit is not a repository whose
+            # checks passed: the run may have failed before it could record
+            # anything, or may not have happened yet. Approving on the absence
+            # of evidence is the one reading fail-closed rules out.
+            detail = (
+                f"({named}) " if inputs.checks_verdict == "incomplete" else "(no run recorded) "
             )
-        )
+            reasons.append(
+                Reason(
+                    ReasonCode.CHECKS_INCOMPLETE,
+                    # Worded so nobody reads it as a finding against the change.
+                    f"A blocking pre-merge check could not reach a conclusion {detail}"
+                    "so the gate does not know whether it would pass",
+                )
+            )
 
     if inputs.open_blockers:
         reasons.append(

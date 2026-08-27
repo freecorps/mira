@@ -396,10 +396,21 @@ class CheckRunInputs:
 
     @property
     def digest(self) -> str:
+        """Content hash of the facts a run was made from.
+
+        Built from the *complete* path list rather than from `as_dict`, which
+        caps it at 200 for the audit row. Hashing the capped copy would give
+        two pull requests that differ only past the two-hundredth path the same
+        identity — so a large change whose base branch moved underneath it
+        would reuse the previous run's results instead of being re-checked.
+        A row is allowed to be an abbreviation of the facts; an identity is
+        not.
+        """
         payload = self.as_dict()
         # A retried review gets a new id for the same facts, and that must not
         # read as a different world to check.
         payload.pop("review_id", None)
+        payload["changed_paths"] = sorted(self.changed_paths)
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:16]

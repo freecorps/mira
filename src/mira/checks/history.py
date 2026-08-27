@@ -208,10 +208,12 @@ def summarize(*, filters: dict[str, Any] | None = None) -> list[dict]:
                         "state": row["state"],
                         "mode": row["mode"],
                         "count": 0,
+                        "incomplete": 0,
                         "_duration_total": 0.0,
                     },
                 )
                 bucket["count"] += row["count"]
+                bucket["incomplete"] += int(row.get("incomplete") or 0)
                 bucket["_duration_total"] += row["average_duration"] * row["count"]
     out = []
     for bucket in buckets.values():
@@ -223,6 +225,7 @@ def summarize(*, filters: dict[str, Any] | None = None) -> list[dict]:
                 "state": bucket["state"],
                 "mode": bucket["mode"],
                 "count": bucket["count"],
+                "incomplete": bucket["incomplete"],
                 "average_duration": round(bucket["_duration_total"] / count, 4),
             }
         )

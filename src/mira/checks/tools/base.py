@@ -67,6 +67,21 @@ MAX_FINDINGS = 20
 MAX_FILES = 200
 MAX_TOTAL_BYTES = 4_000_000
 
+# How far below the check's own budget an analyser's timeout is set.
+#
+# The subprocess runs on a worker thread through `asyncio.to_thread`, and a
+# thread cannot be cancelled. If the runner's `wait_for` fired first, the
+# coroutine would be cancelled while the tool was still running: the scratch
+# directory would be removed from under it, and the process would live on until
+# its own deadline. So the tool's timeout is set *below* the check's, which
+# makes `sandbox.run_argv` — which does kill the process group — the one that
+# fires, and leaves the runner's ceiling as the backstop it should be.
+CANCELLATION_MARGIN_SECONDS = 5.0
+
+# Floor for that subtraction, so a very short check budget still leaves an
+# analyser long enough to start and be killed cleanly rather than never running.
+MIN_TOOL_SECONDS = 1.0
+
 
 @dataclass(frozen=True)
 class ToolFinding:
@@ -287,9 +302,12 @@ class SubprocessTool(ToolAdapter):
                 SkipReason.NOT_APPLICABLE,
             )
 
-        timeout = config.timeout_seconds or min(
-            ctx.policy.check_timeout_seconds, max(5.0, ctx.remaining)
-        )
+        # Clamped under the check's own ceiling even when an operator
+        # configured a longer one: a tool allowed to outlive its check is a
+        # tool the runner will try to cancel and cannot.
+        budget = min(ctx.policy.check_timeout_seconds, max(MIN_TOOL_SECONDS, ctx.remaining))
+        ceiling = max(MIN_TOOL_SECONDS, budget - CANCELLATION_MARGIN_SECONDS)
+        timeout = min(config.timeout_seconds or ceiling, ceiling)
 
         with tempfile.TemporaryDirectory(prefix=f"mira-check-{self.name}-") as scratch:
             workspace = Path(scratch)

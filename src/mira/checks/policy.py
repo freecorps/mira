@@ -96,10 +96,36 @@ class EffectiveChecksPolicy:
         return self.enabled and not self.killed
 
     def mode_for(self, check_id: str) -> str:
-        """The mode this check runs under, after every layer has been applied."""
+        """The mode this check runs under, after every layer has been applied.
+
+        Three sources, most specific first. The scope's ``modes`` mapping wins,
+        because it is the setting an operator reaches for to change one check
+        without touching its definition. Then the entry's own ``mode``, which a
+        tool or a natural-language rule may carry inline — a field that existed
+        and was silently ignored is worse than one that does not exist, and an
+        analyser configured `mode: error` that quietly ran as a warning would
+        be exactly the fail-open this phase is written against. Then the
+        policy's default.
+
+        A tool with ``enabled: false`` resolves to ``off`` here rather than
+        being dropped from the registry, so it is still recorded as
+        `skipped: disabled`. "This analyser is switched off" and "this analyser
+        does not exist in this version of Mira" are different facts, and a
+        dashboard that cannot tell them apart cannot be trusted about coverage.
+        """
         table = dict(self.modes)
         if check_id in table:
             return table[check_id]
+        for tool in self.tools:
+            if tool.check_id == check_id:
+                if not tool.enabled:
+                    return "off"
+                if tool.mode is not None:
+                    return tool.mode
+                return self.default_mode
+        for rule in self.natural_language:
+            if rule.check_id == check_id and rule.mode is not None:
+                return rule.mode
         return self.default_mode
 
     def _payload(self) -> dict[str, Any]:
