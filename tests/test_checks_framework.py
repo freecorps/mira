@@ -727,3 +727,25 @@ async def test_an_unreadable_file_is_an_empty_string_rather_than_an_exception() 
     assert await ctx.file_content("a.py") == ""
     # And the failure is cached too: a second ask does not retry the 404.
     assert await ctx.file_content("a.py") == ""
+
+
+async def test_a_run_where_every_check_is_off_did_not_run() -> None:
+    """ "Passed — 0 passed" is the small lie this phase is written to avoid."""
+
+    async def check(_ctx):
+        raise AssertionError("a check in off mode must not run")
+
+    policy = _policy(default_mode="off")
+    run = await _run([_spec("native.a", check), _spec("native.b", check)], ctx=_ctx(policy))
+    assert all(result.state == "skipped" for result in run.results)
+    assert run.verdict == "not_run"
+
+
+async def test_a_run_where_every_check_correctly_had_no_opinion_is_a_pass() -> None:
+    """A check that decided it does not apply has answered, and answered well."""
+
+    async def check(_ctx):
+        return CheckOutcome.skipped("no migration here", SkipReason.NOT_APPLICABLE)
+
+    run = await _run([_spec("native.migrations", check)])
+    assert run.verdict == "pass"

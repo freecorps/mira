@@ -56,7 +56,11 @@ Each check also has a **mode**, from configuration and never from a check:
 | `error` | yes | yes | on a violation **or** on an unanswered result |
 
 And a whole run has a **verdict** the merge gate reads: `pass`, `violation`,
-`incomplete` or `not_run`.
+`incomplete` or `not_run`. A run in which every check was switched off reports
+`not_run` rather than `pass` — nothing looked at anything, and a row reading
+"Passed — 0 passed" is the sort of small lie this phase exists to remove. A
+check that ran and correctly decided it had no opinion is a different thing and
+does count towards a pass.
 
 ---
 
