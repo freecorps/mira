@@ -112,8 +112,14 @@ def _open_by_walking(root: Path, parts: list[str]) -> int:
     directory for a symlink between two steps gets ``ELOOP`` rather than a
     traversal. Containment needs no separate assertion either — the walk starts
     at the root and can never step outside it.
+
+    ``O_NOFOLLOW`` is on the *root* open too, and that one is easy to leave
+    off. ``root`` is already canonical, so it cannot legitimately be a symlink;
+    but "cannot legitimately be" is not "is not", and without the flag a root
+    renamed and replaced with a symlink between the resolve and this call would
+    start the whole no-follow walk inside a directory the attacker chose.
     """
-    dir_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY)
+    dir_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
     try:
         for part in parts[:-1]:
             nxt = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd)
