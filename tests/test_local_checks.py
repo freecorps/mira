@@ -98,6 +98,24 @@ class TestWorktreeReads:
 
         assert len(_read(git_repo, diff, "src/app.py")) == 65
 
+    def test_a_directory_is_not_a_file_body(self, git_repo: GitRepo) -> None:
+        diff = resolve_diff(git_repo.root, mode=MODE_WORKING_TREE)
+
+        assert _read(git_repo, diff, "src") == ""
+
+    def test_an_absolute_path_reads_as_nothing(self, git_repo: GitRepo) -> None:
+        diff = resolve_diff(git_repo.root, mode=MODE_WORKING_TREE)
+
+        assert _read(git_repo, diff, str(git_repo.root / "src" / "app.py")) == ""
+
+    def test_a_nested_path_is_read_through_every_component(self, git_repo: GitRepo) -> None:
+        # The component-at-a-time walk is the interesting path on platforms
+        # with `openat`; a nested file is what exercises more than one step.
+        git_repo.write("src/deep/nested/app.py", "value = 1\n")
+        diff = resolve_diff(git_repo.root, mode=MODE_WORKING_TREE, include_untracked=True)
+
+        assert "value = 1" in _read(git_repo, diff, "src/deep/nested/app.py")
+
     def test_the_staged_read_sees_the_index(self, git_repo: GitRepo) -> None:
         git_repo.write("src/app.py", "def start():\n    return 2\n")
         git_repo.git("add", "src/app.py")

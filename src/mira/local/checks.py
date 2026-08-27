@@ -31,6 +31,8 @@ pass — and the reason is reported.
 from __future__ import annotations
 
 import logging
+import os
+import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -90,45 +92,127 @@ def local_policy(config: MiraConfig, identity: RepoIdentity) -> EffectiveChecksP
     )
 
 
+#: Whether this platform can open one path component at a time, relative to an
+#: already-open directory, refusing to traverse a symlink at every step. Linux
+#: and macOS can (``openat`` with ``O_NOFOLLOW``); Windows cannot.
+_CAN_WALK_NOFOLLOW = bool(getattr(os, "O_NOFOLLOW", 0)) and os.open in os.supports_dir_fd
+
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _open_by_walking(root: Path, parts: list[str]) -> int:
+    """Open ``parts`` under ``root``, refusing every symlink on the way.
+
+    Each component is opened relative to the descriptor of the one before it,
+    with ``O_NOFOLLOW``. There is no window to race: the check and the open are
+    the same syscall, at every level, so an attacker who swaps a parent
+    directory for a symlink between two steps gets ``ELOOP`` rather than a
+    traversal. Containment needs no separate assertion either — the walk starts
+    at the root and can never step outside it.
+    """
+    dir_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+        return os.open(parts[-1], os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _open_by_checking(root: Path, parts: list[str]) -> int:
+    """The same, where the platform has no ``openat``: check, open, then verify.
+
+    Windows only. The candidate is resolved and required to stay beneath the
+    resolved root, and the descriptor is then compared against the entry that
+    was validated — same device, same inode — so a swap between the two is
+    detected rather than followed. Windows also does not hand out symlink
+    creation to unprivileged processes, which is most of why the weaker
+    sequence is tolerable there.
+    """
+    target = root.joinpath(*parts)
+    if target.is_symlink():
+        raise OSError("refusing to read through a symlink")
+    resolved = target.resolve(strict=True)
+    resolved.relative_to(root)
+    before = os.lstat(resolved)
+    handle = os.open(resolved, os.O_RDONLY | _O_BINARY)
+    after = os.fstat(handle)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        os.close(handle)
+        raise OSError("the file changed identity between the check and the open")
+    return handle
+
+
 def _read_worktree_file(repo_root: Path, path: str) -> str:
     """Read a file from the work tree, or return "" — never following a link out.
 
-    Two things this must not do, and one it cannot fully do.
+    Three things this must not do.
 
     **It must not read outside the repository.** Git tracks symlinks, so a
     branch can add ``leak -> /home/you/.ssh/id_rsa`` and it arrives here as an
-    ordinary changed path. ``Path.is_file()`` follows links, so the naive read
+    ordinary changed path. ``Path.is_file()`` follows links, so a naive read
     hands a host secret to whatever analyser or model the checks are
-    configured with. The candidate is therefore resolved and required to stay
-    beneath the resolved repository root, and a symlink is refused outright:
-    what git stores for one is the target *path*, not the target's contents, so
-    reading through it would misreport the change even when it stays inside.
+    configured with.
+
+    **It must not be racing anything.** Validating a pathname and then opening
+    it is two operations on a name, and a name is not a file: between them the
+    entry — or any directory above it — can become a symlink. Where the
+    platform has ``openat``, this is closed rather than mitigated: the path is
+    walked one component at a time with ``O_NOFOLLOW``, so the check and the
+    open are the same syscall at every level and there is no window. Windows
+    has no ``openat``; there the descriptor is compared against the entry that
+    was validated, and a swap is detected instead of followed.
+
+    A symlink is refused rather than resolved even when it stays inside the
+    repository: what git stores for one is the target *path*, not the target's
+    contents, so reading through it would misreport the change.
 
     **It must not read an unbounded amount.** The shared check context caps a
     file body at ``MAX_FILE_BYTES``, but it caps what the reader returned — so
     a reader that slurped a 400 MB file first has already spent the memory. One
     byte past the cap is read, so the caller's truncation still sees an
     over-long body and behaves exactly as it would with the whole thing.
-
-    What it cannot close is the window between the checks and the open. That is
-    a race an attacker would have to win on the developer's own machine, while
-    the developer runs a review of the tree that attacker already controls; the
-    containment check is what keeps a *committed* symlink from working, which
-    is the reachable half.
     """
+    parts = [part for part in path.replace("\\", "/").split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts) or os.path.isabs(path):
+        return ""
+
     root = repo_root.resolve()
-    target = root / path
-    if target.is_symlink():
-        return ""
     try:
-        resolved = target.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError):
+        handle = (
+            _open_by_walking(root, parts) if _CAN_WALK_NOFOLLOW else _open_by_checking(root, parts)
+        )
+    except (OSError, ValueError) as exc:
+        logger.debug("Local check will not read %s: %s", path, exc)
         return ""
-    if not resolved.is_file():
+
+    try:
+        # A directory, a device or a FIFO is not a file body. `O_NONBLOCK`
+        # above is what keeps the open of a FIFO with no writer from blocking
+        # long enough to be noticed here.
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            return ""
+        # Looped, because `os.read` is allowed to return short and a silently
+        # truncated body would change what every check sees about the file.
+        chunks: list[bytes] = []
+        remaining = MAX_FILE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(handle, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        logger.debug("Local check could not read %s: %s", path, exc)
         return ""
-    with open(resolved, "rb") as handle:
-        raw = handle.read(MAX_FILE_BYTES + 1)
+    finally:
+        os.close(handle)
     return raw.decode("utf-8", errors="replace")
 
 
