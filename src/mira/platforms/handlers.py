@@ -93,6 +93,28 @@ async def _thread_code_context(
         return ""
 
 
+def _path_block(path: str) -> str:
+    """Quote a file path as data, because a file path is data.
+
+    Git will take almost any byte in a filename, including a backtick and a
+    newline. Writing one into ``Path: `{{ path }}`` therefore lets an author
+    who adds such a file close the code span, leave the line, and address the
+    model from outside every untrusted block — in a prompt whose answer
+    resolves a review thread. The path is repository content, and it is framed
+    like the rest of the repository content.
+    """
+    return untrusted.block("FILE", path, redactor=redact) if path else ""
+
+
+def _safe_line(line: Any) -> int:
+    """A line number from a webhook, rendered as a number or not at all."""
+    try:
+        value = int(line or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 async def _recheck_finding(
     llm: Any,
     *,
@@ -115,8 +137,8 @@ async def _recheck_finding(
         finding_block=untrusted.block("FINDING", original_suggestion or "(none)", redactor=redact),
         reply_block=untrusted.block("REPLY", user_reply or "(empty)", redactor=redact),
         code_block=untrusted.block("DIFF", code_context, redactor=redact) if code_context else "",
-        comment_path=comment_path,
-        comment_line=comment_line,
+        path_block=_path_block(comment_path),
+        comment_line=_safe_line(comment_line),
     )
     try:
         raw = await llm.complete_with_tools(
@@ -433,8 +455,8 @@ async def run_thread_reply(
             else ""
         ),
         code_block=untrusted.block("DIFF", code_context, redactor=redact) if code_context else "",
-        comment_path=comment_path,
-        comment_line=comment_line,
+        path_block=_path_block(comment_path),
+        comment_line=_safe_line(comment_line),
     )
     # Tool calling forces a schema-valid result — more reliable than parsing
     # free-form JSON. The provider's tenacity decorator retries transient fails.
