@@ -43,6 +43,8 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 ## Learning from feedback
 
 - Stable finding provenance for replies, explicit rejects, and supported 👍/👎 reactions
+- Reply intent is classified before anything is recorded: "you're wrong" and "good catch, fixed below" mean opposite things and are treated as such
+- Say you fixed a finding and Mira rereads the code before closing the thread — a claim it cannot verify leaves the thread open
 - Explainable learning candidates with rationale, confidence, and linked evidence
 - Semantic candidate deduplication with conservative path/symbol/language/repo/org scopes
 - Admin approval queue: synthesized candidates are inactive by default

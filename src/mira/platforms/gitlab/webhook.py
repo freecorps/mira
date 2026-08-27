@@ -284,7 +284,18 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
                 return
 
         # Explicit reject on an inline (diff) note → record before resolving.
-        if first_word in _REJECT_KEYWORDS and discussion_id and position:
+        #
+        # "Explicit" means addressed to Mira. Without the mention check the
+        # first word of any reply in a thread is read as a command, so
+        # "Resolved in 1a2b3c" — an agreement — dismissed the finding and fed
+        # the learning loop a rejection. An un-mentioned reply is conversation,
+        # and conversation goes to the classifier below.
+        if (
+            first_word in _REJECT_KEYWORDS
+            and has_mention(note_body, names)
+            and discussion_id
+            and position
+        ):
             finding, feedback_event, created = record_finding_feedback(
                 pr_info,
                 kind="dismissed",
