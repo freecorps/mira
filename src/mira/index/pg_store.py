@@ -3054,37 +3054,38 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         return list(self._fetchall(sql, params))
 
     def _checks_exec(self, sql: str, params: tuple = ()) -> int:
+        if self._checks_cursor is not None:
+            self._checks_cursor.execute(sql, params)
+            return int(self._checks_cursor.rowcount or 0)
         with self._cursor() as cur:
             cur.execute(sql, params)
             rowcount = int(cur.rowcount or 0)
-        if not self._checks_in_transaction:
-            self._commit()
+        self._commit()
         return rowcount
 
-    # Set while `_checks_atomic` is open, so the writes inside it commit
-    # together. A gate reading a run mid-write would otherwise compute a
-    # verdict from whichever of its results had landed.
-    _checks_in_transaction = False
+    # The cursor `_checks_atomic` is holding, or None outside one.
+    _checks_cursor: Any = None
 
     @contextmanager
     def _checks_atomic(self):  # type: ignore[no-untyped-def]
-        if self._checks_in_transaction:  # pragma: no cover - not nested today
+        """Write a whole check run on a dedicated connection, or none of it.
+
+        A *dedicated* one, through `_transaction_cursor`, rather than deferring
+        the commits on the shared handle. The shared connection is exactly
+        that — shared — so another write finishing on it mid-run would commit
+        this run's half-written rows along with its own, which is the failure
+        the transaction exists to prevent. The same reasoning the governed
+        learning transitions already use.
+        """
+        if self._checks_cursor is not None:  # pragma: no cover - not nested today
             yield
             return
-        self._checks_in_transaction = True
-        try:
-            yield
-        except Exception:
-            # The same shared handle `_commit` uses, for the same reason: a
-            # reconnect closes the old one, so a cached handle would roll back
-            # a connection nobody is on.
-            with suppress(Exception):
-                _get_conn(self._url).rollback()
-            raise
-        else:
-            self._commit()
-        finally:
-            self._checks_in_transaction = False
+        with self._transaction_cursor() as cur:
+            self._checks_cursor = cur
+            try:
+                yield
+            finally:
+                self._checks_cursor = None
 
     def _checks_scope(self) -> tuple[str, tuple[Any, ...]]:
         """Pin check reads to this store's repository.

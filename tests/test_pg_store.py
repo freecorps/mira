@@ -651,3 +651,46 @@ def test_postgres_and_sqlite_agree_on_a_check_run(store, tmp_path, monkeypatch):
 
     for field in ("state", "mode", "origin", "summary", "config_digest", "findings", "evidence"):
         assert pg_result[field] == sqlite_result[field]
+
+
+def test_postgres_check_writes_commit_together(store):
+    """A dedicated connection, so another writer cannot commit half a run.
+
+    Deferring commits on the *shared* handle would leave this run's rows to be
+    committed by whatever wrote next on it — which is the failure the
+    transaction exists to prevent, wearing a different hat.
+    """
+    store.record_check_run(_check_run(state="pass"))
+    original = store._checks_exec
+    # A flag rather than `monkeypatch.undo()`: undoing would also revert the
+    # fake connection this store is built on, and the read below would try to
+    # reach a real database.
+    failing = True
+
+    def _fail_on_the_run_row(sql, params=()):
+        if failing and "INSERT INTO check_runs" in sql:
+            raise RuntimeError("the connection went away")
+        return original(sql, params)
+
+    store._checks_exec = _fail_on_the_run_row  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        store.record_check_run(_check_run(state="violation"))
+
+    failing = False
+    read = store.get_check_run(_check_run().run_key)
+    assert read.results[0].state == "pass"
+    assert read.verdict == "pass"
+
+
+def test_postgres_check_atomic_uses_a_dedicated_connection(store, monkeypatch):
+    """Asserted directly, because the shared handle is the thing to avoid."""
+    used: list[str] = []
+    original = pg_store.PgIndexStore._transaction_cursor
+
+    def _record(self):
+        used.append("dedicated")
+        return original(self)
+
+    monkeypatch.setattr(pg_store.PgIndexStore, "_transaction_cursor", _record)
+    store.record_check_run(_check_run())
+    assert used == ["dedicated"]

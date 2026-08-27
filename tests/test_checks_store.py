@@ -434,7 +434,7 @@ def test_a_retry_replaces_the_whole_result_set(store) -> None:
     assert read.verdict == "pass"
 
 
-def test_the_whole_write_commits_together(store, monkeypatch) -> None:
+def test_the_whole_write_commits_together(store) -> None:
     """A reader must never see a run whose results are still arriving.
 
     Asserted by making the run-row write fail: nothing from the attempt may be
@@ -447,17 +447,20 @@ def test_the_whole_write_commits_together(store, monkeypatch) -> None:
     assert before.results[0].state == "pass"
 
     original = store._checks_exec
+    # A flag rather than `monkeypatch.undo()`, which would also revert the
+    # fixtures this store was opened under.
+    failing = True
 
     def _fail_on_the_run_row(sql, params=()):
-        if "INSERT INTO check_runs" in sql:
+        if failing and "INSERT INTO check_runs" in sql:
             raise RuntimeError("the disk went away")
         return original(sql, params)
 
-    monkeypatch.setattr(store, "_checks_exec", _fail_on_the_run_row)
+    store._checks_exec = _fail_on_the_run_row  # type: ignore[method-assign]
     with pytest.raises(RuntimeError):
         store.record_check_run(_run("violation", inputs=inputs))
 
-    monkeypatch.undo()
+    failing = False
     after = store.get_check_run(before.run_key)
     # The half-written attempt left nothing behind: the previous answer stands.
     assert after.results[0].state == "pass"
