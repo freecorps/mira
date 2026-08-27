@@ -194,6 +194,20 @@ is the same thing it does on the server. Checks that read file contents get them
 from the work tree, the index or the range's head commit, matching the mode
 being reviewed — not from an empty string, which a linter would report as clean.
 
+That reader only ever reads *repository* content. Git tracks symlinks, so a
+branch can add `leak -> ~/.ssh/id_rsa` and it arrives as an ordinary changed
+path; symlinks are refused rather than followed, including ones that stay inside
+the repository, because what git stores for a symlink is the target path and not
+its contents. Where the platform has `openat` (Linux, macOS) the path is walked
+one component at a time with `O_NOFOLLOW`, so there is no window between
+checking a name and opening it; on Windows the descriptor is compared against
+the entry that was validated. Reads are bounded, and only a regular file is
+read — never a directory, a device or a FIFO.
+
+A run that could not start — an unreadable diff, a broken policy — is reported
+as a check run with its error and the verdict `incomplete`, not as an absence.
+That is what `--fail-on-incomplete-checks` sees.
+
 Skip them entirely with `--no-checks`.
 
 ---
