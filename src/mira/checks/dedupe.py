@@ -13,11 +13,13 @@ in this file. Dropping either one to make a tidy record would throw away the
 half the reader wanted.
 
 **What counts as the same problem** is the finding fingerprint from
-:mod:`mira.checks.models`: the path, a five-line bucket, and the normalised
-description. Coarse on the line number because two producers rarely agree to
-the line; keyed on the description because two producers *do* usually use the
-same nouns, and because a fingerprint keyed only on position would fold two
-genuinely different problems on one line into one.
+:mod:`mira.checks.models`: the path and the normalised description, with no
+line number at all. Two producers rarely agree to the line — a scanner points
+at the assignment, a model points at the function containing it — and any
+bucketing scheme fails at its own boundaries. Keyed on the description because
+two producers *do* usually reach for the same nouns, and because a fingerprint
+keyed only on position would fold two genuinely different problems in one file
+into one.
 
 **Which producer owns the merged finding** is decided by a fixed precedence,
 not by iteration order: native, then tool, then natural language, then external
@@ -28,9 +30,10 @@ history would show a finding moving between checks for no reason.
 
 **A producer whose finding was merged away keeps its own state.** It really did
 find something, and rewriting its result to ``pass`` would be a lie that
-happens to make the summary tidier. It records the fingerprint it contributed
-instead, so the dashboard can show "also found by ruff" on the surviving entry
-and "1 finding, merged into native.migrations" on the other.
+happens to make the summary tidier. Its summary gains a sentence naming where
+the finding is reported instead, so the dashboard shows "also found by ruff" on
+the surviving entry and "1 of them was also found by native.migrations and is
+reported there" on the other.
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ def _rank(result: CheckResult) -> tuple[int, str]:
     return (_ORIGIN_PRECEDENCE.get(result.origin, 9), result.check_id)
 
 
-def _merge(primary: CheckFinding, other: CheckFinding) -> CheckFinding:
+def _merge(primary: CheckFinding, other: CheckFinding, *, reporter: str) -> CheckFinding:
     """Fold ``other`` into ``primary``, keeping every distinct evidence item.
 
     Evidence is deduplicated on its own content, so a producer that quoted the
@@ -75,8 +78,12 @@ def _merge(primary: CheckFinding, other: CheckFinding) -> CheckFinding:
             primary.sources.append(source)
     # The other producer's own words, kept as a second paragraph rather than
     # discarded: two descriptions of one problem is usually two useful halves.
+    # The reporter is named from the *result* rather than from the finding's
+    # own `sources`, which a check is not obliged to populate — losing a merge
+    # to an IndexError would report one problem twice, which is the failure
+    # this module exists to prevent.
     if other.detail and other.detail not in primary.detail:
-        primary.detail = f"{primary.detail}\n\nAlso reported by {other.sources[0]}: {other.detail}"
+        primary.detail = f"{primary.detail}\n\nAlso reported by {reporter}: {other.detail}"
     # Severity is advisory, and the more severe reading is the one worth
     # showing: a reader who dismisses it should do so knowing what was claimed.
     order = {"blocker": 3, "warning": 2, "suggestion": 1}
@@ -109,7 +116,7 @@ def deduplicate(results: list[CheckResult]) -> list[CheckResult]:
                 owner[key] = (result, finding)
                 kept.append(finding)
                 continue
-            _merge(existing[1], finding)
+            _merge(existing[1], finding, reporter=result.check_id)
             merged_away.setdefault(result.check_id, []).append(key)
             logger.debug(
                 "Folded %s's finding %s into %s", result.check_id, key[:8], existing[0].check_id

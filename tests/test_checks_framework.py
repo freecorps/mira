@@ -620,3 +620,56 @@ async def test_the_context_remaining_budget_counts_down() -> None:
     assert 0 < ctx.remaining <= 1.0
     ctx.deadline = time.monotonic() - 1.0
     assert ctx.remaining == 0.0
+
+
+async def test_a_check_that_returns_hundreds_of_findings_is_capped() -> None:
+    """A result row is an audit record, not a second copy of the diff."""
+    from mira.checks.runner import MAX_FINDINGS_PER_CHECK
+
+    async def check(_ctx):
+        findings = [_finding(signature=f"s{n}", line=n) for n in range(200)]
+        return CheckOutcome.violation("many", findings)
+
+    run = await _run([_spec("tool.noisy", check, origin="tool")])
+    assert len(run.results[0].findings) == MAX_FINDINGS_PER_CHECK
+
+
+def test_a_finding_with_no_recorded_source_still_merges() -> None:
+    """Losing a merge to an IndexError would report one problem twice."""
+    first = CheckResult(
+        check_id="native.migrations",
+        origin="native",
+        state="violation",
+        mode="warning",
+        findings=[
+            CheckFinding(
+                fingerprint=fingerprint(path="db/1.sql", signature="drops a column"),
+                title="drops a column",
+                detail="the first description",
+                evidence=[_evidence("db/1.sql", 3)],
+                sources=["native.migrations"],
+            )
+        ],
+        sources=["native.migrations"],
+    )
+    second = CheckResult(
+        check_id="tool.semgrep",
+        origin="tool",
+        state="violation",
+        mode="warning",
+        findings=[
+            CheckFinding(
+                fingerprint=fingerprint(path="db/1.sql", signature="drops a column"),
+                title="drops a column",
+                detail="a second description",
+                evidence=[_evidence("db/1.sql", 4)],
+                # Deliberately unset: a check is not obliged to populate it.
+                sources=[],
+            )
+        ],
+        sources=["tool.semgrep"],
+    )
+    results = deduplicate([first, second])
+    findings = [f for r in results for f in r.findings]
+    assert len(findings) == 1
+    assert "a second description" in findings[0].detail
