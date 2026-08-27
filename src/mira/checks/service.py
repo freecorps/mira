@@ -92,11 +92,15 @@ def _open_store(owner: str, repo: str, platform: str) -> Any:
 
 
 def _llm_factory(config: MiraConfig) -> Any:
-    """A callable that builds a review-tier client, or None when there is none.
+    """A callable that builds a review-tier client when one is asked for.
 
     A factory rather than a client, so a run whose policy carries no
     natural-language rule and no CI summarisation never constructs one — which
-    on the reference deployment is most runs.
+    on the reference deployment is most runs. A deployment with no usable model
+    configuration fails when the client is *used*, and the check that used it
+    records an infrastructure error naming the failure, which is the right
+    place for it: one rule cannot answer, and nothing else about the run
+    changes.
     """
 
     def _build() -> Any:

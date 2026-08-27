@@ -673,3 +673,57 @@ def test_a_finding_with_no_recorded_source_still_merges() -> None:
     findings = [f for r in results for f in r.findings]
     assert len(findings) == 1
     assert "a second description" in findings[0].detail
+
+
+async def test_two_checks_asking_for_one_file_share_a_single_fetch() -> None:
+    """A run that fetched the same file twice would double the API calls."""
+    calls: list[str] = []
+
+    class _Slow:
+        async def get_file_content(self, _pr_info, path, _ref):
+            calls.append(path)
+            await asyncio.sleep(0.02)
+            return f"contents of {path}"
+
+    ctx = _ctx()
+    ctx.provider = _Slow()
+    ctx.pr_info = object()
+
+    results = await asyncio.gather(*(ctx.file_content("a.py") for _ in range(5)))
+    assert results == ["contents of a.py"] * 5
+    assert calls == ["a.py"]
+
+
+async def test_two_checks_asking_for_different_files_do_not_queue() -> None:
+    """One lock over the whole cache would serialise every read in the run."""
+    live = 0
+    peak = 0
+
+    class _Slow:
+        async def get_file_content(self, _pr_info, path, _ref):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.05)
+            live -= 1
+            return path
+
+    ctx = _ctx()
+    ctx.provider = _Slow()
+    ctx.pr_info = object()
+
+    await asyncio.gather(*(ctx.file_content(f"{n}.py") for n in range(4)))
+    assert peak > 1, "distinct files must be fetched concurrently"
+
+
+async def test_an_unreadable_file_is_an_empty_string_rather_than_an_exception() -> None:
+    class _Broken:
+        async def get_file_content(self, _pr_info, path, _ref):
+            raise RuntimeError("404")
+
+    ctx = _ctx()
+    ctx.provider = _Broken()
+    ctx.pr_info = object()
+    assert await ctx.file_content("a.py") == ""
+    # And the failure is cached too: a second ask does not retry the 404.
+    assert await ctx.file_content("a.py") == ""
