@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from mira.autofix.persistence import AutofixStoreMixin
 from mira.checks.persistence import ChecksStoreMixin
+from mira.db.sqltext import like_prefix
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -941,11 +942,22 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
             except Exception as exc:
                 logger.warning("Postgres store unavailable (%s), falling back to SQLite", exc)
 
-        index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
-        repo_dir = os.path.join(index_dir, key_owner)
-        os.makedirs(repo_dir, exist_ok=True)
-        db_path = os.path.join(repo_dir, f"{repo}.db")
+        db_path = cls.db_path_for(owner, repo, platform)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
         return cls(db_path, owner=owner, repo=repo, platform=platform)
+
+    @staticmethod
+    def db_path_for(owner: str, repo: str, platform: str = "github") -> str:
+        """Where this repository's SQLite index lives, without creating it.
+
+        `open` creates the file as a side effect of connecting, which is right
+        for indexing and wrong for a caller that only wants to know whether a
+        repository has been indexed at all. Split out so both agree on the
+        path.
+        """
+        key_owner = owner if platform == "github" else f"_{platform}/{owner}"
+        index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
+        return os.path.join(index_dir, key_owner, f"{repo}.db")
 
     def get_summary(self, path: str) -> FileSummary | None:
         """Get the summary for a single file."""
@@ -1069,6 +1081,37 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
         """Return all indexed file paths."""
         rows = self._conn.execute("SELECT path FROM files").fetchall()
         return {r[0] for r in rows}
+
+    def list_indexed_files(
+        self, *, path_prefix: str = "", limit: int = 50, offset: int = 0
+    ) -> list[FileSummary]:
+        """A page of indexed files, by path.
+
+        Summaries only: symbols, imports and references are per-file joins, and
+        loading them for a page of fifty would be a page of joins. A caller that
+        wants them asks for one path through `get_summary`.
+        """
+        clauses = ""
+        params: list[object] = []
+        if path_prefix:
+            clauses = "WHERE path LIKE ? ESCAPE '\\' "
+            params.append(like_prefix(path_prefix))
+        rows = self._conn.execute(
+            "SELECT path, language, summary, content_hash, loc, updated_at "
+            f"FROM files {clauses}ORDER BY path LIMIT ? OFFSET ?",
+            (*params, max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+        return [
+            FileSummary(
+                path=row[0],
+                language=row[1] or "",
+                summary=row[2] or "",
+                content_hash=row[3] or "",
+                loc=row[4] or 0,
+                updated_at=row[5] or 0.0,
+            )
+            for row in rows
+        ]
 
     def get_call_graph(self, path: str, symbol: str) -> list[tuple[str, str]]:
         """Who calls this symbol? Returns list of (file_path, calling_symbol)."""

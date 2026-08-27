@@ -129,6 +129,24 @@ documented for CI (`--explain-exit-codes`) and `--output json` is stable.
 
 → [docs/local-cli.md](docs/local-cli.md)
 
+## Give your agent Mira's memory
+
+An agent can already read your code. What it cannot see is Mira's history with
+it — which findings were raised and whether they held up, which conventions a
+human approved as rules, and how those rules have performed since.
+
+```bash
+mira mcp serve --repo acme/widgets
+```
+
+A read-only MCP server over stdio: seven tools, all reads, no writes, no
+approvals, no command execution. Off by default, and when it is on it reads
+only the repositories your configuration names — an enabled server with an
+empty list refuses everything. Every answer is redacted and framed as data, and
+every call, answered or refused, is written to an audit trail.
+
+→ [docs/mcp.md](docs/mcp.md)
+
 ## Configuration
 
 `mira.yaml` (loaded via `--config`) holds deployment-wide defaults. Drop a `.mira.yaml` in any repo — or use the dashboard — to override per-repo; both deep-merge over `mira.yaml` for that repo only:

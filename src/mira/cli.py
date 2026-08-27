@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import sys
 from datetime import UTC
 
@@ -746,3 +747,148 @@ def local_review(
     else:
         click.echo(local_output.to_text(review))
     sys.exit(int(review.exit_code()))
+
+
+@main.group("mcp")
+def mcp_group() -> None:
+    """Serve Mira's recorded knowledge to an MCP client, read-only.
+
+    Findings, approved rules, rule evaluations and indexed file summaries, for
+    the repositories the configuration names and no others. Nothing here
+    writes, approves, reviews or runs anything.
+    """
+
+
+def _mcp_config(config_path: str | None):  # type: ignore[no-untyped-def]
+    from mira.config import load_config
+
+    return load_config(config_path).mcp
+
+
+@mcp_group.command("serve")
+@click.option(
+    "--repo",
+    "repos",
+    multiple=True,
+    help=(
+        "Serve only these repositories, from the ones the configuration allows. "
+        "Narrows the grant; it cannot widen it."
+    ),
+)
+@click.option(
+    "--config",
+    "config_path",
+    envvar="MIRA_CONFIG",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Configuration to take the grant from. Defaults to the usual lookup.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logging (on stderr)")
+def mcp_serve(repos: tuple[str, ...], config_path: str | None, verbose: bool) -> None:
+    """Run the read-only MCP server on stdin/stdout.
+
+    Launched by an MCP client as a subprocess, not by a person: stdout carries
+    the protocol, so everything Mira has to say goes to stderr.
+    """
+    from mira.mcp.audit import AuditLog
+    from mira.mcp.authz import Grant, InvalidRepository, NotAuthorized
+    from mira.mcp.server import MiraMcpServer
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="mira.mcp %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+    # A byte on stdout that is not protocol is a parse error at the client, and
+    # a character stdout cannot encode is a dead session. Both are worth ruling
+    # out before the first message rather than diagnosing later.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):  # pragma: no cover
+                reconfigure(encoding="utf-8", errors="replace")
+
+    config = _mcp_config(config_path)
+    if not config.enabled:
+        raise click.ClickException(
+            "The MCP server is off. Turn it on with `mcp.enabled: true` and "
+            "name the repositories it may read under `mcp.repositories`."
+        )
+    grant = Grant.from_specs(config.repositories)
+    if repos:
+        try:
+            grant = grant.narrow(repos)
+        except NotAuthorized as exc:
+            raise click.ClickException(
+                f"{exc} --repo can only ask for less than the configuration allows."
+            ) from exc
+        except InvalidRepository as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    server = MiraMcpServer(grant=grant, config=config, audit=AuditLog(enabled=config.audit))
+    with contextlib.suppress(KeyboardInterrupt):  # pragma: no cover - needs a real signal
+        server.serve()
+
+
+@mcp_group.command("tools")
+@click.option(
+    "--config",
+    "config_path",
+    envvar="MIRA_CONFIG",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Configuration to read, for the repository list.",
+)
+def mcp_tools(config_path: str | None) -> None:
+    """Print the tools the server offers, and the repositories it would read.
+
+    The inventory, without starting a session: what an operator checks before
+    pointing an agent at their install.
+    """
+    from mira.mcp import tools as mcp_tools_module
+
+    config = _mcp_config(config_path)
+    click.echo(f"enabled: {'yes' if config.enabled else 'no'}")
+    click.echo(f"repositories: {', '.join(config.repositories) or 'none (every read is refused)'}")
+    click.echo(f"page size: up to {config.max_page_size} rows")
+    click.echo("")
+    for tool in mcp_tools_module.TOOLS:
+        arguments = ", ".join(sorted(tool.schema.get("properties", {}))) or "none"
+        click.echo(f"{tool.name}")
+        click.echo(f"    {tool.description}")
+        click.echo(f"    arguments: {arguments}")
+
+
+@mcp_group.command("audit")
+@click.option("--repo", "repository", default="", help="Only this repository's reads.")
+@click.option("--limit", default=20, show_default=True, type=int, help="How many entries.")
+def mcp_audit(repository: str, limit: int) -> None:
+    """Show what MCP clients have read, newest first."""
+    from datetime import datetime
+
+    from mira.dashboard.db import AppDatabase
+
+    key = ""
+    if repository:
+        from mira.mcp.authz import InvalidRepository, parse_repository
+
+        try:
+            key = parse_repository(repository).key
+        except InvalidRepository as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    database = AppDatabase(
+        os.environ.get("DATABASE_URL", ""), admin_password=os.environ.get("ADMIN_PASSWORD", "")
+    )
+    entries = database.list_mcp_audit(repository=key, limit=limit)
+    if not entries:
+        click.echo("No MCP reads recorded.")
+        return
+    for entry in entries:
+        when = datetime.fromtimestamp(entry["created_at"], tz=UTC).isoformat(timespec="seconds")
+        click.echo(
+            f"{when}  {entry['outcome']:<8} {entry['tool']:<26} "
+            f"{entry['repository'] or '-':<28} rows={entry['result_count']}"
+        )
+        if entry["detail"]:
+            click.echo(f"    {entry['detail']}")

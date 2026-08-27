@@ -181,6 +181,18 @@ DOCKERFILE
     --entrypoint sh "$helper" /ci/arm64_local_cli_check.sh
 }
 
+# Phase 7B's read-only MCP server. No git and no model: the whole surface is
+# SQLite reads, an audit write and a stdio pipe, all of which are the parts most
+# likely to differ on the reference Orange Pi deployment. Driven through the
+# real `mira mcp serve` process rather than the Python objects, because the
+# pipe and the process's stdout handling are half of what is being checked.
+verify_mcp() {
+  local image=$1
+  docker run --rm --platform linux/arm64 \
+    --volume "$(pwd)/scripts/ci:/ci:ro" \
+    --entrypoint sh "$image" /ci/arm64_mcp_check.sh
+}
+
 echo "Pulling deployed ARM64 baseline: ${baseline_image}"
 docker pull --platform linux/arm64 "$baseline_image"
 
@@ -205,6 +217,8 @@ verify_checks "$candidate_image"
 echo "Confirming the local review surface on ARM64"
 verify_local_cli_without_git "$candidate_image"
 verify_local_cli_with_git "$candidate_image"
+echo "Confirming the read-only MCP server on ARM64"
+verify_mcp "$candidate_image"
 
 echo "Starting the deployed image against the candidate-opened database"
 start_server "$baseline_image" rollback

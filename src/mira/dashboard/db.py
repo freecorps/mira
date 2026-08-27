@@ -220,6 +220,29 @@ CREATE TABLE IF NOT EXISTS config_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_config_audit_section
     ON config_audit_events(section, created_at);
+
+-- One row per MCP tool call: what was asked, of which repository, and what
+-- came back. Read-only surfaces are exactly the ones that need this — nothing
+-- they do leaves a trace anywhere else, so without a log there is no way to
+-- answer "what did that agent read?" after the fact.
+CREATE TABLE IF NOT EXISTS mcp_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT '',
+    client TEXT NOT NULL DEFAULT '',
+    tool TEXT NOT NULL DEFAULT '',
+    repository TEXT NOT NULL DEFAULT '',
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    outcome TEXT NOT NULL DEFAULT 'ok',
+    detail TEXT NOT NULL DEFAULT '',
+    result_count INTEGER NOT NULL DEFAULT 0,
+    duration_ms REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_created
+    ON mcp_audit_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_repository
+    ON mcp_audit_events(repository, created_at);
 """
 
 _PG_SCHEMA = """
@@ -384,6 +407,25 @@ CREATE TABLE IF NOT EXISTS config_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_config_audit_section
     ON config_audit_events(section, created_at);
+
+CREATE TABLE IF NOT EXISTS mcp_audit_events (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL DEFAULT '',
+    client TEXT NOT NULL DEFAULT '',
+    tool TEXT NOT NULL DEFAULT '',
+    repository TEXT NOT NULL DEFAULT '',
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    outcome TEXT NOT NULL DEFAULT 'ok',
+    detail TEXT NOT NULL DEFAULT '',
+    result_count INTEGER NOT NULL DEFAULT 0,
+    duration_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_created
+    ON mcp_audit_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_repository
+    ON mcp_audit_events(repository, created_at);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -1522,6 +1564,108 @@ class AppDatabase:
                 "previous": _load(row[4]),
                 "new": _load(row[5]),
                 "created_at": float(row[6] or 0.0),
+            }
+            for row in rows
+        ]
+
+    def record_mcp_audit(
+        self,
+        *,
+        session_id: str,
+        client: str,
+        tool: str,
+        repository: str,
+        arguments: dict[str, Any] | None,
+        outcome: str,
+        detail: str = "",
+        result_count: int = 0,
+        duration_ms: float = 0.0,
+    ) -> None:
+        """Append one MCP tool call to the trail. Never raises.
+
+        Best effort for the same reason the config trail is: a failed audit
+        write must not turn into a failed read, because the alternative is a
+        server that stops answering when its disk fills. The write is logged
+        where an operator will see it, and the process also logs every call to
+        stderr, so a lost row is not a lost record.
+
+        Refusals are recorded too, and are the rows that matter most: an agent
+        repeatedly asking for a repository it was not granted is the shape of
+        the only attack this surface has.
+        """
+        payload = (
+            session_id or "",
+            client or "",
+            tool or "",
+            repository or "",
+            json.dumps(arguments or {}, sort_keys=True, default=str)[:4000],
+            outcome or "ok",
+            (detail or "")[:1000],
+            int(result_count),
+            float(duration_ms),
+            time.time(),
+        )
+        columns = (
+            "session_id, client, tool, repository, arguments_json, outcome, "
+            "detail, result_count, duration_ms, created_at"
+        )
+        try:
+            if self._backend == "sqlite":
+                assert self._sqlite_conn is not None
+                self._sqlite_conn.execute(
+                    f"INSERT INTO mcp_audit_events ({columns}) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    payload,
+                )
+                self._sqlite_conn.commit()
+            else:
+                with self._pg_cursor() as cur:
+                    cur.execute(
+                        f"INSERT INTO mcp_audit_events ({columns}) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        payload,
+                    )
+                self._pg_commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not record an MCP audit entry for %s: %s", tool, exc)
+
+    def list_mcp_audit(
+        self, *, repository: str = "", limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """The MCP read trail, newest first."""
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        columns = (
+            "id, session_id, client, tool, repository, arguments_json, outcome, "
+            "detail, result_count, duration_ms, created_at"
+        )
+        placeholder = "?" if self._backend == "sqlite" else "%s"
+        where = f"WHERE repository = {placeholder} " if repository else ""
+        params: tuple = (repository, limit, offset) if repository else (limit, offset)
+        sql = (
+            f"SELECT {columns} FROM mcp_audit_events {where}"
+            f"ORDER BY created_at DESC, id DESC LIMIT {placeholder} OFFSET {placeholder}"
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            rows = self._sqlite_conn.execute(sql, params).fetchall()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "session_id": str(row[1] or ""),
+                "client": str(row[2] or ""),
+                "tool": str(row[3] or ""),
+                "repository": str(row[4] or ""),
+                "arguments": str(row[5] or "{}"),
+                "outcome": str(row[6] or ""),
+                "detail": str(row[7] or ""),
+                "result_count": int(row[8] or 0),
+                "duration_ms": float(row[9] or 0.0),
+                "created_at": float(row[10] or 0.0),
             }
             for row in rows
         ]

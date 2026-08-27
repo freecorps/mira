@@ -38,6 +38,7 @@ from mira.autofix.models import (
     reasons_from_json,
     validation_from_json,
 )
+from mira.db.sqltext import like_prefix
 
 _JOB_COLUMNS = (
     "id",
@@ -258,34 +259,66 @@ class AutofixStoreMixin:
     )
 
     def list_review_findings(
-        self, *, pr_number: int, include_closed: bool = False, limit: int = 200
+        self,
+        *,
+        pr_number: int = 0,
+        include_closed: bool = False,
+        state: str = "",
+        category: str = "",
+        severity: str = "",
+        path_prefix: str = "",
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[Any]:
-        """Every finding on one pull request, newest first.
+        """Findings, newest first, narrowed by whatever was asked for.
 
-        Exists here rather than beside `get_review_finding` because ``fix all``
-        is the only caller that needs a *set* of findings, and putting the query
-        in the shared mixin is what keeps the two backends answering it
-        identically. `outdated` counts as open on purpose: it means the diff
-        moved past the anchored line, which is what an unaddressed finding looks
-        like after a rebase — not evidence that anybody dealt with it.
+        Lives here rather than beside `get_review_finding` because ``fix all``
+        was the first caller that needed a *set* of findings, and putting the
+        query in a shared mixin is what keeps the two backends answering it
+        identically. The read-only MCP surface is the second caller, which is
+        why the filters and the offset exist: one query with more ways to narrow
+        it beats two queries that can disagree about scope, ordering or which
+        states count as closed.
+
+        `outdated` counts as open on purpose: it means the diff moved past the
+        anchored line, which is what an unaddressed finding looks like after a
+        rebase — not evidence that anybody dealt with it.
+
+        Ordered by `created_at DESC, id DESC`. The timestamp alone is not a
+        total order — a review records its findings in one pass and they can
+        share a second — and a page boundary falling inside a tie would repeat
+        or drop rows.
         """
         from mira.feedback.models import ReviewFinding
 
-        clauses = ["pr_number = ?"]
-        params: list[Any] = [int(pr_number)]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if pr_number:
+            clauses.append("pr_number = ?")
+            params.append(int(pr_number))
         if not include_closed:
             closed = ("fixed", "resolved", "dismissed")
             clauses.append(f"state NOT IN ({', '.join('?' for _ in closed)})")
             params.extend(closed)
+        for column, value in (("state", state), ("category", category), ("severity", severity)):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if path_prefix:
+            clauses.append("path LIKE ? ESCAPE '\\'")
+            params.append(like_prefix(path_prefix))
         scope_clause, scope_params = self._autofix_scope()
-        where = " AND ".join(clauses) + scope_clause
+        # `_autofix_scope` returns a clause that begins with " AND ", so there
+        # has to be something for it to be joined to. An unfiltered listing is
+        # a real request from the MCP surface, not a caller that forgot.
+        where = " AND ".join(clauses or ["1=1"]) + scope_clause
         params.extend(scope_params)
         rows = self._autofix_query(
             self._ph(
                 f"SELECT {self._FINDING_COLUMNS} FROM review_findings WHERE {where} "
-                "ORDER BY created_at DESC, id DESC LIMIT ?"
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
             ),
-            (*params, int(limit)),
+            (*params, int(limit), max(0, int(offset))),
         )
         return [ReviewFinding(*row) for row in rows]
 

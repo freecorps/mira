@@ -129,6 +129,21 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Needs no forge credentials and contacts no forge — it works offline
 - See [docs/local-cli.md](docs/local-cli.md)
 
+## Read-only MCP server
+
+- `mira mcp serve` exposes what Mira has recorded — findings, approved learned rules, rule evaluations and indexed file summaries — over the MCP stdio transport
+- Seven tools, all reads: nothing writes, approves, dismisses, re-reviews, applies a fix or runs a command, and every tool advertises `readOnlyHint`
+- Off by default; when enabled it reads only the repositories the configuration names, and an enabled server with an empty list refuses every read
+- A tool argument is looked up in the grant rather than parsed into a repository, so no name a client sends — another owner, a path that walks out of the index directory, a spelling that would open another store — reaches the data
+- `--repo` narrows a launch to part of the configured ceiling; it can never widen it
+- Reading creates nothing: an unindexed repository answers `"indexed": false` rather than having its store created by the read
+- Every response is redacted with the same filter autofix uses, then wrapped in one delimited block that announces itself as data and that the content cannot close
+- Install-wide global rules and pull-request authors are deliberately withheld from a repository-scoped grant
+- Paged with opaque cursors bound to their query, a server-enforced page cap, per-field truncation and a response-size ceiling that reduces rows before it shortens fields
+- Every call, answered or refused, is audited to the application database and to stderr — with the arguments redacted and the returned rows never copied
+- stdio only: no network listener, no port to authenticate
+- See [docs/mcp.md](docs/mcp.md)
+
 ## Platform integrations
 
 - GitHub App with webhook support — works against github.com and GitHub Enterprise Server (set `MIRA_GITHUB_API_URL`)
