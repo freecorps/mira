@@ -126,6 +126,20 @@ PROTECTED = [
     ("/api/checks/config", "GET", {}),
     ("/api/checks/config", "PUT", {"body": None}),
     ("/api/checks/config/audit", "GET", {}),
+    # Phase 7C triage. Reads are listed deliberately: a triage run is a record
+    # of people — who owns what, who was suggested, who was passed over — and
+    # the suggestion summary is the most tempting endpoint to leave open and
+    # the one that should not be.
+    ("/api/triage/runs", "GET", {}),
+    ("/api/triage/suggestions", "GET", {}),
+    (
+        "/api/triage/runs/{owner}/{repo}/{run_id}",
+        "GET",
+        {"owner": "o", "repo": "r", "run_id": 1},
+    ),
+    ("/api/triage/config", "GET", {}),
+    ("/api/triage/config", "PUT", {"body": None}),
+    ("/api/triage/config/audit", "GET", {}),
 ]
 
 

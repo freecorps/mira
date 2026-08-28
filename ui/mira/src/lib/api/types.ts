@@ -1096,3 +1096,131 @@ export interface ChecksAuditPage {
   limit: number
   offset: number
 }
+
+// ── Phase 7C: triage and reviewer suggestion ────────────────────────────────
+//
+// `status` and `degraded` are separate fields for the same reason the check
+// framework keeps `state` and `incomplete` apart: a run can have candidates
+// *and* a signal that failed, and a reader shown two names deserves to know a
+// third source was unavailable.
+
+export type TriageStatus = "ok" | "no_candidates" | "unavailable" | "not_run"
+
+export type TriageSignalKind = "codeowners" | "authored" | "reviewed"
+
+export type TriageSignalStatus =
+  "available" | "empty" | "unavailable" | "unsupported" | "disabled"
+
+export interface TriageEvidence {
+  path: string
+  line: number
+  detail: string
+  url: string
+  source: string
+  at: number
+}
+
+export interface TriageContribution {
+  kind: TriageSignalKind
+  raw: number
+  weight: number
+  score: number
+  detail: string
+  evidence: TriageEvidence[]
+}
+
+export interface TriageCandidate {
+  identity: string
+  // "user" | "team" | "email". A team is not a person: it is never excluded
+  // for being the author and carries no review load.
+  kind: string
+  score: number
+  load_penalty: number
+  open_reviews: number
+  signals: TriageSignalKind[]
+  contributions: TriageContribution[]
+}
+
+export interface TriageSignalReport {
+  kind: TriageSignalKind
+  status: TriageSignalStatus
+  detail: string
+  candidates: number
+  duration_seconds: number
+  // False when the signal left the question open, which is what makes a run
+  // with no candidates `unavailable` rather than `no_candidates`.
+  answered: boolean
+}
+
+export interface TriageExclusion {
+  identity: string
+  reason: string
+  detail: string
+}
+
+export interface TriageClassification {
+  size: string
+  changed_files: number
+  changed_lines: number
+  areas: string[]
+  kinds: string[]
+}
+
+export interface TriageRunModel {
+  run_key: string
+  run_id: number
+  policy_version: string
+  status: TriageStatus
+  degraded: boolean
+  inputs: Record<string, unknown>
+  classification: TriageClassification
+  candidates: TriageCandidate[]
+  signals: TriageSignalReport[]
+  excluded: TriageExclusion[]
+  notes: string[]
+  counts: Record<string, number>
+  duration_seconds: number
+  error: string
+  attempts: number
+  created_at: number
+  updated_at: number
+}
+
+export interface TriageRunPage {
+  runs: TriageRunModel[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface TriageRunDetail {
+  run: TriageRunModel
+  public_explanation: string
+  admin_explanation: string
+  policy: Record<string, unknown>
+}
+
+export interface TriageSuggestionRow {
+  identity: string
+  kind: string
+  count: number
+  average_rank: number
+  average_score: number
+}
+
+export interface TriageSuggestionSummary {
+  identities: TriageSuggestionRow[]
+  totals: Record<string, number>
+}
+
+export interface TriageConfigResponse {
+  config: Record<string, unknown>
+  overrides: Record<string, unknown>
+  effective: Record<string, unknown>
+}
+
+export interface TriageAuditPage {
+  entries: ChecksAuditEntry[]
+  limit: number
+  offset: number
+}

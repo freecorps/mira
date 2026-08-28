@@ -58,6 +58,14 @@ EXPECTED_ROUTES = {
     ("/api/checks/runs", "GET"),
     ("/api/checks/runs/{owner}/{repo}/{run_id}", "GET"),
     ("/api/checks/summary", "GET"),
+    # Phase 7C — triage and reviewer suggestion (all admin-only: a run names
+    # people, and "who gets suggested most" is the last thing to make public).
+    ("/api/triage/config", "GET"),
+    ("/api/triage/config", "PUT"),
+    ("/api/triage/config/audit", "GET"),
+    ("/api/triage/runs", "GET"),
+    ("/api/triage/runs/{owner}/{repo}/{run_id}", "GET"),
+    ("/api/triage/suggestions", "GET"),
     ("/api/contributors/summary", "GET"),
     ("/api/contributors/backfill/status", "GET"),
     ("/api/contributors/refresh", "POST"),
