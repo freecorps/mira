@@ -553,6 +553,26 @@ class FileHistoryEntry:
 
 
 @dataclass
+class PathAuthorship:
+    """One commit that touched one path, attributed to a platform account.
+
+    Distinct from :class:`FileHistoryEntry`, which carries the commit's own
+    author *name* — a string whoever made the commit chose. This carries the
+    account the platform resolved the commit to, which is the only kind of
+    identity worth ranking a person on. ``login`` is empty when the platform
+    could not resolve one, and a caller that names people must drop those
+    rather than fall back to the commit's own fields.
+    """
+
+    path: str
+    login: str = ""
+    sha: str = ""
+    url: str = ""
+    # Epoch seconds of the commit, for recency weighting.
+    at: float = 0.0
+
+
+@dataclass
 class ReviewChunk:
     """A chunk of files that fits within a single LLM context window."""
 

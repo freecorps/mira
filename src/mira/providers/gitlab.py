@@ -46,6 +46,12 @@ from mira.models import (
 from mira.platforms import profiles
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
+from mira.triage.capabilities import (
+    GITLAB_CAPABILITIES as GITLAB_TRIAGE_CAPABILITIES,
+)
+from mira.triage.capabilities import (
+    TriageCapabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -658,15 +664,15 @@ class GitLabProvider(BaseProvider):
             return "CONTRIBUTOR"
         return "NONE"
 
-    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
-        """First CODEOWNERS found at the head ref, or ``("", "")`` if none.
+    async def get_codeowners(self, pr_info: PRInfo, ref: str = "") -> tuple[str, str]:
+        """First CODEOWNERS found at ``ref``, or ``("", "")`` if none.
 
         Deliberately not routed through `get_file_content`, which logs a failed
         fetch and returns "". "There are no owners" and "we could not check"
         have to reach the gate as different answers — the first is safe to
         approve past and the second is not — so a real failure raises.
         """
-        ref = pr_info.head_sha or pr_info.head_branch
+        ref = ref or pr_info.head_sha or pr_info.head_branch
         for candidate in CODEOWNERS_LOCATIONS["gitlab"]:
             url = (
                 f"{self._project(pr_info)}/repository/files/"
@@ -710,6 +716,17 @@ class GitLabProvider(BaseProvider):
 
     def checks_capabilities(self) -> CheckCapabilities:
         return GITLAB_CHECK_CAPABILITIES
+
+    def triage_capabilities(self) -> TriageCapabilities:
+        return GITLAB_TRIAGE_CAPABILITIES
+
+    # `get_path_authors` is deliberately not implemented here. GitLab's commits
+    # API returns `author_name` and `author_email` — the fields written into
+    # the commit, which whoever made it chose — and no account. Returning them
+    # as identities would mean ranking a person on a string a contributor
+    # typed, so the base class's empty implementation stands and the capability
+    # table says why. Authorship on GitLab comes from the merge requests Mira
+    # has watched merge, which arrive on a signed webhook.
 
     async def get_issue(
         self, pr_info: PRInfo, number: int, *, owner: str = "", repo: str = ""

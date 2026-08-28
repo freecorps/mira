@@ -668,18 +668,30 @@ def _is_own_check(payload: dict[str, Any], bot_name: str, bot_slug: str | None =
     return slug in ours
 
 
-def _gate_is_active(owner: str, repo: str) -> bool:
-    """Whether the gate runs for this repository at all.
+def _recheck_is_active(owner: str, repo: str) -> bool:
+    """Whether anything re-evaluates for this repository on a bare event.
 
-    Consulted before an installation token is minted, so an install that never
-    turned the gate on pays nothing for every check suite that finishes.
+    Consulted before an installation token is minted, so an install that turned
+    none of this on pays nothing for every check suite that finishes.
+
+    All three, not just the gate: `run_gate_evaluation` re-runs the pre-merge
+    checks and reviewer triage as well, and a repository with the gate off and
+    checks on would otherwise never see a CI completion reach the check that
+    was waiting for it.
     """
+    from mira.checks.policy import resolve_policy as resolve_checks_policy
     from mira.gate.policy import resolve_policy
+    from mira.triage.policy import resolve_policy as resolve_triage_policy
 
     try:
-        return resolve_policy(load_config().gate, owner, repo).active
+        config = load_config()
+        return (
+            resolve_policy(config.gate, owner, repo).active
+            or resolve_checks_policy(config.checks, owner, repo).active
+            or resolve_triage_policy(config.triage, owner, repo).active
+        )
     except Exception as exc:  # noqa: BLE001 - an unreadable policy is not active
-        logger.warning("Could not resolve the gate policy for %s/%s: %s", owner, repo, exc)
+        logger.warning("Could not resolve the recheck policies for %s/%s: %s", owner, repo, exc)
         return False
 
 
@@ -696,7 +708,7 @@ async def handle_gate_recheck(
         return
     owner = payload.get("repository", {}).get("owner", {}).get("login", "")
     repo = payload.get("repository", {}).get("name", "")
-    if not owner or not repo or not _gate_is_active(owner, repo):
+    if not owner or not repo or not _recheck_is_active(owner, repo):
         return
     try:
         token = await app_auth.get_installation_token(installation_id)
@@ -731,7 +743,7 @@ async def handle_gate_pr_event(
     owner = payload.get("repository", {}).get("owner", {}).get("login", "")
     repo = payload.get("repository", {}).get("name", "")
     number = int((payload.get("pull_request") or {}).get("number") or 0)
-    if not owner or not repo or not number or not _gate_is_active(owner, repo):
+    if not owner or not repo or not number or not _recheck_is_active(owner, repo):
         return
     try:
         token = await app_auth.get_installation_token(installation_id)

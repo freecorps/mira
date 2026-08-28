@@ -41,6 +41,11 @@ _SECTION = re.compile(r"^\^?\[[^\]]+\](?:\[\d+\])?")
 class Rule:
     pattern: str
     owners: tuple[str, ...]
+    # Line this rule is written on, 1-based, or 0 for a rule built by hand in
+    # a test. Carried so a caller that names an owner can cite the line that
+    # made them one: "you are here because of `.github/CODEOWNERS:12`" is a
+    # claim the reader can check, and "CODEOWNERS says so" is not.
+    line: int = 0
 
 
 @dataclass
@@ -106,7 +111,7 @@ def parse(text: str, *, source_path: str = "") -> CodeownersFile:
                 path=source_path,
                 error=f"line {lineno}: {exc}",
             )
-        rules.append(Rule(pattern=pattern, owners=owners))
+        rules.append(Rule(pattern=pattern, owners=owners, line=lineno))
     return CodeownersFile(status="ok", path=source_path, rules=rules)
 
 

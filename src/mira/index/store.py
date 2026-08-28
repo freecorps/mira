@@ -21,6 +21,7 @@ from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.gate.persistence import GateStoreMixin
 from mira.index._store_shared import _StoreSharedMixin
 from mira.models import PRFingerprint
+from mira.triage.persistence import TriageStoreMixin
 
 logger = logging.getLogger(__name__)
 
@@ -627,6 +628,122 @@ CREATE INDEX IF NOT EXISTS idx_check_results_state
 CREATE INDEX IF NOT EXISTS idx_check_results_pr
     ON check_results(pr_number, created_at);
 
+-- Phase 7C triage. One row per triage of one pull request: `run_key` hashes the
+-- pull request, head commit, resolved policy and the file list, so a
+-- redelivered webhook converges here instead of stacking a second suggestion,
+-- while a push — which can legitimately change who should look at it — is
+-- recorded as the new run it is.
+CREATE TABLE IF NOT EXISTS triage_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    review_id INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL DEFAULT '',
+    -- 'ok' | 'no_candidates' | 'unavailable' | 'not_run'
+    status TEXT NOT NULL DEFAULT 'not_run',
+    -- 1 when a signal did not answer. Stored alongside `status` because a run
+    -- can have candidates *and* a signal that failed, and a reader who is
+    -- shown two names deserves to know a third source was unavailable.
+    degraded INTEGER NOT NULL DEFAULT 0,
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    classification_json TEXT NOT NULL DEFAULT '{}',
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    signals_json TEXT NOT NULL DEFAULT '[]',
+    excluded_json TEXT NOT NULL DEFAULT '[]',
+    notes_json TEXT NOT NULL DEFAULT '[]',
+    counts_json TEXT NOT NULL DEFAULT '{}',
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_triage_runs_pr
+    ON triage_runs(pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_triage_runs_head
+    ON triage_runs(pr_number, head_sha);
+CREATE INDEX IF NOT EXISTS idx_triage_runs_status
+    ON triage_runs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_triage_runs_created
+    ON triage_runs(created_at);
+
+-- One row per suggested identity per run, so "who does Mira keep suggesting"
+-- is a query rather than a scan over JSON blobs.
+CREATE TABLE IF NOT EXISTS triage_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_key TEXT NOT NULL UNIQUE,
+    run_id INTEGER NOT NULL DEFAULT 0,
+    run_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    identity TEXT NOT NULL DEFAULT '',
+    -- 'user' | 'team' | 'email'
+    kind TEXT NOT NULL DEFAULT 'user',
+    rank INTEGER NOT NULL DEFAULT 0,
+    score REAL NOT NULL DEFAULT 0,
+    load_penalty REAL NOT NULL DEFAULT 0,
+    open_reviews INTEGER NOT NULL DEFAULT 0,
+    signals TEXT NOT NULL DEFAULT '',
+    contributions_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_triage_candidates_run
+    ON triage_candidates(run_key, rank);
+CREATE INDEX IF NOT EXISTS idx_triage_candidates_identity
+    ON triage_candidates(identity, created_at);
+
+-- Who has touched which file, from what Mira watched merge and from what the
+-- platform could attribute. The natural key makes re-observing a merge or
+-- overlapping a history fetch a no-op rather than a double count.
+CREATE TABLE IF NOT EXISTS path_contributions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    -- 'authored' | 'reviewed'
+    role TEXT NOT NULL DEFAULT 'authored',
+    -- 'commit' | 'pull_request' | 'review'
+    source TEXT NOT NULL DEFAULT 'commit',
+    reference TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    event_at REAL NOT NULL DEFAULT 0,
+    recorded_at REAL NOT NULL DEFAULT 0,
+    UNIQUE (platform, owner, repo, path, identity, role, source, reference)
+);
+
+CREATE INDEX IF NOT EXISTS idx_path_contributions_path
+    ON path_contributions(path, event_at);
+CREATE INDEX IF NOT EXISTS idx_path_contributions_identity
+    ON path_contributions(identity, event_at);
+
+-- When each path's history was last fetched, and nothing else. Without it,
+-- "asked, and nobody has touched this file" and "never asked" are the same
+-- empty result — so every run would re-fetch every path forever, or would
+-- record an unasked question as an answered one.
+CREATE TABLE IF NOT EXISTS path_history_fetches (
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    fetched_at REAL NOT NULL DEFAULT 0,
+    entries INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, owner, repo, path)
+);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -836,7 +953,13 @@ class BlastRadiusEntry:
     depth: int
 
 
-class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksStoreMixin):
+class IndexStore(
+    _StoreSharedMixin,
+    GateStoreMixin,
+    AutofixStoreMixin,
+    ChecksStoreMixin,
+    TriageStoreMixin,
+):
     """SQLite-backed index for a single repository."""
 
     def __init__(
@@ -881,6 +1004,9 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
         # it is safe. The lock is per instance for the same reason: two
         # instances have two connections and SQLite serialises them itself.
         self._checks_lock = threading.RLock()
+        # Same reasoning, one phase later: triage writes a run and its
+        # candidates together, and a reader must never see half of that.
+        self._triage_lock = threading.RLock()
         if not create:
             self._conn = sqlite3.connect(
                 f"file:{pathlib.Path(db_path).as_posix()}?mode=ro", uri=True
@@ -2954,6 +3080,43 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
                     self._conn.commit()
             finally:
                 self._checks_depth -= 1
+
+    # --------------------------------------------------------------- Phase 7C
+    # The primitives `TriageStoreMixin` needs. Same shape as the check store's,
+    # and the statements it writes are `ON CONFLICT ... DO UPDATE` / `DO
+    # NOTHING`, both of which SQLite and Postgres spell identically — so there
+    # is no dialect hook here either.
+
+    def _triage_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def _triage_exec(self, sql: str, params: tuple = ()) -> int:
+        cursor = self._conn.execute(sql, params)
+        if not self._triage_depth:
+            self._conn.commit()
+        return int(cursor.rowcount or 0)
+
+    # Guard for `_triage_atomic`: a re-entrant lock plus a depth count, for the
+    # reason spelled out on `_checks_depth` above — a bare flag cannot tell a
+    # nested call from an unrelated concurrent one, and the second would have
+    # its rows committed by a call that had nothing to do with it.
+    _triage_depth = 0
+
+    @contextmanager
+    def _triage_atomic(self):  # type: ignore[no-untyped-def]
+        with self._triage_lock:
+            self._triage_depth += 1
+            try:
+                yield
+            except Exception:
+                if self._triage_depth == 1:
+                    self._conn.rollback()
+                raise
+            else:
+                if self._triage_depth == 1:
+                    self._conn.commit()
+            finally:
+                self._triage_depth -= 1
 
     def record_rule_evaluations(self, evaluations: list[RuleEvaluation]) -> int:
         """Persist rule exposures idempotently; return how many were new.

@@ -892,3 +892,126 @@ def mcp_audit(repository: str, limit: int) -> None:
         )
         if entry["detail"]:
             click.echo(f"    {entry['detail']}")
+
+
+@main.group("triage")
+def triage_group() -> None:
+    """Ask who might review a pull request, without asking anybody to.
+
+    The same ranking the server publishes, printed instead of posted. Nothing
+    in this group comments, requests a review or assigns anybody — on the
+    server or from here.
+    """
+
+
+def _provider_for(pr_url: str, token: str | None, config) -> object:  # type: ignore[no-untyped-def]
+    """A provider for this URL, inferred the same way `mira review` infers it."""
+    if not token:
+        raise click.UsageError(
+            "--token (or GITHUB_TOKEN / MIRA_GIT_TOKEN) is required to read a pull request"
+        )
+    if "/-/merge_requests/" in pr_url or "gitlab" in pr_url:
+        provider_type = "gitlab"
+    elif "/pulls/" in pr_url or "forgejo" in pr_url:
+        provider_type = "forgejo"
+    elif "/pull/" in pr_url or "github" in pr_url:
+        provider_type = "github"
+    else:
+        provider_type = config.provider.type
+    from mira.providers import create_provider, get_available_providers
+
+    try:
+        return create_provider(provider_type, token)
+    except ValueError as err:
+        available = ", ".join(get_available_providers()) or "(none)"
+        raise click.UsageError(
+            f"Unknown provider type {provider_type!r}. Available providers: {available}"
+        ) from err
+
+
+@triage_group.command("suggest")
+@click.option("--pr", "pr_url", required=True, help="PR/MR URL to triage")
+@click.option("--token", envvar="MIRA_GIT_TOKEN", default=None, help="Git platform API token")
+@click.option("--github-token", envvar="GITHUB_TOKEN", default=None, help="Alias for --token")
+@click.option("--config", "config_path", default=None, help="Path to .mira.yaml")
+@click.option("--output", "output_format", type=click.Choice(["text", "json"]), default="text")
+@click.option("--verbose", is_flag=True, help="Show the score arithmetic and everyone dropped")
+def triage_suggest(
+    pr_url: str,
+    token: str | None,
+    github_token: str | None,
+    config_path: str | None,
+    output_format: str,
+    verbose: bool,
+) -> None:
+    """Rank reviewers for one pull request and print the result.
+
+    Reads the pull request and records the run, exactly as the server would.
+    It does not comment: this is the command to run while deciding whether to
+    turn the feature on, and a trial run that announced itself on somebody's
+    pull request would be a poor way to start.
+    """
+    from mira.triage import service as triage_service
+    from mira.triage.explain import admin_explanation, public_explanation
+    from mira.triage.policy import resolve_policy
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+    try:
+        config = load_config(config_path)
+    except MiraError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    provider = _provider_for(pr_url, token or github_token, config)
+    try:
+        pr_info = asyncio.run(provider.get_pr_info(pr_url))  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise click.ClickException(f"Could not read {pr_url}: {exc}") from exc
+
+    policy = resolve_policy(config.triage, pr_info.owner, pr_info.repo)
+    if not policy.active:
+        # Said plainly rather than printing an empty ranking: "off" and "nobody
+        # to suggest" are different answers, here as everywhere else.
+        reason = "the kill switch is on" if policy.killed else "triage is not enabled"
+        raise click.ClickException(
+            f"Triage did not run for {pr_info.owner}/{pr_info.repo}: {reason}."
+        )
+
+    run = asyncio.run(
+        triage_service.evaluate(provider, pr_info, config=config, announce_result=False)
+    )
+    if output_format == "json":
+        click.echo(json.dumps(run.as_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(admin_explanation(run) if verbose else public_explanation(run))
+    # `unavailable` is a failure of Mira's, so it leaves a non-zero status for
+    # anything driving this from a script. `no_candidates` is an answer and
+    # exits zero.
+    if run.status == "unavailable":
+        sys.exit(1)
+
+
+@triage_group.command("policy")
+@click.option("--repo", "repository", default="", help="owner/name to resolve the policy for")
+@click.option("--config", "config_path", default=None, help="Path to .mira.yaml")
+def triage_policy(repository: str, config_path: str | None) -> None:
+    """Print the triage policy that applies to a repository.
+
+    Three layers resolve into one answer — global, organisation, repository —
+    and "which one won" is not something to work out by reading YAML.
+    """
+    from mira.triage.policy import resolve_policy
+
+    try:
+        config = load_config(config_path)
+    except MiraError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    owner, _, repo = repository.partition("/")
+    if repository and not (owner and repo):
+        raise click.UsageError("--repo must be owner/name")
+    policy = resolve_policy(config.triage, owner, repo)
+    click.echo(json.dumps(policy.as_dict(), indent=2, sort_keys=True))
