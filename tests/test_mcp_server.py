@@ -587,6 +587,7 @@ class TestThePostgresReadIsAlsoReadOnly:
                 return None
 
         monkeypatch.setattr(pg_store, "_pg_conn", None, raising=False)
+        monkeypatch.setattr(pg_store, "_pg_conn_read_only", None, raising=False)
         monkeypatch.setattr(pg_store, "_schema_initialized", False, raising=False)
         monkeypatch.setattr("mira.db.postgres.connect", lambda _url: RecordingConn())
 
@@ -631,9 +632,97 @@ class TestThePostgresReadIsAlsoReadOnly:
                 return None
 
         monkeypatch.setattr(pg_store, "_pg_conn", None, raising=False)
+        monkeypatch.setattr(pg_store, "_pg_conn_read_only", None, raising=False)
         monkeypatch.setattr(pg_store, "_schema_initialized", False, raising=False)
         monkeypatch.setattr("mira.db.postgres.connect", lambda _url: Conn())
 
         pg_store.PgIndexStore("acme", "widgets", "postgresql://fake")
 
         assert any("CREATE TABLE" in sql for sql in executed)
+
+
+class TestTheTwoModesDoNotShareAConnection:
+    """Whoever opens first must not decide what the other one gets.
+
+    A single shared handle made the guarantee depend on process startup order:
+    a read-only store opening after a writer would inherit a writable session,
+    and a writer opening after a read-only store would inherit a pinned one and
+    fail on its own migrations.
+    """
+
+    def _recorder(self, monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], list[Any]]:
+        from mira.index import pg_store
+
+        opened: list[Any] = []
+
+        class Cursor:
+            def __init__(self, log: list[str]) -> None:
+                self._log = log
+
+            def execute(self, sql, params=()):  # noqa: ANN001, ANN202
+                self._log.append(sql)
+                return self
+
+            def fetchall(self):  # noqa: ANN202
+                return []
+
+            def fetchone(self):  # noqa: ANN202
+                return None
+
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+        class Conn:
+            def __init__(self) -> None:
+                self.log: list[str] = []
+
+            def cursor(self):  # noqa: ANN202
+                return Cursor(self.log)
+
+            def commit(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def connect(_url: str) -> Conn:
+            conn = Conn()
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(pg_store, "_pg_conn", None, raising=False)
+        monkeypatch.setattr(pg_store, "_pg_conn_read_only", None, raising=False)
+        monkeypatch.setattr(pg_store, "_schema_initialized", False, raising=False)
+        monkeypatch.setattr("mira.db.postgres.connect", connect)
+        return [], opened
+
+    def test_a_read_only_store_opening_second_still_gets_a_pinned_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mira.index import pg_store
+
+        _log, opened = self._recorder(monkeypatch)
+
+        pg_store.PgIndexStore("acme", "widgets", "postgresql://fake")  # writer first
+        pg_store.PgIndexStore("acme", "widgets", "postgresql://fake", read_only=True)
+
+        assert len(opened) == 2, "the read-only store reused the writable connection"
+        assert any("TRANSACTION READ ONLY" in sql for sql in opened[1].log)
+        assert not any("CREATE TABLE" in sql for sql in opened[1].log)
+
+    def test_a_writing_store_opening_second_still_initialises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mira.index import pg_store
+
+        _log, opened = self._recorder(monkeypatch)
+
+        pg_store.PgIndexStore("acme", "widgets", "postgresql://fake", read_only=True)
+        pg_store.PgIndexStore("acme", "widgets", "postgresql://fake")  # writer second
+
+        assert len(opened) == 2
+        assert not any("TRANSACTION READ ONLY" in sql for sql in opened[1].log)
+        assert any("CREATE TABLE" in sql for sql in opened[1].log)
