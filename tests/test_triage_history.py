@@ -318,6 +318,17 @@ async def test_an_unknown_base_stops_the_fetch_rather_than_reading_the_head() ->
     assert "never read from the head" in outcome.authored_report.detail
 
 
-def test_the_module_uses_real_time_only_when_it_is_not_given_one() -> None:
-    """Guards against a test that passes because it froze the wrong clock."""
-    assert history.recency(time.time(), now=time.time(), window_days=1) == 1.0
+def test_the_window_is_measured_against_the_clock_it_is_given() -> None:
+    """Guards against a test that passes because it froze the wrong clock.
+
+    One reading of the clock, not two: two calls are microseconds apart, which
+    is a real age, and asserting it away with an exact 1.0 made this test fail
+    on whichever machine was slower that day.
+    """
+    moment = time.time()
+    assert history.recency(moment, now=moment, window_days=1) == 1.0
+
+
+def test_a_touch_with_no_recorded_time_is_worth_the_floor() -> None:
+    """A row that carries no timestamp is not a fresh row."""
+    assert history.recency(0.0, now=NOW, window_days=180) == history.MIN_RECENCY
