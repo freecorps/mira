@@ -524,3 +524,116 @@ class TestNestedArgumentsAreRedacted:
         stored = database.list_mcp_audit()[0]["arguments"]
         assert "ghp_abcdefghijklmnopqrstuvwxyz012345" not in stored
         assert "REDACTED" in stored
+
+
+class TestArgumentKeysAreRedactedToo:
+    def test_a_credential_used_as_a_key_is_redacted(self) -> None:
+        # A JSON object key is a client-supplied string like any other, and
+        # `{"metadata": {"ghp_...": true}}` puts the secret exactly where a
+        # values-only filter does not look.
+        database = AppDatabase("")
+        audit = AuditLog(enabled=True, db=database)
+
+        server("acme/widgets", audit=audit).call_tool(
+            {
+                "name": "mira_unknown_tool",
+                "arguments": {"metadata": {"ghp_abcdefghijklmnopqrstuvwxyz012345": True}},
+            }
+        )
+
+        stored = database.list_mcp_audit()[0]["arguments"]
+        assert "ghp_abcdefghijklmnopqrstuvwxyz012345" not in stored
+        assert "REDACTED" in stored
+
+
+class TestThePostgresReadIsAlsoReadOnly:
+    """Opening a Postgres store normally runs the schema and its migrations.
+
+    `_get_conn` executes `_PG_SCHEMA` plus a list of `ALTER TABLE ... ADD COLUMN
+    IF NOT EXISTS` on first use, and `PgIndexStore.__init__` follows it with a
+    backfill. All of those are writes, so the first MCP read would have been
+    the thing that migrated somebody's database.
+    """
+
+    def test_a_read_only_store_runs_no_schema_statements(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mira.index import pg_store
+
+        executed: list[str] = []
+
+        class RecordingCursor:
+            def execute(self, sql, params=()):  # noqa: ANN001, ANN202
+                executed.append(sql)
+                return self
+
+            def fetchall(self):  # noqa: ANN202
+                return []
+
+            def fetchone(self):  # noqa: ANN202
+                return None
+
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+        class RecordingConn:
+            def cursor(self):  # noqa: ANN202
+                return RecordingCursor()
+
+            def commit(self) -> None:
+                return None
+
+        monkeypatch.setattr(pg_store, "_pg_conn", None, raising=False)
+        monkeypatch.setattr(pg_store, "_schema_initialized", False, raising=False)
+        monkeypatch.setattr("mira.db.postgres.connect", lambda _url: RecordingConn())
+
+        pg_store.PgIndexStore("acme", "widgets", "postgresql://fake", read_only=True)
+
+        assert not any("CREATE TABLE" in sql for sql in executed)
+        assert not any("ALTER TABLE" in sql for sql in executed)
+        assert not any(sql.strip().upper().startswith(("INSERT", "UPDATE")) for sql in executed)
+        # And the session is pinned, so nothing on this handle can write even
+        # if a query somewhere else forgets.
+        assert any("TRANSACTION READ ONLY" in sql for sql in executed)
+
+    def test_a_writing_store_still_initialises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The other half of the contract: this is a mode, not a change of
+        # behaviour for everybody.
+        from mira.index import pg_store
+
+        executed: list[str] = []
+
+        class Cursor:
+            def execute(self, sql, params=()):  # noqa: ANN001, ANN202
+                executed.append(sql)
+                return self
+
+            def fetchall(self):  # noqa: ANN202
+                return []
+
+            def fetchone(self):  # noqa: ANN202
+                return None
+
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+        class Conn:
+            def cursor(self):  # noqa: ANN202
+                return Cursor()
+
+            def commit(self) -> None:
+                return None
+
+        monkeypatch.setattr(pg_store, "_pg_conn", None, raising=False)
+        monkeypatch.setattr(pg_store, "_schema_initialized", False, raising=False)
+        monkeypatch.setattr("mira.db.postgres.connect", lambda _url: Conn())
+
+        pg_store.PgIndexStore("acme", "widgets", "postgresql://fake")
+
+        assert any("CREATE TABLE" in sql for sql in executed)

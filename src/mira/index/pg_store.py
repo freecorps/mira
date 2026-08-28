@@ -648,14 +648,30 @@ def _drop_pg_conn() -> None:
             _pg_conn = None
 
 
-def _get_conn(url: str) -> Any:
-    """Get the shared Postgres connection, initializing schema on first use."""
+def _get_conn(url: str, *, read_only: bool = False) -> Any:
+    """Get the shared Postgres connection, initializing schema on first use.
+
+    `read_only=True` skips that initialisation and pins the session to
+    read-only transactions. Schema creation and the `ALTER TABLE ... ADD COLUMN
+    IF NOT EXISTS` migrations below are writes, so a caller whose whole
+    contract is that it does not write cannot be the one to run them - and the
+    pin means nothing on this connection can write even by mistake.
+
+    A connection somebody else opened is returned as it is. Pinning a handle
+    this caller did not create would break the caller that did.
+    """
     global _pg_conn, _schema_initialized
     with _lock:
         from mira.db.postgres import connect
 
         if _pg_conn is None:
             _pg_conn = connect(url)
+            if read_only:
+                with _pg_conn.cursor() as cur:
+                    cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                _pg_conn.commit()
+        if read_only:
+            return _pg_conn
         if not _schema_initialized:
             with _pg_conn.cursor() as cur:
                 cur.execute(_PG_SCHEMA)
@@ -954,30 +970,36 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
     # with this so both backends run the same query text.
     _analytics_placeholder = "%s"
 
-    def __init__(self, owner: str, repo: str, url: str) -> None:
+    def __init__(self, owner: str, repo: str, url: str, *, read_only: bool = False) -> None:
         self._owner = owner
         self._repo = repo
         self._url = url
+        self._read_only = read_only
         # Guards `_checks_atomic`. Per instance, because the dedicated
         # connection it opens is per call — the lock only has to stop two
         # callers *on this store* sharing one cursor.
         self._checks_lock = threading.RLock()
-        _get_conn(url)  # eager connect + schema init
-        self._backfill_feedback_v2()
+        _get_conn(url, read_only=read_only)  # eager connect; schema init unless read-only
+        if not read_only:
+            # A backfill is a write. A store opened to read cannot be the thing
+            # that decides another process's rows need rewriting.
+            self._backfill_feedback_v2()
+
+    def _handle(self) -> Any:
+        """The shared connection, opened the way this store was."""
+        return _get_conn(self._url, read_only=self._read_only)
 
     def _refresh_conn(self) -> Any:
         """Drop the shared module connection and bind a fresh handle."""
         _drop_pg_conn()
-        return _get_conn(self._url)
+        return self._handle()
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
         """Cursor on the current shared connection; reconnects once on idle drop."""
         from mira.db.postgres import ReconnectingCursor
 
-        with ReconnectingCursor(
-            _get_conn(self._url).cursor(), on_reconnect=self._refresh_conn
-        ) as cur:
+        with ReconnectingCursor(self._handle().cursor(), on_reconnect=self._refresh_conn) as cur:
             yield cur
 
     @contextmanager
@@ -994,7 +1016,7 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         # Always commit the current shared connection — a reconnect (from this
         # or any other store instance) closes the old handle, so caching one
         # per instance would commit on a dead connection.
-        _get_conn(self._url).commit()
+        self._handle().commit()
 
     def _exec(self, sql: str, params: tuple = ()):
         """Execute a query and return the cursor."""

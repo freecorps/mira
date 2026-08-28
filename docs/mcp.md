@@ -220,9 +220,22 @@ no existing table or column is altered.
 
 A repository that has never been indexed reads as `"indexed": false` with an
 empty list and a note saying so, rather than as a repository with no findings.
-Its store is *not* created by the read: connecting to a SQLite index normally
-creates the file, so these reads open it in a mode that raises instead — not a
-check followed by an open, so there is no window between the two.
+An index that exists but cannot be opened is reported as a *failure* instead —
+a locked or broken backend is not an empty one.
+
+**Reading an index does not write to it.** Opening one normally creates the
+file if it is missing, sets the journal mode, runs the schema and applies any
+column migrations; on PostgreSQL it runs `CREATE TABLE` and
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` on first use. All of those are
+writes. These reads open SQLite `mode=ro` and PostgreSQL with the session
+pinned to read-only transactions, and skip every initialisation statement, so
+the surface cannot migrate an index it was only asked to read. (SQLite may
+still touch the `-shm` sidecar to take a read lock on a WAL database; the index
+file itself does not change, and there is a test that hashes it across a read.)
+
+The trade is that an index written by an older Mira is not brought up to date by
+being read — it answers what it can and fails on a table it does not have, which
+is the operator's to fix by running something that writes.
 
 For the same reason these reads do not go through the store helper the rest of
 Mira uses. That helper falls back to SQLite when PostgreSQL is unreachable,

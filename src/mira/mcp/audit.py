@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -39,23 +40,38 @@ FAILED = "failed"
 
 
 def _redact_deeply(value: Any) -> Any:
-    """Run the redaction filter over every string in a nested structure."""
+    """Run the redaction filter over every string in a nested structure.
+
+    Keys as well as values. A JSON object key is a client-supplied string like
+    any other, and `{"metadata": {"ghp_...": true}}` puts the secret in the
+    position this would otherwise skip.
+    """
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, dict):
-        return {str(key): _redact_deeply(item) for key, item in value.items()}
+        return {redact(str(key)): _redact_deeply(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact_deeply(item) for item in value]
     return value
 
 
 def _open_app_db() -> Any:
-    """The application database, or None if this install has none reachable.
+    """The application database this process should write its trail to.
 
     Imported here rather than at module scope: the dashboard package pulls in
-    optional server dependencies, and the MCP server runs on installs that
-    have none of them.
+    optional server dependencies, and the MCP server runs on installs that have
+    none of them.
+
+    An instance the dashboard already built is reused when there is one. It is
+    the same database either way, so a second connection would buy nothing and
+    cost a duplicate startup - including a second pass at creating the initial
+    admin user.
     """
+    dashboard = sys.modules.get("mira.dashboard.api")
+    existing = getattr(dashboard, "_app_db", None) if dashboard is not None else None
+    if existing is not None:
+        return existing
+
     from mira.dashboard.db import AppDatabase
 
     return AppDatabase(

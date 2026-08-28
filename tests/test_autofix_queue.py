@@ -395,7 +395,7 @@ class _FakeConn:
 @pytest.fixture
 def pg(monkeypatch: pytest.MonkeyPatch) -> PgIndexStore:
     conn = _FakeConn()
-    monkeypatch.setattr(pg_store, "_get_conn", lambda url: conn)
+    monkeypatch.setattr(pg_store, "_get_conn", lambda url, **_kwargs: conn)
     monkeypatch.setattr(pg_store, "_new_pg_conn", lambda url: conn)
     return PgIndexStore("acme", "app", "postgresql://fake")
 
@@ -620,7 +620,7 @@ def pg_gitlab(monkeypatch: pytest.MonkeyPatch) -> PgIndexStore:
     plain one.
     """
     conn = _FakeConn()
-    monkeypatch.setattr(pg_store, "_get_conn", lambda url: conn)
+    monkeypatch.setattr(pg_store, "_get_conn", lambda url, **_kwargs: conn)
     monkeypatch.setattr(pg_store, "_new_pg_conn", lambda url: conn)
     return PgIndexStore("_gitlab/acme", "app", "postgresql://fake")
 

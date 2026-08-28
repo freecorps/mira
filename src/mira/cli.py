@@ -796,7 +796,7 @@ def mcp_serve(repos: tuple[str, ...], config_path: str | None, verbose: bool) ->
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="mira.mcp %(levelname)s: %(message)s",
+        format="%(name)s %(levelname)s: %(message)s",
         stream=sys.stderr,
     )
     # A byte on stdout that is not protocol is a parse error at the client, and

@@ -109,7 +109,7 @@ def postgres_store(monkeypatch: pytest.MonkeyPatch):
     conn = _FakeConn()
     monkeypatch.setattr(pg_store, "_pg_conn", conn, raising=False)
     monkeypatch.setattr(pg_store, "_schema_initialized", True, raising=False)
-    monkeypatch.setattr(pg_store, "_get_conn", lambda url: conn)
+    monkeypatch.setattr(pg_store, "_get_conn", lambda url, **_kwargs: conn)
     monkeypatch.setattr(pg_store, "_new_pg_conn", lambda url: conn)
     store = PgIndexStore("acme", "app", "postgresql://test")
     yield store

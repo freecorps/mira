@@ -850,25 +850,46 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
     ) -> None:
         """Open this repository's index, creating it unless told not to.
 
-        `create=False` is for callers that must not bring an index into
-        existence as a side effect of reading one - the read-only MCP server.
-        It is a mode on the connection rather than a check before it, so there
-        is no window between "does this exist" and "open it" in which the
-        answer can change: SQLite raises rather than creating the file.
+        `create=False` is for callers that must not write to an index as a side
+        effect of reading one - the read-only MCP server. It opens `mode=ro`
+        and runs none of the initialisation below, because all of it writes:
+        setting the journal mode, creating the schema, adding columns that
+        arrived after it, and normalising rule scopes. A reader that migrated
+        somebody else's index would be doing the one thing it promised not to.
+
+        It is also a mode on the connection rather than a check before it, so
+        there is no window between "does this exist" and "open it" in which the
+        answer can change - and no way for a bug in a query to write, because
+        SQLite refuses at the connection.
+
+        The trade is that an index written by an older Mira is not brought up
+        to date by being read. It answers what it can and raises on a table it
+        does not have, which is the correct direction for a reader: a missing
+        table is the operator's to fix by running something that writes.
+
+        One thing `mode=ro` does not stop, and should not: SQLite may touch the
+        `-shm` sidecar to take a read lock on a database in WAL mode. That is
+        how reading a WAL database works. The index itself does not change -
+        there is a test that hashes the file across a read.
         """
         self._db_path = db_path
         self._owner = owner
         self._repo = repo
         self._platform = platform
+        self._read_only = not create
         # Owned by this instance, so `_checks_atomic` deferring its commits on
         # it is safe. The lock is per instance for the same reason: two
         # instances have two connections and SQLite serialises them itself.
         self._checks_lock = threading.RLock()
-        self._conn = (
-            sqlite3.connect(db_path)
-            if create
-            else sqlite3.connect(f"file:{pathlib.Path(db_path).as_posix()}?mode=rw", uri=True)
-        )
+        if not create:
+            self._conn = sqlite3.connect(
+                f"file:{pathlib.Path(db_path).as_posix()}?mode=ro", uri=True
+            )
+            # Connection-local and does not write: it constrains this handle's
+            # own statements and touches nothing on disk.
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            return
+        self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)

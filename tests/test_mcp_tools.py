@@ -11,6 +11,7 @@ whole install rather than one repository.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -449,7 +450,7 @@ class TestTheSharedTableBackendStaysScoped:
         from mira.index import pg_store
 
         conn = _FakeConn()
-        monkeypatch.setattr(pg_store, "_get_conn", lambda url: conn)
+        monkeypatch.setattr(pg_store, "_get_conn", lambda url, **_kwargs: conn)
         monkeypatch.setattr(pg_store, "_new_pg_conn", lambda url: conn)
         ours = PgIndexStore("acme", "widgets", "postgresql://fake")
         theirs = PgIndexStore("other", "thing", "postgresql://fake")
@@ -703,3 +704,98 @@ class TestTruncationRespectsTheLimitItWasGiven:
         ]
 
         assert len(item["body"]) == 500
+
+
+class TestReadingAnIndexDoesNotWriteToIt:
+    """`create=False` is the read-only boundary, so it has to actually be one.
+
+    Not creating the file was only half of it: the constructor went on to set
+    the journal mode, run the schema script and apply column migrations, all of
+    which are writes to somebody else's index performed by a caller whose whole
+    contract is that it does not write.
+    """
+
+    def _existing_index(self):
+        from mira.index.store import IndexStore
+
+        populate(findings=[finding()])
+        return IndexStore.db_path_for("acme", "widgets")
+
+    def test_the_connection_itself_refuses_writes(self) -> None:
+        import sqlite3
+
+        from mira.index.store import IndexStore
+
+        path = self._existing_index()
+        store = IndexStore(path, owner="acme", repo="widgets", create=False)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                store._conn.execute("DELETE FROM review_findings")  # noqa: SLF001
+        finally:
+            store.close()
+
+    def test_no_schema_statement_runs_on_the_way_in(self) -> None:
+        # The proof: drop a table, open read-only, and find it still missing.
+        # If the schema script ran, it would be back.
+        import sqlite3
+
+        from mira.index.store import IndexStore
+
+        path = self._existing_index()
+        scratch = sqlite3.connect(path)
+        scratch.execute("DROP TABLE directories")
+        scratch.commit()
+        scratch.close()
+
+        store = IndexStore(path, owner="acme", repo="widgets", create=False)
+        try:
+            tables = {
+                row[0]
+                for row in store._conn.execute(  # noqa: SLF001
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        finally:
+            store.close()
+
+        assert "directories" not in tables
+        assert "review_findings" in tables
+
+    def test_the_database_file_is_unchanged_by_being_read(self) -> None:
+        # The claim, stated as bytes. SQLite may still touch the -shm sidecar
+        # to take a read lock on a WAL database, which is how reading works and
+        # not a change to the index; what must not move is the index itself.
+        import hashlib
+
+        path = self._existing_index()
+        before = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+        call(server("acme/widgets"), "mira_list_findings", repository="acme/widgets")
+
+        assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == before
+
+    def test_a_read_only_store_still_answers(self) -> None:
+        payload = payload_of(
+            call(server("acme/widgets"), "mira_list_findings", repository="acme/widgets")
+            if self._existing_index()
+            else None
+        )
+
+        assert len(payload["items"]) == 1
+
+
+class TestABackendFailureIsNotAnAbsence:
+    def test_an_index_that_cannot_be_opened_is_reported_as_a_failure(self) -> None:
+        # A directory where the database should be: the open fails, but the
+        # path exists, so this is a broken backend rather than a repository
+        # nobody has indexed. Reporting `indexed: false` would hide it behind
+        # an answer the caller reads as an answer.
+        from mira.index.store import IndexStore
+
+        path = IndexStore.db_path_for("acme", "widgets")
+        os.makedirs(path, exist_ok=True)
+
+        response = call(server("acme/widgets"), "mira_list_findings", repository="acme/widgets")
+
+        assert response["isError"] is True
+        assert "indexed" not in text_of(response)
