@@ -44,13 +44,21 @@ from mira.models import (
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
+    PathAuthorship,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
 )
 from mira.platforms import profiles
+from mira.providers._time import iso_to_epoch
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
+from mira.triage.capabilities import (
+    FORGEJO_CAPABILITIES as FORGEJO_TRIAGE_CAPABILITIES,
+)
+from mira.triage.capabilities import (
+    TriageCapabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -667,15 +675,15 @@ class ForgejoProvider(BaseProvider):
             return "CONTRIBUTOR"
         return "NONE"
 
-    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
-        """First CODEOWNERS found at the head ref, or ``("", "")`` if none.
+    async def get_codeowners(self, pr_info: PRInfo, ref: str = "") -> tuple[str, str]:
+        """First CODEOWNERS found at ``ref``, or ``("", "")`` if none.
 
         Deliberately not routed through `get_file_content`, which logs a failed
         fetch and returns "". "There are no owners" and "we could not check"
         have to reach the gate as different answers — the first is safe to
         approve past and the second is not — so a real failure raises.
         """
-        ref = pr_info.head_sha or pr_info.head_branch
+        ref = ref or pr_info.head_sha or pr_info.head_branch
         for candidate in CODEOWNERS_LOCATIONS["forgejo"]:
             url = (
                 f"{self._repo(pr_info)}/contents/{quote(candidate, safe='')}"
@@ -739,6 +747,67 @@ class ForgejoProvider(BaseProvider):
 
     def checks_capabilities(self) -> CheckCapabilities:
         return FORGEJO_CHECK_CAPABILITIES
+
+    def triage_capabilities(self) -> TriageCapabilities:
+        return FORGEJO_TRIAGE_CAPABILITIES
+
+    async def get_path_authors(
+        self,
+        pr_info: PRInfo,
+        paths: list[str],
+        *,
+        ref: str = "",
+        max_per_path: int = 20,
+    ) -> dict[str, list[PathAuthorship]]:
+        """Who Forgejo says has committed to each path, at ``ref``.
+
+        Forgejo returns a ``author`` user object when the commit's email
+        belongs to an account and ``null`` when it does not, so an unresolved
+        commit is *visibly* unresolved: it yields an empty login, and the
+        caller drops it rather than falling back to the name in the commit.
+        """
+        if not paths:
+            return {}
+        commit_ref = ref or pr_info.base_sha or pr_info.base_branch
+        if not commit_ref:
+            return {}
+
+        sem = asyncio.Semaphore(8)
+        base = f"{self._repo(pr_info)}/commits"
+
+        async def _fetch_one(path: str) -> tuple[str, list[PathAuthorship]]:
+            async with sem:
+                try:
+                    resp = await self._request(
+                        "GET",
+                        f"{base}?path={quote(path, safe='')}"
+                        f"&sha={quote(commit_ref, safe='')}&limit={int(max_per_path)}",
+                        ok=(200, 404),
+                    )
+                    if resp.status_code != 200:
+                        return path, []
+                    data = resp.json() or []
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Path author fetch failed for %s: %s", path, exc)
+                    return path, []
+
+            entries: list[PathAuthorship] = []
+            for item in data[:max_per_path]:
+                author = item.get("author") or {}
+                commit = item.get("commit") or {}
+                entries.append(
+                    PathAuthorship(
+                        path=path,
+                        login=str(author.get("login") or ""),
+                        sha=str(item.get("sha", ""))[:12],
+                        url=str(item.get("html_url") or ""),
+                        at=iso_to_epoch(((commit.get("author") or {}).get("date")) or ""),
+                    )
+                )
+            return path, entries
+
+        results = await asyncio.gather(*[_fetch_one(path) for path in paths])
+        return {path: entries for path, entries in results if entries}
 
     async def get_issue(
         self, pr_info: PRInfo, number: int, *, owner: str = "", repo: str = ""

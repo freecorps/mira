@@ -39,11 +39,13 @@ from mira.models import (
     HumanReviewComment,
     IssueInfo,
     OpenPRRef,
+    PathAuthorship,
     PRInfo,
     ReviewComment,
     ReviewResult,
     UnresolvedThread,
 )
+from mira.providers._time import iso_to_epoch
 from mira.providers.base import BaseProvider
 
 # Shared comment-formatting helpers (re-exported for back-compat — callers and
@@ -57,6 +59,12 @@ from mira.providers.formatting import (
 )
 from mira.providers.formatting import (
     format_key_issues as _format_key_issues,
+)
+from mira.triage.capabilities import (
+    GITHUB_CAPABILITIES as GITHUB_TRIAGE_CAPABILITIES,
+)
+from mira.triage.capabilities import (
+    TriageCapabilities,
 )
 
 # Every check-run name Mira publishes itself. Filtered out of the CI it reads
@@ -1194,6 +1202,81 @@ class GitHubProvider(BaseProvider):
 
         return {path: hist for path, hist in results if hist}
 
+    def triage_capabilities(self) -> TriageCapabilities:
+        return GITHUB_TRIAGE_CAPABILITIES
+
+    async def get_path_authors(
+        self,
+        pr_info: PRInfo,
+        paths: list[str],
+        *,
+        ref: str = "",
+        max_per_path: int = 20,
+    ) -> dict[str, list[PathAuthorship]]:
+        """Who the platform says has committed to each path, at ``ref``.
+
+        ``author.login`` — the account GitHub resolved the commit to — rather
+        than ``commit.author.name``, which is a string the committer wrote. A
+        commit GitHub could not resolve yields an entry with an empty login,
+        which the caller drops: an unattributed commit must not become an
+        unverified name in a suggestion.
+
+        Bounded the same way :meth:`get_file_history` is, with the same small
+        semaphore: a pull request touching many files must not turn into a rate
+        limit incident on a feature nobody is blocked on.
+        """
+        if not paths:
+            return {}
+
+        commit_ref = ref or pr_info.base_sha or pr_info.base_branch
+        if not commit_ref:
+            return {}
+
+        sem = asyncio.Semaphore(8)
+        headers = {
+            "Authorization": f"token {self._token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        base = f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/commits"
+
+        async def _fetch_one(
+            client: httpx.AsyncClient, path: str
+        ) -> tuple[str, list[PathAuthorship]]:
+            async with sem:
+                try:
+                    resp = await client.get(
+                        base,
+                        headers=headers,
+                        params={"path": path, "sha": commit_ref, "per_page": max_per_path},
+                    )
+                    if resp.status_code != 200:
+                        return path, []
+                    data = resp.json()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Path author fetch failed for %s: %s", path, exc)
+                    return path, []
+
+            entries: list[PathAuthorship] = []
+            for item in (data or [])[:max_per_path]:
+                author = item.get("author") or {}
+                commit = item.get("commit") or {}
+                entries.append(
+                    PathAuthorship(
+                        path=path,
+                        login=str(author.get("login") or ""),
+                        sha=str(item.get("sha", ""))[:12],
+                        url=str(item.get("html_url") or ""),
+                        at=iso_to_epoch(((commit.get("author") or {}).get("date")) or ""),
+                    )
+                )
+            return path, entries
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            results = await asyncio.gather(
+                *[_fetch_one(client, p) for p in paths], return_exceptions=False
+            )
+        return {path: entries for path, entries in results if entries}
+
     async def get_human_review_comments(
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:
@@ -1347,14 +1430,18 @@ class GitHubProvider(BaseProvider):
             logger.warning("Could not read change stats for %s: %s", pr_info.url, e)
             raise ProviderError(f"Failed to read change stats: {e}") from e
 
-    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
-        """First CODEOWNERS found at the head ref, in GitHub's own order.
+    async def get_codeowners(self, pr_info: PRInfo, ref: str = "") -> tuple[str, str]:
+        """First CODEOWNERS found at ``ref``, in GitHub's own order.
 
         Raises when the lookup itself fails: "we could not check" and "there
         are no owners" have to reach the gate as different answers, because
         only the second one is safe to approve past.
+
+        ``ref`` defaults to the head, which is what the gate reads. Reviewer
+        triage passes the base, because a branch that could add itself an owner
+        would otherwise be nominating its own reviewer.
         """
-        ref = pr_info.head_sha or pr_info.head_branch
+        ref = ref or pr_info.head_sha or pr_info.head_branch
         last_error: Exception | None = None
         for candidate in CODEOWNERS_LOCATIONS["github"]:
             try:

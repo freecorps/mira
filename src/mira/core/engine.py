@@ -1185,6 +1185,13 @@ class ReviewEngine:
         # would stop vetoing a protected path touched two pushes ago.
         await self._run_merge_gate(pr_info, result, full_diff_text)
 
+        # Phase 7C: reviewer triage. Last, and deliberately after the gate:
+        # nothing reads its output, so nothing should wait for it. A suggestion
+        # that arrives a second after the review is still a suggestion; a gate
+        # decision that waited on one would be a gate that depends on a
+        # ranking.
+        await self._run_reviewer_triage(pr_info, full_diff_text)
+
         return result
 
     async def _run_pre_merge_checks(self, pr_info: PRInfo, full_diff_text: str) -> None:
@@ -1224,6 +1231,41 @@ class ReviewEngine:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Pre-merge checks failed for %s: %s", pr_info.url, exc)
+
+    async def _run_reviewer_triage(self, pr_info: PRInfo, full_diff_text: str) -> None:
+        """Classify the change and suggest who might review it.
+
+        The diff the review already has is handed over rather than fetched
+        again, and it is the *full* one: a suggestion built from the newest
+        commits alone would stop naming the person who owns the file the first
+        push touched.
+
+        Never raises, and never affects anything. Triage publishes no status,
+        the merge gate does not read it, and a failure here leaves a completed
+        review exactly as completed as it was.
+        """
+        from mira.triage import service as triage_service
+        from mira.triage.policy import resolve_policy as resolve_triage_policy
+
+        if self.provider is None:
+            return
+        if not resolve_triage_policy(self.config.triage, pr_info.owner, pr_info.repo).active:
+            return
+        try:
+            await triage_service.evaluate(
+                self.provider,
+                pr_info,
+                config=self.config,
+                signal=triage_service.ReviewSignal(
+                    diff_text=full_diff_text or "",
+                    review_id=self._review_event_id,
+                ),
+                # A dry run must not touch the platform, so triage still runs
+                # and records and announces nothing.
+                announce_result=not self.dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reviewer triage failed for %s: %s", pr_info.url, exc)
 
     async def _run_merge_gate(
         self, pr_info: PRInfo, result: ReviewResult, full_diff_text: str

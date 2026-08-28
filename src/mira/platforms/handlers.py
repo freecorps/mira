@@ -292,18 +292,25 @@ async def run_gate_evaluation(
     checks first, and the function is named for the gate only because that is
     what it was before Phase 6 and every webhook layer calls it by that name.
 
-    Cheap to call when both are off: the policies are resolved first, and an
-    inactive pair returns before anything is fetched.
+    Reviewer triage rides along for the same reason: the event that most often
+    wakes this handler for a *human* reason is a draft being marked ready for
+    review, which is exactly when a suggestion becomes worth publishing.
+
+    Cheap to call when all three are off: the policies are resolved first, and
+    an inactive set returns before anything is fetched.
     """
     from mira.checks import service as checks_service
     from mira.checks.policy import resolve_policy as resolve_checks_policy
     from mira.gate import service as gate_service
     from mira.gate.policy import resolve_policy
+    from mira.triage import service as triage_service
+    from mira.triage.policy import resolve_policy as resolve_triage_policy
 
     config = load_config()
     gate_active = resolve_policy(config.gate, owner, repo).active
     checks_active = resolve_checks_policy(config.checks, owner, repo).active
-    if not gate_active and not checks_active:
+    triage_active = resolve_triage_policy(config.triage, owner, repo).active
+    if not gate_active and not checks_active and not triage_active:
         return
     try:
         pr_info = await provider.get_pr_info(pr_url)
@@ -327,6 +334,28 @@ async def run_gate_evaluation(
             await gate_service.evaluate(provider, pr_info, config=config, bot_name=bot_name)
         except Exception as exc:
             logger.warning("Merge gate re-evaluation failed for %s: %s", pr_url, exc)
+
+    # Triage last, and outside the early return above: a repository can have
+    # triage on with the gate and the checks off, and the event this handler
+    # runs on — a draft marked ready for review — is exactly when a suggestion
+    # becomes worth publishing.
+    #
+    # Skipped when this commit already has an answer. Every CI completion wakes
+    # this handler, and re-ranking the same files under the same policy would
+    # spend API calls to reach the row that is already there. A run that could
+    # *not* answer is deliberately not treated as an answer, so an outage gets
+    # a free retry on the next event.
+    if triage_active:
+        existing = triage_service.latest_for(
+            owner, repo, platform, number, getattr(pr_info, "head_sha", "") or ""
+        )
+        if existing is not None and existing.status != "unavailable":
+            logger.debug("Triage already answered for %s at this commit", pr_url)
+        else:
+            try:
+                await triage_service.evaluate(provider, pr_info, config=config)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Reviewer triage re-run failed for %s: %s", pr_url, exc)
 
 
 async def run_pr_command(
@@ -801,3 +830,14 @@ async def run_pr_merged_learning(
         unobserved,
         fixed,
     )
+
+    # Phase 7C: the merge is also the moment the file history worth ranking on
+    # becomes true. Recorded only where triage is enabled — who worked on which
+    # file is data about people, and collecting it for a repository that never
+    # asked for suggestions is not something to do "just in case".
+    try:
+        from mira.triage.contributions import record_merged_pull_request
+
+        await record_merged_pull_request(provider, pr_info)
+    except Exception as exc:  # noqa: BLE001 - nothing here depends on it
+        logger.debug("Could not record path history for %s: %s", pr_url, exc)

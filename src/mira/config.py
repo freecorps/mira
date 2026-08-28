@@ -26,6 +26,16 @@ from mira.checks.config_models import (  # noqa: F401
 )
 from mira.exceptions import ConfigError
 
+# Triage's configuration follows the same rule as the check framework's and is
+# kept behind the same file boundary for the same reason: nothing in a pull
+# request reaches a value in it, and the module that says so is easier to audit
+# than a paragraph in the middle of this one.
+from mira.triage.config_models import (  # noqa: F401
+    TriageConfig,
+    TriageScopePolicy,
+    TriageWeights,
+)
+
 logger = logging.getLogger(__name__)
 
 # `.mira.yaml` is the canonical per-repo override filename. `.mira.yaml`
@@ -933,6 +943,7 @@ class MiraConfig(BaseModel):
     gate: GateConfig = Field(default_factory=GateConfig)
     autofix: AutofixConfig = Field(default_factory=AutofixConfig)
     checks: ChecksConfig = Field(default_factory=ChecksConfig)
+    triage: TriageConfig = Field(default_factory=TriageConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
 
 

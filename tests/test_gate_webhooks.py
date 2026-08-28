@@ -161,7 +161,7 @@ async def test_an_unreadable_policy_is_not_active(monkeypatch: pytest.MonkeyPatc
         raise RuntimeError("the settings store is unreachable")
 
     monkeypatch.setattr(webhook, "load_config", _explode)
-    assert webhook._gate_is_active("acme", "app") is False
+    assert webhook._recheck_is_active("acme", "app") is False
 
 
 async def test_the_gates_own_check_run_does_not_wake_the_gate() -> None:

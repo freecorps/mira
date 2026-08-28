@@ -36,6 +36,7 @@ from mira.index.store import (
     SymbolInfo,
 )
 from mira.models import PRFingerprint
+from mira.triage.persistence import TriageStoreMixin
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +545,122 @@ CREATE INDEX IF NOT EXISTS idx_pg_check_results_state
 CREATE INDEX IF NOT EXISTS idx_pg_check_results_pr
     ON check_results(owner, repo, pr_number, created_at);
 
+-- Phase 7C triage. One row per triage of one pull request: `run_key` hashes the
+-- pull request, head commit, resolved policy and the file list, so a
+-- redelivered webhook converges here instead of stacking a second suggestion,
+-- while a push — which can legitimately change who should look at it — is
+-- recorded as the new run it is.
+CREATE TABLE IF NOT EXISTS triage_runs (
+    id BIGSERIAL PRIMARY KEY,
+    run_key TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    pr_url TEXT NOT NULL DEFAULT '',
+    pr_author TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    review_id INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL DEFAULT '',
+    -- 'ok' | 'no_candidates' | 'unavailable' | 'not_run'
+    status TEXT NOT NULL DEFAULT 'not_run',
+    -- 1 when a signal did not answer. Stored alongside `status` because a run
+    -- can have candidates *and* a signal that failed, and a reader who is
+    -- shown two names deserves to know a third source was unavailable.
+    degraded INTEGER NOT NULL DEFAULT 0,
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    classification_json TEXT NOT NULL DEFAULT '{}',
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    signals_json TEXT NOT NULL DEFAULT '[]',
+    excluded_json TEXT NOT NULL DEFAULT '[]',
+    notes_json TEXT NOT NULL DEFAULT '[]',
+    counts_json TEXT NOT NULL DEFAULT '{}',
+    duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_triage_runs_pr
+    ON triage_runs(owner, repo, pr_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_triage_runs_head
+    ON triage_runs(owner, repo, pr_number, head_sha);
+CREATE INDEX IF NOT EXISTS idx_pg_triage_runs_status
+    ON triage_runs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_pg_triage_runs_created
+    ON triage_runs(created_at);
+
+-- One row per suggested identity per run, so "who does Mira keep suggesting"
+-- is a query rather than a scan over JSON blobs.
+CREATE TABLE IF NOT EXISTS triage_candidates (
+    id BIGSERIAL PRIMARY KEY,
+    candidate_key TEXT NOT NULL UNIQUE,
+    run_id BIGINT NOT NULL DEFAULT 0,
+    run_key TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    identity TEXT NOT NULL DEFAULT '',
+    -- 'user' | 'team' | 'email'
+    kind TEXT NOT NULL DEFAULT 'user',
+    rank INTEGER NOT NULL DEFAULT 0,
+    score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    load_penalty DOUBLE PRECISION NOT NULL DEFAULT 0,
+    open_reviews INTEGER NOT NULL DEFAULT 0,
+    signals TEXT NOT NULL DEFAULT '',
+    contributions_json TEXT NOT NULL DEFAULT '[]',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_triage_candidates_run
+    ON triage_candidates(run_key, rank);
+CREATE INDEX IF NOT EXISTS idx_pg_triage_candidates_identity
+    ON triage_candidates(identity, created_at);
+
+-- Who has touched which file, from what Mira watched merge and from what the
+-- platform could attribute. The natural key makes re-observing a merge or
+-- overlapping a history fetch a no-op rather than a double count.
+CREATE TABLE IF NOT EXISTS path_contributions (
+    id BIGSERIAL PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    -- 'authored' | 'reviewed'
+    role TEXT NOT NULL DEFAULT 'authored',
+    -- 'commit' | 'pull_request' | 'review'
+    source TEXT NOT NULL DEFAULT 'commit',
+    reference TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    event_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    recorded_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE (platform, owner, repo, path, identity, role, source, reference)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_path_contributions_path
+    ON path_contributions(owner, repo, path, event_at);
+CREATE INDEX IF NOT EXISTS idx_pg_path_contributions_identity
+    ON path_contributions(identity, event_at);
+
+-- When each path's history was last fetched, and nothing else. Without it,
+-- "asked, and nobody has touched this file" and "never asked" are the same
+-- empty result — so every run would re-fetch every path forever, or would
+-- record an unasked question as an answered one.
+CREATE TABLE IF NOT EXISTS path_history_fetches (
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    fetched_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    entries INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, owner, repo, path)
+);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id SERIAL PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -977,7 +1094,13 @@ def search_packages_org_wide(
     ]
 
 
-class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksStoreMixin):
+class PgIndexStore(
+    _StoreSharedMixin,
+    GateStoreMixin,
+    AutofixStoreMixin,
+    ChecksStoreMixin,
+    TriageStoreMixin,
+):
     """PostgreSQL-backed index store with owner/repo scoping.
 
     Implements the same public interface as IndexStore. Shares a single
@@ -997,6 +1120,9 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         # connection it opens is per call — the lock only has to stop two
         # callers *on this store* sharing one cursor.
         self._checks_lock = threading.RLock()
+        # The same guard, one phase later: a triage run and its candidate rows
+        # are one write, and a reader must never see half of it.
+        self._triage_lock = threading.RLock()
         _get_conn(url, read_only=read_only)  # eager connect; schema init unless read-only
         if not read_only:
             # A backfill is a write. A store opened to read cannot be the thing
@@ -3184,6 +3310,68 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         One table holds every repository here, so an unscoped read would return
         another repo's results to a caller that asked about this one. The
         org-wide handle (empty owner/repo) is the deliberate exception.
+        """
+        clauses = []
+        params: list[Any] = []
+        if self._owner:
+            clauses.append(" AND owner = %s")
+            params.append(self._owner)
+        if self._repo:
+            clauses.append(" AND repo = %s")
+            params.append(self._repo)
+        return "".join(clauses), tuple(params)
+
+    # ── Phase 7C ──
+    #
+    # The triage mixin's primitives, shaped exactly like the check mixin's
+    # above and for the same reasons — including the dedicated connection,
+    # because a run and its candidates have to become visible together and the
+    # shared handle is shared.
+
+    _triage_placeholder = "%s"
+
+    def _triage_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return list(self._fetchall(sql, params))
+
+    def _triage_exec(self, sql: str, params: tuple = ()) -> int:
+        if self._triage_cursor is not None:
+            self._triage_cursor.execute(sql, params)
+            return int(self._triage_cursor.rowcount or 0)
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            rowcount = int(cur.rowcount or 0)
+        self._commit()
+        return rowcount
+
+    # The cursor `_triage_atomic` is holding, or None outside one.
+    _triage_cursor: Any = None
+    _triage_depth = 0
+
+    @contextmanager
+    def _triage_atomic(self):  # type: ignore[no-untyped-def]
+        """Write a whole triage run on a dedicated connection, or none of it."""
+        with self._triage_lock:
+            if self._triage_depth:  # pragma: no cover - not nested today
+                self._triage_depth += 1
+                try:
+                    yield
+                finally:
+                    self._triage_depth -= 1
+                return
+            with self._transaction_cursor() as cur:
+                self._triage_cursor = cur
+                self._triage_depth = 1
+                try:
+                    yield
+                finally:
+                    self._triage_depth = 0
+                    self._triage_cursor = None
+
+    def _triage_scope(self) -> tuple[str, tuple[Any, ...]]:
+        """Pin triage reads to this store's repository.
+
+        One table holds every repository here, so an unscoped read would hand
+        a caller another repository's suggestions — which name people.
         """
         clauses = []
         params: list[Any] = []

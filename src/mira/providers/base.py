@@ -25,9 +25,16 @@ from mira.models import (
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
+    PathAuthorship,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
+)
+from mira.triage.capabilities import (
+    NO_CAPABILITIES as NO_TRIAGE_CAPABILITIES,
+)
+from mira.triage.capabilities import (
+    TriageCapabilities,
 )
 
 
@@ -236,12 +243,18 @@ class BaseProvider(abc.ABC):
             for file in patch_set.files
         ]
 
-    async def get_codeowners(self, pr_info: PRInfo) -> tuple[str, str]:
-        """``(path, contents)`` of the repository CODEOWNERS at the head ref.
+    async def get_codeowners(self, pr_info: PRInfo, ref: str = "") -> tuple[str, str]:
+        """``(path, contents)`` of the repository CODEOWNERS, at ``ref``.
 
         ``("", "")`` when the repository has none. A provider that *cannot look*
         must raise rather than return this — the gate distinguishes "no owners
         are declared" from "we could not find out", and only the first is safe.
+
+        ``ref`` defaults to the head, which is what the merge gate wants:
+        ownership declared on the branch can only *add* owners, and an added
+        owner only ever stops an automatic approval. Reviewer suggestion passes
+        the base explicitly, because there the direction reverses — a branch
+        that could add itself an owner would be choosing who reviews it.
         """
         return "", ""
 
@@ -304,6 +317,38 @@ class BaseProvider(abc.ABC):
         as "the job printed nothing".
         """
         return []
+
+    # ── Phase 7C: triage and reviewer suggestion ──
+    #
+    # Two additions, both read-only. There is deliberately no method here that
+    # requests a review, adds an assignee or applies a reviewer label: this
+    # phase suggests, and suggestion and assignment are different acts.
+
+    def triage_capabilities(self) -> TriageCapabilities:
+        """What this provider can tell reviewer triage. Declared, not probed."""
+        return NO_TRIAGE_CAPABILITIES
+
+    async def get_path_authors(
+        self,
+        pr_info: PRInfo,
+        paths: list[str],
+        *,
+        ref: str = "",
+        max_per_path: int = 20,
+    ) -> dict[str, list[PathAuthorship]]:
+        """Recent commits per path, attributed to platform accounts.
+
+        Distinct from :meth:`get_file_history`, which returns the commit's own
+        author name — a string chosen by whoever made the commit, and therefore
+        not something to rank a person on. An entry the platform could not
+        resolve to an account carries an empty ``login`` and is dropped by the
+        caller rather than falling back to the commit's fields.
+
+        ``ref`` is the pull request's base. A provider must not substitute the
+        head: commits on the proposed branch are written by the person
+        proposing the change.
+        """
+        return {}
 
     async def publish_checks_status(
         self,
