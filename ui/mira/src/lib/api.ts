@@ -17,6 +17,7 @@ import { rulesApi } from "./api/rules"
 import { settingsApi } from "./api/settings"
 import { statsApi } from "./api/stats"
 import { systemApi } from "./api/system"
+import { triageApi } from "./api/triage"
 import { usersApi } from "./api/users"
 import { vulnerabilitiesApi } from "./api/vulnerabilities"
 import { webhooksApi } from "./api/webhooks"
@@ -41,4 +42,5 @@ export const api = {
   ...gateApi,
   ...autofixApi,
   ...checksApi,
+  ...triageApi,
 }

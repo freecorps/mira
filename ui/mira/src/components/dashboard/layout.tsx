@@ -17,6 +17,7 @@ import {
   Settings,
   ShieldAlert,
   Sun,
+  UserSearch,
   Users,
   Users2,
   Wrench,
@@ -96,6 +97,12 @@ const navItems = [
     label: "Pre-merge checks",
     adminOnly: true,
   },
+  {
+    to: "/triage",
+    icon: UserSearch,
+    label: "Reviewer triage",
+    adminOnly: true,
+  },
   { to: "/autofix", icon: Wrench, label: "Autofix", adminOnly: true },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
@@ -119,6 +126,7 @@ const PAGE_LABELS: Record<string, string> = {
   learnings: "Learnings",
   "merge-gate": "Merge gate",
   checks: "Pre-merge checks",
+  triage: "Reviewer triage",
   autofix: "Autofix",
   analytics: "Rule analytics",
   settings: "Settings",

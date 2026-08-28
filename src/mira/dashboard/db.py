@@ -1397,7 +1397,9 @@ class AppDatabase:
 
     # Section names the panels may write. A section becomes a JSON path in the
     # statement below, so the set is closed rather than taken from a request.
-    _OVERRIDE_SECTIONS = frozenset({"review", "filter", "learning", "gate", "autofix", "checks"})
+    _OVERRIDE_SECTIONS = frozenset(
+        {"review", "filter", "learning", "gate", "autofix", "checks", "triage"}
+    )
 
     def update_global_review_overrides_section(
         self, section: str, value: dict[str, Any] | None
