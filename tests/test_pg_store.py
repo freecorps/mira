@@ -694,3 +694,180 @@ def test_postgres_check_atomic_uses_a_dedicated_connection(store, monkeypatch):
     monkeypatch.setattr(pg_store.PgIndexStore, "_transaction_cursor", _record)
     store.record_check_run(_check_run())
     assert used == ["dedicated"]
+
+
+# ── Phase 7C triage ─────────────────────────────────────────────────────────
+#
+# The same parity questions the checks asked, about a table that names people:
+# does a run round-trip, does a retry converge on one row, is a read scoped to
+# one repository, and does a run become visible all at once or not at all.
+
+
+def _triage_run(pr_number=7, *, head_sha="head222", owner="acme", repo="widgets", identity="dana"):
+    from mira.triage.models import (
+        Classification,
+        Evidence,
+        Exclusion,
+        ReviewerCandidate,
+        SignalContribution,
+        SignalReport,
+        TriageInputs,
+        TriageRun,
+        run_key,
+    )
+
+    inputs = TriageInputs(
+        platform="github",
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        pr_url=f"https://github.com/{owner}/{repo}/pull/{pr_number}",
+        pr_author="kit",
+        base_sha="base111",
+        head_sha=head_sha,
+        ownership_ref="base111",
+        changed_paths=["src/app.py"],
+        changed_files=1,
+    )
+    return TriageRun(
+        run_key=run_key(
+            platform="github",
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            policy_version="triage-v1+abc",
+            inputs_digest=inputs.digest,
+        ),
+        policy_version="triage-v1+abc",
+        inputs=inputs,
+        classification=Classification(size="s", changed_files=1, changed_lines=4, kinds=["code"]),
+        candidates=[
+            ReviewerCandidate(
+                identity=identity,
+                score=3.0,
+                contributions=[
+                    SignalContribution(
+                        kind="codeowners",
+                        raw=1,
+                        weight=3.0,
+                        score=3.0,
+                        evidence=[Evidence(path="src/app.py", line=2, source="codeowners")],
+                    )
+                ],
+            )
+        ],
+        signals=[SignalReport(kind="codeowners", status="available", candidates=1)],
+        excluded=[Exclusion(identity="kit", reason="author")],
+        notes=["review load could not be read"],
+        created_at=time.time(),
+    )
+
+
+def test_postgres_triage_run_round_trips_with_its_evidence(store):
+    run = _triage_run()
+    stored, created = store.record_triage_run(run)
+    assert created is True
+    assert stored.status == "ok"
+    assert stored.suggested == ["dana"]
+    assert stored.candidates[0].contributions[0].evidence[0].line == 2
+    assert stored.notes == ["review load could not be read"]
+    assert stored.excluded[0].reason == "author"
+
+
+def test_postgres_triage_retry_is_idempotent(store):
+    store.record_triage_run(_triage_run())
+    stored, created = store.record_triage_run(_triage_run())
+    assert created is False
+    assert stored.attempts == 2
+    assert store.count_triage_runs({"pr_number": 7}) == 1
+
+
+def test_postgres_triage_rows_are_scoped_by_repository(fake_conn):
+    """One table holds every repository, and these rows name people."""
+    a = PgIndexStore("acme", "alpha", "postgresql://fake")
+    b = PgIndexStore("acme", "beta", "postgresql://fake")
+    a.record_triage_run(_triage_run(pr_number=1, repo="alpha"))
+    b.record_triage_run(_triage_run(pr_number=2, repo="beta", identity="sam"))
+
+    assert a.count_triage_runs({}) == 1
+    assert b.count_triage_runs({}) == 1
+    assert a.list_triage_runs({})[0].suggested == ["dana"]
+    assert a.summarize_triage_candidates({}) == [
+        {"identity": "dana", "kind": "user", "count": 1, "average_rank": 1.0, "average_score": 3.0}
+    ]
+    # The org-wide handle is the deliberate exception.
+    assert PgIndexStore("", "", "postgresql://fake").count_triage_runs({}) == 2
+
+
+def test_postgres_path_contributions_are_scoped_and_idempotent(fake_conn):
+    a = PgIndexStore("acme", "alpha", "postgresql://fake")
+    b = PgIndexStore("acme", "beta", "postgresql://fake")
+    row = {
+        "platform": "github",
+        "path": "src/app.py",
+        "identity": "dana",
+        "role": "authored",
+        "source": "commit",
+        "reference": "abc",
+        "event_at": 1.0,
+    }
+    assert a.record_path_contributions([row]) == 1
+    assert a.record_path_contributions([row]) == 0
+    assert len(a.path_contributions(["src/app.py"], since=0)) == 1
+    assert b.path_contributions(["src/app.py"], since=0) == []
+
+
+def test_postgres_and_sqlite_agree_on_a_triage_run(store, tmp_path, monkeypatch):
+    """Identical inputs must produce identical rows on both backends."""
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    run = _triage_run()
+    store.record_triage_run(run)
+    pg_row = store.get_triage_run(run.run_key).as_dict()
+
+    sqlite_store = IndexStore.open("acme", "widgets")
+    try:
+        sqlite_store.record_triage_run(_triage_run())
+        sqlite_row = sqlite_store.get_triage_run(run.run_key).as_dict()
+    finally:
+        sqlite_store.close()
+
+    for field in ("status", "degraded", "candidates", "signals", "excluded", "classification"):
+        assert pg_row[field] == sqlite_row[field]
+
+
+def test_postgres_triage_writes_commit_together(store):
+    """A run and its candidates become visible at once, or not at all.
+
+    A reader that found the run row without its candidates would be reading a
+    suggestion with somebody missing from it.
+    """
+    store.record_triage_run(_triage_run())
+    original = store._triage_exec
+    failing = True
+
+    def _fail_on_the_run_row(sql, params=()):
+        if failing and "INSERT INTO triage_runs" in sql:
+            raise RuntimeError("the connection went away")
+        return original(sql, params)
+
+    store._triage_exec = _fail_on_the_run_row  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        store.record_triage_run(_triage_run(identity="sam"))
+
+    failing = False
+    read = store.get_triage_run(_triage_run().run_key)
+    assert read.suggested == ["dana"]
+
+
+def test_postgres_triage_atomic_uses_a_dedicated_connection(store, monkeypatch):
+    used: list[str] = []
+    original = pg_store.PgIndexStore._transaction_cursor
+
+    def _record(self):
+        used.append("dedicated")
+        return original(self)
+
+    monkeypatch.setattr(pg_store.PgIndexStore, "_transaction_cursor", _record)
+    store.record_triage_run(_triage_run())
+    assert used == ["dedicated"]
