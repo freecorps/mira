@@ -87,7 +87,7 @@ with open("/tmp/mcp-session.jsonl", encoding="utf-8") as handle:
             message = json.loads(line)
             responses[message.get("id")] = message
 
-# A notification is not answered, so four responses for five messages.
+# Six messages went in; the notification is not answered, so five come back.
 assert set(responses) == {1, 2, 3, 4, 5}, sorted(responses)
 
 assert responses[1]["result"]["serverInfo"]["name"] == "mira"

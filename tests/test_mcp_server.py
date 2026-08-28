@@ -418,3 +418,109 @@ class TestTheCommandLine:
         assert result.exit_code == 0
         assert "mira_list_findings" in result.output
         assert "rows=3" in result.output
+
+
+class TestTheReadItselfIsBounded:
+    """The ceiling has to be on what is *read*, not on what was already read.
+
+    `for line in reader` pulls a whole newline-delimited record into memory
+    before any length check can run, so a client sending gigabytes without a
+    newline would exhaust the process before the guard it was supposed to be
+    held to ever executed.
+    """
+
+    def test_an_oversized_line_is_never_materialised(self) -> None:
+        class CountingReader(io.StringIO):
+            """A stream that fails if anybody asks it for an unbounded read."""
+
+            def readline(self, size: int = -1, /) -> str:  # type: ignore[override]
+                if size is None or size < 0:
+                    raise AssertionError("the message loop read without a bound")
+                return super().readline(size)
+
+        reader = CountingReader("x" * (protocol.MAX_MESSAGE_BYTES + 5_000) + "\n")
+        writer = io.StringIO()
+
+        server().serve(reader, writer)
+
+        assert json.loads(writer.getvalue())["error"]["code"] == protocol.INVALID_REQUEST
+
+    def test_the_message_after_an_oversized_one_still_parses(self) -> None:
+        # The tail of a refused frame must be drained, not left to be read as
+        # the beginning of the next message.
+        reader = io.StringIO(
+            "x" * (protocol.MAX_MESSAGE_BYTES + 10)
+            + '\n{"jsonrpc": "2.0", "id": 2, "method": "ping"}\n'
+        )
+        writer = io.StringIO()
+
+        server().serve(reader, writer)
+
+        responses = [json.loads(line) for line in writer.getvalue().splitlines()]
+        assert responses[0]["error"]["code"] == protocol.INVALID_REQUEST
+        assert responses[1]["result"] == {}
+
+    def test_a_stream_that_never_sends_a_newline_ends_rather_than_hangs(self) -> None:
+        reader = io.StringIO("y" * (protocol.MAX_MESSAGE_BYTES * 2))
+        writer = io.StringIO()
+
+        server().serve(reader, writer)
+
+        assert json.loads(writer.getvalue())["error"]["code"] == protocol.INVALID_REQUEST
+
+
+class TestFailuresDoNotDescribeTheDeployment:
+    def test_an_unexpected_failure_is_reported_without_its_detail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A database or filesystem error carries local paths, table names and
+        # query fragments. An agent that can provoke failures could otherwise
+        # read the shape of somebody's deployment out of them.
+        from mira.mcp import reads as reads_module
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("no such table: review_findings in /srv/mira/data/acme/widgets.db")
+
+        monkeypatch.setattr(reads_module, "list_findings", explode)
+        audit = SilentAudit()
+        populate(findings=[finding()])
+
+        response = call(
+            server("acme/widgets", audit=audit), "mira_list_findings", repository="acme/widgets"
+        )
+
+        body = text_of(response)
+        assert response["isError"] is True
+        assert "/srv/mira/data" not in body
+        assert "review_findings" not in body
+        assert "RuntimeError" not in body
+        # And it is not lost: the operator's copy keeps the whole thing.
+        assert "/srv/mira/data/acme/widgets.db" in audit.entries[-1]["detail"]
+
+    def test_a_refusal_the_client_can_act_on_still_says_why(self) -> None:
+        # The distinction being kept: "you asked for a repository you were not
+        # granted" is the client's business; "the query failed" is not.
+        response = call(server("acme/widgets"), "mira_list_findings", repository="other/thing")
+
+        assert "not granted" in text_of(response)
+
+
+class TestNestedArgumentsAreRedacted:
+    def test_a_credential_nested_in_arguments_never_reaches_the_database(self) -> None:
+        # `tools/call` takes an arbitrary object, and a call is audited before
+        # - and even without - a tool validating its shape. Redacting only the
+        # top level would store the secret verbatim.
+        database = AppDatabase("")
+        audit = AuditLog(enabled=True, db=database)
+        session = server("acme/widgets", audit=audit)
+
+        session.call_tool(
+            {
+                "name": "mira_unknown_tool",
+                "arguments": {"metadata": {"nested": ["ghp_abcdefghijklmnopqrstuvwxyz012345"]}},
+            }
+        )
+
+        stored = database.list_mcp_audit()[0]["arguments"]
+        assert "ghp_abcdefghijklmnopqrstuvwxyz012345" not in stored
+        assert "REDACTED" in stored

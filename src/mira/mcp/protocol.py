@@ -37,6 +37,11 @@ INTERNAL_ERROR = -32603
 #: The largest single message this server will parse. A pipe has no natural
 #: bound and a request is a few hundred bytes; anything past this is a mistake
 #: or an attempt to exhaust memory.
+#:
+#: Enforced by *how much is read*, not by measuring afterwards. `for line in
+#: reader` would have the whole thing in memory before any check could run, so
+#: a newline-free stream of any size would defeat the ceiling it was supposed
+#: to be held to.
 MAX_MESSAGE_BYTES = 1024 * 1024
 
 
@@ -105,17 +110,50 @@ def dispatch(
     return result_response(request_id, result)
 
 
+#: What `_read_line` returns instead of a message it refused to hold.
+_OVERSIZED = object()
+
+
+def _read_line(reader: TextIO) -> Any:
+    """One message, or `_OVERSIZED`, or None at end of stream.
+
+    Bounded on the way in. `readline(n)` stops after n characters whether or
+    not a newline arrived, so a client sending gigabytes without one is read a
+    megabyte at a time and never accumulated. The rest of an oversized frame is
+    read and dropped in the same bounded steps, so the message after it still
+    parses instead of being swallowed as the tail of a refused one.
+    """
+    chunk = reader.readline(MAX_MESSAGE_BYTES + 1)
+    if chunk == "":
+        return None
+    if len(chunk) <= MAX_MESSAGE_BYTES or chunk.endswith("\n"):
+        return chunk
+    while True:
+        more = reader.readline(MAX_MESSAGE_BYTES)
+        if more == "" or more.endswith("\n"):
+            return _OVERSIZED
+
+
 def serve(
     reader: TextIO,
     writer: TextIO,
     methods: dict[str, Callable[[dict[str, Any]], dict[str, Any]]],
 ) -> None:
     """Read newline-delimited JSON until the client closes the pipe."""
-    for line in reader:
-        text = line.strip()
+    while True:
+        line = _read_line(reader)
+        if line is None:
+            return
+        if line is _OVERSIZED:
+            _write(writer, error_response(None, INVALID_REQUEST, "Message too large."))
+            continue
+        text = str(line).strip()
         if not text:
             continue
         if len(text.encode("utf-8", errors="ignore")) > MAX_MESSAGE_BYTES:
+            # A megabyte of multi-byte characters is under the character bound
+            # above and over the byte one. Both are ceilings; this is the one
+            # the constant is named for.
             _write(writer, error_response(None, INVALID_REQUEST, "Message too large."))
             continue
         try:

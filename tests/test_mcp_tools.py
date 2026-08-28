@@ -10,6 +10,8 @@ whole install rather than one repository.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from mira.config import McpConfig
@@ -484,3 +486,220 @@ class TestOpeningTheIndex:
         monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
 
         assert reads.is_indexed(Repository("github", "acme", "widgets")) is True
+
+
+class TestTheConfiguredBackendIsTheOneRead:
+    """A backend that is configured and down is an error, not a quieter source.
+
+    `IndexStore.open` falls back to SQLite when Postgres is unreachable, which
+    is right for a server that should keep working. Here it would be wrong
+    twice: the fallback creates a per-repository file, so a read becomes a
+    write, and it then answers from whatever stale local index it found.
+    """
+
+    def test_a_postgres_outage_does_not_create_a_sqlite_index(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mira.index import pg_store
+        from mira.index.store import IndexStore
+
+        monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
+
+        def unreachable(*_args, **_kwargs):
+            raise ConnectionError("could not connect to server")
+
+        monkeypatch.setattr(pg_store.PgIndexStore, "__init__", unreachable)
+
+        response = call(server("acme/widgets"), "mira_list_findings", repository="acme/widgets")
+
+        assert response["isError"] is True
+        assert not os.path.exists(IndexStore.db_path_for("acme", "widgets"))
+
+    def test_a_postgres_outage_does_not_answer_from_a_stale_local_index(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The worse half: a local file left over from before the install moved
+        # to Postgres would otherwise be served as if it were current.
+        from mira.index import pg_store
+
+        populate(findings=[finding(title="stale local data")])
+        monkeypatch.setenv("DATABASE_URL", "postgresql://example/db")
+
+        def unreachable(*_args, **_kwargs):
+            raise ConnectionError("could not connect to server")
+
+        monkeypatch.setattr(pg_store.PgIndexStore, "__init__", unreachable)
+
+        response = call(server("acme/widgets"), "mira_list_findings", repository="acme/widgets")
+
+        assert response["isError"] is True
+        assert "stale local data" not in text_of(response)
+
+    def test_a_missing_sqlite_index_is_not_created_by_opening_it(self) -> None:
+        # No check before the open, so no window between them: the connection
+        # is made in a mode that raises rather than creating.
+        from mira.index.store import IndexStore
+        from mira.mcp import reads as reads_module
+        from mira.mcp.authz import Repository
+
+        repository = Repository("github", "acme", "widgets")
+        with pytest.raises(reads_module.NotIndexed), reads_module.open_index(repository):
+            pass  # pragma: no cover - the open is what raises
+
+        assert not os.path.exists(IndexStore.db_path_for("acme", "widgets"))
+
+
+class TestCursorsCannotBeForged:
+    def _five(self) -> None:
+        populate(
+            findings=[
+                finding(finding_id=f"f-{n}", created_at=1_700_000_000.0 + n) for n in range(5)
+            ]
+        )
+
+    def test_an_edited_offset_is_rejected(self) -> None:
+        # A cursor is base64, so a client can decode one, put any number in it
+        # and re-encode. The signature covers the offset, so the edit shows.
+        import base64
+        import json
+
+        self._five()
+        session = server("acme/widgets")
+        cursor = payload_of(
+            call(session, "mira_list_findings", repository="acme/widgets", limit=2)
+        )["next_cursor"]
+
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        envelope = json.loads(raw)
+        payload = json.loads(envelope["p"])
+        payload["o"] = 4
+        envelope["p"] = json.dumps(payload, separators=(",", ":"))
+        forged = (
+            base64.urlsafe_b64encode(json.dumps(envelope, separators=(",", ":")).encode())
+            .decode()
+            .rstrip("=")
+        )
+
+        response = call(
+            session, "mira_list_findings", repository="acme/widgets", limit=2, cursor=forged
+        )
+
+        assert response["isError"] is True
+        assert "not issued by this server" in text_of(response)
+
+    def test_a_cursor_past_the_offset_ceiling_is_rejected(self) -> None:
+        # An offset with no ceiling is a `LIMIT ... OFFSET` scan a client can
+        # make as expensive as it likes.
+        from mira.mcp.limits import MAX_OFFSET, encode_cursor
+
+        self._five()
+        query = {
+            "tool": "list_findings",
+            "repository": "github:acme/widgets",
+            "pr_number": 0,
+            "state": "",
+            "category": "",
+            "severity": "",
+            "path_prefix": "",
+        }
+        cursor = encode_cursor(query, MAX_OFFSET + 1)
+
+        response = call(
+            server("acme/widgets"), "mira_list_findings", repository="acme/widgets", cursor=cursor
+        )
+
+        assert response["isError"] is True
+        assert "does not page past" in text_of(response)
+
+
+class TestTheCeilingIsAlwaysHeld:
+    def test_a_file_with_too_many_neighbours_is_bounded(self) -> None:
+        # `mira_get_indexed_file` has no page to shrink, and shortening every
+        # entry of a list does not make the list shorter.
+        from mira.index.store import IndexStore, SymbolInfo
+
+        populate(files=[file_summary()])
+        store = IndexStore.open("acme", "widgets")
+        summary = file_summary(
+            imports=[f"src/dep{n}.py" for n in range(5_000)],
+        )
+        summary.symbols = [
+            SymbolInfo(name=f"symbol_{n}", kind="function", signature="()", description="x")
+            for n in range(5_000)
+        ]
+        store.upsert_summary(summary)
+        store.close()
+
+        payload = payload_of(
+            call(
+                server("acme/widgets"),
+                "mira_get_indexed_file",
+                repository="acme/widgets",
+                path="src/app.py",
+            )
+        )
+
+        assert len(payload["file"]["symbols"]) == 200
+        assert len(payload["file"]["imports"]) == 200
+        assert payload["file"]["omitted"]["symbols"] == 4_800
+
+    def test_a_response_that_still_will_not_fit_is_refused_rather_than_sent(self) -> None:
+        # The ceiling is a ceiling. Sending the oversized response anyway would
+        # make it something Mira aims at. Two hundred symbols is under the
+        # neighbour bound and still well over four kilobytes however short each
+        # name is cut, which is the case per-field truncation cannot answer.
+        from mira.index.store import IndexStore, SymbolInfo
+
+        populate(files=[file_summary()])
+        store = IndexStore.open("acme", "widgets")
+        summary = file_summary()
+        summary.symbols = [
+            SymbolInfo(name=f"symbol_{n}", kind="function", signature="()", description="x")
+            for n in range(200)
+        ]
+        store.upsert_summary(summary)
+        store.close()
+        session = server(
+            "acme/widgets",
+            config=McpConfig(enabled=True, max_text_chars=4_000, max_response_bytes=4_096),
+        )
+
+        response = call(
+            session,
+            "mira_get_indexed_file",
+            repository="acme/widgets",
+            path="src/app.py",
+        )
+
+        assert response["isError"] is True
+        assert "response ceiling" in text_of(response)
+        assert len(text_of(response).encode("utf-8")) <= 4_096
+
+
+class TestTruncationRespectsTheLimitItWasGiven:
+    def test_a_cut_field_is_no_longer_than_the_limit(self) -> None:
+        # Appending the mark on top of `limit` characters puts every truncated
+        # field over the ceiling it was cut to satisfy, and makes the
+        # response-size arithmetic that depends on this limit wrong the wrong
+        # way.
+        from mira.mcp.limits import TRUNCATION_MARK, truncate
+
+        cut = truncate("x" * 1_000, limit=100)
+
+        assert len(cut) == 100
+        assert cut.endswith(TRUNCATION_MARK)
+
+    def test_a_field_that_already_fits_is_untouched(self) -> None:
+        from mira.mcp.limits import truncate
+
+        assert truncate("short", limit=100) == "short"
+
+    def test_a_body_in_a_response_obeys_the_configured_field_ceiling(self) -> None:
+        populate(findings=[finding(body="z" * 10_000)])
+        session = server("acme/widgets", config=McpConfig(enabled=True, max_text_chars=500))
+
+        item = payload_of(call(session, "mira_list_findings", repository="acme/widgets"))["items"][
+            0
+        ]
+
+        assert len(item["body"]) == 500

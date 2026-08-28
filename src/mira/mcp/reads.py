@@ -10,18 +10,27 @@ exposing it is a decision made here, once, in the open. That is also where a
 field is *withheld* - the evaluation rows carry the pull request's author, and
 who wrote a pull request is not what a question about rule quality is asking.
 
-**A repository with no index is not an error.** Findings, rules, evaluations
-and file summaries all live in one per-repository store, so a repository that
-has never been indexed has no data of any kind. Opening the store would create
-it, which is a write, on a surface whose whole claim is that it does not write.
-So the store is opened only when it already exists, and otherwise the answer
-is an honest empty one that says the repository has not been indexed.
+**A repository with no index is not an error, and reading never makes one.**
+Findings, rules, evaluations and file summaries all live in one per-repository
+store, so a repository that has never been indexed has no data of any kind.
+Creating that store to discover it is empty would be a write, on a surface
+whose whole claim is that it does not write - so the SQLite store is opened in
+a mode that raises rather than creating, and the absence comes back as an
+honest empty answer.
+
+Which is also why this does not go through `IndexStore.open`. That helper falls
+back to SQLite when Postgres is unreachable, which is right for a server that
+should keep working and wrong here twice over: a transient outage would turn a
+read into a write, and would answer from whatever stale local file the fallback
+found. A backend that is configured and unavailable is an error, not a quieter
+source of data.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -29,16 +38,36 @@ from typing import Any
 from mira.index.store import IndexStore
 from mira.mcp.authz import Repository
 
+#: Ceiling on the neighbour lists a single indexed file comes back with. A
+#: generated module can import hundreds of things and be depended on by
+#: hundreds more, and `get_indexed_file` has no page to shrink if it does not
+#: bound them here.
+MAX_RELATED_ITEMS = 200
+
+
+class NotIndexed(Exception):
+    """This repository has no store to read. Not an error the client caused."""
+
+    def __init__(self, repository: Repository) -> None:
+        super().__init__(f"{repository.key} has not been indexed")
+        self.repository = repository
+
+
+def _postgres_url() -> str:
+    url = os.environ.get("DATABASE_URL", "")
+    return url if url.startswith(("postgresql://", "postgres://")) else ""
+
 
 def is_indexed(repository: Repository) -> bool:
     """Whether this repository has a store to read, without making one.
 
     On Postgres every repository shares one set of tables, so there is nothing
-    to create and nothing to check: the answer is yes, and an unindexed
-    repository simply has no rows.
+    per-repository to create and nothing to check: the answer is yes, and an
+    unindexed repository simply has no rows. A Postgres that is configured and
+    down does not make this false - it makes the read fail, which `open_index`
+    is where that happens.
     """
-    url = os.environ.get("DATABASE_URL", "")
-    if url.startswith("postgresql://") or url.startswith("postgres://"):
+    if _postgres_url():
         return True
     return os.path.isfile(
         IndexStore.db_path_for(repository.owner, repository.repo, repository.platform)
@@ -52,8 +81,36 @@ def open_index(repository: Repository) -> Iterator[Any]:
     One connection per call rather than one per session: an MCP client can hold
     a server open for a working day, and a long-lived handle on a SQLite file
     is a lock somebody else's indexing run has to wait behind.
+
+    Deliberately not `IndexStore.open`: this must never create a store and must
+    never silently answer from a different backend than the one configured.
+    Postgres is opened directly, so an outage raises here instead of falling
+    back; SQLite is opened in read-write-no-create mode, so a missing index
+    raises rather than being brought into existence. Neither is a check
+    followed by an open, so there is no window between the two.
     """
-    store = IndexStore.open(repository.owner, repository.repo, platform=repository.platform)
+    url = _postgres_url()
+    if url:
+        from mira.index.pg_store import PgIndexStore
+
+        key_owner = (
+            repository.owner
+            if repository.platform == "github"
+            else f"_{repository.platform}/{repository.owner}"
+        )
+        store: Any = PgIndexStore(key_owner, repository.repo, url)
+    else:
+        path = IndexStore.db_path_for(repository.owner, repository.repo, repository.platform)
+        try:
+            store = IndexStore(
+                path,
+                owner=repository.owner,
+                repo=repository.repo,
+                platform=repository.platform,
+                create=False,
+            )
+        except sqlite3.OperationalError as exc:
+            raise NotIndexed(repository) from exc
     try:
         yield store
     finally:
@@ -266,6 +323,21 @@ def list_indexed_files(
     ]
 
 
+def _bounded(items: list[Any], name: str, omitted: dict[str, int]) -> list[Any]:
+    """Cut a neighbour list to the ceiling, recording what was left out.
+
+    This tool returns one file and so has no page for the response ceiling to
+    shrink; without a bound here, a generated module with thousands of symbols
+    would be an unbounded payload that only per-field truncation could attack,
+    and shortening every name in a list of ten thousand does not make the list
+    shorter.
+    """
+    if len(items) <= MAX_RELATED_ITEMS:
+        return items
+    omitted[name] = len(items) - MAX_RELATED_ITEMS
+    return items[:MAX_RELATED_ITEMS]
+
+
 def get_indexed_file(repository: Repository, path: str) -> dict[str, Any] | None:
     """One file's indexed context: its summary, symbols and neighbours."""
     with open_index(repository) as store:
@@ -273,21 +345,29 @@ def get_indexed_file(repository: Repository, path: str) -> dict[str, Any] | None
         if summary is None:
             return None
         dependents = store.get_dependents(path)
+    omitted: dict[str, int] = {}
     return {
         "path": summary.path,
         "language": summary.language,
         "summary": summary.summary,
         "loc": summary.loc,
         "updated_at": summary.updated_at,
-        "symbols": [
-            {
-                "name": symbol.name,
-                "kind": symbol.kind,
-                "signature": symbol.signature,
-                "description": symbol.description,
-            }
-            for symbol in summary.symbols
-        ],
-        "imports": list(summary.imports),
-        "dependents": list(dependents),
+        "symbols": _bounded(
+            [
+                {
+                    "name": symbol.name,
+                    "kind": symbol.kind,
+                    "signature": symbol.signature,
+                    "description": symbol.description,
+                }
+                for symbol in summary.symbols
+            ],
+            "symbols",
+            omitted,
+        ),
+        "imports": _bounded(list(summary.imports), "imports", omitted),
+        "dependents": _bounded(list(dependents), "dependents", omitted),
+        # Present only when something was cut, and naming how much: a list that
+        # silently stops is a file that reads as having fewer neighbours.
+        "omitted": omitted,
     }

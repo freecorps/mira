@@ -38,6 +38,17 @@ REFUSED = "refused"
 FAILED = "failed"
 
 
+def _redact_deeply(value: Any) -> Any:
+    """Run the redaction filter over every string in a nested structure."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {str(key): _redact_deeply(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_deeply(item) for item in value]
+    return value
+
+
 def _open_app_db() -> Any:
     """The application database, or None if this install has none reachable.
 
@@ -93,13 +104,13 @@ class AuditLog:
     ) -> None:
         if not self.enabled:
             return
-        # Arguments are client-supplied text. They are the one part of a call
-        # Mira did not choose, so they get the same filter as anything else
-        # that is about to be written down or shown to somebody.
-        safe_arguments = {
-            key: redact(value) if isinstance(value, str) else value
-            for key, value in (arguments or {}).items()
-        }
+        # Arguments are client-supplied and arbitrary: `tools/call` takes any
+        # JSON object, and a call is audited before - and even without - a tool
+        # validating its shape. So the filter goes all the way down. Redacting
+        # only the top level would leave `{"metadata": {"token": "ghp_..."}}`
+        # in the database verbatim, which is a secret stored by the very
+        # feature that exists to keep track of secrets not leaving.
+        safe_arguments = _redact_deeply(arguments or {})
         logger.info(
             "mcp %s tool=%s repository=%s outcome=%s rows=%d ms=%.1f %s",
             self.session_id,

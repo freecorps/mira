@@ -117,12 +117,21 @@ because the limit is Mira's and the client has no way to learn it up front.
 `next_cursor` continues the *same* query. A cursor carries a fingerprint of the
 filters it came from, so replaying one against different filters is an error
 rather than a walk through a different result set from a meaningless position.
+It is also signed with a per-process key and bounded: an edited offset is
+refused, and so is one pointing past 100,000 rows, because an unbounded offset
+is a `LIMIT ... OFFSET` scan a client could make as expensive as it liked.
+Cursors do not survive a restart, which is the right lifetime for a server that
+lives as long as the conversation that launched it.
 
 A response that would exceed `mcp.max_response_bytes` (256 KiB) is reduced
 before it is sent: fewer rows first, which keeps every field whole and leaves
 the cursor pointing at the row after the last one actually returned; then
 shorter fields, for the tools that return one thing and have no page to shrink.
-Truncated text is marked `... [truncated]`.
+Truncated text is marked `... [truncated]`, within the field's limit rather than
+on top of it. `mira_get_indexed_file` also caps its symbol, import and dependent
+lists at 200 entries and says how many it left out — shortening every entry of a
+list does not make the list shorter. And if a response still will not fit, it is
+refused with a message that does: the ceiling is a ceiling, not a target.
 
 ---
 
@@ -174,11 +183,21 @@ Refusals are the rows that matter most: an agent repeatedly asking for a
 repository it was not granted is the shape of the only attack this surface has,
 and it is invisible unless refusals are written down.
 
+The trail is also where the *detail* of a failure goes. A client is told that a
+read failed and nothing else: a database or filesystem error carries local
+paths, table names and query fragments, and an agent that can provoke failures
+should not be able to read the shape of a deployment out of them. A refusal the
+client can act on — an ungranted repository, a bad argument, a stale cursor —
+still says exactly what was wrong.
+
 The trail records *which* tool was called, for which repository, with which
 arguments, and how many rows came back — never the rows themselves. Copying
 them would make the audit log a second, permanent, unredacted copy of
 everything the surface exists to hand out carefully. Arguments are redacted
-before they are stored; they are the one part of a call Mira did not choose.
+before they are stored, all the way down through nested objects and lists: a
+tool call takes an arbitrary JSON object and is audited before — and even
+without — a tool validating its shape, so `{"metadata": {"token": "..."}}` must
+not land in the database verbatim.
 
 A failed audit write degrades the trail rather than the read: a full disk must
 not turn into a server that stops answering. The stderr line is written first,
@@ -201,9 +220,16 @@ no existing table or column is altered.
 
 A repository that has never been indexed reads as `"indexed": false` with an
 empty list and a note saying so, rather than as a repository with no findings.
-Its store is *not* created by the read: connecting to a SQLite index creates the
-file, and a read-only surface that leaves a file behind is a claim failing
-quietly.
+Its store is *not* created by the read: connecting to a SQLite index normally
+creates the file, so these reads open it in a mode that raises instead — not a
+check followed by an open, so there is no window between the two.
+
+For the same reason these reads do not go through the store helper the rest of
+Mira uses. That helper falls back to SQLite when PostgreSQL is unreachable,
+which is right for a server that should keep working and wrong here twice over:
+the fallback would turn a read into a write, and would then answer from whatever
+stale local index it found. A backend that is configured and unavailable fails
+the read.
 
 ---
 
