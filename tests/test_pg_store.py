@@ -103,7 +103,7 @@ class _FakeConn:
 @pytest.fixture
 def fake_conn(monkeypatch):
     conn = _FakeConn()
-    monkeypatch.setattr(pg_store, "_get_conn", lambda url: conn)
+    monkeypatch.setattr(pg_store, "_get_conn", lambda url, **_kwargs: conn)
     monkeypatch.setattr(pg_store, "_new_pg_conn", lambda url: conn)
     return conn
 

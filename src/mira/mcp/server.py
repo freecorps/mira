@@ -150,6 +150,10 @@ class MiraMcpServer:
             try:
                 result, text = self._render(tool, arguments)
             except NotAuthorized as exc:
+                # The repository column stays empty: it names repositories this
+                # server actually reached, so filtering the trail by one never
+                # turns up a string a client made up. What was asked for is in
+                # the recorded arguments, which are redacted and bounded.
                 record["outcome"] = REFUSED
                 record["detail"] = str(exc)
                 return _error(str(exc))

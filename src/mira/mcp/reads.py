@@ -98,7 +98,7 @@ def open_index(repository: Repository) -> Iterator[Any]:
             if repository.platform == "github"
             else f"_{repository.platform}/{repository.owner}"
         )
-        store: Any = PgIndexStore(key_owner, repository.repo, url)
+        store: Any = PgIndexStore(key_owner, repository.repo, url, read_only=True)
     else:
         path = IndexStore.db_path_for(repository.owner, repository.repo, repository.platform)
         try:
@@ -110,6 +110,17 @@ def open_index(repository: Repository) -> Iterator[Any]:
                 create=False,
             )
         except sqlite3.OperationalError as exc:
+            # Only "there is no such file" means unindexed. A locked database,
+            # a permission error, a directory where the file should be, a
+            # corrupt header - those are backend failures, and reporting them
+            # as "this repository has nothing" would hide an outage behind an
+            # empty answer the caller reads as an answer.
+            #
+            # The existence test is after the failed open, not before it, so it
+            # still cannot create anything; the worst a race does here is
+            # report a failure where an absence would have done.
+            if os.path.exists(path):
+                raise
             raise NotIndexed(repository) from exc
     try:
         yield store
