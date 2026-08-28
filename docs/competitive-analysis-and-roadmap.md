@@ -559,14 +559,53 @@ padrão, kill switch global e nenhuma aprovação real habilitada por padrão.
 
 ### Fase 7 — expansão de superfície (posterior, por demanda)
 
-- CLI para review de diff local/staged/commit range usando o mesmo engine.
-- MCP server read-only para findings, regras e contexto indexado.
-- Triage e sugestão de reviewer com CODEOWNERS + histórico, sem atribuição automática inicialmente.
+- ✅ **7A** — CLI para review de diff local/staged/commit range usando o mesmo engine.
+- ✅ **7B** — MCP server read-only para findings, regras e contexto indexado.
+- ✅ **7C** — Triage e sugestão de reviewer com CODEOWNERS + histórico, sem atribuição automática.
 - Runtime validation em sandbox para findings de alta incerteza.
 - Ações pós-merge e geração de changelog/docs.
 - Suporte específico a stacks apenas se a base de usuários justificar.
 
 Esses itens têm valor, mas não devem atrasar o ciclo de aprendizado e o autofix.
+
+#### 7C — triage e sugestão de reviewer
+
+**Entregue.** Notas de implementação:
+
+- Sugerir e atribuir são atos diferentes, e só o primeiro acontece. Não existe
+  caminho de código que peça review, adicione assignee ou aplique label; nenhum
+  provider expõe método capaz disso, e um teste afirma as duas coisas. Nomes
+  são renderizados como texto, nunca como menção: uma sugestão que notifica
+  quatro pessoas a cada push é uma sugestão que será desligada.
+- CODEOWNERS é lido no commit **base**, nunca no head. É a propriedade de
+  segurança da fase: um branch que adiciona `src/auth/ @conta-que-eu-controlo`
+  e é ranqueado por essa linha escolheu o próprio revisor em um commit. O ref
+  usado fica registrado na run; base desconhecido significa *sem* sinal de
+  ownership, não fallback para o head. O gate continua lendo no head — lá a
+  direção se inverte e um owner declarado no branch só pode adicionar veto.
+- Só identidades que a plataforma resolveu entram no ranking. Nome e e-mail de
+  um commit são escritos por quem fez o commit; então o adapter devolve a
+  *conta* que o GitHub ou o Forgejo associou, e um commit não resolvido é
+  contado e descartado — nunca convertido em nome. O GitLab não expõe conta
+  nenhuma na API de commits, declara `can_attribute_commits: false`, e ali a
+  autoria vem dos merge requests que a própria Mira viu integrar.
+- "Ninguém óbvio" e "não deu para saber" são estados distintos, e o status é
+  derivado: zero candidatos com um sinal que não respondeu só pode ser
+  `unavailable`, exibido em nome da Mira. Uma run pode ser `ok` e degradada ao
+  mesmo tempo, e o comentário diz qual metade faltou.
+- Todo mundo que *não* foi sugerido fica registrado com o motivo — autor, bot,
+  opt-out, abaixo do piso, quarto colocado. "Você ficou em quarto" é resposta;
+  espaço em branco não é.
+- O ranking é aritmética pura: uma pessoa pontua uma vez por arquivo alterado
+  ao qual está ligada, com peso por sinal e decaimento linear por recência.
+  Quarenta commits no mesmo arquivo contam uma vez — contar todos ranquearia
+  quem mais faz rebase.
+- Histórico de path só é gravado onde triage está ligado, no merge e não no
+  review, com teto de arquivos, janela em dias e um marcador de fetch que
+  separa "perguntamos e ninguém tocou" de "nunca perguntamos".
+- Nenhum status publicado e nenhum gate lê triage: um merge nunca espera por um
+  ranking construído sobre inferência.
+- Detalhes em [docs/triage.md](triage.md).
 
 ## Backlog priorizado
 
@@ -596,6 +635,7 @@ Esses itens têm valor, mas não devem atrasar o ciclo de aprendizado e o autofi
 | DX-001 | CLI de review local | P2 | Engine estabilizado |
 | MCP-001 | MCP read-only | P2 | LR-003 |
 | SB-001 | Sandbox validation | P2 | FX-001 |
+| TR-001 | Triage e sugestão de reviewer | P2 ✅ | GT-002 |
 
 ## Métricas de sucesso
 

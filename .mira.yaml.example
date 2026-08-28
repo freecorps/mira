@@ -278,3 +278,77 @@ checks:
   #     tools:
   #       - name: "ruff"
   #         enabled: false
+
+# ── Reviewer triage (Phase 7C) ────────────────────────────────────────────────
+#
+# What a change is, and who is closest to it. Mira suggests; a human decides.
+# Nothing here assigns a reviewer, requests a review or mentions anybody, and
+# no status is published, so no merge can ever wait on a ranking.
+triage:
+  # Off by default. Turning it on starts two things: a suggestion comment on
+  # reviewed pull requests, and a record of who authored and reviewed which
+  # files — kept only for repositories where this is on.
+  enabled: false
+
+  # Stops every suggestion everywhere in one edit, independent of `enabled` and
+  # of every per-scope override. For an incident, not for a policy edit.
+  kill_switch: false
+
+  # Post the suggestion as a comment, updated in place, never on a draft.
+  # There is deliberately no status-publishing option.
+  comment: true
+
+  max_suggestions: 3
+
+  # Just under the weight of one authorship: one file you changed recently is
+  # enough to be suggested, the same file changed most of a window ago is not.
+  min_score: 0.75
+
+  # The two signals. CODEOWNERS is the repository *stating* who reviews a file
+  # and is read at the pull request's base commit, so a branch cannot add
+  # itself an owner. History is Mira *inferring* it from commits the platform
+  # attributed to an account and from reviews Mira watched.
+  codeowners: true
+  history: true
+
+  # How far back history counts, and how hard it may look. The caps are the
+  # Orange Pi's: a pull request touching 300 files must not become 300 API
+  # calls.
+  history_days: 180
+  history_max_paths: 12
+  history_max_per_path: 20
+  history_refresh_hours: 168
+
+  # Never suggested, whatever the signals say. The answer to "please stop
+  # suggesting me", matched with or without the `@` and case-insensitively.
+  exclude: []
+
+  # Skip identities that look like machines: anything ending in `[bot]`, plus
+  # the logins below for accounts whose names do not say so.
+  exclude_bots: true
+  bots: []
+
+  # Points off per pull request already waiting on somebody. A dampener, not a
+  # cap — the best reviewer is still the best reviewer when they are busy.
+  load_penalty: 0.25
+
+  # Whole-run budget. A suggestion that arrives after the human has already
+  # picked somebody is worth nothing.
+  budget_seconds: 30
+
+  # Declared ownership above observed history, on purpose: when the two
+  # disagree, the repository's own statement should win. A scope that
+  # overrides these sets all three.
+  weights:
+    codeowners: 3.0
+    reviewed: 1.5
+    authored: 1.0
+
+  # Three layers: this block, then the organisation, then the repository.
+  # `null` inherits, anything else overrides, and `[]` means "empty here".
+  # organizations:
+  #   acme:
+  #     max_suggestions: 2
+  # repositories:
+  #   acme/infra:
+  #     history: false        # CODEOWNERS only here

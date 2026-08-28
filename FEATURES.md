@@ -115,6 +115,24 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Idempotent runs: a redelivered webhook converges on one row, and a retry that succeeds replaces the error it recorded
 - Dashboard panel for runs, per-check history, coverage catalog, policy and a policy-change audit trail
 
+## Reviewer triage
+
+- Classifies a change from the diff alone — size bucket, directory areas, and whether it carries tests, docs, a migration, a lockfile or generated files
+- Ranks who is closest to the changed files from two signals: what CODEOWNERS declares, and who has authored or reviewed those files before
+- Suggests and never assigns: no code path requests a review, adds an assignee or applies a label, and no provider in the codebase offers a method that could
+- CODEOWNERS is read at the pull request's **base** commit, so a branch cannot add itself an owner and be ranked under it; the ref that was used is recorded on the run
+- Only identities the platform itself resolved a commit to are ranked — a commit's own author fields are written by whoever made the commit, so an unattributable commit is counted and dropped rather than turned into a name
+- "Nobody obvious" and "we could not tell" are separate states: a failed lookup is rendered in Mira's name and never as a statement that nobody is available
+- Every name carries its evidence — the CODEOWNERS file and line, the commit, the pull request somebody reviewed — and a name no signal can justify is dropped
+- Nobody is @-mentioned: a suggestion that pings four people is a suggestion that gets switched off
+- Everyone *not* suggested is recorded with the reason, including the author, machine accounts, anybody who opted out, and whoever ranked just below the cut
+- Load-aware: points come off for pull requests already waiting on somebody, as a dampener rather than a cap, and an unreadable load table is admitted rather than silently ignored
+- Publishes no status and is read by no gate — a merge can never wait on a ranking built out of inference
+- Path history is recorded only for repositories where triage is on, at merge rather than at review, and bounded: the hottest files, a window in days, one fetch per path per refresh interval
+- Off by default, three-layer policy inheritance, an opt-out list that matches however a name is written, and a kill switch that beats every override
+- Dashboard panel for runs, evidence, who gets suggested most, policy and a policy-change audit trail
+- See [docs/triage.md](docs/triage.md)
+
 ## Local review
 
 - `mira local review` reviews the working tree, the index (`--staged`) or a commit range (`--range main...HEAD`) without a pull request

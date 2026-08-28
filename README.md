@@ -240,6 +240,29 @@ live at `/checks` (admin only).
 
 → [Pre-merge check docs](docs/pre-merge-checks.md)
 
+**Reviewer triage** answers the other question a fresh pull request raises: who
+should look at this. Mira classifies the change from the diff alone — size,
+areas, whether it carries tests or a migration — and ranks who is closest to the
+files, from what the repository *declares* in CODEOWNERS and what Mira has
+*observed* about who writes and reviews them:
+
+```yaml
+triage:
+  enabled: true
+  max_suggestions: 3
+  exclude: [somebody-who-asked-not-to-be]
+```
+
+Every name carries the evidence that produced it: the CODEOWNERS line, the
+commit, the pull request somebody reviewed. **Nothing is assigned, requested or
+mentioned** — the suggestion is text a human reads, and asking a colleague to
+review stays something a person does. CODEOWNERS is read at the pull request's
+**base** commit, so a branch cannot add itself an owner and be ranked under it,
+and a lookup that fails is reported as Mira's failure rather than as "nobody is
+available". Runs, evidence and policy live at `/triage` (admin only).
+
+→ [Reviewer triage docs](docs/triage.md)
+
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 
 ## Development
