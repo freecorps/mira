@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pathlib
 import sqlite3
 import threading
 import time
@@ -844,7 +845,17 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
         owner: str = "",
         repo: str = "",
         platform: str = "github",
+        *,
+        create: bool = True,
     ) -> None:
+        """Open this repository's index, creating it unless told not to.
+
+        `create=False` is for callers that must not bring an index into
+        existence as a side effect of reading one - the read-only MCP server.
+        It is a mode on the connection rather than a check before it, so there
+        is no window between "does this exist" and "open it" in which the
+        answer can change: SQLite raises rather than creating the file.
+        """
         self._db_path = db_path
         self._owner = owner
         self._repo = repo
@@ -853,7 +864,11 @@ class IndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksSto
         # it is safe. The lock is per instance for the same reason: two
         # instances have two connections and SQLite serialises them itself.
         self._checks_lock = threading.RLock()
-        self._conn = sqlite3.connect(db_path)
+        self._conn = (
+            sqlite3.connect(db_path)
+            if create
+            else sqlite3.connect(f"file:{pathlib.Path(db_path).as_posix()}?mode=rw", uri=True)
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)

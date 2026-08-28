@@ -41,6 +41,23 @@ LATEST_PROTOCOL_VERSION = PROTOCOL_VERSIONS[0]
 
 SERVER_NAME = "mira"
 
+#: The shortest a free-text field is squeezed to before Mira gives up on
+#: fitting a response by shortening strings. Below this the fields stop being
+#: worth reading, and whatever is over the ceiling is not the strings.
+MIN_TEXT_CHARS = 200
+
+
+class TooLarge(Exception):
+    """A response that cannot be brought under the ceiling by any reduction."""
+
+    def __init__(self, tool: str) -> None:
+        super().__init__(
+            f"The answer to {tool} does not fit this server's response ceiling, "
+            "even reduced. Ask for a narrower slice of it - a path prefix, a "
+            "single pull request, or a smaller page."
+        )
+
+
 #: Sent to the client on initialize. A model reads this before it reads a tool
 #: description, so it is where the boundary belongs.
 INSTRUCTIONS = (
@@ -136,15 +153,24 @@ class MiraMcpServer:
                 record["outcome"] = REFUSED
                 record["detail"] = str(exc)
                 return _error(str(exc))
-            except (tools.InvalidArguments, InvalidCursor) as exc:
+            except (tools.InvalidArguments, InvalidCursor, TooLarge) as exc:
                 record["outcome"] = REFUSED
                 record["detail"] = str(exc)
                 return _error(str(exc))
             except Exception as exc:  # noqa: BLE001 - reported, not raised at the client
+                # The client is told that the read failed and nothing else. A
+                # database or filesystem error carries local paths, table
+                # names, connection strings and query fragments, and an agent
+                # that can provoke failures could otherwise read the shape of
+                # somebody's deployment out of them. The detail goes to the
+                # log and the audit trail, where the operator is.
                 logger.exception("MCP tool %s failed", name)
                 record["outcome"] = FAILED
                 record["detail"] = f"{type(exc).__name__}: {exc}"
-                return _error(f"This read failed: {type(exc).__name__}: {exc}")
+                return _error(
+                    "This read failed. The reason is in the server's log and "
+                    "audit trail; it is not reported here."
+                )
             record["outcome"] = OK
             record["repository"] = result.repository
             record["result_count"] = result.count
@@ -166,6 +192,13 @@ class MiraMcpServer:
 
         Then shorter fields, for the tools that return one thing and have no
         page to shrink. Truncation is marked, so a body that was cut says so.
+
+        And if neither is enough, a refusal. Shortening strings cannot bound a
+        payload whose size is in the *number* of them — a file with ten
+        thousand dependents stays over the ceiling however short each entry
+        gets — so the last step is to say so in a message that fits, rather
+        than to send the oversized response anyway and leave the ceiling as
+        something Mira aims at.
         """
         budget = self.config.max_response_bytes
         pageable = "limit" in tool.schema.get("properties", {})
@@ -175,16 +208,18 @@ class MiraMcpServer:
 
         while True:
             call_arguments = {**arguments, "limit": size} if pageable else arguments
-            result = tool.handler(self.context, call_arguments)
+            result = tool.run(self.context, call_arguments)
             text = self._frame(result.payload, self.config.max_text_chars)
             if framing.fits(text, max_response_bytes=budget) or not pageable or size <= 1:
                 break
             size = max(1, size // 2)
 
         chars = self.config.max_text_chars
-        while not framing.fits(text, max_response_bytes=budget) and chars > 200:
-            chars = max(200, chars // 2)
+        while not framing.fits(text, max_response_bytes=budget) and chars > MIN_TEXT_CHARS:
+            chars = max(MIN_TEXT_CHARS, chars // 2)
             text = self._frame(result.payload, chars)
+        if not framing.fits(text, max_response_bytes=budget):
+            raise TooLarge(tool.name)
         return result, text
 
     def _frame(self, payload: dict[str, Any], max_text_chars: int) -> str:

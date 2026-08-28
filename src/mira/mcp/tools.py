@@ -163,8 +163,6 @@ def list_findings(context: Context, arguments: dict[str, Any]) -> Result:
         "path_prefix": _text(arguments, "path_prefix"),
     }
     size, offset, query = _paging(context, arguments, query)
-    if not reads.is_indexed(repository):
-        return _unindexed(repository)
     rows = reads.list_findings(
         repository,
         pr_number=int(query["pr_number"]),
@@ -192,8 +190,6 @@ def get_finding(context: Context, arguments: dict[str, Any]) -> Result:
     _check_names(arguments, ("repository", "finding_id"))
     repository = _repository(context, arguments)
     finding_id = _text(arguments, "finding_id", required=True)
-    if not reads.is_indexed(repository):
-        return _unindexed(repository)
     finding = reads.get_finding(repository, finding_id)
     return Result(
         payload={
@@ -212,8 +208,6 @@ def list_rules(context: Context, arguments: dict[str, Any]) -> Result:
     repository = _repository(context, arguments)
     query: dict[str, Any] = {"tool": "list_rules", "repository": repository.key}
     size, offset, query = _paging(context, arguments, query)
-    if not reads.is_indexed(repository):
-        return _unindexed(repository)
     rows = reads.list_rules(repository, limit=size, offset=offset)
     items, cursor = _page(rows, query=query, size=size, offset=offset)
     return Result(
@@ -243,8 +237,6 @@ def list_evaluations(context: Context, arguments: dict[str, Any]) -> Result:
         "outcome": _text(arguments, "outcome"),
     }
     size, offset, query = _paging(context, arguments, query)
-    if not reads.is_indexed(repository):
-        return _unindexed(repository)
     rows = reads.list_evaluations(
         repository,
         rule_id=int(query["rule_id"]),
@@ -276,8 +268,6 @@ def list_indexed_files(context: Context, arguments: dict[str, Any]) -> Result:
         "path_prefix": _text(arguments, "path_prefix"),
     }
     size, offset, query = _paging(context, arguments, query)
-    if not reads.is_indexed(repository):
-        return _unindexed(repository)
     rows = reads.list_indexed_files(
         repository, path_prefix=str(query["path_prefix"]), limit=size, offset=offset
     )
@@ -298,8 +288,6 @@ def get_indexed_file(context: Context, arguments: dict[str, Any]) -> Result:
     _check_names(arguments, ("repository", "path"))
     repository = _repository(context, arguments)
     path = _text(arguments, "path", required=True)
-    if not reads.is_indexed(repository):
-        return _unindexed(repository)
     file = reads.get_indexed_file(repository, path)
     return Result(
         payload={
@@ -365,6 +353,19 @@ class Tool:
     #: Every field the descriptor advertises is here, so `tools/list` cannot
     #: drift from what a handler actually accepts.
     annotations: dict[str, Any] = field(default_factory=dict)
+
+    def run(self, context: Context, arguments: dict[str, Any]) -> Result:
+        """Run the tool, turning "there is nothing stored" into an answer.
+
+        A repository with no index raises out of `open_index` rather than being
+        checked for first, because a check followed by an open is a window in
+        which the answer can change. Handled here, once, so every tool reports
+        the absence the same way.
+        """
+        try:
+            return self.handler(context, arguments)
+        except reads.NotIndexed as exc:
+            return _unindexed(exc.repository)
 
     def descriptor(self) -> dict[str, Any]:
         return {
