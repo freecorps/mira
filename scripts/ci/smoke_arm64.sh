@@ -108,6 +108,19 @@ verify_checks() {
   docker run --rm     --platform linux/arm64     --volume "${data_dir}:/data"     --env MIRA_INDEX_DIR=/data/indexes     --entrypoint python     "$image"     -c 'from mira.checks.models import CheckResult, CheckRun, CheckRunInputs; from mira.index.store import IndexStore; store = IndexStore.open("phase-zero", "canary"); inputs = CheckRunInputs(owner="phase-zero", repo="canary", pr_number=1, head_sha="smoke"); run = CheckRun(run_key="smoke-run", policy_version="checks-v1+smoke", inputs=inputs, results=[CheckResult(check_id="native.tests", mode="warning", state="pass", result_key="smoke-result")]); store.record_check_run(run); store.record_check_run(run); assert store.count_check_runs({}) == 1, "a retried run must converge on one row"; assert store.latest_check_run(pr_number=1, head_sha="smoke").verdict == "pass"; store.close()'
 }
 
+# Phase 7C's triage tables, for the same reason as the check tables above:
+# the deployed image created this volume's database without them, so writing
+# and reading a run through the candidate proves the upgrade is `CREATE TABLE
+# IF NOT EXISTS` on connection rather than a migration step somebody has to
+# sequence. The idempotency of a path contribution is asserted here too — it
+# is a UNIQUE constraint doing the work, and a constraint that behaved
+# differently on this architecture would put whoever pushes most at the top of
+# every ranking.
+verify_triage() {
+  local image="$1"
+  docker run --rm     --platform linux/arm64     --volume "${data_dir}:/data"     --env MIRA_INDEX_DIR=/data/indexes     --entrypoint python     "$image"     -c 'from mira.index.store import IndexStore; from mira.triage.models import Evidence, ReviewerCandidate, SignalContribution, SignalReport, TriageInputs, TriageRun; store = IndexStore.open("phase-zero", "canary"); inputs = TriageInputs(owner="phase-zero", repo="canary", pr_number=1, head_sha="smoke"); run = TriageRun(run_key="smoke-triage", policy_version="triage-v1+smoke", inputs=inputs, candidates=[ReviewerCandidate(identity="dana", score=3.0, contributions=[SignalContribution(kind="codeowners", raw=1, weight=3.0, score=3.0, evidence=[Evidence(path="a.py", line=1, source="codeowners")])])], signals=[SignalReport(kind="codeowners", status="available", candidates=1)]); store.record_triage_run(run); store.record_triage_run(run); assert store.count_triage_runs({}) == 1, "a retried triage must converge on one row"; stored = store.latest_triage_run(pr_number=1, head_sha="smoke"); assert stored.suggested == ["dana"], stored.suggested; assert stored.status == "ok", stored.status; row = {"platform": "github", "path": "a.py", "identity": "dana", "role": "authored", "source": "commit", "reference": "abc", "event_at": 1.0}; assert store.record_path_contributions([row]) == 1; assert store.record_path_contributions([row]) == 0, "the same contribution must not be counted twice"; store.close()'
+}
+
 # Phase 7A's local review surface. Two halves, because they need different
 # things from the environment.
 #
@@ -214,6 +227,8 @@ start_server "$candidate_image" candidate
 verify_canary "$candidate_image"
 echo "Confirming the candidate creates and uses its check tables on ARM64"
 verify_checks "$candidate_image"
+echo "Confirming the candidate creates and uses its triage tables on ARM64"
+verify_triage "$candidate_image"
 echo "Confirming the local review surface on ARM64"
 verify_local_cli_without_git "$candidate_image"
 verify_local_cli_with_git "$candidate_image"
