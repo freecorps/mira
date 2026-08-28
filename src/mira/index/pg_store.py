@@ -633,15 +633,27 @@ CREATE INDEX IF NOT EXISTS idx_pg_learning_audit_created
 
 # Module-level shared connection — initialized lazily
 _pg_conn = None
+#: A second shared handle, pinned read-only and never given schema statements.
+#: Separate from `_pg_conn` rather than a mode on it, because one handle shared
+#: between the two would hand whichever caller arrived second the wrong thing:
+#: a read-only store would inherit a writable session and lose the guarantee,
+#: and a writing store would inherit a pinned one and fail its migrations.
+_pg_conn_read_only = None
 _schema_initialized = False
 _lock = threading.Lock()
 _learning_lock = threading.RLock()
 
 
-def _drop_pg_conn() -> None:
-    """Close and discard the module-level shared connection."""
-    global _pg_conn
+def _drop_pg_conn(*, read_only: bool = False) -> None:
+    """Close and discard one of the module-level shared connections."""
+    global _pg_conn, _pg_conn_read_only
     with _lock:
+        if read_only:
+            if _pg_conn_read_only is not None:
+                with suppress(Exception):
+                    _pg_conn_read_only.close()
+                _pg_conn_read_only = None
+            return
         if _pg_conn is not None:
             with suppress(Exception):
                 _pg_conn.close()
@@ -651,27 +663,33 @@ def _drop_pg_conn() -> None:
 def _get_conn(url: str, *, read_only: bool = False) -> Any:
     """Get the shared Postgres connection, initializing schema on first use.
 
-    `read_only=True` skips that initialisation and pins the session to
-    read-only transactions. Schema creation and the `ALTER TABLE ... ADD COLUMN
-    IF NOT EXISTS` migrations below are writes, so a caller whose whole
-    contract is that it does not write cannot be the one to run them - and the
-    pin means nothing on this connection can write even by mistake.
+    `read_only=True` returns a different connection: one pinned to read-only
+    transactions and never given the schema statements below. Schema creation
+    and the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migrations are writes, so
+    a caller whose whole contract is that it does not write cannot be the one
+    to run them, and the pin means nothing on that handle can write by mistake.
 
-    A connection somebody else opened is returned as it is. Pinning a handle
-    this caller did not create would break the caller that did.
+    Two handles rather than one, because a single shared one would give
+    whichever caller arrived second the wrong thing: a read-only store opening
+    after a writer would silently inherit a writable session and lose the
+    guarantee, and a writer opening after a read-only store would inherit a
+    pinned session and fail on its own migrations. Neither depends on anything
+    a caller can see, which is what makes sharing the wrong answer here.
     """
-    global _pg_conn, _schema_initialized
+    global _pg_conn, _pg_conn_read_only, _schema_initialized
     with _lock:
         from mira.db.postgres import connect
 
+        if read_only:
+            if _pg_conn_read_only is None:
+                conn = connect(url)
+                with conn.cursor() as cur:
+                    cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                conn.commit()
+                _pg_conn_read_only = conn
+            return _pg_conn_read_only
         if _pg_conn is None:
             _pg_conn = connect(url)
-            if read_only:
-                with _pg_conn.cursor() as cur:
-                    cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-                _pg_conn.commit()
-        if read_only:
-            return _pg_conn
         if not _schema_initialized:
             with _pg_conn.cursor() as cur:
                 cur.execute(_PG_SCHEMA)
@@ -990,8 +1008,12 @@ class PgIndexStore(_StoreSharedMixin, GateStoreMixin, AutofixStoreMixin, ChecksS
         return _get_conn(self._url, read_only=self._read_only)
 
     def _refresh_conn(self) -> Any:
-        """Drop the shared module connection and bind a fresh handle."""
-        _drop_pg_conn()
+        """Drop this store's shared connection and bind a fresh handle.
+
+        Its own, not the other mode's: a read-only store reconnecting must not
+        close the handle a writer is using, and the reverse.
+        """
+        _drop_pg_conn(read_only=self._read_only)
         return self._handle()
 
     @contextmanager
