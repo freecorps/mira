@@ -178,12 +178,16 @@ export function SettingsPage() {
     setSavingOverrides(true)
     setFieldErrors({})
     try {
-      const body: Record<string, Record<string, unknown>> = {}
-      if (Object.keys(overrides.filter).length > 0)
-        body.filter = overrides.filter
-      if (Object.keys(overrides.review).length > 0)
-        body.review = overrides.review
-      await api.saveGlobalSettings(body)
+      // Both sections, always — including empty ones. The endpoint writes
+      // what it is sent and leaves the sections it is not sent alone (the
+      // gate, checks, autofix and triage panels own those), so an omitted
+      // section is "not mine to touch" and an empty one is "remove it".
+      // Sending only the non-empty ones would make the last override in a
+      // section impossible to clear.
+      await api.saveGlobalSettings({
+        filter: overrides.filter,
+        review: overrides.review,
+      })
       setOverridesSaved(true)
       setTimeout(() => setOverridesSaved(false), 2000)
       const fresh = await api.getGlobalSettings()
