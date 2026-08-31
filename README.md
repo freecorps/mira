@@ -175,6 +175,29 @@ Rule analytics live at `/learnings/analytics` (admin only). Setting
 behave identically either way, since exposures are written only after the
 review has already been posted.
 
+Every review publishes a **`mira/review` check** on the head commit — pending
+while it works, then green, red or neutral — and **approves** pull requests it
+read clean:
+
+```yaml
+review:
+  verdict:
+    mode: "approve"             # off | approve | request_changes
+    approve_max_severity: "suggestion"
+    approve_min_confidence: 4   # the walkthrough's own 1–5 merge-readiness score
+  status:
+    fail_on: "blocker"          # never | blocker | above_ceiling
+```
+
+Two independent conditions gate an approval: nothing was found above the
+severity ceiling, and Mira rated its own read of the change at least 4/5. It
+never approves over a human who requested changes, its own pull request, or a
+diff it only partly read. `request_changes` stays opt-in — an approval adds a
+signal you can dismiss, a rejection takes the merge button away. Mira's own
+failures show as a *neutral* check naming the failure, never red.
+
+→ [Review status and approvals](docs/review-status.md)
+
 The **merge gate** is a separate, conservative approval decision — the review
 verdict says whether the code is good, the gate says whether Mira may put its
 name on merging it. It ships off. Turn it on in shadow first, which records the

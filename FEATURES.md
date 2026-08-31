@@ -15,6 +15,10 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Noise filtering: confidence thresholds, severity sorting, per-PR comment caps
 - Per-language file-type support
 - Confidence score auto-clamped to match findings (a blocker forces "Do not merge" regardless of the LLM's initial read)
+- A `mira/review` check run on the head commit: pending while the review runs, then green, red or neutral — so a slow review is visibly running instead of looking like a bot that never arrived
+- Mira's own failures are neutral on that check, never red: a status that goes red when the model times out is a status people learn to ignore
+- Approves clean pull requests by default, on two independent conditions — nothing above the severity ceiling, and a merge-readiness confidence of at least 4/5. Requesting changes stays opt-in, because it takes the merge button away
+- Never approves over a human who requested changes, its own pull request, or a review that only read part of the diff
 
 ## Codebase intelligence
 

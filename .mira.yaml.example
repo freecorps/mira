@@ -73,20 +73,43 @@ review:
   # Include a Mermaid sequence diagram in the walkthrough
   walkthrough_sequence_diagram: true
 
-  # Submit a real review event, not just comments. Off by default: an APPROVE
-  # from a GitHub App counts toward branch-protection approvals, and a
-  # REQUEST_CHANGES blocks the merge until a later review supersedes it.
+  # Submit a real review event, not just comments. Approving is the default;
+  # requesting changes is not. An APPROVE adds a signal a human can dismiss —
+  # note it counts toward branch-protection approvals — while a
+  # REQUEST_CHANGES holds the merge until a later review supersedes it.
   verdict:
-    #   off             — comment only (default)
-    #   approve         — approve clean PRs, stay silent on findings
+    #   off             — comment only
+    #   approve         — approve clean PRs, stay silent on findings (default)
     #   request_changes — also request changes on findings above the ceiling
-    mode: "off"
+    mode: "approve"
     # Highest severity tolerated in an approved PR: blocker | warning |
     # suggestion | nitpick. "suggestion" approves a PR whose only findings are
     # suggestions and nitpicks.
     approve_max_severity: "suggestion"
+    # The walkthrough's merge-readiness score, 1–5, has to be at least this to
+    # approve. It asks the question the severity ceiling cannot: not "did I
+    # find a problem?" but "did I understand this well enough for finding
+    # nothing to mean anything?". 0 turns the floor off; a review with no
+    # score (walkthrough disabled) is judged on severity alone.
+    approve_min_confidence: 4
     # Never approve when files were skipped for exceeding max_diff_size.
     require_all_files_reviewed: true
+
+  # The commit status / check run that says whether the review has finished.
+  # Published as `mira/review`: pending while Mira works, then a terminal
+  # state. The name is fixed, because Mira filters its own contexts out of the
+  # CI it reads back and a renameable one would eventually be read as a build.
+  status:
+    enabled: true
+    # Publish "in progress" as soon as the review starts.
+    pending: true
+    # What a finding does to the colour — and only a finding. Mira's own
+    # failures are always neutral, never red: red on a pull request reads as a
+    # statement about the change, and "the model timed out" is not one.
+    #   never          — always green once the review finished
+    #   blocker        — red when a blocker was posted (default)
+    #   above_ceiling  — red when anything above approve_max_severity was
+    fail_on: "blocker"
 
 # ── Merge gate (Phase 4) ──
 #
