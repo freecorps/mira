@@ -100,6 +100,15 @@ class LLMConfig(BaseModel):
     request_timeout: int = Field(default=120, ge=1)
     retry_min_wait: int = Field(default=2, ge=0)
     retry_max_wait: int = Field(default=30, ge=0)
+    # Extra attempts spent re-rolling a model that answered a tool call with
+    # unparsable arguments (or with prose instead of a call). Separate from
+    # `max_retries`, which covers transport/API failures: a broken tool call
+    # is the model's fault, and a fresh sample usually fixes it.
+    tool_call_retries: int = Field(default=2, ge=0)
+    # Last resort when tool calling keeps failing: ask the same model for the
+    # tool's arguments as plain JSON (response_format=json_object) instead of
+    # as a tool call. Set false to fail the call instead.
+    json_mode_fallback: bool = True
 
     @field_validator("base_url")
     @classmethod

@@ -13,10 +13,15 @@ from typing import ClassVar
 
 import httpx
 
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, ToolCallFormatError
 from mira.llm.base import (
     OpenAICompatibleProvider,
+    _as_json_object,
+    _pick_tool_call,
+    _preview,
     _strip_model_prefix,
+    _tool_arguments,
+    _tool_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,7 +69,7 @@ class LLMProvider(OpenAICompatibleProvider):
             data = resp.json()
 
         self._account_usage(data)
-        return data["choices"][0]["message"].get("content") or ""
+        return self._chat_message(data).get("content") or ""
 
     async def _call_llm_with_tools(
         self,
@@ -128,20 +133,26 @@ class LLMProvider(OpenAICompatibleProvider):
 
         self._account_usage(data)
 
-        message = data["choices"][0]["message"]
-        tool_calls = message.get("tool_calls")
+        message = self._chat_message(data)
+        call = _pick_tool_call(message.get("tool_calls"), tools)
+        if call is not None:
+            return _tool_arguments(call["function"].get("arguments"), tools)
 
-        if tool_calls and len(tool_calls) > 0:
-            return tool_calls[0]["function"]["arguments"]
-
-        # Fallback: if the model returned content instead of a tool call,
-        # return the content as-is (some models may not support tool calling)
+        # Some models answer with content instead of calling the tool. That is
+        # fine when the content is the JSON object we asked for; when it is
+        # prose we raise, so the caller re-rolls with a correction rather than
+        # sending unparsable text downstream.
         content = message.get("content") or ""
-        if content:
-            logger.warning("Model returned content instead of tool call, using content as fallback")
-            return content
+        as_json = _as_json_object(content) if content else None
+        if as_json is not None:
+            logger.warning("Model returned content instead of a tool call; parsed it as JSON")
+            return as_json
 
-        raise LLMError("no_tool_call")
+        raise ToolCallFormatError(
+            "bad_tool_arguments",
+            tool=_tool_name(tools),
+            preview=_preview(content) if content else "empty response",
+        )
 
     async def _call_llm_agentic(
         self,
@@ -177,4 +188,4 @@ class LLMProvider(OpenAICompatibleProvider):
             data = resp.json()
 
         self._account_usage(data)
-        return data["choices"][0]["message"]
+        return self._chat_message(data)

@@ -2408,3 +2408,57 @@ class TestAgenticToolsOnIndexedRepos:
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert engine._agentic_source_fetcher is None
+
+
+class TestChunkFailureIsolation:
+    """A chunk the LLM never gets through must not take the whole review down
+    with it — but a review where nothing was read must not look clean either."""
+
+    def _one_chunk_per_file(self, monkeypatch):
+        from mira.core import engine as engine_mod
+        from mira.models import ReviewChunk
+
+        monkeypatch.setattr(
+            engine_mod,
+            "chunk_files",
+            lambda files, *a, **kw: [ReviewChunk(files=[f]) for f in files],
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dead_chunk_leaves_the_rest_of_the_review_standing(
+        self,
+        mock_llm: LLMProvider,
+        sample_diff_text: str,
+        sample_llm_response_text: str,
+        monkeypatch,
+    ):
+        self._one_chunk_per_file(monkeypatch)
+        from mira.exceptions import LLMError
+
+        mock_llm.review = AsyncMock(
+            side_effect=[
+                LLMError("tool_call_failed", model="m", error="broken"),
+                sample_llm_response_text,
+            ]
+        )
+
+        result = await ReviewEngine(config=MiraConfig(), llm=mock_llm).review_diff(sample_diff_text)
+
+        assert mock_llm.review.await_count == 2
+        assert any(e.get("stage") == "chunk_failed" for e in result.audit)
+
+    @pytest.mark.asyncio
+    async def test_a_review_that_read_nothing_reports_failure(
+        self, mock_llm: LLMProvider, sample_diff_text: str, monkeypatch
+    ):
+        """Posting "no findings" for a review that never ran is worse than
+        reporting the error: it reads as an approval."""
+        self._one_chunk_per_file(monkeypatch)
+        from mira.exceptions import LLMError
+
+        mock_llm.review = AsyncMock(
+            side_effect=LLMError("tool_call_failed", model="m", error="broken")
+        )
+
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await ReviewEngine(config=MiraConfig(), llm=mock_llm).review_diff(sample_diff_text)

@@ -15,8 +15,15 @@ from typing import ClassVar
 import httpx
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
-from mira.llm.base import OpenAICompatibleProvider, _strip_model_prefix
+from mira.exceptions import LLMError, ToolCallFormatError
+from mira.llm.base import (
+    OpenAICompatibleProvider,
+    _as_json_object,
+    _preview,
+    _strip_model_prefix,
+    _tool_arguments,
+    _tool_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,19 +277,33 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         self._account_usage(data)
 
-        # Check for tool calls in the response
-        output = data.get("output", [])
-        for item in output:
-            if item.get("type") == "function_call":
-                return item.get("arguments") or "{}"
+        # Check for tool calls in the response. A model may emit more than one;
+        # the name match keeps us on the tool we actually asked for.
+        output = data.get("output")
+        calls = [
+            item
+            for item in (output if isinstance(output, list) else [])
+            if isinstance(item, dict) and item.get("type") == "function_call"
+        ]
+        wanted = _tool_name(tools)
+        call = next((c for c in calls if c.get("name") == wanted), calls[0] if calls else None)
+        if call is not None:
+            return _tool_arguments(call.get("arguments"), tools)
 
-        # Fallback: text content
+        # Fallback: text content, but only when it is the JSON object we asked
+        # for. Prose means the model missed the format, which the caller
+        # re-rolls with a correction.
         text = _output_text(data)
-        if text:
-            logger.warning("Model returned content instead of tool call, using content as fallback")
-            return text
+        as_json = _as_json_object(text) if text else None
+        if as_json is not None:
+            logger.warning("Model returned content instead of a tool call; parsed it as JSON")
+            return as_json
 
-        raise LLMError("no_tool_call")
+        raise ToolCallFormatError(
+            "bad_tool_arguments",
+            tool=wanted,
+            preview=_preview(text) if text else "empty response",
+        )
 
     async def _call_llm_agentic(
         self,

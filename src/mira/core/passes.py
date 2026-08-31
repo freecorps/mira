@@ -8,7 +8,6 @@ the heavyweight review model isn't paying for verification work.
 from __future__ import annotations
 
 import asyncio
-import json as _json
 import logging
 
 from mira.config import load_config
@@ -116,10 +115,8 @@ async def agentic_review_loop(
                 return fn.get("arguments") or ""
 
             raw_args = fn.get("arguments") or "{}"
-            try:
-                args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except Exception:
-                args = {}
+            parsed_args = raw_args if isinstance(raw_args, dict) else loads_lenient(raw_args)
+            args = parsed_args if isinstance(parsed_args, dict) else {}
 
             tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
             convo.append(

@@ -26,6 +26,13 @@ llm:
   # retry_min_wait: 2
   # retry_max_wait: 30
 
+  # Recovery from a model that botches the tool call itself (truncated JSON
+  # arguments, prose instead of a call). Separate from max_retries, which
+  # covers transport and API failures: extra attempts re-ask with a correction,
+  # and json_mode_fallback finally asks for plain JSON instead of a tool call.
+  # tool_call_retries: 2
+  # json_mode_fallback: true
+
 filter:
   # Minimum confidence threshold (0.0 - 1.0)
   confidence_threshold: 0.7
