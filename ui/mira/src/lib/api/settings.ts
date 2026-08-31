@@ -20,7 +20,11 @@ export const settingsApi = {
         recommended?: boolean
       }[]
       review_options: { value: string; label: string; recommended?: boolean }[]
-      security_options: { value: string; label: string; recommended?: boolean }[]
+      security_options: {
+        value: string
+        label: string
+        recommended?: boolean
+      }[]
       review_thinking_mode: string
       thinking_options: {
         value: string
@@ -59,16 +63,17 @@ export const settingsApi = {
       file_count: number
     }>("/api/indexing/estimate"),
 
+  // The override blob mirrors the config tree rather than flattening it, so a
+  // section's values are `unknown`: `review.verdict` is an object, not a scalar.
   getGlobalSettings: () =>
     fetchJson<{
       overrides: {
-        filter?: Record<string, number | boolean | string>
-        review?: Record<string, number | boolean | string>
+        filter?: Record<string, unknown>
+        review?: Record<string, unknown>
       }
       effective: Record<string, unknown>
     }>("/api/admin/settings"),
 
-  saveGlobalSettings: (
-    overrides: Record<string, Record<string, number | boolean | string>>
-  ) => putJson<{ ok: boolean }>("/api/admin/settings", { overrides }),
+  saveGlobalSettings: (overrides: Record<string, Record<string, unknown>>) =>
+    putJson<{ ok: boolean }>("/api/admin/settings", { overrides }),
 }

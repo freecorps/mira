@@ -24,6 +24,46 @@ import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import { useDocumentTitle } from "@/lib/hooks"
 
+// A settings key is a *path*: `verdict.mode` lives under a `verdict` object,
+// because the override blob mirrors the shape of the config tree rather than
+// flattening it. Reading and writing both have to walk it.
+function readPath(
+  source: Record<string, unknown> | undefined,
+  path: string
+): unknown {
+  let node: unknown = source
+  for (const part of path.split(".")) {
+    if (!node || typeof node !== "object") return undefined
+    node = (node as Record<string, unknown>)[part]
+  }
+  return node
+}
+
+// Writing `null` *removes* the key, and removes the parent it leaves empty:
+// an override of `{}` is not the same as no override — it is a stored object
+// that shadows nothing, forever, and there is no UI to notice it.
+function writePath(
+  source: Record<string, unknown>,
+  path: string,
+  value: number | boolean | string | null
+): Record<string, unknown> {
+  const [head, ...rest] = path.split(".")
+  const next = { ...source }
+  if (rest.length === 0) {
+    if (value === null || value === "") delete next[head]
+    else next[head] = value
+    return next
+  }
+  const child = writePath(
+    (next[head] as Record<string, unknown> | undefined) ?? {},
+    rest.join("."),
+    value
+  )
+  if (Object.keys(child).length === 0) delete next[head]
+  else next[head] = child
+  return next
+}
+
 export function SettingsPage() {
   useDocumentTitle("Settings")
   const { user: currentUser } = useAuth()
@@ -51,9 +91,11 @@ export function SettingsPage() {
     filter?: Record<string, number | boolean | string>
     review?: Record<string, number | boolean | string>
   } | null>(null)
+  // `unknown`, not a scalar union: a nested setting like `verdict.mode` is
+  // stored the way the config tree stores it, as an object under `verdict`.
   const [overrides, setOverrides] = useState<{
-    filter: Record<string, number | boolean | string>
-    review: Record<string, number | boolean | string>
+    filter: Record<string, unknown>
+    review: Record<string, unknown>
   }>({ filter: {}, review: {} })
   const [savingOverrides, setSavingOverrides] = useState(false)
   const [overridesSaved, setOverridesSaved] = useState(false)
@@ -93,8 +135,8 @@ export function SettingsPage() {
         }) ?? null
       )
       setOverrides({
-        filter: s.overrides.filter ?? {},
-        review: s.overrides.review ?? {},
+        filter: (s.overrides.filter ?? {}) as Record<string, unknown>,
+        review: (s.overrides.review ?? {}) as Record<string, unknown>,
       })
     })
   }, [currentUser])
@@ -126,19 +168,17 @@ export function SettingsPage() {
     key: string,
     value: number | boolean | string | null
   ) => {
-    setOverrides((prev) => {
-      const next = { ...prev[section] }
-      if (value === null || value === "") delete next[key]
-      else next[key] = value
-      return { ...prev, [section]: next }
-    })
+    setOverrides((prev) => ({
+      ...prev,
+      [section]: writePath(prev[section], key, value),
+    }))
   }
 
   const saveOverrides = async () => {
     setSavingOverrides(true)
     setFieldErrors({})
     try {
-      const body: Record<string, Record<string, number | boolean | string>> = {}
+      const body: Record<string, Record<string, unknown>> = {}
       if (Object.keys(overrides.filter).length > 0)
         body.filter = overrides.filter
       if (Object.keys(overrides.review).length > 0)
@@ -189,10 +229,11 @@ export function SettingsPage() {
     max?: number
   ) => {
     const fieldKey = `${section}.${key}`
-    const eff = (effective?.[section] as Record<string, unknown> | undefined)?.[
+    const eff = readPath(
+      effective?.[section] as Record<string, unknown> | undefined,
       key
-    ]
-    const override = overrides[section][key]
+    )
+    const override = readPath(overrides[section], key)
     const overridden = override !== undefined
     const committed = typeof override === "number" ? override : eff
     const draft = drafts[fieldKey]
@@ -274,10 +315,11 @@ export function SettingsPage() {
     label: string,
     description: string
   ) => {
-    const eff = (effective?.[section] as Record<string, unknown> | undefined)?.[
+    const eff = readPath(
+      effective?.[section] as Record<string, unknown> | undefined,
       key
-    ]
-    const override = overrides[section][key]
+    )
+    const override = readPath(overrides[section], key)
     const overridden = override !== undefined
     const checked = typeof override === "boolean" ? override : Boolean(eff)
     const error = fieldErrors[`${section}.${key}`]
@@ -315,6 +357,65 @@ export function SettingsPage() {
           </p>
         ) : (
           <p className="pl-6 text-xs text-muted-foreground">{description}</p>
+        )}
+      </div>
+    )
+  }
+
+  const choiceField = (
+    section: "filter" | "review",
+    key: string,
+    label: string,
+    description: string,
+    options: { value: string; label: string }[]
+  ) => {
+    const fieldKey = `${section}.${key}`
+    const eff = readPath(
+      effective?.[section] as Record<string, unknown> | undefined,
+      key
+    )
+    const override = readPath(overrides[section], key)
+    const overridden = override !== undefined
+    const value = typeof override === "string" ? override : String(eff ?? "")
+    const error = fieldErrors[fieldKey]
+    return (
+      <div className="space-y-1">
+        <div className="flex items-baseline gap-3">
+          <label className="text-sm font-medium" htmlFor={fieldKey}>
+            {label}
+          </label>
+          {overridden && (
+            <span className="text-[11px] font-semibold text-primary">
+              Overrides <code className="font-mono">mira.yaml</code>
+            </span>
+          )}
+        </div>
+        <Select
+          value={value}
+          onValueChange={(next) =>
+            // Choosing what the config already says clears the override rather
+            // than storing a copy of it — otherwise editing mira.yaml later
+            // would silently stop taking effect for this field.
+            setOverride(section, key, next === String(eff ?? "") ? null : next)
+          }
+        >
+          <SelectTrigger id={fieldKey} className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {options.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {error ? (
+          <p className="text-xs text-destructive">
+            {label} {error}
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">{description}</p>
         )}
       </div>
     )
@@ -542,6 +643,75 @@ export function SettingsPage() {
                   "1",
                   1,
                   20
+                )}
+              </div>
+            </div>
+
+            <div>
+              <h3 className="mb-3 text-sm font-semibold">
+                Approvals and the review check
+              </h3>
+              <div className="space-y-4">
+                {choiceField(
+                  "review",
+                  "verdict.mode",
+                  "Review verdict",
+                  "Approving adds a signal a human can dismiss; requesting changes takes the merge button away until somebody does. On GitHub an approval from Mira counts toward a branch-protection approval requirement.",
+                  [
+                    { value: "off", label: "Comment only" },
+                    { value: "approve", label: "Approve clean pull requests" },
+                    {
+                      value: "request_changes",
+                      label: "Approve, and request changes on findings",
+                    },
+                  ]
+                )}
+                {choiceField(
+                  "review",
+                  "verdict.approve_max_severity",
+                  "Highest severity still approved",
+                  "A pull request whose worst finding is above this is never approved.",
+                  [
+                    {
+                      value: "nitpick",
+                      label: "Nitpick — a completely clean pass",
+                    },
+                    { value: "suggestion", label: "Suggestion" },
+                    { value: "warning", label: "Warning" },
+                    { value: "blocker", label: "Blocker — approve anything" },
+                  ]
+                )}
+                {numField(
+                  "review",
+                  "verdict.approve_min_confidence",
+                  "Confidence floor for an approval",
+                  "The walkthrough's own merge-readiness score, 1–5. It asks what the severity ceiling cannot: not whether Mira found a problem, but whether it understood the change well enough for finding nothing to mean anything. 0 turns the floor off.",
+                  "1",
+                  0,
+                  5
+                )}
+                {boolField(
+                  "review",
+                  "status.enabled",
+                  "Publish the review check",
+                  "A `mira/review` check on the head commit: pending while the review runs, then what it found. Without it a slow review looks like a bot that never arrived."
+                )}
+                {choiceField(
+                  "review",
+                  "status.fail_on",
+                  "Turn the check red when",
+                  "Findings only. Mira's own failures — a timeout, a rate limit — are always neutral and say so: a check that goes red when the API has a bad afternoon is a check people learn to ignore.",
+                  [
+                    {
+                      value: "never",
+                      label: "Never — green once the review finished",
+                    },
+                    { value: "blocker", label: "A blocker was posted" },
+                    {
+                      value: "above_ceiling",
+                      label: "Anything above the approval ceiling was posted",
+                    },
+                  ]
                 )}
               </div>
             </div>
