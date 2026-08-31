@@ -239,7 +239,7 @@ class TestCompleteWithTools:
     @pytest.mark.asyncio
     async def test_forced_tool_choice(self, config: LLMConfig):
         provider = ResponsesProvider(config)
-        mock_data = _make_resp_tool("submit_review", "{}")
+        mock_data = _make_resp_tool("submit_review", '{"comments": []}')
         mock_resp = _mock_httpx_response(mock_data, 200)
         mock_client = _mock_client(mock_resp)
 

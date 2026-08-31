@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -798,3 +799,150 @@ class TestRetryPacing:
 
         assert len(delays) > 1
         assert all(2 <= d <= 4 for d in delays)
+
+
+class TestBotchedCallsThatWouldLookClean:
+    """Each of these used to end as a review that found nothing, which is the
+    one wrong answer nobody double-checks."""
+
+    _TOOL = {
+        "type": "function",
+        "function": {
+            "name": "submit_review",
+            "parameters": {"type": "object", "required": ["comments", "summary"]},
+        },
+    }
+
+    def _provider(self, **kw) -> LLMProvider:
+        base = {
+            "model": "test-model",
+            "max_retries": 2,
+            "retry_min_wait": 0,
+            "retry_max_wait": 0,
+            "tool_call_retries": 1,
+            "json_mode_fallback": False,
+        }
+        base.update(kw)
+        return LLMProvider(LLMConfig(**base))
+
+    def _client(self, responses):
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=responses)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    async def _call(self, provider, responses):
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client(responses)
+            try:
+                return await provider.complete_with_tools(
+                    [{"role": "user", "content": "review this"}], tools=[self._TOOL]
+                )
+            finally:
+                self.posts = cls.return_value.post.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_a_reply_cut_off_before_any_finding_is_not_an_empty_review(self):
+        """`{"comments":[` balances into `{"comments": []}` — a clean review
+        nobody performed. Only a salvage that recovered content is kept."""
+        provider = self._provider()
+        cut_off = _mock_httpx_response(_make_tool_response_json('{"comments":['))
+        good = _mock_httpx_response(
+            _make_tool_response_json('{"comments": [], "summary": "nothing found"}')
+        )
+
+        result = await self._call(provider, [cut_off, good])
+
+        assert json.loads(result)["summary"] == "nothing found"
+        assert len(self.posts) == 2
+
+    @pytest.mark.asyncio
+    async def test_an_unrepaired_empty_comment_list_is_a_real_answer(self):
+        """The model saying it found nothing must still cost only one call."""
+        provider = self._provider()
+        clean = _mock_httpx_response(
+            _make_tool_response_json('{"comments": [], "summary": "looks fine"}')
+        )
+
+        result = await self._call(provider, [clean])
+
+        assert result == '{"comments": [], "summary": "looks fine"}'
+        assert len(self.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_empty_object_is_not_an_answer(self):
+        provider = self._provider()
+        empty = _mock_httpx_response(_make_tool_response_json("{}"))
+
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await self._call(provider, [empty, empty])
+
+    @pytest.mark.asyncio
+    async def test_another_tools_arguments_are_not_taken_as_the_review(self):
+        """A call to a tool we didn't ask for is not a near-miss to fall back
+        on — its arguments would be filed as the review."""
+        provider = self._provider()
+        data = _make_tool_response_json('{"path": "a.py"}')
+        data["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = "read_file"
+        wrong_tool = _mock_httpx_response(data)
+
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await self._call(provider, [wrong_tool, wrong_tool])
+
+    @pytest.mark.asyncio
+    async def test_an_object_carrying_none_of_the_required_fields_is_rejected(self):
+        provider = self._provider()
+        off_topic = _mock_httpx_response(_make_tool_response_json('{"thoughts": "hmm"}'))
+
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await self._call(provider, [off_topic, off_topic])
+
+    @pytest.mark.asyncio
+    async def test_a_gateway_that_drops_the_call_name_is_still_understood(self):
+        """One unnamed call is a gateway omitting the field, not the model
+        answering something else."""
+        provider = self._provider()
+        data = _make_tool_response_json('{"comments": [], "summary": "ok"}')
+        del data["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+
+        result = await self._call(provider, [_mock_httpx_response(data)])
+
+        assert json.loads(result)["summary"] == "ok"
+
+
+class TestRetryAfterForms:
+    """RFC 9110 allows delay-seconds or an HTTP date; reading only the first
+    discards the server's answer and retries ahead of it."""
+
+    def _response(self, header: str):
+        resp = MagicMock()
+        resp.headers = {"retry-after": header}
+        return resp
+
+    def test_delay_seconds(self):
+        from mira.llm.base import _retry_after_seconds
+
+        assert _retry_after_seconds(self._response("12")) == 12.0
+
+    def test_an_http_date_is_read_as_the_delay_until_then(self):
+        from datetime import datetime, timedelta
+        from email.utils import format_datetime
+
+        from mira.llm.base import _retry_after_seconds
+
+        when = datetime.now(UTC) + timedelta(seconds=45)
+        delay = _retry_after_seconds(self._response(format_datetime(when, usegmt=True)))
+
+        assert delay is not None
+        assert 40 <= delay <= 46
+
+    def test_a_date_already_past_means_no_wait(self):
+        from mira.llm.base import _retry_after_seconds
+
+        assert _retry_after_seconds(self._response("Wed, 21 Oct 2015 07:28:00 GMT")) == 0.0
+
+    def test_nonsense_falls_back_to_the_backoff_curve(self):
+        from mira.llm.base import _retry_after_seconds
+
+        assert _retry_after_seconds(self._response("soon")) is None

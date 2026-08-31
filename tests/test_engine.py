@@ -2462,3 +2462,38 @@ class TestChunkFailureIsolation:
 
         with pytest.raises(LLMError, match="tool-call failed"):
             await ReviewEngine(config=MiraConfig(), llm=mock_llm).review_diff(sample_diff_text)
+
+
+class TestUnreadFilesAreNotReviewedFiles:
+    """Coverage is what the verdict consults before approving, so a file the
+    review never got to must not be counted as read."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_chunk_moves_its_files_to_skipped(
+        self,
+        mock_llm: LLMProvider,
+        sample_diff_text: str,
+        sample_llm_response_text: str,
+        monkeypatch,
+    ):
+        from mira.core import engine as engine_mod
+        from mira.exceptions import LLMError
+        from mira.models import ReviewChunk
+
+        monkeypatch.setattr(
+            engine_mod,
+            "chunk_files",
+            lambda files, *a, **kw: [ReviewChunk(files=[f]) for f in files],
+        )
+        mock_llm.review = AsyncMock(
+            side_effect=[
+                LLMError("tool_call_failed", model="m", error="broken"),
+                sample_llm_response_text,
+            ]
+        )
+
+        result = await ReviewEngine(config=MiraConfig(), llm=mock_llm).review_diff(sample_diff_text)
+
+        assert result.skipped_paths, "the unread file must be reported as skipped"
+        assert not set(result.skipped_paths) & set(result.reviewed_paths)
+        assert result.reviewed_files == len(result.reviewed_paths)

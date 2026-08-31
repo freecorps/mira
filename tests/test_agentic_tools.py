@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mira.core.passes import agentic_review_loop
@@ -185,3 +187,59 @@ class TestAgenticLoopFallback:
         )
 
         assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_a_call_with_unparsable_arguments_is_not_executed(self):
+        """Running the tool on invented arguments hands the model a failed
+        lookup, which it can only read as a fact about the repository."""
+        executed: list[tuple[str, dict]] = []
+
+        class _Executor:
+            call_log: list = []
+
+            async def execute(self, name, args):  # type: ignore[no-untyped-def]
+                executed.append((name, args))
+                return "file contents"
+
+        class _Provider:
+            def __init__(self) -> None:
+                self.hops = 0
+
+            async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+                self.hops += 1
+                if self.hops == 1:
+                    return {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"name": "read_file", "arguments": "path=a.py"},
+                            }
+                        ],
+                    }
+                self.last_messages = list(messages)  # the loop mutates this list
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "function": {
+                                "name": "submit_review",
+                                "arguments": '{"comments": [], "summary": "done"}',
+                            },
+                        }
+                    ],
+                }
+
+        provider = _Provider()
+        result = await agentic_review_loop(  # type: ignore[arg-type]
+            provider,
+            [{"role": "user", "content": "review"}],
+            _Executor(),
+        )
+
+        assert json.loads(result)["summary"] == "done"
+        assert executed == [], "the tool must not run on arguments we invented"
+        tool_reply = provider.last_messages[-1]
+        assert tool_reply["role"] == "tool"
+        assert "not valid JSON" in tool_reply["content"]

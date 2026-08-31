@@ -116,9 +116,25 @@ async def agentic_review_loop(
 
             raw_args = fn.get("arguments") or "{}"
             parsed_args = raw_args if isinstance(raw_args, dict) else loads_lenient(raw_args)
-            args = parsed_args if isinstance(parsed_args, dict) else {}
+            if not isinstance(parsed_args, dict):
+                # Running the tool on invented arguments hands the model a
+                # failed lookup, which it can only read as a fact about the
+                # repository. Say what actually went wrong and let it re-issue
+                # the call.
+                logger.warning("Agentic hop %d: unparsable arguments for %s", hop + 1, name)
+                convo.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or "",
+                        "content": (
+                            "[error: the arguments were not valid JSON, so this call did not "
+                            "run — re-issue it with one complete JSON object]"
+                        ),
+                    }
+                )
+                continue
 
-            tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
+            tool_result = await executor.execute(name, parsed_args)  # type: ignore[attr-defined]
             convo.append(
                 {
                     "role": "tool",
