@@ -241,6 +241,11 @@ async def run_pr_review(
         review_tracker.complete(repo_full, number)
     except Exception as exc:
         review_tracker.fail(repo_full, number, str(exc))
+        # The engine cannot report the failure that is unwinding it, so the
+        # caller that caught it settles the commit status. Without this the
+        # "Mira is reviewing" status published at the start stays pending on
+        # the commit forever, which is the one state that is worse than absent.
+        await engine.report_review_failure(exc)
         raise
 
     # The walkthrough comment already carries the "more accurate after indexing"
@@ -426,6 +431,7 @@ async def run_pr_command(
             review_tracker.complete(repo_full, number)
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
+            await engine.report_review_failure(exc)
             raise
     elif is_review:
         engine = ReviewEngine(
@@ -445,6 +451,7 @@ async def run_pr_command(
             review_tracker.complete(repo_full, number)
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
+            await engine.report_review_failure(exc)
             raise
     else:
         pr_info = await provider.get_pr_info(pr_url)

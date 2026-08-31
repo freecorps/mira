@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from mira.analysis.severity import classify_severity
 from mira.config import MiraConfig
 from mira.core.chunker import chunk_files
+from mira.core.commit_status import ReviewStatusReporter
 from mira.core.context import expand_context
 from mira.core.diff_parser import parse_diff
 from mira.core.ensemble import merge_ensemble_runs
@@ -469,6 +470,22 @@ class ReviewEngine:
         # Row id of the review this pass recorded, so the Phase 4 gate decision
         # can point back at the review it was decided from.
         self._review_event_id = 0
+        # The commit status announcing this review. Built here rather than per
+        # call so a caller that catches a failure can still report it — see
+        # `report_review_failure`.
+        self._status = ReviewStatusReporter(provider, config, dry_run=dry_run)
+        self._pr_info: PRInfo | None = None
+
+    async def report_review_failure(self, exc: BaseException) -> None:
+        """Turn a review that raised into a status saying so. Never raises.
+
+        Called by whoever caught the exception, because that is who knows the
+        review stopped: the engine cannot report a failure it is being unwound
+        by. Does nothing when the review had already published its result, when
+        it never got as far as a pull request, or when the status is off — in
+        each of those cases there is no pending status of Mira's left hanging.
+        """
+        await self._status.failed(self._pr_info, exc)
 
     async def _submit_verdict(self, pr_info: PRInfo, result: ReviewResult) -> None:
         """Submit an approve / request-changes review event, when opted in."""
@@ -641,6 +658,11 @@ class ReviewEngine:
 
         pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
+
+        # Say that the review is running before anything slow starts. Until the
+        # first comment lands there is nothing on the pull request to say Mira
+        # is here at all, and "no status" and "nothing to flag" look identical.
+        await self._status.start(pr_info)
 
         async def _resolve_threads() -> tuple[
             int, int, list[UnresolvedThread], list[ThreadDecision]
@@ -1041,6 +1063,12 @@ class ReviewEngine:
             await self._submit_verdict(pr_info, result)
         except Exception as exc:
             logger.warning("Verdict submission failed for %s: %s", pr_info.url, exc)
+
+        # Settle the status as soon as the review itself is out, and before the
+        # checks, the gate and triage run: those publish their own contexts and
+        # carry their own failures, and a review that finished should not read
+        # as still running while something downstream of it works.
+        await self._status.finish(pr_info, result)
 
         result.thread_decisions = thread_decisions
 

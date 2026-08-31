@@ -611,6 +611,79 @@ class GitHubProvider(BaseProvider):
             logger.warning("Failed to submit %s verdict on %s: %s", event, pr_info.url, e)
             return False
 
+    async def publish_review_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        state: str,
+        title: str,
+        summary: str = "",
+        target_url: str = "",
+    ) -> str:
+        """Publish the review's progress as a check run on the head commit.
+
+        Updated in place where the run can be found. The gate publishes once
+        and can rely on GitHub surfacing the newest run for a name, but this
+        one publishes twice per review — creating a second run every time
+        would leave a trail of stale "in progress" entries in the Checks tab
+        for anybody who scrolls. A failed lookup falls back to creating, since
+        a duplicated row is a much smaller problem than a lost status.
+
+        Requires `checks:write`. Without it this raises and the caller records
+        that the status never went out, rather than pretending it did.
+        """
+        gh_state = {
+            "pending": ("in_progress", None),
+            "success": ("completed", "success"),
+            "failure": ("completed", "failure"),
+            "neutral": ("completed", "neutral"),
+        }.get(state, ("completed", "neutral"))
+        run_status, conclusion = gh_state
+
+        @_retry_transient
+        def _publish() -> str:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            sha = pr_info.head_sha or gh_repo.get_pull(pr_info.number).head.sha
+            fields: dict[str, Any] = {
+                "status": run_status,
+                "output": {"title": title[:255], "summary": (summary or title)[:65535]},
+            }
+            if conclusion:
+                fields["conclusion"] = conclusion
+            if target_url:
+                fields["details_url"] = target_url
+
+            existing = None
+            try:
+                runs = list(gh_repo.get_commit(sha).get_check_runs(check_name=context))
+                # Newest first is not a documented ordering, and editing the
+                # wrong one would update a row nobody is looking at.
+                existing = max(
+                    runs, key=lambda run: getattr(run, "started_at", None) or 0, default=None
+                )
+            except Exception as exc:  # noqa: BLE001 - lookup is an optimisation
+                logger.debug("Could not look up the %s check run: %s", context, exc)
+
+            # A new review over a finished one gets a new row rather than
+            # reopening the old: a completed run keeps its conclusion, so
+            # reusing it would show the *previous* review's colour beside
+            # "in progress" until this one lands.
+            reopening = run_status == "in_progress" and (
+                str(getattr(existing, "status", "") or "") == "completed"
+            )
+            if existing is not None and not reopening:
+                existing.edit(**fields)
+                return str(getattr(existing, "id", "") or "")
+            run = gh_repo.create_check_run(name=context, head_sha=sha, **fields)
+            return str(getattr(run, "id", "") or "")
+
+        try:
+            return await asyncio.to_thread(_publish)
+        except Exception as e:
+            logger.warning("Could not publish the review status on %s: %s", pr_info.url, e)
+            raise ProviderError(f"Failed to publish review status: {e}") from e
+
     async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
         @_retry_transient
         def _states() -> dict[str, str]:

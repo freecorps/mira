@@ -153,9 +153,10 @@ def mira_status_contexts() -> frozenset[str]:
     solved it for its own context; a second published context needs the same
     exclusion or it reintroduces the loop.
     """
+    from mira.core.commit_status import STATUS_CONTEXT as REVIEW_STATUS_CONTEXT
     from mira.gate.models import STATUS_CONTEXT as GATE_STATUS_CONTEXT
 
-    return frozenset({STATUS_CONTEXT, GATE_STATUS_CONTEXT})
+    return frozenset({STATUS_CONTEXT, GATE_STATUS_CONTEXT, REVIEW_STATUS_CONTEXT})
 
 
 @dataclass(frozen=True)
