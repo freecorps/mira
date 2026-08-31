@@ -253,6 +253,27 @@ def test_the_policy_endpoint_shows_the_override_and_what_applies(
     assert response.effective["enabled"] is False
 
 
+def test_the_policy_endpoint_also_says_what_would_apply_without_the_override(
+    registry: _Registry,
+) -> None:
+    """The panel has to be able to hand a field back to inheritance.
+
+    Comparing an edit against the *resolved* policy compares each field to
+    itself, so nothing ever looks changed and a stored value can never be
+    removed. `inherited` is the same resolution with the database layer left
+    out, which is what a field returns to when its override is deleted.
+    """
+    triage_routes.set_triage_config(
+        triage_routes.TriageConfigUpdate(triage={"enabled": True, "max_suggestions": 9}),
+        _request(),
+    )
+    response = triage_routes.get_triage_config(_request())
+    assert response.config["max_suggestions"] == 9
+    assert response.effective["enabled"] is True
+    assert response.inherited["max_suggestions"] == 3
+    assert response.inherited["enabled"] is False
+
+
 def test_a_policy_edit_is_validated_before_it_is_stored(registry: _Registry) -> None:
     with pytest.raises(HTTPException) as exc:
         triage_routes.set_triage_config(

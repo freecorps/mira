@@ -69,44 +69,59 @@ function draftFrom(config: Record<string, unknown>): Draft {
 // The override blob is a *layer*, not a copy of the resolved policy. Writing
 // every field the form shows would freeze whatever `mira.yaml` currently says
 // into the database, and a later edit to that file would then stop taking
-// effect. So a field is written only when it differs from what was resolved
-// without it.
+// effect. So a field is written only when it differs from `inherited` — what
+// the server says would apply if this layer were removed — and is *deleted*
+// from the layer when it matches again, which is how a field is handed back to
+// inheritance. Deleting matters as much as writing: without it, setting a value
+// and then setting it back would leave the old override in place for good.
 //
-// `exclude` is the exception and is written whole: it is the opt-out list, an
-// admin edits it as one thing, and a per-entry diff would make "I removed that
-// person" indistinguishable from "I did not touch it" — in the direction that
-// keeps somebody opted out, which is the safe way to be wrong here.
-function payloadFrom(draft: Draft, resolved: Draft): Record<string, unknown> {
-  const payload: Record<string, unknown> = {}
-  const put = <K extends keyof Draft>(key: K) => {
-    if (draft[key] !== resolved[key]) payload[key] = draft[key]
+// `existing` carries the keys this form does not render — the bot list, the
+// history fetch caps, the budget, per-organisation and per-repository entries.
+// The endpoint replaces the whole `triage` section, so anything not sent is
+// deleted, and dropping them here would silently wipe them.
+//
+// `exclude` and `weights` are written whole rather than per-entry: an admin
+// edits each of them as one thing, and a per-entry diff would make "I removed
+// that person" indistinguishable from "I did not touch it".
+function payloadFrom(
+  draft: Draft,
+  inherited: Draft,
+  existing: Record<string, unknown>
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { ...existing }
+  const put = (key: string, value: unknown, matches: boolean) => {
+    if (matches) delete payload[key]
+    else payload[key] = value
   }
-  put("enabled")
-  put("kill_switch")
-  put("comment")
-  put("codeowners")
-  put("history")
-  put("exclude_bots")
+  for (const key of [
+    "enabled",
+    "kill_switch",
+    "comment",
+    "codeowners",
+    "history",
+    "exclude_bots",
+  ] as const) {
+    put(key, draft[key], draft[key] === inherited[key])
+  }
   for (const key of [
     "max_suggestions",
     "min_score",
     "history_days",
     "load_penalty",
   ] as const) {
-    if (Number(draft[key]) !== Number(resolved[key]))
-      payload[key] = Number(draft[key])
+    const value = Number(draft[key])
+    put(key, value, value === Number(inherited[key]))
   }
-  if (
-    draft.exclude.length ||
-    resolved.exclude.length ||
-    payload.exclude !== undefined
-  ) {
-    payload.exclude = draft.exclude
-  }
-  const weightsChanged = (["codeowners", "authored", "reviewed"] as const).some(
-    (key) => Number(draft.weights[key]) !== Number(resolved.weights[key])
+  const sameExclude =
+    draft.exclude.length === inherited.exclude.length &&
+    draft.exclude.every(
+      (identity, index) => identity === inherited.exclude[index]
+    )
+  put("exclude", draft.exclude, sameExclude)
+  const sameWeights = (["codeowners", "authored", "reviewed"] as const).every(
+    (key) => Number(draft.weights[key]) === Number(inherited.weights[key])
   )
-  if (weightsChanged) payload.weights = draft.weights
+  put("weights", draft.weights, sameWeights)
   return payload
 }
 
@@ -256,9 +271,11 @@ export function TriagePolicyPanel() {
 
 function PolicyForm({ config: data }: { config: TriageConfigResponse }) {
   const [draft, setDraft] = useState<Draft>(() => draftFrom(data.config))
-  // What the server resolved *before* this save. Anything left equal to it is
-  // not written, so an inherited `mira.yaml` value stays inherited.
-  const [resolved] = useState<Draft>(() => draftFrom(data.config))
+  // What would apply *without* the stored override — the file and the built-in
+  // defaults. Comparing against the resolved config instead would compare each
+  // field to itself, so nothing would ever look changed and no field could ever
+  // be handed back to inheritance.
+  const [inherited] = useState<Draft>(() => draftFrom(data.inherited))
   const [saving, setSaving] = useState(false)
   const [newExclusion, setNewExclusion] = useState("")
 
@@ -285,14 +302,7 @@ function PolicyForm({ config: data }: { config: TriageConfigResponse }) {
   const save = async () => {
     setSaving(true)
     try {
-      // The endpoint replaces the whole `triage` section, so keys this form
-      // does not render — the bot list, the history fetch caps, the budget,
-      // per-organisation and per-repository entries — are carried over from
-      // what was loaded, or saving would silently delete them.
-      await api.setTriageConfig({
-        ...data.overrides,
-        ...payloadFrom(draft, resolved),
-      })
+      await api.setTriageConfig(payloadFrom(draft, inherited, data.overrides))
       toast.success("Triage policy saved")
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "The policy was refused")
@@ -452,7 +462,8 @@ function PolicyForm({ config: data }: { config: TriageConfigResponse }) {
           <CardDescription>
             Never suggested, whatever the signals say. This is the answer to
             &quot;please stop suggesting me&quot;, and it is matched
-            case-insensitively with or without the <span className="font-mono">@</span>.
+            case-insensitively with or without the{" "}
+            <span className="font-mono">@</span>.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
