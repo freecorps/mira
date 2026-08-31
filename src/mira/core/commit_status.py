@@ -204,10 +204,29 @@ class ReviewStatusReporter:
             self._config.review.status.enabled and self._provider is not None and not self._dry_run
         )
 
-    async def _publish(self, pr_info: PRInfo, status: CommitStatus) -> None:
+    def reset(self) -> None:
+        """Forget the last review. Called when a new one starts.
+
+        An engine can review more than once — `review-rest`, a re-review, a
+        second pull request through the same object — and a reporter that
+        remembered being settled would ignore the next review's failure, or
+        report it against the pull request before it.
+        """
+        self.published = False
+        self.settled = False
+
+    async def _publish(self, pr_info: PRInfo, status: CommitStatus) -> bool:
+        """Publish one state. Returns whether the platform was left in it.
+
+        False means the call *failed*, so whatever was published before it —
+        a pending status, most importantly — is still what the commit shows.
+        A provider that declines (GitLab, which writes nothing on purpose)
+        returns True: it published no pending status either, so there is
+        nothing left hanging for a later state to correct.
+        """
         publish = getattr(self._provider, "publish_review_status", None)
         if not callable(publish):
-            return
+            return True
         try:
             reference = await publish(
                 pr_info,
@@ -218,12 +237,12 @@ class ReviewStatusReporter:
             )
         except Exception as exc:  # noqa: BLE001 - announcing is never fatal
             logger.warning("Could not publish the review status on %s: %s", pr_info.url, exc)
-            return
+            return False
         if not reference:
-            # The provider declined rather than failed — GitLab, deliberately.
             logger.debug("No review status published on %s: unsupported", pr_info.url)
-            return
+            return True
         self.published = True
+        return True
 
     async def start(self, pr_info: PRInfo) -> None:
         if not self.active or not self._config.review.status.pending:
@@ -233,8 +252,10 @@ class ReviewStatusReporter:
     async def finish(self, pr_info: PRInfo, result: ReviewResult) -> None:
         if not self.active:
             return
-        await self._publish(pr_info, finished_status(result, self._config))
-        self.settled = True
+        # Settled only if the platform took it. A terminal state that failed to
+        # publish leaves the pending one on the commit, and the next chance to
+        # replace it must not be skipped on the strength of an attempt.
+        self.settled = await self._publish(pr_info, finished_status(result, self._config))
 
     async def failed(self, pr_info: PRInfo | None, exc: BaseException) -> None:
         """Report a review that stopped early.
@@ -245,5 +266,4 @@ class ReviewStatusReporter:
         """
         if not self.active or self.settled or pr_info is None:
             return
-        await self._publish(pr_info, failed_status(exc))
-        self.settled = True
+        self.settled = await self._publish(pr_info, failed_status(exc))
