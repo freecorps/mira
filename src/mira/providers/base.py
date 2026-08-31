@@ -81,6 +81,32 @@ class BaseProvider(abc.ABC):
         """
         return False
 
+    async def publish_review_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        state: str,
+        title: str,
+        summary: str = "",
+        target_url: str = "",
+    ) -> str:
+        """Publish "Mira is reviewing" / "Mira finished" as a commit status.
+
+        ``state`` is one of ``pending``, ``success``, ``failure`` or
+        ``neutral``. Idempotent by ``context``: publishing again replaces the
+        previous entry rather than adding one, so the pending status becomes
+        the terminal one instead of sitting next to it forever.
+
+        Returns a provider reference, or ``""`` when the platform has nothing
+        safe to write here. ``""`` is the honest answer for a provider without
+        the capability, and the caller records it as "not published" rather
+        than as a failure — but a provider that *tried* and was refused must
+        raise, because a token missing `checks:write` is a fixable
+        misconfiguration and silence is how it stays unfixed.
+        """
+        return ""
+
     async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
         """Latest review state per reviewer login (e.g. ``{"alice": "CHANGES_REQUESTED"}``).
 

@@ -137,6 +137,9 @@ def mock_provider(sample_diff_text: str) -> AsyncMock:
     provider.find_bot_comment = AsyncMock(return_value=None)
     provider.update_comment = AsyncMock()
     provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+    # Verdicts are on by default, so the review path reads these on every pass.
+    provider.get_review_states = AsyncMock(return_value={})
+    provider.submit_verdict = AsyncMock(return_value=True)
     return provider
 
 
@@ -161,6 +164,41 @@ class TestReviewEngine:
         mock_provider.get_pr_diff.assert_called_once()
         # Should post review since there are comments
         mock_provider.post_review.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_review_announces_itself_before_and_after(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """The checks box is what people look at, and until the first comment
+        lands it says nothing — which reads the same as "not installed here"."""
+        mock_provider.publish_review_status = AsyncMock(return_value="1")
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        states = [
+            call.kwargs["state"] for call in mock_provider.publish_review_status.call_args_list
+        ]
+        assert states[0] == "pending"
+        assert states[-1] in {"success", "failure"}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_review_settles_the_status_it_opened(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """A "reviewing…" status that never resolves is worse than none: it is
+        the state a required check would wait on forever."""
+        mock_provider.publish_review_status = AsyncMock(return_value="1")
+        mock_provider.get_pr_diff.side_effect = RuntimeError("the diff never arrived")
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+
+        with pytest.raises(RuntimeError):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+        await engine.report_review_failure(RuntimeError("the diff never arrived"))
+
+        states = [
+            call.kwargs["state"] for call in mock_provider.publish_review_status.call_args_list
+        ]
+        assert states == ["pending", "neutral"]
 
     @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
@@ -900,6 +938,9 @@ class TestDryRun:
         provider.post_comment = AsyncMock()
         provider.update_comment = AsyncMock()
         provider.find_bot_comment = AsyncMock(return_value=None)
+        provider.get_review_states = AsyncMock(return_value={})
+        provider.submit_verdict = AsyncMock(return_value=True)
+        provider.publish_review_status = AsyncMock(return_value="1")
 
         llm = MagicMock(spec=LLMProvider)
         llm.count_tokens = MagicMock(return_value=100)
@@ -930,6 +971,10 @@ class TestDryRun:
         provider.post_review.assert_not_called()
         provider.post_comment.assert_not_called()
         provider.update_comment.assert_not_called()
+        # A verdict and a commit status are writes too: a dry run that
+        # approved the PR or turned its check green would be a dry run in name.
+        provider.submit_verdict.assert_not_called()
+        provider.publish_review_status.assert_not_called()
 
         # Result should still be populated
         assert result is not None

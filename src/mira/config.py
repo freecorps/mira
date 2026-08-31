@@ -226,6 +226,50 @@ class VerdictConfig(BaseModel):
         return v
 
 
+class ReviewStatusConfig(BaseModel):
+    """The commit status that says whether the review has finished.
+
+    A pull request already shows Mira's comments, but only once they exist. Up
+    to that point the box that people actually watch — the checks list — says
+    nothing at all, which is indistinguishable from "this bot is not running
+    here". So the review publishes its own status: pending while it works,
+    then a terminal state naming what it found.
+
+    ``fail_on`` decides what a *finding* does to that state, and only findings:
+
+      "never"         — always green once the review finished
+      "blocker"       — red when at least one blocker was posted
+      "above_ceiling" — red when anything above ``verdict.approve_max_severity``
+                        was posted
+
+    Mira's own failures are never red. A review that could not finish publishes
+    a neutral state naming the failure, because red on a pull request reads as
+    a statement about the change, and "the model timed out" is a statement
+    about Mira. That distinction is worth more than the alarm: a status that
+    goes red when the API rate-limits is a status people learn to ignore.
+
+    The status name itself is not configurable, for the same reason the gate's
+    and the check framework's are not: providers filter Mira's own contexts out
+    of the CI they read back, and a name that could be changed in the database
+    is a name that exclusion list cannot know. A renameable status is a status
+    that eventually reads its own red state as a failing build.
+    """
+
+    enabled: bool = True
+    # Publish "in progress" as soon as the review starts. Off leaves the status
+    # absent until there is something to say.
+    pending: bool = True
+    fail_on: str = "blocker"
+
+    @field_validator("fail_on")
+    @classmethod
+    def _valid_fail_on(cls, v: str) -> str:
+        allowed = {"never", "blocker", "above_ceiling"}
+        if v not in allowed:
+            raise ValueError(f"review.status.fail_on must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+
 class ReviewConfig(BaseModel):
     context_lines: int = Field(default=3, ge=0)
     # Total diff size cap. Above this, the diff is *not* truncated arbitrarily —
@@ -312,6 +356,9 @@ class ReviewConfig(BaseModel):
 
     # Submit an approve / request-changes review event alongside the comments.
     verdict: VerdictConfig = Field(default_factory=VerdictConfig)
+
+    # The commit status carrying "Mira is reviewing" and then what it found.
+    status: ReviewStatusConfig = Field(default_factory=ReviewStatusConfig)
 
     # Automatically resolve bot review threads that the LLM verifies as fixed
     # on each review pass. Disable to leave all bot comments open until a human

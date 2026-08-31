@@ -578,6 +578,53 @@ class ForgejoProvider(BaseProvider):
             return False
         return True
 
+    async def publish_review_status(
+        self,
+        pr_info: PRInfo,
+        *,
+        context: str,
+        state: str,
+        title: str,
+        summary: str = "",
+        target_url: str = "",
+    ) -> str:
+        """Publish the review's progress as a commit status on the head SHA.
+
+        Keyed by `context`, so the terminal status replaces the pending one
+        rather than sitting beside it. Forgejo carries an `error` state that
+        means "this never produced a verdict", which is exactly what a review
+        that could not finish is — so `neutral` maps there rather than to the
+        `success` the gate uses for its dry run. The two say different things:
+        the gate's neutral is a decision it deliberately withheld, this one is
+        a review that broke.
+        """
+        sha = pr_info.head_sha
+        if not sha:
+            return ""
+        forgejo_state = {
+            "pending": "pending",
+            "success": "success",
+            "failure": "failure",
+            "neutral": "error",
+        }.get(state, "error")
+        payload: dict[str, Any] = {
+            "state": forgejo_state,
+            "context": context,
+            "description": title[:255],
+        }
+        if target_url:
+            payload["target_url"] = target_url
+        try:
+            resp = await self._request(
+                "POST",
+                f"{self._repo(pr_info)}/statuses/{quote(sha, safe='')}",
+                json=payload,
+                ok=(200, 201),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"Failed to publish review status: {exc}") from exc
+        return str((resp.json() or {}).get("id", "") or "")
+
     async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
         """Latest review state per reviewer login."""
         try:

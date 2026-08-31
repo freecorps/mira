@@ -529,6 +529,15 @@ class GitLabProvider(BaseProvider):
     def gate_capabilities(self) -> GateCapabilities:
         return GITLAB_CAPABILITIES
 
+    # `publish_review_status` is deliberately not implemented here, for the
+    # same reason `publish_gate_status` is not: a GitLab commit status joins
+    # the head pipeline. A pending one would hold the merge request open on a
+    # pipeline Mira never finishes running, and a green one can *satisfy* a
+    # "pipelines must succeed" rule on a project with no other CI. The review
+    # already speaks through its comments and its approval; it does not need to
+    # forge a build result to do it. The base class returns "" and the caller
+    # records that nothing was published.
+
     async def submit_verdict(self, pr_info: PRInfo, event: str, body: str) -> bool:
         """Approve a merge request; report anything else as unsupported.
 
