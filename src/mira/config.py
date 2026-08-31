@@ -1002,6 +1002,8 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
 def load_config(
     config_path: Path | str | None = None,
     overrides: dict[str, Any] | None = None,
+    *,
+    use_db_overrides: bool = True,
 ) -> MiraConfig:
     """Load config, layering global defaults → per-repo `.mira.yaml` → overrides.
 
@@ -1015,20 +1017,28 @@ def load_config(
          the explicit `config_path` if passed).
       5. Caller-supplied `overrides` dict.
       6. `DATABASE_URL` / `MIRA_MODEL` env-var fallbacks.
+
+    ``use_db_overrides=False`` skips step 3 and answers a different question:
+    *what would apply if the dashboard override were removed*. A settings panel
+    needs that to be able to hand a field back to inheritance — comparing an
+    edit against a baseline that already contains the override makes returning
+    a key to its `mira.yaml` value indistinguishable from setting it, so the
+    override can never be cleared one field at a time.
     """
     data: dict[str, Any] = _deep_merge({}, _global_defaults)
 
     # Lazy import + broad except: this function runs in CLI / test contexts
     # that have no DB attached. A DB error must never block a review.
-    try:
-        from mira.dashboard.api import _app_db
+    if use_db_overrides:
+        try:
+            from mira.dashboard.api import _app_db
 
-        if _app_db is not None:
-            db_overrides = _app_db.get_global_review_overrides()
-            if db_overrides:
-                data = _deep_merge(data, db_overrides)
-    except Exception as _db_exc:  # noqa: BLE001
-        logger.debug("load_config: skipping DB overrides (%s)", _db_exc)
+            if _app_db is not None:
+                db_overrides = _app_db.get_global_review_overrides()
+                if db_overrides:
+                    data = _deep_merge(data, db_overrides)
+        except Exception as _db_exc:  # noqa: BLE001
+            logger.debug("load_config: skipping DB overrides (%s)", _db_exc)
 
     if config_path is not None:
         path = Path(config_path)

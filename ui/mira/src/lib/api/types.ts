@@ -1217,6 +1217,11 @@ export interface TriageConfigResponse {
   config: Record<string, unknown>
   overrides: Record<string, unknown>
   effective: Record<string, unknown>
+  // What would apply if the stored override were removed — the file and the
+  // built-in defaults, without the database layer folded in. The form needs it
+  // to tell "this value was typed here" from "this value was inherited", and so
+  // to be able to hand a field back to inheritance.
+  inherited: Record<string, unknown>
 }
 
 export interface TriageAuditPage {

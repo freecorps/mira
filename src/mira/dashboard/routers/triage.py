@@ -75,6 +75,12 @@ class TriageConfigResponse(BaseModel):
     config: dict
     overrides: dict
     effective: dict
+    # What would apply if the stored override were removed. The panel needs it
+    # as the baseline for "did the admin change this?": comparing against
+    # `config`, which already has the override folded in, makes handing a field
+    # back to its `mira.yaml` value indistinguishable from setting it, so an
+    # override could never be cleared one field at a time.
+    inherited: dict
 
 
 class TriageConfigUpdate(BaseModel):
@@ -271,6 +277,7 @@ def get_triage_config(request: Request, owner: str = "", repo: str = "") -> Tria
 
     stored = (_app_db.get_global_review_overrides() or {}).get(_SECTION, {}) if _app_db else {}
     config = load_config()
+    inherited = load_config(use_db_overrides=False)
     # `_public_owner`, because a non-GitHub repository reaches these routes
     # under the namespaced owner `IndexStore.open` uses (`_gitlab/acme`), while
     # `triage.organizations` and `triage.repositories` are keyed on the plain
@@ -281,6 +288,7 @@ def get_triage_config(request: Request, owner: str = "", repo: str = "") -> Tria
         config=config.triage.model_dump(),
         overrides=stored,
         effective=policy.as_dict(),
+        inherited=inherited.triage.model_dump(),
     )
 
 
