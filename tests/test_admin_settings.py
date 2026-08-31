@@ -265,6 +265,32 @@ class TestEndpointValidation:
         assert "filter" not in stored
         assert stored["review"] == {"walkthrough": False}
 
+    def test_a_section_is_written_without_rewriting_the_document(self, in_memory_db: AppDatabase):
+        """Two admins on two panels must not have to be serialised by luck.
+
+        Reading the blob, merging locally and writing the whole thing back
+        carries whatever the *other* panel had stored when this request
+        started — the same cross-panel loss, in a smaller window. Each section
+        goes in with one statement instead, which is what the DB layer exists
+        for and what every other policy panel already uses.
+        """
+        written: list[tuple[str, dict | None]] = []
+        original = in_memory_db.update_global_review_overrides_section
+
+        def _record(section, value):
+            written.append((section, value))
+            return original(section, value)
+
+        in_memory_db.update_global_review_overrides_section = _record  # type: ignore[method-assign]
+        in_memory_db.set_global_review_overrides = lambda _blob: pytest.fail(  # type: ignore[method-assign]
+            "the whole document was rewritten"
+        )
+        set_global_settings(
+            GlobalSettingsUpdate(overrides={"filter": {"max_comments": 8}, "review": {}}),
+            _admin_request(),
+        )
+        assert written == [("filter", {"max_comments": 8}), ("review", None)]
+
     def test_a_nested_override_round_trips(self, in_memory_db: AppDatabase):
         """`review.verdict.mode` is a field inside an object, not a flat key."""
         set_global_settings(

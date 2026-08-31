@@ -227,6 +227,14 @@ def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
     value replaces it, an empty one removes it, and an absent one is not the
     panel's business. Clearing everything is therefore posting every section
     empty rather than posting nothing.
+
+    Each section is written with one statement rather than by rewriting the
+    document, so two admins on two panels do not need to be serialised by luck:
+    a read-modify-write here would carry back whatever the *other* panel had
+    stored when this request started, which is the same data loss in a smaller
+    window. Validation still runs against the document this request believes it
+    is producing — that is a check on the values, and the values are this
+    request's own.
     """
     user = getattr(request.state, "user", None)
     if not user or not user.is_admin:
@@ -276,7 +284,8 @@ def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
             status_code=400, detail={"message": f"Invalid overrides: {exc}"}
         ) from exc
 
-    _api._app_db.set_global_review_overrides(overrides)
+    for section, value in body.overrides.items():
+        _api._app_db.update_global_review_overrides_section(section, value or None)
     return {"ok": True}
 
 
