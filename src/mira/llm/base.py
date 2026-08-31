@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import random
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import httpx
@@ -134,16 +136,32 @@ def _retriable(exception: BaseException) -> bool:
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
-    """Parse a Retry-After header expressed in seconds, if the server sent one."""
+    """Seconds to wait per a Retry-After header, in either form the RFC allows.
+
+    Delay-seconds is the common one, but an HTTP date is equally valid and
+    reading it as a number silently discards the server's answer — we would
+    then retry on the backoff curve, ahead of the time it asked for.
+    """
     try:
         raw = resp.headers.get("retry-after")
     except Exception:
         return None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    header = raw.strip()
     try:
-        value = float(str(raw).strip())
+        return max(0.0, float(header))
+    except ValueError:
+        pass
+    try:
+        deadline = parsedate_to_datetime(header)
     except (TypeError, ValueError):
         return None
-    return value if value >= 0 else None
+    if deadline is None:
+        return None
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)
+    return max(0.0, (deadline - datetime.now(UTC)).total_seconds())
 
 
 def _make_wait(config: LLMConfig) -> Any:
@@ -206,6 +224,11 @@ def _preview(value: object, limit: int = 200) -> str:
     return text[:limit] + "..." if len(text) > limit else text
 
 
+def _carries_content(obj: dict) -> bool:
+    """True when at least one field holds something the model actually said."""
+    return any(value not in (None, "", [], {}) for value in obj.values())
+
+
 def _as_json_object(raw: object) -> str | None:
     """Normalize a model payload to a JSON-object string, or None if it isn't one.
 
@@ -213,19 +236,50 @@ def _as_json_object(raw: object) -> str | None:
     JSON string, a fenced one, or a truncated / XML-polluted one that
     ``loads_lenient`` can repair. The repaired object is re-serialized, so
     everything downstream sees valid JSON.
+
+    Two things are refused rather than passed on, because both would surface as
+    a review that found nothing rather than as a review that failed: an empty
+    object, and a repair that balanced its way to no content. A reply cut off
+    at ``{"comments":[`` closes into ``{"comments": []}``, which is
+    indistinguishable from a clean review nobody performed. A repair that
+    salvaged real findings before the cut is still kept — that is the case the
+    repair pass exists for. The distinction is deliberate: an *unrepaired*
+    ``{"comments": []}`` is the model saying it found nothing, and is accepted.
     """
     if isinstance(raw, dict):
-        return json.dumps(raw)
+        return json.dumps(raw) if raw else None
     if not isinstance(raw, str) or not raw.strip():
         return None
     text = raw.strip()
     try:
-        if isinstance(json.loads(text, strict=False), dict):
-            return text  # already clean — hand it on verbatim
+        parsed = json.loads(text, strict=False)
     except (json.JSONDecodeError, TypeError):
-        pass
-    parsed = loads_lenient(strip_code_fences(strip_think_blocks(text)))
-    return json.dumps(parsed) if isinstance(parsed, dict) else None
+        repaired = loads_lenient(strip_code_fences(strip_think_blocks(text)))
+        if not isinstance(repaired, dict) or not _carries_content(repaired):
+            return None
+        return json.dumps(repaired)
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    return text  # already clean — hand it on verbatim
+
+
+def _answers_the_tool(payload: str, tools: list[dict]) -> bool:
+    """True when the object plausibly answers the tool we asked for.
+
+    Not schema validation — it is one question the JSON itself cannot answer:
+    whether this object belongs to *this* tool. An object carrying none of the
+    fields the schema declares required is either another tool's arguments or
+    the model changing the subject, and accepting it turns both into a review
+    that found nothing.
+    """
+    try:
+        required = tools[0]["function"]["parameters"]["required"]
+    except (KeyError, IndexError, TypeError):
+        return True
+    if not isinstance(required, list) or not required:
+        return True
+    data = json.loads(payload)
+    return any(key in data for key in required)
 
 
 def _tool_arguments(raw: object, tools: list[dict]) -> str:
@@ -236,7 +290,7 @@ def _tool_arguments(raw: object, tools: list[dict]) -> str:
     which would silently drop the whole chunk.
     """
     normalized = _as_json_object(raw)
-    if normalized is None:
+    if normalized is None or not _answers_the_tool(normalized, tools):
         raise ToolCallFormatError(
             "bad_tool_arguments", tool=_tool_name(tools), preview=_preview(raw)
         )
@@ -244,10 +298,14 @@ def _tool_arguments(raw: object, tools: list[dict]) -> str:
 
 
 def _pick_tool_call(tool_calls: object, tools: list[dict]) -> dict | None:
-    """Pick the call to the tool we asked for, else the first well-formed one.
+    """Pick the call to the tool we asked for.
 
     Models sometimes emit several calls, or repeat the call alongside a stray
-    extra entry; matching on the name keeps us on the one we asked for.
+    extra entry, so the name decides. A call to a *different* tool is not a
+    near-miss to fall back on — its arguments would be accepted as the review —
+    so it counts as no call at all and the caller re-rolls. The one exception is
+    a single unnamed call, which is a gateway dropping the field rather than the
+    model answering something else.
     """
     if not isinstance(tool_calls, list):
         return None
@@ -258,7 +316,9 @@ def _pick_tool_call(tool_calls: object, tools: list[dict]) -> dict | None:
     for call in candidates:
         if call["function"].get("name") == wanted:
             return call
-    return candidates[0] if candidates else None
+    if len(candidates) == 1 and not candidates[0]["function"].get("name"):
+        return candidates[0]
+    return None
 
 
 # ── Shared base for OpenAI-compatible providers ─────────────────────

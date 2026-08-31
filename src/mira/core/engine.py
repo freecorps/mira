@@ -1698,10 +1698,11 @@ class ReviewEngine:
         audit: list[dict] = []
 
         # Chunks that never produced a review, with the error that stopped
-        # them. One dead chunk costs its files; all of them dead means the
-        # review didn't happen and must be reported as a failure, not as a
-        # clean "no findings".
+        # them, and the files that went unread with them. One dead chunk costs
+        # its files; all of them dead means the review didn't happen and must be
+        # reported as a failure, not as a clean "no findings".
         chunk_failures: list[Exception] = []
+        unread_paths: set[str] = set()
 
         async def _review_chunk(
             idx: int,
@@ -1820,6 +1821,7 @@ class ReviewEngine:
                         exc,
                     )
                     chunk_failures.append(exc)
+                    unread_paths.update(f.path for f in chunk.files)
                     return [], [], ""
                 except Exception as exc:
                     # An LLM that stays broken through every retry, re-roll and
@@ -1834,6 +1836,7 @@ class ReviewEngine:
                     )
                     audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
                     chunk_failures.append(exc)
+                    unread_paths.update(f.path for f in chunk.files)
                     return [], [], ""
 
         review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
@@ -1907,10 +1910,16 @@ class ReviewEngine:
             raise chunk_failures[0]
         if chunk_failures:
             logger.warning(
-                "Partial review: %d of %d chunk(s) failed and were skipped",
+                "Partial review: %d of %d chunk(s) failed, leaving %d file(s) unread",
                 len(chunk_failures),
                 len(chunks),
+                len(unread_paths),
             )
+            # Files nobody read are skipped files, whatever stopped the read.
+            # Left in `reviewed_paths` they would report a fully-covered review,
+            # and coverage is what the verdict consults before it approves.
+            selected_paths = [p for p in selected_paths if p not in unread_paths]
+            skipped_paths_only = sorted({*skipped_paths_only, *unread_paths})
 
         all_comments: list[ReviewComment] = []
         all_key_issues: list[KeyIssue] = []
@@ -2001,7 +2010,7 @@ class ReviewEngine:
             comments=final_comments,
             key_issues=all_key_issues,
             summary=summary,
-            reviewed_files=len(filtered),
+            reviewed_files=len(filtered) - len(unread_paths),
             token_usage=self.llm.usage,
             walkthrough=walkthrough,
             reviewed_paths=selected_paths,

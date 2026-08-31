@@ -32,8 +32,19 @@ _JSON_RESPONSE_TOOL = {
 }
 
 
+# Bedrock's "let the model decide" toolChoice, used when a model rejects the
+# forced form.
+_AUTO_TOOL: dict = {"auto": {}}
+
+
 class _BedrockThrottlingError(Exception):
     """Wrapper for Bedrock throttling/availability errors to target retries."""
+
+
+def _rejects_forced_tool_choice(error: Exception) -> bool:
+    """True when Bedrock refused the request *because* a tool was forced."""
+    message = str(error).lower()
+    return "toolchoice" in message or "tool choice" in message
 
 
 def _openai_tool_to_bedrock(tool: dict) -> dict:
@@ -71,12 +82,17 @@ def _messages_to_bedrock(messages: list[dict]) -> tuple[list[dict] | None, list[
                 blocks.append({"text": content})
             for tc in msg.get("tool_calls", []):
                 # The arguments came from a model, so they may be truncated or
-                # fence-wrapped; a bad one drops that block instead of raising
-                # and losing the whole conversation.
+                # fence-wrapped. Repair what we can and fall back to an empty
+                # input rather than raising — and rather than dropping the
+                # block, which would orphan the toolResult that answers it and
+                # get the whole next request rejected by Bedrock.
                 arguments = loads_lenient(tc["function"].get("arguments") or "")
                 if not isinstance(arguments, dict):
-                    logger.warning("Dropping assistant tool call with unparsable arguments")
-                    continue
+                    logger.warning(
+                        "Assistant tool call %s had unparsable arguments; replaying it empty",
+                        tc["function"].get("name", "?"),
+                    )
+                    arguments = {}
                 blocks.append(
                     {
                         "toolUse": {
@@ -129,6 +145,7 @@ class BedrockProvider:
             raise LLMError("bedrock_no_boto3") from e
 
         self.config = config
+        self._no_forced_tool_choice: set[str] = set()
         session = boto3.Session(
             profile_name=config.aws_profile,
             region_name=config.region,
@@ -247,6 +264,12 @@ class BedrockProvider:
 
         # Catch-all
         raise LLMError("bedrock_api_error", model=model, error=error_msg) from error
+
+    def _tool_choice(self, tool_name: str) -> dict:
+        """Force the one tool, unless this model already refused a forced choice."""
+        if self.config.model in self._no_forced_tool_choice:
+            return dict(_AUTO_TOOL)
+        return {"tool": {"name": tool_name}}
 
     def _extract_text(self, response: dict) -> str:
         """Extract text content from a Bedrock Converse response."""
@@ -370,7 +393,7 @@ class BedrockProvider:
         tool_name = _tool_name(tools)
         tool_config = {
             "tools": bedrock_tools,
-            "toolChoice": {"tool": {"name": tool_name}},
+            "toolChoice": self._tool_choice(tool_name),
         }
 
         attempts = 1 + self.config.tool_call_retries
@@ -379,11 +402,29 @@ class BedrockProvider:
         last_text = ""
 
         for attempt in range(attempts):
-            response = await self._call_with_fallback(
-                convo,
-                tool_config=tool_config,
-                temperature=temp,
-            )
+            try:
+                response = await self._call_with_fallback(
+                    convo,
+                    tool_config=tool_config,
+                    temperature=temp,
+                )
+            except LLMError as exc:
+                # Several Bedrock models reject a forced tool selection with a
+                # ValidationException. Without this, every structured review on
+                # one of them fails; letting the model choose still gets the
+                # call in practice, since it is the only tool on offer.
+                if not _rejects_forced_tool_choice(exc) or tool_config["toolChoice"] == _AUTO_TOOL:
+                    raise
+                logger.info(
+                    "Model %s rejected a forced toolChoice; retrying with auto", self.config.model
+                )
+                self._no_forced_tool_choice.add(self.config.model)
+                tool_config["toolChoice"] = _AUTO_TOOL
+                response = await self._call_with_fallback(
+                    convo,
+                    tool_config=tool_config,
+                    temperature=temp,
+                )
 
             tool_json = self._extract_tool_use(response, tool_name)
             if tool_json:

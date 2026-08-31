@@ -580,3 +580,111 @@ class TestUsage:
             "completion_tokens": 130,
             "total_tokens": 430,
         }
+
+
+class TestBedrockToolChoiceFallback:
+    """Several Bedrock models reject a forced tool selection with a
+    ValidationException. Without a fallback every structured review on one of
+    them fails — and the tool we force is the only one on offer anyway."""
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_a_rejected_forced_choice_retries_with_auto(self, mock_session_cls):
+        from botocore.exceptions import ClientError
+
+        from mira.llm.bedrock import BedrockProvider
+
+        rejection = ClientError(
+            {
+                "Error": {
+                    "Code": "ValidationException",
+                    "Message": "This model doesn't support toolChoice of type tool",
+                }
+            },
+            "Converse",
+        )
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = [
+            rejection,
+            _mock_tool_use_response("submit_review", {"comments": [], "summary": "ok"}),
+        ]
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config())
+        result = await provider.review([{"role": "user", "content": "review this"}])
+
+        assert json.loads(result)["summary"] == "ok"
+        assert mock_client.converse.call_count == 2
+        assert mock_client.converse.call_args_list[1].kwargs["toolConfig"]["toolChoice"] == {
+            "auto": {}
+        }
+        assert provider.config.model in provider._no_forced_tool_choice
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_a_remembered_model_skips_the_forced_attempt(self, mock_session_cls):
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = _mock_tool_use_response(
+            "submit_review", {"comments": [], "summary": "ok"}
+        )
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config())
+        provider._no_forced_tool_choice.add(provider.config.model)
+        await provider.review([{"role": "user", "content": "review this"}])
+
+        assert mock_client.converse.call_count == 1
+        assert mock_client.converse.call_args.kwargs["toolConfig"]["toolChoice"] == {"auto": {}}
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_an_unrelated_validation_error_still_fails(self, mock_session_cls):
+        from botocore.exceptions import ClientError
+
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "input is too long"}},
+            "Converse",
+        )
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config())
+        with pytest.raises(LLMError):
+            await provider.review([{"role": "user", "content": "review this"}])
+
+        assert provider.config.model not in provider._no_forced_tool_choice
+
+
+class TestReplayingABrokenToolCall:
+    def test_unparsable_arguments_keep_their_block(self):
+        """Bedrock rejects a toolResult with no matching toolUse, so dropping
+        the call would take the next request down with it."""
+        from mira.llm.bedrock import _messages_to_bedrock
+
+        messages = [
+            {"role": "user", "content": "check file"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "function": {"name": "read_file", "arguments": "not json"}}
+                ],
+            },
+            {"role": "tool", "content": "contents", "tool_call_id": "call_1"},
+        ]
+        _system, conversation = _messages_to_bedrock(messages)
+
+        tool_use = conversation[1]["content"][0]["toolUse"]
+        assert tool_use["toolUseId"] == "call_1"
+        assert tool_use["input"] == {}
+        assert conversation[2]["content"][0]["toolResult"]["toolUseId"] == "call_1"
