@@ -74,6 +74,10 @@ export const settingsApi = {
       effective: Record<string, unknown>
     }>("/api/admin/settings"),
 
+  // Sections are written, not replaced-around: the endpoint writes the ones it
+  // is sent and leaves the rest — `gate`, `checks`, `autofix`, `triage`, each
+  // owned by its own panel — untouched. So an omitted section means "not
+  // mine", and an empty one means "remove it".
   saveGlobalSettings: (overrides: Record<string, Record<string, unknown>>) =>
     putJson<{ ok: boolean }>("/api/admin/settings", { overrides }),
 }

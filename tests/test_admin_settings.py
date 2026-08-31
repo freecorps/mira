@@ -227,6 +227,65 @@ class TestEndpointValidation:
             "review": {"auto_resolve_conversations": False}
         }
 
+    def test_saving_one_panel_does_not_delete_another_panels_settings(
+        self, in_memory_db: AppDatabase
+    ):
+        """The override blob is shared, and this endpoint owns three keys of it.
+
+        The gate, the check framework, autofix and reviewer triage each write
+        their own section from their own panel. Replacing the whole document
+        here deleted all of them — silently, with no error and no UI that
+        would ever show what was lost.
+        """
+        in_memory_db.set_global_review_overrides(
+            {
+                "triage": {"enabled": True},
+                "checks": {"enabled": True},
+                "filter": {"max_comments": 3},
+            }
+        )
+        set_global_settings(
+            GlobalSettingsUpdate(overrides={"filter": {"max_comments": 8}}),
+            _admin_request(),
+        )
+        stored = in_memory_db.get_global_review_overrides()
+        assert stored["triage"] == {"enabled": True}
+        assert stored["checks"] == {"enabled": True}
+        assert stored["filter"] == {"max_comments": 8}
+
+    def test_an_empty_section_removes_it_and_an_absent_one_is_left_alone(
+        self, in_memory_db: AppDatabase
+    ):
+        """Which is how the last override in a section can still be cleared."""
+        in_memory_db.set_global_review_overrides(
+            {"filter": {"max_comments": 3}, "review": {"walkthrough": False}}
+        )
+        set_global_settings(GlobalSettingsUpdate(overrides={"filter": {}}), _admin_request())
+        stored = in_memory_db.get_global_review_overrides()
+        assert "filter" not in stored
+        assert stored["review"] == {"walkthrough": False}
+
+    def test_a_nested_override_round_trips(self, in_memory_db: AppDatabase):
+        """`review.verdict.mode` is a field inside an object, not a flat key."""
+        set_global_settings(
+            GlobalSettingsUpdate(
+                overrides={"review": {"verdict": {"mode": "off"}, "status": {"fail_on": "never"}}}
+            ),
+            _admin_request(),
+        )
+        stored = in_memory_db.get_global_review_overrides()
+        assert stored["review"]["verdict"]["mode"] == "off"
+        assert stored["review"]["status"]["fail_on"] == "never"
+
+    def test_a_nested_value_is_validated_before_it_is_stored(self, in_memory_db: AppDatabase):
+        with pytest.raises(HTTPException) as exc:
+            set_global_settings(
+                GlobalSettingsUpdate(overrides={"review": {"verdict": {"mode": "yolo"}}}),
+                _admin_request(),
+            )
+        assert exc.value.status_code == 400
+        assert in_memory_db.get_global_review_overrides() == {}
+
     def test_allowed_sections_constant(self):
         # `gate` joined the list in Phase 4. The merge-gate panel writes it
         # through its own endpoint, but the settings blob is one document and

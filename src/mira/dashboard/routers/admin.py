@@ -215,7 +215,19 @@ def get_global_settings(request: Request) -> GlobalSettingsResponse:
 
 @router.put("/api/admin/settings")
 def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
-    """Replace the admin override blob. Pass `{"overrides": {}}` to clear."""
+    """Write the sections this panel owns, and leave every other one alone.
+
+    The override blob is shared: the merge gate, the check framework, autofix
+    and reviewer triage each have their own panel writing their own section of
+    it. This endpoint used to replace the whole blob, so saving a filter
+    setting from the general panel silently deleted every one of them — a data
+    loss with no error, no trace, and no UI that would ever show it again.
+
+    So a section is written only when it is present in the request: a non-empty
+    value replaces it, an empty one removes it, and an absent one is not the
+    panel's business. Clearing everything is therefore posting every section
+    empty rather than posting nothing.
+    """
     user = getattr(request.state, "user", None)
     if not user or not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -238,7 +250,16 @@ def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
 
     from mira.config import MiraConfig, _deep_merge, _global_defaults
 
-    merged = _deep_merge(_global_defaults, body.overrides)
+    overrides = dict(_api._app_db.get_global_review_overrides() or {})
+    for section, value in body.overrides.items():
+        if value:
+            overrides[section] = value
+        else:
+            overrides.pop(section, None)
+
+    # The whole resulting blob, not just the part that arrived: a section is
+    # only as valid as what it is layered with.
+    merged = _deep_merge(_global_defaults, overrides)
     try:
         MiraConfig.model_validate(merged)
     except ValidationError as exc:
@@ -255,7 +276,7 @@ def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
             status_code=400, detail={"message": f"Invalid overrides: {exc}"}
         ) from exc
 
-    _api._app_db.set_global_review_overrides(body.overrides)
+    _api._app_db.set_global_review_overrides(overrides)
     return {"ok": True}
 
 
