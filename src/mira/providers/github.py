@@ -1224,6 +1224,14 @@ class GitHubProvider(BaseProvider):
         Bounded the same way :meth:`get_file_history` is, with the same small
         semaphore: a pull request touching many files must not turn into a rate
         limit incident on a feature nobody is blocked on.
+
+        **A failed lookup raises.** GitHub answers a path with no commits with
+        an empty 200, so an empty result here is a fact; returning the same
+        thing for a rate limit or a 502 would make an outage indistinguishable
+        from "nobody has touched this file" — and the caller would cache that
+        non-answer for the whole refresh interval and report `no_candidates`
+        on the strength of it. Unlike :meth:`get_file_history`, whose result
+        only enriches a prompt, this one is ranked on.
         """
         if not paths:
             return {}
@@ -1250,11 +1258,14 @@ class GitHubProvider(BaseProvider):
                         params={"path": path, "sha": commit_ref, "per_page": max_per_path},
                     )
                     if resp.status_code != 200:
-                        return path, []
+                        raise ProviderError(
+                            f"GitHub returned HTTP {resp.status_code} for the history of {path}"
+                        )
                     data = resp.json()
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Path author fetch failed for %s: %s", path, exc)
-                    return path, []
+                except ProviderError:
+                    raise
+                except Exception as exc:
+                    raise ProviderError(f"Failed to read the history of {path}: {exc}") from exc
 
             entries: list[PathAuthorship] = []
             for item in (data or [])[:max_per_path]:

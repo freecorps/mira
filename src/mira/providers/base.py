@@ -347,6 +347,12 @@ class BaseProvider(abc.ABC):
         ``ref`` is the pull request's base. A provider must not substitute the
         head: commits on the proposed branch are written by the person
         proposing the change.
+
+        **A provider that could not look must raise**, never return an empty
+        mapping. A path with no commits in range is legitimately empty, and a
+        caller that cannot tell that apart from a rate limit will cache the
+        outage and report that nobody has worked on the code — which is the
+        one thing triage promises not to say.
         """
         return {}
 
