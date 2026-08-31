@@ -80,6 +80,11 @@ def test_the_kill_switch_beats_every_layer() -> None:
     # Recorded, not inferred: a run row has to be able to say that a switch —
     # not a policy edit — made triage inert.
     assert policy.killed is True
+    # And `enabled` still reports what the configuration says. During an
+    # incident the useful answer is "enabled, and currently killed", not
+    # "disabled" — which is what a reader would be told if the switch were
+    # folded into the configured state.
+    assert policy.enabled is True
 
 
 def test_an_opt_out_matches_however_it_was_written() -> None:

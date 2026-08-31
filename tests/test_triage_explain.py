@@ -21,6 +21,7 @@ from mira.triage.explain import (
     mask_email,
     one_line,
     public_explanation,
+    safe_url,
 )
 from mira.triage.models import (
     Classification,
@@ -227,3 +228,48 @@ def test_a_note_is_shown_without_being_dressed_up_as_a_finding() -> None:
     run = _run(notes=["Review load could not be read, so nobody was dampened."])
     body = public_explanation(run)
     assert "Review load could not be read" in body
+
+
+def test_only_an_https_link_is_ever_rendered() -> None:
+    """Every URL here comes from a platform API today; it is a public comment
+    tomorrow, and the values pass through a database on the way."""
+    assert safe_url("https://github.com/acme/app/commit/abc") == (
+        "https://github.com/acme/app/commit/abc"
+    )
+    assert safe_url("javascript:alert(1)") == ""
+    assert safe_url("http://example.com") == ""
+    assert safe_url("https://example.com/a b") == ""
+    # A legal URL may contain parentheses, and an unencoded one ends the link
+    # destination early — turning the rest of the value into rendered markdown.
+    assert safe_url("https://x.example/a(b)c") == "https://x.example/a%28b%29c"
+
+
+def test_an_unsafe_evidence_url_becomes_no_link_rather_than_a_link() -> None:
+    run = _run(
+        candidates=[
+            ReviewerCandidate(
+                identity="dana",
+                score=3.0,
+                contributions=[
+                    SignalContribution(
+                        kind="codeowners",
+                        raw=1,
+                        weight=3.0,
+                        score=3.0,
+                        evidence=[
+                            Evidence(
+                                path="src/app.py",
+                                url="javascript:alert(document.cookie)",
+                                source="commit",
+                            )
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+    body = public_explanation(run)
+    assert "javascript:" not in body
+    assert "([link]" not in body
+    # The evidence itself is still shown — hiding it would be the wrong fix.
+    assert "src/app.py" in body

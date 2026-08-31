@@ -66,6 +66,26 @@ def code(text: str, limit: int = 200) -> str:
     return f"`{_clean(text, limit)}`"
 
 
+def safe_url(value: str) -> str:
+    """An ``https`` URL safe to put in a markdown link, or ``""``.
+
+    Every URL triage renders comes from a platform API today, so this is a
+    belt on a working pair of braces — but it is a *public* comment, the
+    values pass through a database on the way there, and the two failure modes
+    are cheap to close and expensive to notice. A scheme other than ``https``
+    is refused outright, so a stored ``javascript:`` value can never become a
+    link. Parentheses are percent-encoded rather than refused, because a legal
+    URL may contain them and an unencoded ``)`` ends the link destination
+    early — which turns the rest of the value into rendered markdown.
+    """
+    text = _clean(value, 300).strip()
+    if not text.lower().startswith("https://"):
+        return ""
+    if any(char.isspace() or char in "<>" for char in text):
+        return ""
+    return text.replace("(", "%28").replace(")", "%29")
+
+
 def mask_email(identity: str) -> str:
     """``dana@example.com`` becomes ``d***@example.com``.
 
@@ -97,8 +117,9 @@ def _evidence_line(item: Evidence) -> str:
     if item.detail:
         parts.append(_clean(item.detail, 120))
     text = " — ".join(parts) if parts else _clean(item.source or "evidence", 60)
-    if item.url:
-        return f"{text} ([link]({_clean(item.url, 300)}))"
+    link = safe_url(item.url)
+    if link:
+        return f"{text} ([link]({link}))"
     return text
 
 
