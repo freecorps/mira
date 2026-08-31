@@ -6,11 +6,17 @@ findings were fixed. What it never did was *say so* in the only place the merge
 box reads: the review event. This module maps a finished ``ReviewResult`` onto
 ``APPROVE`` / ``REQUEST_CHANGES``, and the engine submits it.
 
-Opt-in via ``review.verdict.mode`` (default ``off``), because both directions
-are load-bearing: an ``APPROVE`` can satisfy a branch-protection rule, and a
-``REQUEST_CHANGES`` blocks the merge until it's superseded. Every guard below
-resolves doubt to "say nothing" — silence is recoverable, a wrong verdict is
-someone merging on Mira's word.
+``review.verdict.mode`` decides how far this goes, and the two directions are
+not symmetric. ``approve`` is the default: an approval adds a signal that a
+human can ignore, dismiss or override, and it is the thing a reviewer wants
+back from a bot that read the whole diff and found nothing. ``request_changes``
+stays opt-in, because it *removes* the ability to merge until somebody
+dismisses it.
+
+Two conditions gate an approval — nothing above ``approve_max_severity``, and a
+walkthrough confidence of at least ``approve_min_confidence`` — and every other
+guard below resolves doubt to "say nothing". Silence is recoverable; a wrong
+verdict is someone merging on Mira's word.
 """
 
 from __future__ import annotations
@@ -102,6 +108,21 @@ def decide_verdict(
         if authored_by_self:
             return None
 
+    score = getattr(getattr(result.walkthrough, "confidence_score", None), "score", None)
+    if cfg.approve_min_confidence and score is not None and score < cfg.approve_min_confidence:
+        # The walkthrough's own merge-readiness score, after the engine has
+        # clamped it against the findings. It answers a question the severity
+        # ceiling does not: the ceiling asks whether Mira found a problem, this
+        # asks whether it believes it understood the change well enough for
+        # "nothing found" to mean anything. A 40-file refactor the model scored
+        # 2/5 is not an approval whatever the comment list looks like.
+        logger.info(
+            "Skipping approval — confidence %s is below the floor of %s",
+            score,
+            cfg.approve_min_confidence,
+        )
+        return None
+
     blocking_humans = sorted(
         login
         for login, state in (human_states or {}).items()
@@ -118,12 +139,16 @@ def decide_verdict(
         if remaining
         else " No issues found."
     )
+    confidence = f" Merge-readiness confidence: {score}/5." if score is not None else ""
     return Verdict(
         event=APPROVE,
         body=(
             f"✅ **Mira approved** — reviewed "
             f"{_plural(result.reviewed_files, 'file')} and found nothing above "
-            f"`{ceiling.name.lower()}` severity.{detail}"
+            f"`{ceiling.name.lower()}` severity.{detail}{confidence}"
         ),
-        reason=f"worst severity {worst.name if worst else 'none'} within ceiling {ceiling.name}",
+        reason=(
+            f"worst severity {worst.name if worst else 'none'} within ceiling {ceiling.name}"
+            + (f", confidence {score}" if score is not None else "")
+        ),
     )
