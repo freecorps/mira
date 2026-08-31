@@ -656,6 +656,12 @@ class ReviewEngine:
         if not self.provider:
             raise RuntimeError("A provider is required for PR review")
 
+        # A fresh review: forget whether the *last* one settled its status, or
+        # this one's failure would be dropped as already reported — and, until
+        # `get_pr_info` returns, reported against the previous pull request.
+        self._pr_info = None
+        self._status.reset()
+
         pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
 

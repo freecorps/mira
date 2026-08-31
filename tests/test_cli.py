@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from mira.cli import _format_json, _format_text, main
+from mira.exceptions import ProviderError
 from mira.models import (
     FileChangeType,
     ReviewComment,
@@ -178,6 +180,9 @@ class TestFormatJson:
 # ---------------------------------------------------------------------------
 
 
+_STDIN_DIFF = "diff --git a/f.py b/f.py\n"
+
+
 class TestCLI:
     def test_version(self):
         runner = CliRunner()
@@ -217,6 +222,24 @@ class TestCLI:
         assert result.exit_code == 0
         assert "All good." in result.output
         assert "No issues found." in result.output
+
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("the API vanished"), ProviderError("GitHub said no")]
+    )
+    def test_a_failed_review_settles_its_commit_status_whatever_broke(self, error):
+        """The status is published before the review runs, so every way out of
+        it has to settle — and an unexpected exception is the likelier one."""
+        with patch("mira.cli.ReviewEngine") as mock_engine_cls:
+            mock_engine = MagicMock()
+            mock_engine.review_diff = AsyncMock(side_effect=error)
+            mock_engine.report_review_failure = AsyncMock()
+            mock_engine_cls.return_value = mock_engine
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["review", "--stdin"], input=_STDIN_DIFF)
+
+        assert result.exit_code != 0
+        mock_engine.report_review_failure.assert_awaited_once()
 
     def test_review_stdin_json_output(self):
         review_result = _make_result(summary="JSON output.")

@@ -201,6 +201,27 @@ class TestReviewEngine:
         assert states == ["pending", "neutral"]
 
     @pytest.mark.asyncio
+    async def test_a_second_review_reports_its_own_failure(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        """One engine, two reviews. The second must not be treated as already
+        settled by the first — that is how a pending status becomes permanent."""
+        mock_provider.publish_review_status = AsyncMock(return_value="1")
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.get_pr_diff.side_effect = RuntimeError("gone")
+        with pytest.raises(RuntimeError):
+            await engine.review_pr("https://github.com/test/repo/pull/1")
+        await engine.report_review_failure(RuntimeError("gone"))
+
+        states = [
+            call.kwargs["state"] for call in mock_provider.publish_review_status.call_args_list
+        ]
+        assert states[-3] in {"success", "failure"}
+        assert states[-2:] == ["pending", "neutral"]
+
+    @pytest.mark.asyncio
     async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
         llm = MagicMock(spec=LLMProvider)
         no_comments = json.dumps(

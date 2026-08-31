@@ -263,6 +263,46 @@ async def test_a_failure_after_the_result_does_not_overwrite_it() -> None:
     assert [call["state"] for call in provider.calls] == ["success"]
 
 
+async def test_a_terminal_state_that_never_landed_does_not_count_as_settled() -> None:
+    """ "I tried" is not "the commit shows it".
+
+    A terminal publish that failed leaves the pending status up, and treating
+    the attempt as settled would make that pending status permanent — the one
+    state worse than no status at all.
+    """
+    provider = _Provider(error=ProviderError("502 from the API"))
+    reporter = ReviewStatusReporter(provider, _config())
+    await reporter.start(_pr())
+    await reporter.finish(_pr(), _result())
+    assert reporter.settled is False
+
+    provider.error = None
+    await reporter.failed(_pr(), RuntimeError("and then the gate crashed"))
+    assert provider.calls[-1]["state"] == "neutral"
+
+
+async def test_a_provider_that_writes_nothing_leaves_nothing_to_settle() -> None:
+    """GitLab publishes no pending status either, so there is none to correct."""
+    provider = _Provider(reference="")
+    reporter = ReviewStatusReporter(provider, _config())
+    await reporter.finish(_pr(), _result())
+    assert reporter.settled is True
+
+
+async def test_a_second_review_is_not_silenced_by_the_first() -> None:
+    """An engine reviews more than once — `review-rest`, a re-review, another
+    pull request — and a reporter that stayed settled would drop the next
+    review's failure as already reported."""
+    provider = _Provider()
+    reporter = ReviewStatusReporter(provider, _config())
+    await reporter.finish(_pr(), _result())
+
+    reporter.reset()
+    await reporter.start(_pr())
+    await reporter.failed(_pr(), RuntimeError("boom"))
+    assert [call["state"] for call in provider.calls] == ["success", "pending", "neutral"]
+
+
 async def test_a_failure_before_there_is_a_pull_request_publishes_nothing() -> None:
     provider = _Provider()
     reporter = ReviewStatusReporter(provider, _config())

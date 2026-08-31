@@ -154,12 +154,16 @@ def review(
             result = asyncio.run(engine.review_diff(diff_text))
         else:
             result = asyncio.run(engine.review_pr(pr_url))  # type: ignore[arg-type]
-    except MiraError as e:
+    except Exception as e:
         # Settle the "reviewing…" status this run may have published, so a
         # failed CLI review does not leave a pending check on the commit.
+        # Every failure, not only the ones Mira wrapped: an unexpected one
+        # leaves the same pending check behind, and is the likelier of the two.
         with contextlib.suppress(Exception):
             asyncio.run(engine.report_review_failure(e))
-        raise click.ClickException(str(e)) from e
+        if isinstance(e, MiraError):
+            raise click.ClickException(str(e)) from e
+        raise
 
     if output_format == "json":
         click.echo(_format_json(result))
