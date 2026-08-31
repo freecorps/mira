@@ -188,21 +188,44 @@ class OverlapConfig(BaseModel):
 class VerdictConfig(BaseModel):
     """Whether Mira submits a real review event, not just comments.
 
-    Off by default: an APPROVE from a GitHub App counts toward branch-protection
-    approvals, and a REQUEST_CHANGES blocks the merge until it's superseded.
-    Both are opt-in decisions for the deployment, not defaults to inherit.
+    Approvals are on by default; ``REQUEST_CHANGES`` is not, and the asymmetry
+    is the point. An approval *adds* a signal a human can ignore, override or
+    dismiss, and it is the thing a reviewer actually wants back from a bot that
+    read the whole diff and found nothing. A ``REQUEST_CHANGES`` *removes* the
+    ability to merge until somebody dismisses it, so it stays a deliberate
+    decision rather than a default to inherit.
 
-      "off"             — comment only (historical behaviour)
+      "off"             — comment only
       "approve"         — approve clean PRs; stay silent when findings exceed
                           the ceiling (the inline comments already say it)
       "request_changes" — also submit REQUEST_CHANGES on findings above it
+
+    Two independent conditions have to hold before an approval is submitted,
+    and both are about how much of the change Mira actually understood: nothing
+    was found above ``approve_max_severity``, and the walkthrough's own
+    merge-readiness score is at least ``approve_min_confidence``. The severity
+    ceiling asks "did I find a problem?"; the confidence floor asks "would I
+    bet on having *looked* properly?" — and a model that read a 40-file
+    refactor and scored its own understanding 2/5 has answered the second
+    question no matter what the first one says.
     """
 
-    mode: str = "off"
+    mode: str = "approve"
     # Highest severity tolerated in an approved PR. "suggestion" approves a PR
     # whose only findings are suggestions and nitpicks; "nitpick" demands a
     # completely clean pass.
     approve_max_severity: str = "suggestion"
+    # The walkthrough scores merge readiness 1–5 (1 = major concerns, 5 = safe
+    # to merge) and the engine clamps it down against the findings, so ≥4 also
+    # means "no blockers and at most two warnings" whatever the model first
+    # thought. 0 disables the floor.
+    #
+    # A review with *no* score — walkthrough off, or a model that omitted the
+    # field — is not treated as a failing one: the floor is evidence Mira has
+    # when it has it, and refusing every approval on installs with the
+    # walkthrough disabled would be a silent behaviour change dressed up as
+    # caution. The severity ceiling still applies there, alone.
+    approve_min_confidence: int = Field(default=4, ge=0, le=5)
     # Never approve when files were skipped because the diff blew past
     # max_diff_size — approving a partially-read PR is the worst failure mode.
     require_all_files_reviewed: bool = True
