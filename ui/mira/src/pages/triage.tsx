@@ -49,7 +49,7 @@ import type {
   TriageSuggestionSummary,
 } from "@/lib/api"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
-import { cn } from "@/lib/utils"
+import { cn, safeHref } from "@/lib/utils"
 
 import { TriagePolicyPanel } from "./triage-policy"
 
@@ -192,9 +192,9 @@ function CandidateCard({
                 >
                   {item.path}
                   {item.line ? `:${item.line}` : ""}
-                  {item.url && (
+                  {safeHref(item.url) && (
                     <a
-                      href={item.url}
+                      href={safeHref(item.url)}
                       target="_blank"
                       rel="noreferrer"
                       className="ml-1 inline-flex align-middle text-muted-foreground hover:text-foreground"
@@ -484,9 +484,9 @@ function RunHistory() {
                             <span className="font-medium">
                               {owner}/{repoName}#{inputs.pr_number}
                             </span>
-                            {inputs.pr_url && (
+                            {safeHref(inputs.pr_url) && (
                               <a
-                                href={String(inputs.pr_url)}
+                                href={safeHref(inputs.pr_url)}
                                 target="_blank"
                                 rel="noreferrer"
                                 onClick={(event) => event.stopPropagation()}

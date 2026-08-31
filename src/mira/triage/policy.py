@@ -217,7 +217,13 @@ def resolve_policy(config: TriageConfig, owner: str = "", repo: str = "") -> Eff
 
     killed = bool(config.kill_switch)
     return EffectiveTriagePolicy(
-        enabled=bool(values["enabled"]) and not killed,
+        # `enabled` is what the configuration says and `killed` is what the
+        # switch says; `active` is the only thing that combines them. Folding
+        # the switch into `enabled` here would make a killed install report
+        # "triage is disabled" on the dashboard and in the CLI, when the true
+        # answer — the one an operator needs during an incident — is "enabled,
+        # and currently killed".
+        enabled=bool(values["enabled"]),
         killed=killed,
         declared_version=config.policy_version,
         owner=owner,
