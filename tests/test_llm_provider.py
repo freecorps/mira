@@ -6,10 +6,11 @@ import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError, NonRetriableLLMError
+from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
 from mira.llm.provider import LLMProvider
 
 # Set a dummy API key for tests so _get_api_key() doesn't fail
@@ -54,6 +55,16 @@ def _make_tool_response_json(arguments: str, usage: dict | None = None) -> dict:
     if usage is not None:
         resp["usage"] = usage
     return resp
+
+
+def _retry_state(exception: BaseException, attempt: int):
+    """Minimal stand-in for tenacity's RetryCallState: attempt number + outcome."""
+    outcome = MagicMock()
+    outcome.exception.return_value = exception
+    state = MagicMock()
+    state.attempt_number = attempt
+    state.outcome = outcome
+    return state
 
 
 def _mock_httpx_response(data: dict, status_code: int = 200):
@@ -619,3 +630,171 @@ class TestReasoningFallback:
 
         assert len(posts) == 1  # no wasted reasoning attempt
         assert "reasoning" not in posts[0].kwargs["json"]
+
+
+class TestToolCallRecovery:
+    """A model that flubs the tool call used to fail the whole review. Each
+    recovery step here exists because a real model got it wrong that way."""
+
+    _TOOL = {
+        "type": "function",
+        "function": {"name": "submit_review", "parameters": {"type": "object"}},
+    }
+
+    def _config(self, **kw) -> LLMConfig:
+        base = {
+            "model": "test-model",
+            "max_retries": 2,
+            "retry_min_wait": 0,
+            "retry_max_wait": 0,
+        }
+        base.update(kw)
+        return LLMConfig(**base)
+
+    def _client(self, responses):
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=responses)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    async def _call(self, provider, responses):
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client(responses)
+            try:
+                result = await provider.complete_with_tools(
+                    [{"role": "user", "content": "review this"}], tools=[self._TOOL]
+                )
+            finally:
+                self.posts = cls.return_value.post.call_args_list
+        return result
+
+    @pytest.mark.asyncio
+    async def test_truncated_arguments_are_repaired(self):
+        """Hitting the token cap mid-object is the single most common way a
+        tool call arrives broken; the repair pass salvages it."""
+        provider = LLMProvider(self._config())
+        truncated = '{"comments": [{"path": "a.py", "line": 1, "body": "half a thought'
+
+        result = await self._call(
+            provider, [_mock_httpx_response(_make_tool_response_json(truncated))]
+        )
+
+        assert json.loads(result)["comments"][0]["path"] == "a.py"
+        assert len(self.posts) == 1
+
+    @pytest.mark.asyncio
+    async def test_prose_instead_of_a_tool_call_is_rerolled_with_a_correction(self):
+        provider = LLMProvider(self._config())
+        prose = _mock_httpx_response(_make_response_json("Sure! Here is my review: looks fine."))
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        result = await self._call(provider, [prose, good])
+
+        assert result == '{"comments": []}'
+        assert len(self.posts) == 2
+        correction = self.posts[1].kwargs["json"]["messages"][-1]
+        assert correction["role"] == "user"
+        assert "submit_review" in correction["content"]
+        # An identical sample would reproduce the same mistake.
+        assert (
+            self.posts[1].kwargs["json"]["temperature"]
+            > self.posts[0].kwargs["json"]["temperature"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_json_mode_rescues_a_model_that_never_calls_the_tool(self):
+        provider = LLMProvider(self._config(tool_call_retries=1))
+        prose = _mock_httpx_response(_make_response_json("I cannot use tools."))
+        as_json = _mock_httpx_response(_make_response_json('{"comments": [], "summary": "ok"}'))
+
+        result = await self._call(provider, [prose, prose, as_json])
+
+        assert json.loads(result)["summary"] == "ok"
+        assert len(self.posts) == 3
+        assert "tools" not in self.posts[2].kwargs["json"]
+        assert self.posts[2].kwargs["json"]["response_format"] == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_call_fails_when_no_recovery_path_lands(self):
+        provider = LLMProvider(self._config(tool_call_retries=1, json_mode_fallback=False))
+        prose = _mock_httpx_response(_make_response_json("nope"))
+
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await self._call(provider, [prose, prose])
+
+        assert len(self.posts) == 2  # one attempt, one re-roll, no JSON fallback
+
+    @pytest.mark.asyncio
+    async def test_the_requested_tool_wins_over_a_stray_extra_call(self):
+        provider = LLMProvider(self._config())
+        data = _make_tool_response_json('{"comments": []}')
+        data["choices"][0]["message"]["tool_calls"].insert(
+            0, {"function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}
+        )
+
+        result = await self._call(provider, [_mock_httpx_response(data)])
+
+        assert result == '{"comments": []}'
+
+    @pytest.mark.asyncio
+    async def test_a_200_carrying_an_error_body_is_retried(self):
+        """Gateways answer 200 with an error object. Indexing straight into it
+        raised KeyError, which skipped the retry and killed the review."""
+        provider = LLMProvider(self._config())
+        broken = _mock_httpx_response({"error": {"message": "upstream is down"}})
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        result = await self._call(provider, [broken, good])
+
+        assert result == '{"comments": []}'
+        assert len(self.posts) == 2
+
+
+class TestRetryPacing:
+    def test_a_server_disconnect_mid_response_is_retriable(self):
+        from mira.llm.base import _retriable
+
+        assert _retriable(httpx.RemoteProtocolError("server disconnected"))
+
+    def test_a_4xx_is_not_retriable(self):
+        from mira.llm.base import _retriable
+
+        assert not _retriable(NonRetriableLLMError("api_error", status=400, body=""))
+
+    def test_a_bad_tool_call_is_not_retried_at_the_transport_level(self):
+        """It is re-rolled with a correction instead — resending the identical
+        request just resamples the same mistake."""
+        from mira.llm.base import _retriable
+
+        assert not _retriable(ToolCallFormatError("bad_tool_arguments", tool="t", preview=""))
+
+    def test_retry_after_beats_the_backoff_curve(self):
+        from mira.llm.base import _make_wait
+
+        wait = _make_wait(LLMConfig(retry_min_wait=1, retry_max_wait=30))
+        error = LLMError("api_error", status=429, body="")
+        error.retry_after = 7.0
+
+        assert wait(_retry_state(error, attempt=1)) == 7.0
+
+    def test_retry_after_is_clamped_to_the_configured_ceiling(self):
+        from mira.llm.base import _make_wait
+
+        wait = _make_wait(LLMConfig(retry_min_wait=1, retry_max_wait=30))
+        error = LLMError("api_error", status=429, body="")
+        error.retry_after = 3600.0
+
+        assert wait(_retry_state(error, attempt=1)) == 30.0
+
+    def test_concurrent_chunks_do_not_retry_in_lockstep(self):
+        """Without jitter every in-flight chunk re-hits the rate limit at the
+        same instant, and they all fail together again."""
+        from mira.llm.base import _make_wait
+
+        wait = _make_wait(LLMConfig(retry_min_wait=2, retry_max_wait=30))
+        error = LLMError("api_error", status=429, body="")
+        delays = {wait(_retry_state(error, attempt=1)) for _ in range(20)}
+
+        assert len(delays) > 1
+        assert all(2 <= d <= 4 for d in delays)

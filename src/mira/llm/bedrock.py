@@ -15,7 +15,9 @@ from tenacity import (
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError
+from mira.llm.base import _TOOL_CORRECTION, _as_json_object, _preview, _tool_name
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
+from mira.llm.utils import loads_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +70,19 @@ def _messages_to_bedrock(messages: list[dict]) -> tuple[list[dict] | None, list[
             if content:
                 blocks.append({"text": content})
             for tc in msg.get("tool_calls", []):
+                # The arguments came from a model, so they may be truncated or
+                # fence-wrapped; a bad one drops that block instead of raising
+                # and losing the whole conversation.
+                arguments = loads_lenient(tc["function"].get("arguments") or "")
+                if not isinstance(arguments, dict):
+                    logger.warning("Dropping assistant tool call with unparsable arguments")
+                    continue
                 blocks.append(
                     {
                         "toolUse": {
                             "toolUseId": tc["id"],
                             "name": tc["function"]["name"],
-                            "input": json.loads(tc["function"]["arguments"]),
+                            "input": arguments,
                         }
                     }
                 )
@@ -248,14 +257,25 @@ class BedrockProvider:
                 return block["text"]
         return ""
 
-    def _extract_tool_use(self, response: dict) -> str | None:
-        """Extract tool use input JSON from a Bedrock Converse response."""
+    def _extract_tool_use(self, response: dict, tool_name: str | None = None) -> str | None:
+        """Extract tool use input JSON from a Bedrock Converse response.
+
+        Returns None when the model used no tool, or used one whose input isn't
+        a JSON object — the caller re-rolls rather than passing it downstream.
+        When several blocks come back, the one matching ``tool_name`` wins.
+        """
         output = response.get("output", {})
-        message = output.get("message", {})
-        for block in message.get("content", []):
-            if "toolUse" in block:
-                return json.dumps(block["toolUse"]["input"])
-        return None
+        message = output.get("message", {}) if isinstance(output, dict) else {}
+        content = message.get("content") if isinstance(message, dict) else None
+        blocks = [
+            block["toolUse"]
+            for block in (content if isinstance(content, list) else [])
+            if isinstance(block, dict) and isinstance(block.get("toolUse"), dict)
+        ]
+        if not blocks:
+            return None
+        chosen = next((b for b in blocks if b.get("name") == tool_name), blocks[0])
+        return _as_json_object(chosen.get("input"))
 
     async def _call_with_fallback(
         self,
@@ -340,28 +360,60 @@ class BedrockProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> str:
-        """Complete using tool calling for structured output."""
+        """Complete using tool calling for structured output.
+
+        A model that answers with prose, or with truncated tool input, gets
+        re-rolled with a corrective prompt at a slightly higher temperature —
+        resending the identical request would just resample the same mistake.
+        """
         bedrock_tools = [_openai_tool_to_bedrock(t) for t in tools]
+        tool_name = _tool_name(tools)
         tool_config = {
             "tools": bedrock_tools,
-            "toolChoice": {"tool": {"name": tools[0]["function"]["name"]}},
+            "toolChoice": {"tool": {"name": tool_name}},
         }
 
-        response = await self._call_with_fallback(
-            messages,
-            tool_config=tool_config,
-            temperature=temperature,
-        )
+        attempts = 1 + self.config.tool_call_retries
+        convo: list[dict] = list(messages)
+        temp = temperature
+        last_text = ""
 
-        tool_json = self._extract_tool_use(response)
-        if tool_json:
-            return tool_json
+        for attempt in range(attempts):
+            response = await self._call_with_fallback(
+                convo,
+                tool_config=tool_config,
+                temperature=temp,
+            )
 
-        # Fallback: some models may return text instead of tool call
-        text = self._extract_text(response)
-        if text:
-            logger.warning("Bedrock model returned text instead of tool call, using as fallback")
-            return text
+            tool_json = self._extract_tool_use(response, tool_name)
+            if tool_json:
+                return tool_json
+
+            # Some models answer with text instead of a tool call. Keep it when
+            # it is the JSON object we asked for; otherwise re-roll.
+            last_text = self._extract_text(response)
+            as_json = _as_json_object(last_text) if last_text else None
+            if as_json is not None:
+                logger.warning("Bedrock model returned text instead of a tool call; parsed as JSON")
+                return as_json
+
+            logger.warning(
+                "Bedrock model returned an unusable tool call (attempt %d/%d): %s",
+                attempt + 1,
+                attempts,
+                _preview(last_text) if last_text else "empty response",
+            )
+            convo = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": _TOOL_CORRECTION.format(
+                        tool=tool_name, reason="the arguments were not valid JSON"
+                    ),
+                },
+            ]
+            base_temp = self.config.temperature if temperature is None else temperature
+            temp = min(1.0, base_temp + 0.2 * (attempt + 1))
 
         raise LLMError("bedrock_no_tool_call")
 

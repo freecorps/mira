@@ -42,6 +42,14 @@ class LLMError(MiraError):
     def __init__(self, code: str, **kwargs: object) -> None:
         self._code = code
         self._full, self._safe = get_error_message(code, **kwargs)
+        # HTTP status, when the error came from a response. Lets callers pick
+        # a recovery path (e.g. "tools unsupported" 400s) without re-parsing
+        # the message.
+        status = kwargs.get("status")
+        self.status: int | None = status if isinstance(status, int) else None
+        # Seconds the server asked us to wait (Retry-After), when it said so.
+        # The retry wait strategy honours it in place of the backoff curve.
+        self.retry_after: float | None = None
         super().__init__(self._full)
 
     @property
@@ -57,6 +65,17 @@ class LLMError(MiraError):
 
 class NonRetriableLLMError(LLMError):
     """LLM client error (4xx) that should not be retried."""
+
+
+class ToolCallFormatError(LLMError):
+    """The model answered, but not with a usable tool call.
+
+    Malformed/truncated JSON arguments, prose where a call was required, or a
+    call to a tool we never offered. Retrying the identical request would just
+    resample the same mistake, so this is excluded from the transport-level
+    retry and handled by ``complete_with_tools``, which re-rolls with a
+    corrective prompt and finally falls back to JSON mode.
+    """
 
 
 class ResponseParseError(MiraError):

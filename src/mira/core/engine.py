@@ -1697,6 +1697,12 @@ class ReviewEngine:
         semaphore = _asyncio.Semaphore(self.config.review.max_concurrent_chunks)
         audit: list[dict] = []
 
+        # Chunks that never produced a review, with the error that stopped
+        # them. One dead chunk costs its files; all of them dead means the
+        # review didn't happen and must be reported as a failure, not as a
+        # clean "no findings".
+        chunk_failures: list[Exception] = []
+
         async def _review_chunk(
             idx: int,
             chunk: ReviewChunk,
@@ -1813,6 +1819,21 @@ class ReviewEngine:
                         len(chunks),
                         exc,
                     )
+                    chunk_failures.append(exc)
+                    return [], [], ""
+                except Exception as exc:
+                    # An LLM that stays broken through every retry, re-roll and
+                    # fallback used to take the whole review down with it. Drop
+                    # the chunk instead: the other chunks still get reviewed,
+                    # and the all-chunks-failed case is raised after the gather.
+                    logger.warning(
+                        "Chunk %d/%d failed, skipping: %s",
+                        idx + 1,
+                        len(chunks),
+                        exc,
+                    )
+                    audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
+                    chunk_failures.append(exc)
                     return [], [], ""
 
         review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
@@ -1879,6 +1900,17 @@ class ReviewEngine:
         chunk_results, security_comments, dependency_comments, osv_comments = await _asyncio.gather(
             review_task, security_task, dependency_task, osv_task
         )
+
+        if chunks and len(chunk_failures) == len(chunks):
+            # Nothing was reviewed. Surfacing the first error keeps the PR
+            # comment honest about why, instead of posting an empty review.
+            raise chunk_failures[0]
+        if chunk_failures:
+            logger.warning(
+                "Partial review: %d of %d chunk(s) failed and were skipped",
+                len(chunk_failures),
+                len(chunks),
+            )
 
         all_comments: list[ReviewComment] = []
         all_key_issues: list[KeyIssue] = []

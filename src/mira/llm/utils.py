@@ -51,3 +51,57 @@ def strip_code_fences(text: str | None) -> str:
     # Fall back to a generic code fence at the start of the response
     match = re.match(r"^```\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     return match.group(1).strip() if match else text
+
+
+# Anthropic-style tool-call XML delimiters some models leak into the JSON
+# arguments string (seen on Haiku via OpenRouter), e.g. a valid object
+# followed by ``</parameter></invoke>``. We cut the response at the first such
+# tag, then re-balance braces.
+_TOOL_XML_TAGS = ("</parameter>", "</invoke>", "</function_calls>", "<parameter", "<invoke")
+
+
+def _balance_json(text: str) -> str:
+    """Close any unclosed strings/brackets so a truncated object parses."""
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif (ch == "}" and stack and stack[-1] == "{") or (
+            ch == "]" and stack and stack[-1] == "["
+        ):
+            stack.pop()
+    out = text.rstrip().rstrip(",").rstrip()
+    if in_string:
+        out += '"'
+    closers = {"{": "}", "[": "]"}
+    return out + "".join(closers[c] for c in reversed(stack))
+
+
+def _repair_json(text: str) -> str:
+    """Best-effort repair: drop leaked tool-call XML, then re-balance brackets."""
+    cut = min((i for i in (text.find(t) for t in _TOOL_XML_TAGS) if i != -1), default=-1)
+    if cut != -1:
+        text = text[:cut]
+    return _balance_json(text)
+
+
+def loads_lenient(text: str) -> object | None:
+    """Parse JSON, repairing leaked tool-call XML / missing braces. None on failure."""
+    for candidate in (text, _repair_json(text)):
+        try:
+            return json.loads(candidate, strict=False)
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return None
