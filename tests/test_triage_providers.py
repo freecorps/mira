@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from mira.exceptions import ProviderError
 from mira.models import PRInfo
 from mira.providers.base import BaseProvider
 from mira.providers.forgejo import ForgejoProvider
@@ -278,7 +279,15 @@ async def test_forgejo_attributes_a_commit_when_the_email_maps_to_an_account() -
     assert logins == ["sam", ""]
 
 
-async def test_a_failed_fetch_yields_no_entries_rather_than_an_exception() -> None:
+async def test_a_failed_fetch_raises_rather_than_reporting_an_empty_history() -> None:
+    """The finding that made this the shape it is.
+
+    GitHub answers a path with no commits with an empty 200, so an empty
+    result is a *fact*. Returning the same thing for a 500 would make an
+    outage indistinguishable from "nobody has touched this file" — and the
+    caller caches that for the refresh interval and reports `no_candidates`
+    on the strength of it.
+    """
     provider = GitHubProvider("token")
 
     class _Client:
@@ -291,8 +300,53 @@ async def test_a_failed_fetch_yields_no_entries_rather_than_an_exception() -> No
         async def get(self, url: str, **kwargs: Any) -> _FakeResp:
             return _FakeResp(500, {})
 
+    with patch("httpx.AsyncClient", lambda *a, **k: _Client()), pytest.raises(ProviderError):
+        await provider.get_path_authors(_pr(), ["src/app.py"], ref="base111")
+
+
+async def test_a_transport_failure_raises_too() -> None:
+    provider = GitHubProvider("token")
+
+    class _Client:
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+            raise OSError("connection reset")
+
+    with patch("httpx.AsyncClient", lambda *a, **k: _Client()), pytest.raises(ProviderError):
+        await provider.get_path_authors(_pr(), ["src/app.py"], ref="base111")
+
+
+async def test_a_path_with_no_commits_is_still_an_empty_answer() -> None:
+    """The other half: an empty 200 means what it says."""
+    provider = GitHubProvider("token")
+
+    class _Client:
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def get(self, url: str, **kwargs: Any) -> _FakeResp:
+            return _FakeResp(200, [])
+
     with patch("httpx.AsyncClient", lambda *a, **k: _Client()):
         assert await provider.get_path_authors(_pr(), ["src/app.py"], ref="base111") == {}
+
+
+async def test_forgejo_also_raises_rather_than_caching_an_outage() -> None:
+    provider = ForgejoProvider("token")
+
+    async def _request(self: Any, method: str, url: str, **kwargs: Any) -> _FakeResp:
+        return _FakeResp(503, {})
+
+    with patch.object(ForgejoProvider, "_request", _request), pytest.raises(ProviderError):
+        await provider.get_path_authors(_pr("forgejo"), ["src/app.py"], ref="base111")
 
 
 def test_no_provider_offers_a_way_to_request_a_review() -> None:
@@ -310,3 +364,37 @@ def test_no_provider_offers_a_way_to_request_a_review() -> None:
     }
     for provider_class in (BaseProvider, GitHubProvider, GitLabProvider, ForgejoProvider):
         assert forbidden.isdisjoint(set(dir(provider_class)))
+
+
+# ─────────────────────────────────────────────── inferring the platform ──
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # The bug a review found in the substring version: the repository is
+        # named after the other platform, and a repository name is chosen by
+        # whoever made the repository.
+        ("https://github.com/acme/gitlab-tools/pull/1", "github"),
+        ("https://gitlab.com/acme/github-actions/-/merge_requests/2", "gitlab"),
+        ("https://github.com/acme/app/pull/7", "github"),
+        ("https://codeberg.org/acme/app/pulls/3", "forgejo"),
+        # Self-hosted instances answer to any hostname, so the path shape is
+        # what is left.
+        ("https://git.internal/acme/app/-/merge_requests/4", "gitlab"),
+        ("https://git.internal/acme/app/pulls/5", "forgejo"),
+        ("https://git.internal/acme/app/pull/6", "github"),
+    ],
+)
+def test_a_platform_is_inferred_from_the_host_and_the_path(url: str, expected: str) -> None:
+    from mira.providers import platform_for_url
+
+    assert platform_for_url(url, "forgejo") == expected
+
+
+def test_an_unrecognisable_url_falls_back_to_the_configured_default() -> None:
+    """An explicit setting is a better answer than a guess."""
+    from mira.providers import platform_for_url
+
+    assert platform_for_url("https://example.com/somewhere", "gitlab") == "gitlab"
+    assert platform_for_url("", "forgejo") == "forgejo"

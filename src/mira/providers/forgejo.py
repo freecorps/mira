@@ -765,6 +765,11 @@ class ForgejoProvider(BaseProvider):
         belongs to an account and ``null`` when it does not, so an unresolved
         commit is *visibly* unresolved: it yields an empty login, and the
         caller drops it rather than falling back to the name in the commit.
+
+        **A failed lookup raises**, for the same reason it does on GitHub: an
+        empty answer is a fact about the file, and returning one for an outage
+        would have the caller cache the non-answer and report that nobody has
+        worked on the code.
         """
         if not paths:
             return {}
@@ -785,11 +790,14 @@ class ForgejoProvider(BaseProvider):
                         ok=(200, 404),
                     )
                     if resp.status_code != 200:
-                        return path, []
+                        raise ProviderError(
+                            f"Forgejo returned HTTP {resp.status_code} for the history of {path}"
+                        )
                     data = resp.json() or []
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Path author fetch failed for %s: %s", path, exc)
-                    return path, []
+                except ProviderError:
+                    raise
+                except Exception as exc:
+                    raise ProviderError(f"Failed to read the history of {path}: {exc}") from exc
 
             entries: list[PathAuthorship] = []
             for item in data[:max_per_path]:

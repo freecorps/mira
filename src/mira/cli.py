@@ -120,16 +120,16 @@ def review(
             raise click.UsageError(
                 "--token (or --github-token / GITHUB_TOKEN / MIRA_GIT_TOKEN) is required for PR review"
             )
-        # Infer the platform from the URL shape; fall back to the configured default.
-        if "/-/merge_requests/" in pr_url or "gitlab" in pr_url:
-            provider_type = "gitlab"
-        elif "/pulls/" in pr_url or "forgejo" in pr_url:
-            provider_type = "forgejo"
-        elif "/pull/" in pr_url or "github" in pr_url:
-            provider_type = "github"
-        else:
-            provider_type = config.provider.type
-        from mira.providers import create_provider, get_available_providers
+        from mira.providers import (
+            create_provider,
+            get_available_providers,
+            platform_for_url,
+        )
+
+        # Inferred from the host and the path shape, never from a substring of
+        # the whole URL: `acme/gitlab-tools` on github.com is a GitHub
+        # repository, and a repository name is chosen by whoever made it.
+        provider_type = platform_for_url(pr_url, config.provider.type)
 
         try:
             github_provider = create_provider(provider_type, git_token)
@@ -910,15 +910,9 @@ def _provider_for(pr_url: str, token: str | None, config) -> object:  # type: ig
         raise click.UsageError(
             "--token (or GITHUB_TOKEN / MIRA_GIT_TOKEN) is required to read a pull request"
         )
-    if "/-/merge_requests/" in pr_url or "gitlab" in pr_url:
-        provider_type = "gitlab"
-    elif "/pulls/" in pr_url or "forgejo" in pr_url:
-        provider_type = "forgejo"
-    elif "/pull/" in pr_url or "github" in pr_url:
-        provider_type = "github"
-    else:
-        provider_type = config.provider.type
-    from mira.providers import create_provider, get_available_providers
+    from mira.providers import create_provider, get_available_providers, platform_for_url
+
+    provider_type = platform_for_url(pr_url, config.provider.type)
 
     try:
         return create_provider(provider_type, token)

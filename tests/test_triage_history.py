@@ -178,6 +178,9 @@ async def test_a_failed_fetch_is_unavailable_even_when_stored_history_answered()
     assert "were still used" in outcome.authored_report.detail
     # The stored history is still used — a degraded ranking beats none.
     assert set(outcome.authored) == {"dana"}
+    # And nothing is marked as fetched, so the next event tries again rather
+    # than serving the outage back for the whole refresh interval.
+    assert store.marked == []
 
 
 async def test_a_platform_that_cannot_attribute_commits_says_so_rather_than_empty() -> None:
