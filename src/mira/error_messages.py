@@ -69,6 +69,22 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Both primary ({primary_model}) and fallback ({fallback_model}) models failed: {error}",
         safe="Both primary and fallback models failed",
     ),
+    # OAuth-backed providers (ChatGPT/Codex and friends)
+    "oauth_not_connected": ErrorMessage(
+        full=(
+            "No {provider} session. Connect one in the dashboard under "
+            "Settings → Connections, or run: mira auth login {provider_id}"
+        ),
+        safe="LLM provider is not connected",
+    ),
+    "oauth_session_failed": ErrorMessage(
+        full="{provider} session could not be renewed: {error}",
+        safe="LLM provider session expired",
+    ),
+    "oauth_stream_failed": ErrorMessage(
+        full="{provider} ended the response stream without completing it: {detail}",
+        safe="LLM response stream ended early",
+    ),
     # Bedrock-specific errors
     "bedrock_no_boto3": ErrorMessage(
         full="boto3 is required for the Bedrock provider. Install with: pip install mira-reviewer[bedrock]",

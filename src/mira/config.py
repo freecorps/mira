@@ -84,6 +84,12 @@ class LLMConfig(BaseModel):
     # Only meaningful when `provider` is "openai" — bedrock ignores it
     # (create_llm checks provider first).
     api_style: str = "chat"
+    # Review with an account signed in over OAuth (e.g. "chatgpt") instead of
+    # an API key. Set here for a CLI-only install, or from the dashboard's
+    # Connections page, which also stores the session. When set it wins over
+    # `provider`/`base_url`/`api_key_env`: the endpoint and auth both come from
+    # the provider spec in `mira.oauth`.
+    oauth_provider: str | None = None
     # Endpoint configuration. Defaults to OpenRouter but any OpenAI-compatible
     # chat-completions endpoint works — vLLM, Ollama, LiteLLM proxy, LocalAI,
     # llama.cpp server, Together, Fireworks, Groq, etc. Set api_key_env to ""
@@ -123,6 +129,25 @@ class LLMConfig(BaseModel):
                 "hostnames like docker-compose services)"
             )
         return v
+
+    @field_validator("oauth_provider")
+    @classmethod
+    def _validate_oauth_provider(cls, v: str | None) -> str | None:
+        """Reject a provider id nothing can serve, here rather than at review time.
+
+        A typo in this field would otherwise resolve to "no session" and quietly
+        put every review back on the API key — the exact opposite of what was
+        asked for, with nothing in the config to show why.
+        """
+        if not v:
+            return None
+        from mira.oauth import registry
+
+        spec = registry.get(v)
+        if spec is None or spec.llm is None:
+            known = ", ".join(sorted(registry.llm_providers())) or "none"
+            raise ValueError(f"llm.oauth_provider {v!r} is not a known provider (have: {known})")
+        return spec.id
 
 
 class FilterConfig(BaseModel):

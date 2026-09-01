@@ -47,6 +47,15 @@ EXPECTED_ROUTES = {
     ("/api/logs", "DELETE"),
     ("/api/logs/export", "GET"),
     ("/api/logs/loggers", "GET"),
+    # OAuth logins for LLM backends (all admin-only). No route returns token
+    # material: /providers reports who is connected, not what with.
+    ("/api/oauth/providers", "GET"),
+    ("/api/oauth/active", "PUT"),
+    ("/api/oauth/callback", "GET"),
+    ("/api/oauth/{provider_id}", "DELETE"),
+    ("/api/oauth/{provider_id}/complete", "POST"),
+    ("/api/oauth/{provider_id}/refresh", "POST"),
+    ("/api/oauth/{provider_id}/start", "POST"),
     # Phase 5 — assisted correction (all admin-only; the cancel route
     # additionally requires the cancel permission). There is deliberately no
     # route that *starts* a fix: that is a repository write permission, not a

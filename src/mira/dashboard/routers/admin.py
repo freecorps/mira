@@ -156,11 +156,13 @@ async def get_models() -> ModelsResponse:
     from mira.dashboard.models_config import (
         API_STYLES,
         THINKING_MODES,
+        apply_oauth_binding,
         get_indexing_model,
         get_review_model,
         get_review_thinking_mode,
         get_security_model,
         resolve_api_style,
+        resolve_oauth_provider,
     )
 
     config = load_config()
@@ -175,8 +177,18 @@ async def get_models() -> ModelsResponse:
     )
     api_style = resolve_api_style(config.llm, _api._app_db.get_setting("api_style"))
 
-    backend = active_backend(config.llm)
-    catalog = await fetch_catalog(config.llm)
+    # The catalog has to be read through the same binding a review would use:
+    # with a ChatGPT session connected, the dropdown must offer that account's
+    # models, not OpenRouter's.
+    oauth_provider = resolve_oauth_provider(
+        config.llm, _api._app_db.get_setting("llm_oauth_provider")
+    )
+    catalog_config = config.llm
+    if oauth_provider:
+        catalog_config = apply_oauth_binding(catalog_config, oauth_provider, model_is_explicit=True)
+        api_style = catalog_config.api_style
+    backend = active_backend(catalog_config)
+    catalog = await fetch_catalog(catalog_config)
 
     return ModelsResponse(
         indexing_model=indexing,
@@ -196,7 +208,19 @@ async def get_models() -> ModelsResponse:
         thinking_options=[ModelOption(**m) for m in THINKING_MODES],
         api_style=api_style,
         api_style_options=[ModelOption(**m) for m in API_STYLES],
+        oauth_provider=oauth_provider,
+        oauth_label=_oauth_label(oauth_provider),
     )
+
+
+def _oauth_label(provider_id: str) -> str:
+    """Display name for a connected OAuth provider, or "" if none."""
+    if not provider_id:
+        return ""
+    from mira.oauth import registry
+
+    spec = registry.get(provider_id)
+    return spec.label if spec else provider_id
 
 
 @router.get("/api/admin/settings", response_model=GlobalSettingsResponse)

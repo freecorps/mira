@@ -176,6 +176,18 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
     # ── Overrides ────────────────────────────────────────────────────
 
+    async def _post(self, client: httpx.AsyncClient, body: dict) -> httpx.Response:
+        """One round-trip to the endpoint.
+
+        Every request in this class goes through here — including the 400
+        retries that drop ``tool_choice`` or ``reasoning`` — so a subclass can
+        change how the call is authenticated or transported (see
+        :class:`mira.llm.oauth.OAuthResponsesProvider`, which signs it with a
+        stored OAuth grant and reads the answer back off an SSE stream) without
+        re-implementing the three call methods and their fallbacks.
+        """
+        return await client.post(self._url, headers=self._build_headers(), json=body)
+
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts from Responses API usage.
 
@@ -209,11 +221,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(
-                self._url,
-                headers=self._build_headers(),
-                json=body,
-            )
+            resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -250,11 +258,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(
-                self._url,
-                headers=self._build_headers(),
-                json=body,
-            )
+            resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and body["tool_choice"] != "auto"
@@ -263,7 +267,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 logger.info("Model %s rejected forced tool_choice; retrying with auto", api_model)
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
-                resp = await client.post(self._url, headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
@@ -271,7 +275,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
-                resp = await client.post(self._url, headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -330,11 +334,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(
-                self._url,
-                headers=self._build_headers(),
-                json=body,
-            )
+            resp = await self._post(client, body)
             if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
                 api_model = _strip_model_prefix(model, self.config.base_url)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
@@ -343,7 +343,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 body["temperature"] = (
                     temperature if temperature is not None else self.config.temperature
                 )
-                resp = await client.post(self._url, headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 

@@ -10,6 +10,7 @@ import { checksApi } from "./api/checks"
 import { contributorsApi } from "./api/contributors"
 import { gateApi } from "./api/gate"
 import { logsApi } from "./api/logs"
+import { oauthApi } from "./api/oauth"
 import { packagesApi } from "./api/packages"
 import { relationshipsApi } from "./api/relationships"
 import { reposApi } from "./api/repos"
@@ -44,5 +45,6 @@ export const api = {
   ...autofixApi,
   ...checksApi,
   ...logsApi,
+  ...oauthApi,
   ...triageApi,
 }

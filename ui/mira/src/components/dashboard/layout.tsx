@@ -114,6 +114,7 @@ const navItems = [
 const settingsSubItems = [
   { to: "/settings/models", label: "Models" },
   { to: "/settings/review", label: "Review" },
+  { to: "/settings/connections", label: "Connections" },
   { to: "/settings/webhooks", label: "Webhooks" },
 ]
 
@@ -140,6 +141,7 @@ const PAGE_LABELS: Record<string, string> = {
   password: "Password",
   models: "Models",
   review: "Review",
+  connections: "Connections",
   webhooks: "Webhooks",
 }
 

@@ -112,6 +112,24 @@ docker run -p 8000:8000 --env-file .env \
 
 → Full walkthrough: [creating the GitHub App & quickstart](https://docs.miracode.ai/quickstart) · [GitLab setup](https://docs.miracode.ai/gitlab) · [deploy options](https://docs.miracode.ai/deployment) · [choosing models, custom endpoints & AWS Bedrock](https://docs.miracode.ai/configuration/models)
 
+## Sign in instead of paying per token
+
+Mira can review with the models a ChatGPT plan already includes, through the
+same backend the Codex CLI uses — no API key, nothing to rotate:
+
+```bash
+mira auth login chatgpt    # or: dashboard → Settings → Connections
+mira auth use chatgpt
+```
+
+The session lives in Mira's database and is renewed before it expires, and the
+model dropdown switches to that account's models. It is one setting away from
+the API-key path in either direction, so a repository whose volume outgrows a
+plan's allowance can move back without touching anything else. The OAuth layer
+is generic; ChatGPT is the first provider on it.
+
+→ [docs/oauth.md](docs/oauth.md)
+
 ## Review before you push
 
 The same review, against a change that is not a pull request yet:

@@ -33,6 +33,18 @@ llm:
   # tool_call_retries: 2
   # json_mode_fallback: true
 
+  # ── Sign in with an account instead of an API key ──
+  # Review with the models included in a ChatGPT plan, through the same
+  # backend the Codex CLI uses. Connect the account first — from the
+  # dashboard (Settings -> Connections) or with `mira auth login chatgpt` —
+  # then point reviews at it. The session lives in Mira's database and is
+  # renewed automatically; nothing is stored in this file.
+  # When set, this wins over provider/base_url/api_key_env: the endpoint and
+  # the auth both come from the provider. The dashboard's Connections page
+  # sets the same thing, and its choice takes precedence over this one.
+  # oauth_provider: "chatgpt"
+  # model: "gpt-5-codex"   # or gpt-5; the account's models, not OpenRouter ids
+
 filter:
   # Minimum confidence threshold (0.0 - 1.0)
   confidence_threshold: 0.7

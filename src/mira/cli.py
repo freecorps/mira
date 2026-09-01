@@ -1017,3 +1017,160 @@ def triage_policy(repository: str, config_path: str | None) -> None:
         raise click.UsageError("--repo must be owner/name")
     policy = resolve_policy(config.triage, owner, repo)
     click.echo(json.dumps(policy.as_dict(), indent=2, sort_keys=True))
+
+
+@main.group("auth")
+def auth_group() -> None:
+    """Sign in to an LLM provider with an account instead of an API key.
+
+    The session is stored where the dashboard keeps its settings, so a login
+    done here is the login the server uses — and the other way around.
+    """
+
+
+def _auth_providers() -> dict:
+    from mira.oauth import registry
+
+    return registry.all_providers()
+
+
+def _run_auth(coro):  # type: ignore[no-untyped-def]
+    """Run one OAuth coroutine, turning its errors into CLI errors."""
+    import asyncio
+
+    from mira.oauth.base import OAuthError
+
+    try:
+        return asyncio.run(coro)
+    except OAuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@auth_group.command("login")
+@click.argument("provider", required=False)
+@click.option(
+    "--manual",
+    is_flag=True,
+    help="Print the URL and ask for the redirect you land on, instead of listening locally.",
+)
+@click.option("--no-browser", is_flag=True, help="Don't try to open a browser.")
+@click.option(
+    "--timeout",
+    default=300,
+    show_default=True,
+    type=int,
+    help="Seconds to wait for the browser to come back.",
+)
+def auth_login(provider: str | None, manual: bool, no_browser: bool, timeout: int) -> None:
+    """Sign in to PROVIDER (e.g. chatgpt) and store the session.
+
+    By default this listens on the provider's registered localhost port and
+    catches the redirect itself, which needs the browser to be on this machine.
+    Use --manual anywhere else: you get a URL to open, and paste back whatever
+    it redirects you to.
+    """
+    import webbrowser
+
+    from mira.oauth import manager, registry
+    from mira.oauth.base import OAuthError
+
+    providers = _auth_providers()
+    if not provider:
+        raise click.UsageError(f"Pick a provider: {', '.join(sorted(providers))}")
+    spec = registry.get(provider)
+    if spec is None:
+        raise click.UsageError(
+            f"Unknown provider {provider!r}. Available: {', '.join(sorted(providers))}"
+        )
+
+    if manual:
+        try:
+            started = manager.start_login(spec.id)
+        except OAuthError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(
+            f"Open this URL and sign in to {spec.label}:\n\n{started['authorization_url']}\n"
+        )
+        click.echo(
+            "You will be redirected to a page that cannot load — that is expected.\n"
+            "Copy that URL from the address bar and paste it here."
+        )
+        redirect_url = click.prompt("Redirect URL", type=str)
+        status = _run_auth(manager.complete_login(redirect_url=redirect_url))
+    else:
+        from mira.oauth.loopback import login_via_loopback
+
+        def _announce(url: str) -> None:
+            click.echo(f"Opening {spec.label} sign-in:\n\n{url}\n")
+            if not no_browser:
+                webbrowser.open(url)
+            click.echo("Waiting for the browser to come back…")
+
+        status = _run_auth(login_via_loopback(spec.id, timeout=float(timeout), on_url=_announce))
+
+    account = status.get("account_label") or "(account)"
+    plan = f" [{status['plan']}]" if status.get("plan") else ""
+    click.echo(f"Connected {spec.label} as {account}{plan}.")
+    click.echo(f"Route reviews through it with: mira auth use {spec.id}")
+
+
+@auth_group.command("status")
+def auth_status() -> None:
+    """Show which providers are connected, and which one serves reviews."""
+    from datetime import UTC, datetime
+
+    from mira.oauth import manager
+
+    state = manager.list_status()
+    active = state["active_provider"]
+    for entry in state["providers"]:
+        mark = "*" if entry["id"] == active else " "
+        if not entry["connected"]:
+            click.echo(f"{mark} {entry['id']:<10} not connected")
+            continue
+        expires = entry.get("expires_at") or 0
+        when = (
+            datetime.fromtimestamp(expires, UTC).strftime("%Y-%m-%d %H:%M UTC")
+            if expires
+            else "no expiry"
+        )
+        plan = f" [{entry['plan']}]" if entry.get("plan") else ""
+        account = entry.get("account_label") or "(account)"
+        click.echo(f"{mark} {entry['id']:<10} {account}{plan} — session valid until {when}")
+    if active:
+        click.echo(f"\nReviews run through: {active}")
+    else:
+        click.echo("\nReviews run through the configured API key.")
+
+
+@auth_group.command("use")
+@click.argument("provider", required=False)
+def auth_use(provider: str | None) -> None:
+    """Route reviews through PROVIDER. Pass nothing to go back to the API key."""
+    from mira.oauth import registry, store
+
+    if not provider:
+        store.set_active_provider("")
+        click.echo("Reviews will use the configured API key.")
+        return
+    spec = registry.get(provider)
+    if spec is None or spec.llm is None:
+        raise click.UsageError(f"{provider!r} is not a provider that can serve models")
+    if store.load(spec.id) is None:
+        raise click.ClickException(
+            f"{spec.label} is not connected — run: mira auth login {spec.id}"
+        )
+    store.set_active_provider(spec.id)
+    click.echo(f"Reviews will run through {spec.label}.")
+
+
+@auth_group.command("logout")
+@click.argument("provider")
+def auth_logout(provider: str) -> None:
+    """Forget PROVIDER's stored session."""
+    from mira.oauth import manager, registry
+
+    if registry.get(provider) is None:
+        raise click.UsageError(f"Unknown provider {provider!r}")
+    manager.disconnect(provider)
+    click.echo(f"Disconnected {provider}.")

@@ -1,0 +1,209 @@
+"""The login state machine: start an attempt, finish it, hand back a session.
+
+An attempt is the PKCE verifier plus the redirect URI it was started with,
+remembered under its ``state`` until the user comes back with a code. It is
+persisted (one JSON row in ``settings``) rather than held in memory so a
+dashboard restart — or a second worker process — between "Connect" and the
+redirect does not strand a login the user has already approved.
+
+Two ways an attempt finishes, both landing in :func:`complete_login`:
+
+* **dashboard redirect** — the provider allows our own callback URL, the
+  browser returns to ``/api/oauth/callback``, and we finish it there.
+* **pasted URL** — the provider only accepts a fixed ``localhost`` redirect
+  (ChatGPT does), so a browser on a different machine than the server lands on
+  a page that cannot load. The user copies that URL back into the dashboard and
+  we take the code out of it. Unglamorous, but it is the only thing that works
+  for a remotely-hosted dashboard against a fixed loopback redirect — and the
+  CLI (``mira auth login``) runs a real listener for the local case.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+from mira.oauth import registry, store
+from mira.oauth.base import OAuthError, OAuthTokens, PkcePair, new_state
+from mira.oauth.store import SettingsStore
+
+logger = logging.getLogger(__name__)
+
+_PENDING_KEY = "oauth_pending_logins"
+# How long an approved login may sit before the code is redeemed. Long enough
+# to walk through a consent screen and paste a URL, short enough that an
+# abandoned attempt is not a verifier sitting in the database for a week.
+PENDING_TTL_SECONDS = 900
+
+
+# ── Pending-attempt bookkeeping ─────────────────────────────────────
+
+
+def _read_pending(db: SettingsStore) -> dict[str, dict[str, Any]]:
+    raw = db.get_setting(_PENDING_KEY)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_pending(db: SettingsStore, attempts: dict[str, dict[str, Any]]) -> None:
+    db.set_setting(_PENDING_KEY, json.dumps(attempts))
+
+
+def _prune(attempts: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    cutoff = time.time() - PENDING_TTL_SECONDS
+    return {s: a for s, a in attempts.items() if float(a.get("created_at", 0)) > cutoff}
+
+
+# ── Flow ────────────────────────────────────────────────────────────
+
+
+def start_login(
+    provider_id: str,
+    *,
+    dashboard_origin: str = "",
+    db: SettingsStore | None = None,
+) -> dict[str, Any]:
+    """Begin a login and return everything the caller needs to send the user off.
+
+    ``dashboard_origin`` (e.g. ``https://mira.example.com``) is used only by
+    providers that accept our own callback URL; loopback-only providers ignore
+    it and get their fixed redirect.
+    """
+    spec = registry.require(provider_id)
+    resolved_db = db or store.default_db()
+    if resolved_db is None:
+        raise OAuthError("No dashboard database available to track the login")
+
+    if spec.redirect_mode == "dashboard":
+        if not dashboard_origin:
+            raise OAuthError(
+                f"{spec.label} needs the dashboard's public URL — set MIRA_DASHBOARD_URL"
+            )
+        redirect_uri = dashboard_origin.rstrip("/") + spec.dashboard_callback_path
+    else:
+        redirect_uri = spec.loopback_redirect_uri()
+
+    pkce = PkcePair.generate()
+    state = new_state()
+    attempts = _prune(_read_pending(resolved_db))
+    attempts[state] = {
+        "provider": spec.id,
+        "verifier": pkce.verifier,
+        "redirect_uri": redirect_uri,
+        "created_at": time.time(),
+    }
+    _write_pending(resolved_db, attempts)
+
+    return {
+        "provider": spec.id,
+        "label": spec.label,
+        "authorization_url": spec.authorization_url(
+            state=state, challenge=pkce.challenge, redirect_uri=redirect_uri
+        ),
+        "state": state,
+        "redirect_uri": redirect_uri,
+        "redirect_mode": spec.redirect_mode,
+        # True when the browser cannot deliver the code back to us on its own
+        # and the user has to paste the redirect URL.
+        "manual_exchange": spec.redirect_mode != "dashboard",
+        "expires_in": PENDING_TTL_SECONDS,
+    }
+
+
+def parse_redirect(url: str) -> dict[str, str]:
+    """Pull ``code``/``state`` out of a pasted redirect URL (or bare query string).
+
+    Raises :class:`OAuthError` when the provider redirected with an error
+    instead of a code — that message is the useful part of a failed consent,
+    and swallowing it leaves the user with "invalid URL" for a denied login.
+    """
+    text = (url or "").strip()
+    if not text:
+        raise OAuthError("Paste the full URL you were redirected to")
+    query = urlsplit(text).query or (text if "=" in text else "")
+    params = parse_qs(query)
+    error = (params.get("error") or [""])[0]
+    if error:
+        detail = (params.get("error_description") or [""])[0]
+        raise OAuthError(f"Sign-in was not completed: {detail or error}")
+    code = (params.get("code") or [""])[0]
+    state = (params.get("state") or [""])[0]
+    if not code:
+        raise OAuthError("That URL has no authorization code in it")
+    return {"code": code, "state": state}
+
+
+async def complete_login(
+    *,
+    code: str = "",
+    state: str = "",
+    redirect_url: str = "",
+    db: SettingsStore | None = None,
+) -> dict[str, Any]:
+    """Redeem a code against its pending attempt and store the session.
+
+    The attempt is removed before the exchange runs, not after: an
+    authorization code is single-use, so a retry must start a fresh login
+    rather than replay a verifier against a code the issuer has already burned.
+    """
+    resolved_db = db or store.default_db()
+    if resolved_db is None:
+        raise OAuthError("No dashboard database available to complete the login")
+
+    if redirect_url:
+        parsed = parse_redirect(redirect_url)
+        code = code or parsed["code"]
+        state = state or parsed["state"]
+    if not code:
+        raise OAuthError("No authorization code to redeem")
+    if not state:
+        raise OAuthError("The redirect carried no state value — start the sign-in again")
+
+    attempts = _prune(_read_pending(resolved_db))
+    attempt = attempts.pop(state, None)
+    _write_pending(resolved_db, attempts)
+    if attempt is None:
+        raise OAuthError("This sign-in expired or was already completed — start it again")
+
+    spec = registry.require(str(attempt.get("provider", "")))
+    tokens = await spec.exchange_code(
+        code=code,
+        verifier=str(attempt.get("verifier", "")),
+        redirect_uri=str(attempt.get("redirect_uri", "")),
+    )
+    _store_session(tokens, spec.label, resolved_db)
+    return store.status(spec.id, resolved_db)
+
+
+def _store_session(tokens: OAuthTokens, label: str, db: SettingsStore) -> None:
+    """Persist a fresh grant and log who it belongs to (never the token)."""
+    store.save(tokens, db)
+    logger.info(
+        "Connected %s account %s%s",
+        label,
+        tokens.account_label or tokens.account_id or "(unknown)",
+        f" [{tokens.plan}]" if tokens.plan else "",
+    )
+
+
+def disconnect(provider_id: str, db: SettingsStore | None = None) -> None:
+    """Forget a provider's session."""
+    spec = registry.require(provider_id)
+    store.delete(spec.id, db)
+    logger.info("Disconnected %s", spec.label)
+
+
+def list_status(db: SettingsStore | None = None) -> dict[str, Any]:
+    """Every provider's connection state plus which one is serving reviews."""
+    return {
+        "active_provider": store.get_active_provider(db),
+        "providers": [store.status(pid, db) for pid in sorted(registry.all_providers())],
+    }
