@@ -52,10 +52,14 @@ trap cleanup EXIT
 
 wait_for_health() {
   local label="$1"
-  # Same three-minute ceiling as before, polled every second: the server is
-  # up in a couple of seconds on a native runner, and this waits for four
+  # A three-minute wall-clock ceiling, polled every second: the server is up
+  # in a couple of seconds on a native runner, and this waits for four
   # separate starts, so a coarse poll was paying up to five seconds each.
-  for _ in $(seq 1 180); do
+  # Wall-clock rather than an attempt count, because an endpoint that
+  # accepts the connection and then hangs costs curl its full --max-time on
+  # every attempt, and would stretch a count of attempts well past the limit.
+  local deadline=$((SECONDS + 180))
+  while ((SECONDS < deadline)); do
     if curl --fail --silent --show-error --max-time 3 \
       "http://127.0.0.1:${host_port}/health" >/dev/null 2>&1; then
       return 0
