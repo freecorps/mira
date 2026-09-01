@@ -13,6 +13,12 @@ Two access rules the rest of the codebase depends on:
   concurrently; without the lock they would each notice the same expiring token
   and fire their own refresh, and an issuer that rotates refresh tokens would
   invalidate all but one of them — logging the user out mid-review.
+
+That lock lives in one process, which covers the server as deployed (a single
+uvicorn worker) but not a second one alongside it, nor a ``mira auth`` command
+run against the same database. So a refusal is not taken at face value: a
+refresh that fails re-reads the store, and a grant somebody else has since
+rotated in is used instead of reporting a session that was never lost.
 """
 
 from __future__ import annotations
@@ -36,11 +42,15 @@ _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 class SettingsStore(Protocol):
-    """The slice of ``AppDatabase`` this module needs."""
+    """The slice of ``AppDatabase`` the OAuth package needs."""
 
     def get_setting(self, key: str) -> str | None: ...
 
     def set_setting(self, key: str, value: str) -> None: ...
+
+    def delete_setting(self, key: str) -> None: ...
+
+    def list_settings(self, prefix: str) -> dict[str, str]: ...
 
 
 def default_db() -> SettingsStore | None:
@@ -158,22 +168,40 @@ def active_binding(db: SettingsStore | None = None) -> tuple[str, OAuthTokens] |
 # ── Refresh ─────────────────────────────────────────────────────────
 
 
-async def valid_tokens(provider_id: str, db: SettingsStore | None = None) -> OAuthTokens:
-    """A grant that is good right now, refreshing and persisting if needed."""
+async def valid_tokens(
+    provider_id: str, db: SettingsStore | None = None, *, force: bool = False
+) -> OAuthTokens:
+    """A grant that is good right now, refreshing and persisting if needed.
+
+    ``force`` renews even when the stored token still looks valid. That is the
+    only correct answer to a 401: the endpoint has told us the token is dead,
+    which the expiry cannot, and re-reading the store would return it again.
+    """
     spec = registry.require(provider_id)
     tokens = load(provider_id, db)
     if tokens is None:
         raise OAuthError(f"{spec.label} is not connected — sign in from Settings → Connections")
-    if not tokens.is_expired():
+    if not force and not tokens.is_expired():
         return tokens
 
     async with _locks[provider_id]:
         # Another caller may have refreshed while we waited for the lock.
         current = load(provider_id, db) or tokens
-        if not current.is_expired():
+        if not current.is_expired() and (not force or current.access_token != tokens.access_token):
             return current
         logger.info("Refreshing %s OAuth session", spec.label)
-        refreshed = await spec.refresh(current)
+        try:
+            refreshed = await spec.refresh(current)
+        except OAuthError:
+            # The lock is per-process, so a second worker (or a `mira auth`
+            # command) may have rotated this grant out from under us, leaving
+            # ours refused. Its replacement is already in the store, so read
+            # once more before reporting a session nobody has actually lost.
+            replacement = load(provider_id, db)
+            if replacement is not None and replacement.access_token != current.access_token:
+                logger.info("%s session was renewed elsewhere; using it", spec.label)
+                return replacement
+            raise
         save(refreshed, db)
         return refreshed
 

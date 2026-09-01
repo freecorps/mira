@@ -157,6 +157,7 @@ async def get_models() -> ModelsResponse:
         API_STYLES,
         THINKING_MODES,
         apply_oauth_binding,
+        effective_model,
         get_indexing_model,
         get_review_model,
         get_review_thinking_mode,
@@ -166,41 +167,50 @@ async def get_models() -> ModelsResponse:
     )
 
     config = load_config()
+    llm = config.llm
     db_indexing = _api._app_db.get_setting("indexing_model")
     db_review = _api._app_db.get_setting("review_model")
     db_security = _api._app_db.get_setting("security_model")
-    indexing = get_indexing_model(config.llm, db_indexing)
-    review = get_review_model(config.llm, db_review)
-    security = get_security_model(config.llm, db_security, db_review)
-    thinking = get_review_thinking_mode(
-        config.llm, _api._app_db.get_setting("review_thinking_mode")
-    )
-    api_style = resolve_api_style(config.llm, _api._app_db.get_setting("api_style"))
+    thinking = get_review_thinking_mode(llm, _api._app_db.get_setting("review_thinking_mode"))
+    api_style = resolve_api_style(llm, _api._app_db.get_setting("api_style"))
 
-    # The catalog has to be read through the same binding a review would use:
-    # with a ChatGPT session connected, the dropdown must offer that account's
-    # models, not OpenRouter's.
-    oauth_provider = resolve_oauth_provider(
-        config.llm, _api._app_db.get_setting("llm_oauth_provider")
-    )
-    catalog_config = config.llm
+    # Every model this endpoint reports has to be read through the binding a
+    # review would use. With a ChatGPT session connected the dropdown must offer
+    # that account's models, and the *selected* values must be the ids the calls
+    # will actually carry — reporting the OpenRouter-side resolution next to a
+    # ChatGPT catalog names a model no call will ever make.
+    oauth_provider = resolve_oauth_provider(llm, _api._app_db.get_setting("llm_oauth_provider"))
+    catalog_config = llm
     if oauth_provider:
-        catalog_config = apply_oauth_binding(catalog_config, oauth_provider, model_is_explicit=True)
+        catalog_config = apply_oauth_binding(llm, oauth_provider, model_is_explicit=True)
         api_style = catalog_config.api_style
     backend = active_backend(catalog_config)
     catalog = await fetch_catalog(catalog_config)
 
+    def effective(resolved: str, chosen: str | None) -> str:
+        """``resolved`` as the call will carry it. ``chosen`` = who picked it."""
+        return effective_model(llm, resolved, chosen, oauth_provider)
+
     return ModelsResponse(
-        indexing_model=indexing,
-        review_model=review,
-        security_model=security,
+        indexing_model=effective(
+            get_indexing_model(llm, db_indexing), db_indexing or llm.indexing_model
+        ),
+        review_model=effective(get_review_model(llm, db_review), db_review or llm.review_model),
+        security_model=effective(
+            get_security_model(llm, db_security, db_review),
+            db_security or llm.security_model or db_review or llm.review_model,
+        ),
         backend=backend,
         indexing_source="dashboard" if db_indexing else "config",
         review_source="dashboard" if db_review else "config",
         security_source="dashboard" if db_security else "config",
-        config_indexing_model=get_indexing_model(config.llm),
-        config_review_model=get_review_model(config.llm),
-        config_security_model=get_security_model(config.llm),
+        # The "inherit from deployment config" targets: what each purpose would
+        # resolve to with its dashboard override cleared.
+        config_indexing_model=effective(get_indexing_model(llm), llm.indexing_model),
+        config_review_model=effective(get_review_model(llm), llm.review_model),
+        config_security_model=effective(
+            get_security_model(llm), llm.security_model or llm.review_model
+        ),
         indexing_options=[ModelOption(**m) for m in build_options(backend, catalog, "indexing")],
         review_options=[ModelOption(**m) for m in build_options(backend, catalog, "review")],
         security_options=[ModelOption(**m) for m in build_options(backend, catalog, "review")],

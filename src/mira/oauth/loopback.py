@@ -1,10 +1,10 @@
-"""A one-shot localhost listener for the CLI login flow.
+"""A localhost listener for the CLI login flow.
 
 Providers with a fixed ``http://localhost:<port>/auth/callback`` redirect can
 be logged into properly — no pasting — as long as the browser and the process
 waiting for the callback are on the same machine. That is exactly the CLI case,
-so ``mira auth login`` serves a single request on that port, takes the code out
-of the query string, and shuts down.
+so ``mira auth login`` listens on that port until the redirect arrives, takes
+the code out of the query string, and shuts down.
 
 It is deliberately not used by the dashboard: a server-side listener would bind
 a port on the *server*, while the browser resolves ``localhost`` to the user's
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -40,11 +41,24 @@ _FAILURE_HTML = b"""<!doctype html>
 </body></html>"""
 
 
+# How long a single connected client may take to send its request line before
+# we give up on it and go back to waiting for the real callback.
+_REQUEST_TIMEOUT = 10.0
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Answers exactly one callback and records its query parameters."""
+    """Answers the callback and records its query parameters.
+
+    Requests for any other path are answered 404 and left unrecorded — see
+    :func:`_serve_once`, which keeps waiting for the one it wants.
+    """
 
     result: dict[str, str] = {}
     callback_path: str = "/auth/callback"
+    # Applied to the accepted connection by StreamRequestHandler.setup(). Without
+    # it a client that connects and then sends nothing blocks the read forever:
+    # HTTPServer.timeout only bounds the wait for a *connection*.
+    timeout = _REQUEST_TIMEOUT
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
         parsed = urlsplit(self.path)
@@ -67,15 +81,28 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 
 def _serve_once(port: int, path: str, timeout: float) -> dict[str, str]:
-    """Block until one callback arrives (or ``timeout`` seconds pass)."""
+    """Serve until the callback arrives, or ``timeout`` seconds pass.
+
+    Deliberately not one `handle_request()`: a browser aims more than the
+    redirect at a port it has open — a favicon probe, a preconnect, a stray
+    request from another tab — and any one of them would consume a single-shot
+    listener and fail a login the user had already approved. So requests keep
+    being served until one of them is the callback, against a wall-clock
+    deadline that an abandoned tab still runs out.
+    """
     _CallbackHandler.result = {}
     _CallbackHandler.callback_path = path
     server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    server.timeout = timeout
+    deadline = time.monotonic() + timeout
     try:
-        # handle_request honours `timeout` and returns without a result when it
-        # expires, which is how an abandoned browser tab stops being a hang.
-        server.handle_request()
+        while not _CallbackHandler.result:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Bounds the wait for the next connection; the handler's own
+            # `timeout` bounds how long that connection may then stay silent.
+            server.timeout = remaining
+            server.handle_request()
     finally:
         server.server_close()
     return dict(_CallbackHandler.result)

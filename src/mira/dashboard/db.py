@@ -1460,6 +1460,39 @@ class AppDatabase:
                     (key, value),
                 )
 
+    def delete_setting(self, key: str) -> None:
+        """Remove a setting row. No-op when the key isn't stored."""
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.execute("DELETE FROM settings WHERE key=?", (key,))
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute("DELETE FROM settings WHERE key=%s", (key,))
+
+    def list_settings(self, prefix: str) -> dict[str, str]:
+        """Every setting whose key starts with ``prefix``.
+
+        Lets a caller keep one row per item instead of one JSON blob holding
+        all of them — the blob turns every write into a read-modify-write, and
+        two writers then overwrite each other's entries.
+        """
+        # The prefix is escaped for LIKE: a caller's `_` or `%` must match
+        # itself rather than act as a wildcard.
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            rows = self._sqlite_conn.execute(
+                "SELECT key, value FROM settings WHERE key LIKE ? ESCAPE '\\'", (pattern,)
+            ).fetchall()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE %s ESCAPE '\\'", (pattern,)
+                )
+                rows = cur.fetchall()
+        return {row[0]: row[1] for row in rows}
+
     @property
     def setup_complete(self) -> bool:
         return self.get_setting("setup_complete") == "true"

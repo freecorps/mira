@@ -11,6 +11,7 @@ import logging
 
 from mira.config import LLMConfig
 from mira.llm import registry
+from mira.oauth.base import LLMBinding
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +84,19 @@ def apply_oauth_binding(
     ``base_url``/``api_style``: those describe the API-key path, and leaving
     them in place would send an OAuth bearer token to OpenRouter.
 
-    The model is only replaced when nobody chose one. Somebody who typed a
-    model id — in mira.yaml or in the dashboard — gets it sent as-is, since the
-    dropdown is a guide and these endpoints accept ids the registry has never
-    heard of. But the *default* model id is an OpenRouter-style Claude id that
-    this endpoint cannot serve, so inheriting it would turn "connect ChatGPT"
-    into a 400 on the next PR.
+    A model somebody typed is sent as-is, since the dropdown is a guide and
+    these endpoints accept ids the registry has never heard of. Two kinds of id
+    are replaced by the provider's default instead:
+
+    * the one nobody chose — Mira's built-in default is an OpenRouter-style
+      Claude id this endpoint cannot serve, so inheriting it would turn
+      "connect ChatGPT" into a 400 on the next pull request;
+    * one belonging to a *different* vendor. This binding applies to indexing
+      and the security sweep as well as reviews, and those two are usually
+      pinned to a cheap model in mira.yaml — an `anthropic/…` id that would now
+      be sent to an endpoint that has never served one. A vendor-prefixed id is
+      the reliable tell: OpenRouter and Bedrock ids carry a prefix, the ids
+      these accounts serve do not.
     """
     from mira.oauth import registry
 
@@ -100,9 +108,32 @@ def apply_oauth_binding(
         "base_url": spec.llm.base_url,
         "api_style": spec.llm.api_style,
     }
-    if not model_is_explicit and spec.llm.default_model:
+    if spec.llm.default_model and (
+        not model_is_explicit or _is_foreign_model(config.model, spec.llm)
+    ):
         update["model"] = spec.llm.default_model
     return config.model_copy(update=update)
+
+
+def _is_foreign_model(model: str, binding: LLMBinding) -> bool:
+    """True when ``model`` plainly belongs to another backend, not this one.
+
+    Only a vendor prefix counts. An unfamiliar bare id (``gpt-5.2-codex``, a
+    model released after this build) is left alone — the point is to catch ids
+    that provably came from somewhere else, not to reject everything the
+    curated list does not already name.
+    """
+    if not model or "/" not in model:
+        return False
+    if any(model == option.get("value") for option in binding.models):
+        return False
+    logger.warning(
+        "Model %r is not one %s serves; using %s instead",
+        model,
+        binding.base_url,
+        binding.default_model,
+    )
+    return True
 
 
 def estimate_indexing_cost(file_count: int, model: str) -> dict:
@@ -272,3 +303,24 @@ def _model_is_explicit(base: LLMConfig, per_purpose: str | None) -> bool:
         return True
     default = LLMConfig.model_fields["model"].default
     return base.model != default
+
+
+def effective_model(
+    base: LLMConfig, resolved: str, per_purpose: str | None, oauth_provider: str
+) -> str:
+    """The model id a call for this purpose will actually be made with.
+
+    ``resolved`` is what the DB → config chain produced; with an OAuth session
+    connected, the binding may still replace it (see :func:`apply_oauth_binding`).
+    The dashboard has to report the same answer the review path computes, or the
+    Models page names a model that no call will ever use — the mismatch is
+    invisible until a review fails on an id the endpoint has never served.
+    """
+    if not oauth_provider:
+        return resolved
+    bound = apply_oauth_binding(
+        base.model_copy(update={"model": resolved}),
+        oauth_provider,
+        model_is_explicit=_model_is_explicit(base, per_purpose),
+    )
+    return bound.model
