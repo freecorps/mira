@@ -91,6 +91,14 @@ _BATCH_INTERVAL = 1.0
 # batch: the trim is two statements and neither belongs on every insert.
 _PRUNE_INTERVAL = 300.0
 
+# Shutdown budget. The flush is bounded rather than exhaustive because the
+# queue holds twenty thousand records and a shutdown that insists on writing
+# all of them against a slow disk is a container that gets killed instead of
+# exiting. The join has to outlast the flush plus the batch already in
+# progress, or it reports a hang that was only ever slowness.
+_SHUTDOWN_FLUSH_SECONDS = 2.0
+_SHUTDOWN_JOIN_SECONDS = 5.0
+
 _LEVELS = {
     "CRITICAL": logging.CRITICAL,
     "ERROR": logging.ERROR,
@@ -233,13 +241,32 @@ class LogCaptureHandler(logging.Handler):
                 self._dropped += 1
 
     def close(self) -> None:
-        """Stop the writer and flush what is queued. Bounded wait: shutdown is
-        not allowed to hang on a database that has stopped answering."""
+        """Stop the writer, flush what is queued, and wait for it to exit.
+
+        The flag is the stop signal; the sentinel only wakes a thread blocked
+        on an empty queue. That split matters: the queue can be full at exactly
+        the moment shutdown is called — which is when a busy process shuts down
+        — and a stop signal that can be dropped is one that eventually is,
+        leaving a live thread holding a database connection behind a handler
+        nobody has a reference to any more.
+
+        The wait is bounded, because shutdown is not allowed to hang on a
+        database that has stopped answering. If the bound is hit, that is said
+        out loud rather than left as a thread that quietly outlives its owner.
+        """
         if not self._stopping.is_set():
             self._stopping.set()
             with contextlib.suppress(queue.Full):
                 self._queue.put_nowait(None)
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=_SHUTDOWN_JOIN_SECONDS)
+            if self._thread.is_alive():
+                logger.warning(
+                    "The log writer did not stop within %.0fs and is still "
+                    "running; up to %d queued lines will be lost. It is a "
+                    "daemon thread, so it will not hold up process exit.",
+                    _SHUTDOWN_JOIN_SECONDS,
+                    self._queue.qsize(),
+                )
         super().close()
 
     # ── writer thread ──
@@ -247,14 +274,45 @@ class LogCaptureHandler(logging.Handler):
     def _drain(self) -> None:
         next_prune = time.monotonic() + _PRUNE_INTERVAL
         while True:
+            if self._stopping.is_set():
+                self._flush_remaining()
+                return
             batch, stop = self._collect_batch()
             if batch:
                 self._write(batch)
             if time.monotonic() >= next_prune:
                 self._prune()
                 next_prune = time.monotonic() + _PRUNE_INTERVAL
-            if stop:
+            # The flag is checked as well as the sentinel, so a queue that was
+            # full when `close` ran still stops this thread.
+            if stop or self._stopping.is_set():
+                self._flush_remaining()
                 return
+
+    def _flush_remaining(self) -> None:
+        """Write what is still queued at shutdown, within a deadline.
+
+        Whatever the deadline leaves behind is counted as dropped rather than
+        forgotten: the page already knows how to report a trail with gaps, and
+        that is a better answer than a silently shorter one.
+        """
+        deadline = time.monotonic() + _SHUTDOWN_FLUSH_SECONDS
+        while time.monotonic() < deadline:
+            batch: list[dict[str, Any]] = []
+            while len(batch) < _BATCH_MAX:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    batch.append(item)
+            if not batch:
+                break
+            self._write(batch)
+        abandoned = self._queue.qsize()
+        if abandoned:
+            with self._counter_lock:
+                self._dropped += abandoned
 
     def _collect_batch(self) -> tuple[list[dict[str, Any]], bool]:
         """Block for one record, then take whatever else arrives within the

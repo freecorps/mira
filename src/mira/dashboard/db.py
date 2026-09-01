@@ -648,9 +648,13 @@ class AppDatabase:
         self._sqlite_conn: sqlite3.Connection | None = None
         self._sqlite_path = ""
         # A second SQLite connection, for the log writer thread alone. See
-        # `_log_writer_conn` for why it is not the shared one.
+        # `_log_writer_conn` for why it is not the shared one. The lock guards
+        # every transaction on it, not just its creation: one connection with
+        # two threads on it has exactly the interleaving problem the second
+        # connection exists to avoid. Re-entrant so a transaction can open the
+        # connection without releasing and reacquiring around the call.
         self._sqlite_log_conn: sqlite3.Connection | None = None
-        self._sqlite_log_lock = threading.Lock()
+        self._sqlite_log_lock = threading.RLock()
 
         if url.startswith("postgresql://") or url.startswith("postgres://"):
             self._init_postgres(url)
@@ -1785,6 +1789,12 @@ class AppDatabase:
         two writers at once — waits rather than failing. If it does fail, the
         handler counts it and the dashboard says the trail has gaps.
 
+        Callers must hold ``_sqlite_log_lock`` for the whole transaction, not
+        merely to reach this connection. Splitting the connection only moves
+        the interleaving problem if two threads then share the new one, and
+        nothing structurally stops a second caller: these are public methods,
+        and a handler installed twice would run two writer threads.
+
         This deliberately does not touch the shared connection's other users.
         Whatever races exist between two request threads predate the log trail
         and are not this method's to fix quietly.
@@ -1829,13 +1839,23 @@ class AppDatabase:
             for e in entries
         ]
         if self._backend == "sqlite":
-            conn = self._log_writer_conn()
-            conn.executemany(
-                f"INSERT INTO app_logs ({self._APP_LOG_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
-            conn.commit()
+            with self._sqlite_log_lock:
+                conn = self._log_writer_conn()
+                try:
+                    conn.executemany(
+                        f"INSERT INTO app_logs ({self._APP_LOG_COLUMNS}) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    )
+                    conn.commit()
+                except Exception:
+                    # A failed `executemany` or `commit` leaves the transaction
+                    # open. Without this, the next batch joins the wreckage of
+                    # this one and a single "database is locked" poisons every
+                    # batch after it. Rolling back first means one transient
+                    # failure costs one batch.
+                    conn.rollback()
+                    raise
         else:
             with self._pg_cursor() as cur:
                 cur.executemany(
@@ -1993,8 +2013,17 @@ class AppDatabase:
         ``NOT IN (SELECT …)``, which rescans the whole table every pass.
         """
         # Called from the log writer thread, so it uses that thread's own
-        # connection for the same reason the inserts do.
-        conn = self._log_writer_conn() if self._backend == "sqlite" else None
+        # connection for the same reason the inserts do — and holds the same
+        # lock, so its three statements are not interleaved with a batch.
+        if self._backend != "sqlite":
+            return self._prune_app_logs(max_age_days, max_rows, None)
+        with self._sqlite_log_lock:
+            return self._prune_app_logs(max_age_days, max_rows, self._log_writer_conn())
+
+    def _prune_app_logs(
+        self, max_age_days: float, max_rows: int, conn: sqlite3.Connection | None
+    ) -> int:
+        """The pruning itself, with the connection and lock already settled."""
         deleted = 0
         if max_age_days > 0:
             cutoff = time.time() - max_age_days * 86400
@@ -2028,8 +2057,16 @@ class AppDatabase:
         if self._backend == "sqlite":
             target = conn if conn is not None else self._sqlite_conn
             assert target is not None
-            cur = target.execute(sql, params)
-            target.commit()
+            try:
+                cur = target.execute(sql, params)
+                target.commit()
+            except Exception:
+                # Only ever roll back a connection this call owns. On the
+                # shared one a rollback would discard whatever a request thread
+                # had in flight — the exact damage the split was meant to stop.
+                if conn is not None:
+                    conn.rollback()
+                raise
             return max(0, cur.rowcount)
         with self._pg_cursor() as cur:
             cur.execute(sql.replace("?", "%s"), params)
