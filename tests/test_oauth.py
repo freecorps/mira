@@ -412,6 +412,62 @@ class TestManager:
         # Refused, not consumed: the attempt on screen is still redeemable.
         assert db.get_setting(f"oauth_pending:{mine['state']}")
 
+    @pytest.mark.asyncio
+    async def test_a_redirect_without_state_is_refused(self, db: AppDatabase):
+        # The state is the only evidence a pasted URL came back from the login
+        # we started. Accepting one that carries none — and standing the
+        # caller's expectation in for it — proves nothing and spends the
+        # pending attempt doing it.
+        mine = manager.start_login("chatgpt", db=db)
+        with pytest.raises(OAuthError, match="carries no state"):
+            await manager.complete_login(
+                redirect_url="http://localhost:1455/auth/callback?code=c",
+                state=mine["state"],
+                db=db,
+            )
+        assert db.get_setting(f"oauth_pending:{mine['state']}")
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_redirect_is_refused_with_no_expectation_either(self, db):
+        manager.start_login("chatgpt", db=db)
+        with pytest.raises(OAuthError, match="carries no state"):
+            await manager.complete_login(
+                redirect_url="http://localhost:1455/auth/callback?code=c", db=db
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_redirects_code_wins_over_a_supplied_one(self, db, monkeypatch):
+        # The redirect is what came back from the provider; a code passed
+        # alongside it must not override what it actually carries.
+        started = manager.start_login("chatgpt", db=db)
+        seen: dict = {}
+
+        def _exchange(cls, **kw):
+            seen.update(kw)
+            return _async(_tokens())
+
+        monkeypatch.setattr(ChatGPTOAuthProvider, "exchange_code", classmethod(_exchange))
+        await manager.complete_login(
+            redirect_url=f"http://localhost:1455/auth/callback?code=real&state={started['state']}",
+            code="other",
+            state=started["state"],
+            db=db,
+        )
+        assert seen["code"] == "real"
+
+    @pytest.mark.asyncio
+    async def test_code_and_state_without_a_redirect_still_works(self, db, monkeypatch):
+        # The dashboard-callback path: the state arrives as its own request
+        # parameter rather than inside a URL somebody pasted.
+        started = manager.start_login("chatgpt", db=db)
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider,
+            "exchange_code",
+            classmethod(lambda cls, **kw: _async(_tokens())),
+        )
+        status = await manager.complete_login(code="c", state=started["state"], db=db)
+        assert status["connected"] is True
+
     def test_an_attempt_can_only_be_claimed_once(self, db: AppDatabase):
         # Two workers handling the same callback must not both come away with
         # the verifier and both go redeem the single-use code.

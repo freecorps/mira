@@ -214,11 +214,17 @@ async def complete_login(
     authorization code is single-use, so a retry must start a fresh login
     rather than replay a verifier against a code the issuer has already burned.
 
-    ``state`` from the caller is the attempt it *expects* this redirect to
-    belong to — the dashboard passes the one it started. It is checked against
-    the redirect rather than allowed to stand in for it: taking the caller's
-    word would redeem a pasted URL from some other login against the attempt on
-    screen, which is the mismatch the state parameter exists to catch.
+    A pasted redirect has to identify its own attempt: the state it carries is
+    the only evidence that this URL came back from the login we started, so it
+    is required and it decides which attempt is claimed. ``state`` from the
+    caller — the dashboard passes the one its dialog started — is an
+    expectation checked against it, never a substitute for it. Falling back to
+    the caller's value when the redirect has none accepts a URL that proves
+    nothing, and spends the pending attempt on screen doing it.
+
+    Completing with ``code`` and ``state`` directly, with no redirect URL, is
+    the dashboard-callback path and stays available: there the state arrives as
+    its own request parameter rather than inside a URL somebody pasted.
     """
     resolved_db = db or store.default_db()
     if resolved_db is None:
@@ -226,10 +232,11 @@ async def complete_login(
 
     if redirect_url:
         parsed = parse_redirect(redirect_url)
-        code = code or parsed["code"]
-        if state and parsed["state"] and parsed["state"] != state:
+        if not parsed["state"]:
+            raise OAuthError("That redirect carries no state — start the sign-in again")
+        if state and parsed["state"] != state:
             raise OAuthError("That redirect belongs to a different sign-in — start this one again")
-        state = parsed["state"] or state
+        code, state = parsed["code"], parsed["state"]
     if not code:
         raise OAuthError("No authorization code to redeem")
     if not state:
