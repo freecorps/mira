@@ -57,11 +57,11 @@ The blocking local gates are:
 # Lint, format, YAML/TOML, and repository hygiene
 uv run pre-commit run --all-files
 
-# Tests
-uv run pytest tests/ --ignore=tests/evals --ignore=tests/test_integration.py
+# Tests (`-n auto` runs them across every core, as CI does)
+uv run pytest tests/ -n auto --ignore=tests/evals --ignore=tests/test_integration.py
 
-# UI type check (if you touched the UI)
-cd ui/mira && npx tsc --noEmit
+# UI type check + bundle (if you touched the UI)
+cd ui/mira && npm run build
 ```
 
 `mypy` is currently advisory because the synchronized upstream tree has a
@@ -73,10 +73,12 @@ retired:
 uv run pre-commit run --all-files --hook-stage manual mypy
 ```
 
-CI runs tests on Python 3.11 and 3.12, builds and starts the native `amd64`
-image, and executes the `arm64` image under QEMU against a database produced
-by the currently deployed `edge` image. The ARM job also proves that the
-previous image can reopen the candidate-touched database.
+CI runs tests on Python 3.11 and 3.12, then builds and starts the image on a
+native runner for each architecture (`amd64` and `arm64`, no emulation). The
+`arm64` job also exercises the candidate against a database produced by the
+currently deployed `edge` image and proves that the previous image can reopen
+the candidate-touched database. Jobs are skipped when the paths they cover
+did not change, so a docs-only PR runs only the pre-commit hooks.
 
 ## PR flow
 

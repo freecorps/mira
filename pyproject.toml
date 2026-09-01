@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "pytest-mock>=3.12",
+    "pytest-xdist>=3.6",
     "ruff>=0.4",
     "types-PyYAML>=6.0",
     "cryptography>=42.0",

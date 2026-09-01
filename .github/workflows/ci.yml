@@ -12,33 +12,88 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR cancels the run still going for the previous
+# one — three pushes in a row used to mean three full pipelines. Pushes to
+# main are never cancelled: an interrupted run would leave `edge` stale.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  python:
+  # Cheap gate so a docs-only change does not run the test matrix, the UI
+  # build and two image builds. Skipped jobs count as passing for `needs`.
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12"]
-    env:
-      # .python-version pins local development to 3.12. Override it here so
-      # each matrix entry really exercises the advertised interpreter.
-      UV_PYTHON: ${{ matrix.python-version }}
-
+    permissions:
+      contents: read
+      # paths-filter lists a PR's files through the API; pushes are diffed
+      # from the checkout.
+      pull-requests: read
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      ui: ${{ steps.filter.outputs.ui }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'src/**'
+              - 'tests/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/workflows/ci.yml'
+            ui:
+              - 'ui/**'
+              - '.github/workflows/ci.yml'
+            docker:
+              - 'src/**'
+              - 'ui/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'README.md'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'scripts/ci/**'
+              - 'deploy/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/docker-publish.yml'
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+  # Runs on every change: the hygiene hooks (trailing whitespace, EOF, YAML,
+  # TOML, large files) cover files the other jobs never look at.
+  lint:
+    name: Lint (pre-commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+          # Every dependency ships a wheel, so a cold `uv sync` is a few
+          # seconds; caching it would spend ~100 MB of the cache quota per
+          # lockfile hash to save almost nothing.
+          enable-cache: false
 
       - name: Install dependencies
-        run: uv sync --locked --extra dev --extra serve --extra bedrock
+        run: uv sync --locked --extra dev
+
+      # The hook environments (ruff, mypy + its stubs) are what pre-commit
+      # spends its time installing; one cache entry per config hash.
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
 
       # Run the same pre-commit hooks contributors run locally. Single source
       # of truth — if a hook is added/removed/version-bumped in
@@ -51,43 +106,112 @@ jobs:
         continue-on-error: true
         run: uv run --no-sync pre-commit run --all-files --hook-stage manual mypy
 
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # .python-version pins local development to 3.12. `python-version`
+      # overrides it so each matrix entry really exercises the advertised
+      # interpreter.
+      - name: Install uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: false
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev --extra serve --extra bedrock
+
+      # `-n auto` spreads the suite over every runner core; the slowest tests
+      # are retry/backoff waits that parallelise perfectly.
       - name: Test
-        run: uv run --no-sync pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
+        run: >-
+          uv run --no-sync pytest tests/
+          -n auto
+          -rfE --durations=10
+          --ignore=tests/evals --ignore=tests/test_integration.py
 
   ui:
+    name: UI build
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ui/mira
-
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: ui/mira/package-lock.json
 
       - name: Install
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
-      - name: Type check
-        run: npx tsc --noEmit
-
-      - name: Build
+      # `npm run build` is `tsc -b && vite build`, so this is the type check
+      # as well as the bundle.
+      - name: Type check and build
         run: npm run build
 
+  # Build the unified UI+backend image for each architecture on a native
+  # runner and smoke-test it boots. Catches packaging issues (missing extras,
+  # broken Dockerfile, bad UI assets) before they hit `edge` or a release tag.
+  # The arm64 leg also runs the SQLite-upgrade and updater-rollback checks
+  # against the deployed image, since that is the reference deployment.
   docker:
-    # Build the unified UI+backend image and smoke-test it boots. Catches
-    # packaging issues (missing extras, broken Dockerfile, bad UI assets)
-    # before they hit a release tag.
-    runs-on: ubuntu-latest
+    name: Image (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Read-only use of the layer cache the publish workflow maintains in the
+      # registry. Nothing is written from here, so this job never needs more
+      # than `packages: read` and PRs cannot poison the cache.
       - name: Build image
-        run: docker build -t mira:ci .
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: mira:ci
+          provenance: false
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
 
       # Image ENTRYPOINT is `mira serve`, so anything after the image name
       # is appended as args to `serve`. Override the entrypoint for tests
@@ -101,99 +225,33 @@ jobs:
       - name: Smoke test — UI assets bundled
         run: docker run --rm --entrypoint ls mira:ci /app/ui_dist/index.html
 
-  docker-arm64:
-    name: ARM64 runtime and rollback
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build loadable ARM64 candidate
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/arm64
-          load: true
-          tags: mira:ci-arm64
-          provenance: false
-          cache-from: type=gha,scope=arm64-smoke
-          cache-to: type=gha,mode=max,scope=arm64-smoke
-
       - name: Smoke test ARM64, SQLite migration, and app rollback
+        if: matrix.arch == 'arm64'
         env:
-          MIRA_CANDIDATE_IMAGE: mira:ci-arm64
+          MIRA_CANDIDATE_IMAGE: mira:ci
           MIRA_BASELINE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge
         run: bash scripts/ci/smoke_arm64.sh
 
+  # Rebuilds each architecture natively from the (now warm) registry cache,
+  # pushes, merges into one manifest list and signs it. `test`/`ui` may be
+  # skipped for a change that did not touch them; `docker` must have run.
   publish-edge:
     name: Publish edge image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [python, ui, docker, docker-arm64]
-    runs-on: ubuntu-latest
+    needs: [changes, lint, test, ui, docker]
+    if: >-
+      !cancelled()
+      && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.lint.result == 'success'
+      && needs.docker.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.test.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.ui.result)
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=edge
-            type=sha,prefix=sha-
-
-      - name: Build and push multi-platform image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Sign build provenance
-        uses: actions/attest@v4
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      tags: |
+        type=raw,value=edge
+        type=sha,prefix=sha-
