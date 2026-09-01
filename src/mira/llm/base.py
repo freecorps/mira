@@ -574,6 +574,15 @@ class OpenAICompatibleProvider:
         the caller to raise.
         """
         if not self.config.json_mode_fallback or not tools:
+            # Said out loud: from the outside, "the last recovery path was
+            # switched off" and "the last recovery path ran and failed" produce
+            # the same failure, and only one of them is a configuration answer.
+            logger.info(
+                "Skipping the JSON-mode fallback (%s)",
+                "llm.json_mode_fallback is off"
+                if not self.config.json_mode_fallback
+                else "no tools were offered",
+            )
             return None
         function = tools[0].get("function") or {}
         prompt = [
@@ -589,7 +598,13 @@ class OpenAICompatibleProvider:
         try:
             raw = await self._call_llm(self.config.model, prompt, True, temperature=temperature)
         except Exception as exc:
-            logger.warning("JSON-mode fallback failed on %s: %s", self.config.model, exc)
+            logger.warning(
+                "JSON-mode fallback failed on %s (%s: %s)",
+                self.config.model,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             return None
         normalized = _as_json_object(raw)
         if normalized is None:
@@ -619,17 +634,31 @@ class OpenAICompatibleProvider:
             # gateway doesn't take tools at all — worth one JSON-mode attempt.
             # Anything else (auth, quota) would fail the same way, so re-raise.
             if exc.status in (400, 404, 422):
+                logger.warning(
+                    "Tool-calling request rejected by %s with HTTP %s; trying JSON mode. Error: %s",
+                    self.config.model,
+                    exc.status,
+                    exc,
+                )
                 recovered = await self._json_mode_tool_fallback(
                     messages, tools, temperature=temperature
                 )
                 if recovered is not None:
                     return recovered
+            logger.warning(
+                "Tool call to %s failed and is not retriable (HTTP %s): %s",
+                self.config.model,
+                exc.status,
+                exc,
+                exc_info=True,
+            )
             raise
         except Exception as primary_err:
             if self.config.fallback_model:
                 logger.warning(
-                    "Primary model %s failed (%s), trying fallback %s",
+                    "Primary model %s failed (%s: %s), trying fallback %s",
                     self.config.model,
+                    type(primary_err).__name__,
                     primary_err,
                     self.config.fallback_model,
                 )
@@ -646,6 +675,21 @@ class OpenAICompatibleProvider:
                     )
                     if recovered is not None:
                         return recovered
+                    # Every recovery path is spent, so this is where the review
+                    # dies. Log the whole chain before the message is collapsed
+                    # into the one safe line a pull request gets to see: the
+                    # notice says "LLM tool-call failed" and nothing else, and
+                    # which model, which status and which stack is exactly what
+                    # the person reading it needs next.
+                    logger.error(
+                        "Tool call failed on both models (primary %s: %s; "
+                        "fallback %s: %s), and JSON mode did not recover it",
+                        self.config.model,
+                        primary_err,
+                        self.config.fallback_model,
+                        fallback_err,
+                        exc_info=True,
+                    )
                     raise LLMError(
                         "both_models_failed",
                         primary_model=self.config.model,
@@ -657,6 +701,15 @@ class OpenAICompatibleProvider:
             )
             if recovered is not None:
                 return recovered
+            logger.error(
+                "Tool call failed on %s after %d attempt(s) with no fallback "
+                "model configured, and JSON mode did not recover it (%s: %s)",
+                self.config.model,
+                1 + self.config.tool_call_retries,
+                type(primary_err).__name__,
+                primary_err,
+                exc_info=True,
+            )
             raise LLMError(
                 "tool_call_failed", model=self.config.model, error=primary_err
             ) from primary_err

@@ -14,6 +14,7 @@ import {
   LogOut,
   Moon,
   Package,
+  ScrollText,
   Settings,
   ShieldAlert,
   Sun,
@@ -104,6 +105,7 @@ const navItems = [
     adminOnly: true,
   },
   { to: "/autofix", icon: Wrench, label: "Autofix", adminOnly: true },
+  { to: "/logs", icon: ScrollText, label: "Logs", adminOnly: true },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
 
@@ -128,6 +130,7 @@ const PAGE_LABELS: Record<string, string> = {
   checks: "Pre-merge checks",
   triage: "Reviewer triage",
   autofix: "Autofix",
+  logs: "Logs",
   analytics: "Rule analytics",
   settings: "Settings",
   users: "Users",

@@ -54,6 +54,7 @@ from mira.llm.response_parser import (
     parse_llm_response,
     parse_walkthrough_response,
 )
+from mira.logs import current_trace_id, log_context, set_log_target
 from mira.models import (
     WALKTHROUGH_MARKER,
     FileChangeStat,
@@ -544,14 +545,30 @@ class ReviewEngine:
 
     @staticmethod
     def _format_failure_notice(exc: BaseException) -> str:
-        """Format a user-safe failure notice without model names or internal errors."""
+        """Format a user-safe failure notice without model names or internal errors.
+
+        The trace id is the one detail here that is not about the error: it is
+        the handle for the full story. The safe message is deliberately thin —
+        it goes on a public pull request, so it names no model and carries no
+        internal error — and without a pointer, "LLM tool-call failed" is where
+        the investigation stops. With one, it is a filter on the Logs page that
+        returns every line the review emitted, including the ones the safe
+        message had to leave out.
+        """
         message = exc.safe_message if isinstance(exc, MiraError) else type(exc).__name__
-        return (
-            f"The code review failed to complete due to an unexpected error.\n\n"
-            f"**Stage:** Code review\n"
-            f"**Error type:** `{type(exc).__name__}`\n"
-            f"**Message:** {message}"
-        )
+        parts = [
+            "The code review failed to complete due to an unexpected error.\n",
+            "**Stage:** Code review",
+            f"**Error type:** `{type(exc).__name__}`",
+            f"**Message:** {message}",
+        ]
+        trace_id = current_trace_id()
+        if trace_id:
+            parts.append(
+                f"**Trace ID:** `{trace_id}` — search this on the Logs page of "
+                f"your Mira dashboard for the full diagnostics."
+            )
+        return "\n".join(parts)
 
     async def _detect_overlaps_safe(
         self,
@@ -645,6 +662,20 @@ class ReviewEngine:
     async def review_pr(self, pr_url: str) -> ReviewResult:
         """Full pipeline: fetch PR -> review -> post results.
 
+        A thin wrapper that opens a log context, so every line this review
+        emits — including the ones from the LLM client and the providers, which
+        know nothing about pull requests — carries the same trace id. The id is
+        printed on the failure notice, which is what turns "Review failed" on a
+        pull request into one filter on the dashboard's Logs page rather than a
+        timestamp hunt through the output of every review running at once.
+        """
+        with log_context() as trace_id:
+            logger.info("Review starting for %s (trace %s)", pr_url, trace_id)
+            return await self._review_pr_traced(pr_url)
+
+    async def _review_pr_traced(self, pr_url: str) -> ReviewResult:
+        """Fetch PR -> review -> post results.
+
         Runs thread resolution and diff fetching in parallel to reduce latency.
         """
         self._reset_exposures()
@@ -664,6 +695,10 @@ class ReviewEngine:
 
         pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
+        # Now that the pull request is known, name it on every subsequent line.
+        # The outer log_context still owns the reset, so this cannot leak into
+        # whatever runs next.
+        set_log_target(repo=f"{pr_info.owner}/{pr_info.repo}", pr_number=pr_info.number)
 
         # Say that the review is running before anything slow starts. Until the
         # first comment lands there is nothing on the pull request to say Mira
@@ -836,6 +871,29 @@ class ReviewEngine:
                 team_conventions=team_conventions,
             )
         except BaseException as exc:
+            # Log the full traceback here, once, at the point the review gives
+            # up. Callers re-raise or swallow this at their own level, so
+            # without it the captured trail ends on the last warning some inner
+            # retry loop happened to emit — and the one thing the person
+            # reading the failure notice needs is the stack that produced it.
+            if isinstance(exc, Exception):
+                logger.exception(
+                    "Review failed for %s (trace %s): %s: %s",
+                    pr_info.url,
+                    current_trace_id(),
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                # Cancellation and shutdown are not review failures, and
+                # logging them with a traceback teaches whoever reads this page
+                # to skip the entries that are.
+                logger.warning(
+                    "Review for %s was interrupted (trace %s): %s",
+                    pr_info.url,
+                    current_trace_id(),
+                    type(exc).__name__,
+                )
             if overlap_task is not None:
                 overlap_task.cancel()
 

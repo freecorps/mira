@@ -1229,3 +1229,43 @@ export interface TriageAuditPage {
   limit: number
   offset: number
 }
+
+// ── Captured application logs ──
+
+export interface AppLogEntry {
+  id: number
+  created_at: number
+  level: string
+  level_no: number
+  logger: string
+  message: string
+  traceback: string
+  module: string
+  func_name: string
+  lineno: number
+  // Correlation id shared by every line one review emitted, and printed on
+  // the review's failure notice. Empty for lines emitted outside a review.
+  trace_id: string
+  repo: string
+  pr_number: number
+  thread: string
+}
+
+export interface AppLogPage {
+  entries: AppLogEntry[]
+  total: number
+  limit: number
+  offset: number
+  // Capture state travels with the page so an empty table can explain itself:
+  // "nothing was logged" and "capture is switched off" look identical
+  // otherwise, and only one of them is an env var to go and change.
+  capture_enabled: boolean
+  capture_level: string
+  dropped: number
+  write_errors: number
+}
+
+export interface AppLogLogger {
+  logger: string
+  count: number
+}
