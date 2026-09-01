@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,30 @@ from mira.models import (
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+_STATE_ROOT = pytest.StashKey[str]()
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Point Mira's durable state at a throwaway directory before anything imports.
+
+    ``mira.dashboard.api`` opens the application database at import time,
+    under ``MIRA_INDEX_DIR`` — and collection imports it before any fixture
+    has run. Left unset, every pytest-xdist worker would open (and try to
+    create the admin user in) the same ``./data/indexes/_app.db`` at once,
+    which is a locked database for one and a duplicate ``admin`` row for the
+    next. One directory per worker, removed when the session ends.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    root = tempfile.mkdtemp(prefix=f"mira-tests-{worker}-")
+    os.environ["MIRA_INDEX_DIR"] = os.path.join(root, "indexes")
+    config.stash[_STATE_ROOT] = root
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    root = config.stash.get(_STATE_ROOT, None)
+    if root:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
