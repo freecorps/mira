@@ -10,6 +10,7 @@ import { useAuth } from "@/lib/auth"
 import { ActivityPage } from "@/pages/activity"
 import { AutofixPage } from "@/pages/autofix"
 import { ChecksPage } from "@/pages/checks"
+import { ConnectionsPage } from "@/pages/connections"
 import { TriagePage } from "@/pages/triage"
 import { ContributorDetailPage } from "@/pages/contributor-detail"
 import { ContributorsPage } from "@/pages/contributors"
@@ -239,6 +240,7 @@ export function App() {
             path="settings"
             element={<Navigate to="/settings/models" replace />}
           />
+          <Route path="settings/connections" element={<ConnectionsPage />} />
           <Route path="settings/webhooks" element={<WebhooksPage />} />
           <Route path="settings/webhooks/new" element={<WebhookFormPage />} />
           <Route path="settings/webhooks/:id" element={<WebhookFormPage />} />

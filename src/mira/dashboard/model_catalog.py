@@ -29,12 +29,30 @@ _cache: dict[str, tuple[float, list[dict] | None]] = {}
 _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
+# Prefix marking a backend served by a signed-in account rather than a key.
+OAUTH_BACKEND_PREFIX = "oauth:"
+
+
 def active_backend(config: LLMConfig) -> str:
-    """Return "bedrock", "openrouter", or "openai-compatible"."""
+    """Return ``"oauth:<id>"``, "bedrock", "openrouter", or "openai-compatible"."""
+    if config.oauth_provider:
+        return f"{OAUTH_BACKEND_PREFIX}{config.oauth_provider}"
     if config.provider == "bedrock":
         return "bedrock"
     profile = profiles.resolve(config.base_url)
     return "openrouter" if profile.get("name") == "openrouter" else "openai-compatible"
+
+
+def _oauth_models(backend: str) -> list[dict] | None:
+    """The curated model list for an OAuth backend, or None if not one."""
+    if not backend.startswith(OAUTH_BACKEND_PREFIX):
+        return None
+    from mira.oauth import registry
+
+    spec = registry.get(backend[len(OAUTH_BACKEND_PREFIX) :])
+    if spec is None or spec.llm is None:
+        return []
+    return [dict(m) for m in spec.llm.models]
 
 
 def _norm(model_id: str) -> str:
@@ -97,6 +115,11 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     coalesces concurrent cold-cache fetches (two tabs, the setup modal poll).
     """
     backend = active_backend(config)
+    # An OAuth backend serves a fixed, curated list — there is no catalog
+    # endpoint to call, and no key to call it with.
+    oauth = _oauth_models(backend)
+    if oauth is not None:
+        return oauth
     if backend == "bedrock":
         cache_key = f"bedrock:{config.region}:{config.aws_profile or ''}"
     else:
@@ -136,6 +159,11 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
     purposes. On a generic endpoint only its own list is trustworthy — registry
     ids are OpenRouter-style — so the registry is used there only as fallback.
     """
+    if backend.startswith(OAUTH_BACKEND_PREFIX):
+        # The provider spec's own list, in its own order: it is short, curated,
+        # and already says which model to reach for first.
+        return [{"recommended": False, **d} for d in (dynamic or [])]
+
     if backend == "openai-compatible" and dynamic is not None:
         options = [{**d, "recommended": False} for d in dynamic]
         options.sort(key=lambda m: m["label"].lower())

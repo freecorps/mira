@@ -1,0 +1,216 @@
+"""Responses-API provider authenticated by a stored OAuth grant.
+
+Same protocol as :class:`~mira.llm.responses.ResponsesProvider` — it is a
+subclass, so message conversion, tool handling, retries and fallbacks are
+shared — with three things swapped underneath:
+
+* **auth**: the bearer token comes from :mod:`mira.oauth.store` and is renewed
+  before it expires, instead of from an environment variable;
+* **body shape**: the provider spec gets the last word on the request, because
+  a consumer endpoint accepts a narrower set of fields than the public API;
+* **transport**: endpoints that only answer as an event stream are read back
+  into the one final response object the rest of the code already knows how to
+  parse, so streaming stays an implementation detail of this file.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import httpx
+
+from mira.config import LLMConfig
+from mira.exceptions import LLMError
+from mira.llm.responses import ResponsesProvider
+from mira.oauth import registry, store
+from mira.oauth.base import OAuthError, OAuthProviderSpec, OAuthTokens
+
+logger = logging.getLogger(__name__)
+
+# Long enough for a slow first token on a big review prompt; the per-request
+# ceiling is still `config.request_timeout` on the client.
+_STREAM_CHUNK_LIMIT = 1_000_000
+
+
+class OAuthResponsesProvider(ResponsesProvider):
+    """Talks to a provider the operator signed into rather than paid per token."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        super().__init__(config)
+        self._spec: type[OAuthProviderSpec] = registry.require(config.oauth_provider or "")
+        if self._spec.llm is None:
+            raise LLMError(
+                "oauth_not_connected",
+                provider=self._spec.label,
+                provider_id=self._spec.id,
+            )
+        self._tokens: OAuthTokens | None = None
+        # `_apply_reasoning` reads the effort map off `self.profile`, which the
+        # base class resolves from `base_url`. An OAuth endpoint has no entry in
+        # providers.json, so give it the spec's map here rather than asking
+        # operators to register a profile for a URL they never typed.
+        self.profile = {
+            **self.profile,
+            "name": f"oauth:{self._spec.id}",
+            "reasoning_effort_map": dict(self._spec.llm.reasoning_effort_map),
+        }
+
+    # ── Auth ───────────────────────────────────────────────────────
+
+    async def _ensure_token(self, force_refresh: bool = False) -> OAuthTokens:
+        """Load (and if needed renew) the grant backing this provider."""
+        if force_refresh:
+            self._tokens = None
+        if self._tokens is not None and not self._tokens.is_expired():
+            return self._tokens
+        try:
+            self._tokens = await store.valid_tokens(self._spec.id)
+        except OAuthError as exc:
+            if store.load(self._spec.id) is None:
+                raise LLMError(
+                    "oauth_not_connected",
+                    provider=self._spec.label,
+                    provider_id=self._spec.id,
+                ) from exc
+            raise LLMError(
+                "oauth_session_failed", provider=self._spec.label, error=str(exc)
+            ) from exc
+        return self._tokens
+
+    def _build_headers(self) -> dict[str, str]:
+        """Headers for the current grant.
+
+        Deliberately not memoised the way the base class memoises an API key:
+        the token here rotates, and a cached ``Authorization`` outlives it.
+        """
+        tokens = self._tokens
+        if tokens is None:
+            raise LLMError(
+                "oauth_not_connected", provider=self._spec.label, provider_id=self._spec.id
+            )
+        return {"Content-Type": "application/json", **self._spec.llm_headers(tokens)}
+
+    # ── Call methods (token first, then the inherited protocol) ────
+
+    async def _call_llm(self, *args: Any, **kwargs: Any) -> str:
+        await self._ensure_token()
+        return await super()._call_llm(*args, **kwargs)
+
+    async def _call_llm_with_tools(self, *args: Any, **kwargs: Any) -> str:
+        await self._ensure_token()
+        return await super()._call_llm_with_tools(*args, **kwargs)
+
+    async def _call_llm_agentic(self, *args: Any, **kwargs: Any) -> dict:
+        await self._ensure_token()
+        return await super()._call_llm_agentic(*args, **kwargs)
+
+    # ── Transport ──────────────────────────────────────────────────
+
+    async def _post(self, client: httpx.AsyncClient, body: dict) -> httpx.Response:
+        """Send one request, renewing the session once if it comes back 401.
+
+        A token can go stale between the pre-flight check and the request
+        landing — a long queue, a clock a few minutes out, a session revoked
+        elsewhere. The base class treats 401 as non-retriable (it is, for an API
+        key), so re-authenticating has to happen here or a whole review dies on
+        a token that a single refresh would have fixed.
+        """
+        adapted = self._spec.adapt_llm_body(body)
+        resp = await self._send(client, adapted)
+        if resp.status_code == 401:
+            logger.info("%s rejected the session; refreshing and retrying once", self._spec.label)
+            await self._ensure_token(force_refresh=True)
+            resp = await self._send(client, adapted)
+        return resp
+
+    async def _send(self, client: httpx.AsyncClient, body: dict) -> httpx.Response:
+        if not self._spec.requires_stream():
+            return await client.post(self._url, headers=self._build_headers(), json=body)
+        return await self._stream(client, body)
+
+    async def _stream(self, client: httpx.AsyncClient, body: dict) -> httpx.Response:
+        """Consume an SSE response and hand back the final object as a response.
+
+        The caller (and every parser downstream) expects a plain
+        ``httpx.Response`` holding one Responses-API payload, so the stream is
+        collapsed here into exactly that. Errors are passed through as the real
+        response, headers included, so ``Retry-After`` still reaches the retry
+        policy.
+        """
+        async with client.stream(
+            "POST", self._url, headers=self._build_headers(), json=body
+        ) as resp:
+            if resp.status_code != 200:
+                raw = await resp.aread()
+                return httpx.Response(
+                    resp.status_code,
+                    content=raw[:_STREAM_CHUNK_LIMIT],
+                    headers={
+                        k: v
+                        for k, v in resp.headers.items()
+                        if k.lower() in {"retry-after", "content-type"}
+                    },
+                )
+            payload = await _collect_stream(resp, self._spec.label)
+        return httpx.Response(200, json=payload)
+
+
+async def _collect_stream(resp: httpx.Response, label: str) -> dict[str, Any]:
+    """Reduce an SSE stream to the final ``response`` object it carried.
+
+    The stream is a running commentary — deltas, item lifecycle, usage — and
+    every event that matters here also ships the whole response object, so we
+    keep the last one we see and return it when the stream ends. That tolerates
+    a provider adding event types without this parser needing to know them.
+    """
+    latest: dict[str, Any] | None = None
+    failure: str = ""
+
+    async for line in resp.aiter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type", "")
+        response = event.get("response")
+        if isinstance(response, dict):
+            latest = response
+        if kind == "response.completed":
+            return latest or {}
+        if kind in ("response.failed", "error", "response.incomplete"):
+            failure = _stream_error_detail(event) or kind
+
+    if failure:
+        raise LLMError("oauth_stream_failed", provider=label, detail=failure)
+    if latest is not None:
+        # Stream cut off after the response was described but before it said
+        # "completed". The object we have is still the model's answer; letting
+        # the normal parser judge it beats failing on a missing event.
+        logger.warning("%s stream ended without a completion event", label)
+        return latest
+    raise LLMError("oauth_stream_failed", provider=label, detail="no response events")
+
+
+def _stream_error_detail(event: dict[str, Any]) -> str:
+    """The human-readable part of a failure event, wherever it was put."""
+    for source in (event.get("response"), event):
+        if not isinstance(source, dict):
+            continue
+        error = source.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(error, str) and error:
+            return error
+        detail = source.get("incomplete_details")
+        if isinstance(detail, dict) and detail.get("reason"):
+            return str(detail["reason"])
+    return ""

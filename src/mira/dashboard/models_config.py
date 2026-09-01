@@ -48,6 +48,63 @@ def resolve_api_style(config: LLMConfig, db_value: str | None = None) -> str:
     return config.api_style if config.api_style in API_STYLE_VALUES else "chat"
 
 
+def resolve_oauth_provider(config: LLMConfig, db_value: str | None = None) -> str:
+    """Resolve which OAuth session serves reviews: DB → config → none.
+
+    A stored "" means "not set" (the same convention the model settings use),
+    so clearing the dashboard's choice hands the decision back to mira.yaml
+    rather than pinning it off forever.
+
+    An id we do not recognise, or one whose session has been disconnected,
+    resolves to "" — a stale pointer must degrade to the API-key path instead
+    of failing every review with an unexplainable provider error.
+    """
+    from mira.oauth import registry, store
+
+    chosen = (db_value or "").strip() or (config.oauth_provider or "").strip()
+    if not chosen:
+        return ""
+    spec = registry.get(chosen)
+    if spec is None or spec.llm is None:
+        logger.warning("Ignoring unknown OAuth provider %r", chosen)
+        return ""
+    if store.load(spec.id) is None:
+        logger.warning("OAuth provider %s is selected but not connected", spec.id)
+        return ""
+    return spec.id
+
+
+def apply_oauth_binding(
+    config: LLMConfig, provider_id: str, *, model_is_explicit: bool
+) -> LLMConfig:
+    """Point an LLMConfig at an OAuth provider's endpoint.
+
+    The endpoint and protocol come from the provider spec, not from
+    ``base_url``/``api_style``: those describe the API-key path, and leaving
+    them in place would send an OAuth bearer token to OpenRouter.
+
+    The model is only replaced when nobody chose one. Somebody who typed a
+    model id — in mira.yaml or in the dashboard — gets it sent as-is, since the
+    dropdown is a guide and these endpoints accept ids the registry has never
+    heard of. But the *default* model id is an OpenRouter-style Claude id that
+    this endpoint cannot serve, so inheriting it would turn "connect ChatGPT"
+    into a 400 on the next PR.
+    """
+    from mira.oauth import registry
+
+    spec = registry.get(provider_id)
+    if spec is None or spec.llm is None:
+        return config
+    update: dict = {
+        "oauth_provider": spec.id,
+        "base_url": spec.llm.base_url,
+        "api_style": spec.llm.api_style,
+    }
+    if not model_is_explicit and spec.llm.default_model:
+        update["model"] = spec.llm.default_model
+    return config.model_copy(update=update)
+
+
 def estimate_indexing_cost(file_count: int, model: str) -> dict:
     """Estimate cost of indexing N files with the given model.
 
@@ -147,6 +204,7 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     db_thinking: str | None = None
     db_review: str | None = None
     db_style: str | None = None
+    db_oauth: str | None = None
     try:
         from mira.dashboard.api import _app_db
 
@@ -161,8 +219,11 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
                 db_thinking = _app_db.get_setting("review_thinking_mode")
                 db_review = _app_db.get_setting("review_model")
             db_style = _app_db.get_setting("api_style")
+            db_oauth = _app_db.get_setting("llm_oauth_provider")
     except Exception:
         pass  # DB not available — resolve from config fields alone
+
+    oauth_provider = resolve_oauth_provider(base, db_oauth)
 
     # Thinking mode only applies to reviews; other purposes leave it off.
     thinking_mode: str | None = None
@@ -179,10 +240,35 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
         config_model = base.review_model
         thinking_mode = get_review_thinking_mode(base, db_thinking)
     else:
-        return base.model_copy(update={"reasoning_effort": None, "api_style": resolved_style})
+        config = base.model_copy(update={"reasoning_effort": None, "api_style": resolved_style})
+        if oauth_provider:
+            config = apply_oauth_binding(
+                config, oauth_provider, model_is_explicit=_model_is_explicit(base, None)
+            )
+        return config
 
     source = "dashboard setting" if db_model else ("mira.yaml" if config_model else "default")
     logger.info("%s model: %s (source: %s)", purpose.capitalize(), resolved, source)
-    return base.model_copy(
+    config = base.model_copy(
         update={"model": resolved, "reasoning_effort": thinking_mode, "api_style": resolved_style}
     )
+    if oauth_provider:
+        config = apply_oauth_binding(
+            config,
+            oauth_provider,
+            model_is_explicit=_model_is_explicit(base, db_model or config_model),
+        )
+        logger.info("Reviewing through the %s OAuth session", oauth_provider)
+    return config
+
+
+def _model_is_explicit(base: LLMConfig, per_purpose: str | None) -> bool:
+    """Did anyone actually choose this model, or is it just the built-in default?
+
+    ``llm.model`` always has a value, so "did the user pick one" cannot be read
+    off the resolved id alone — it is compared against the field's default.
+    """
+    if per_purpose:
+        return True
+    default = LLMConfig.model_fields["model"].default
+    return base.model != default

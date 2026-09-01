@@ -383,7 +383,7 @@ class ModelsResponse(BaseModel):
     indexing_model: str
     review_model: str
     security_model: str
-    backend: str  # "openrouter" | "bedrock" | "openai-compatible"
+    backend: str  # "openrouter" | "bedrock" | "openai-compatible" | "oauth:<id>"
     indexing_source: str  # "dashboard" (DB override) | "config" (mira.yaml)
     review_source: str
     security_source: str
@@ -401,6 +401,10 @@ class ModelsResponse(BaseModel):
     # resolved DB → config → default. Mirrors review_thinking_mode.
     api_style: str
     api_style_options: list[ModelOption]
+    # The OAuth session serving reviews, if any ("" = API-key path). When set,
+    # the model options come from that provider and `api_style` is fixed by it.
+    oauth_provider: str = ""
+    oauth_label: str = ""
 
 
 class ModelsUpdate(BaseModel):
@@ -1357,6 +1361,7 @@ import mira.dashboard.routers.checks  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
 import mira.dashboard.routers.gate  # noqa: E402,F401
 import mira.dashboard.routers.logs  # noqa: E402,F401
+import mira.dashboard.routers.oauth  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.repos  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401

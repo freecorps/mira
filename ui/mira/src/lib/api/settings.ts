@@ -37,6 +37,11 @@ export const settingsApi = {
         label: string
         recommended?: boolean
       }[]
+      // Set when a signed-in account (Settings → Connections) is serving
+      // reviews: the options above then come from that provider, and the
+      // endpoint/protocol are fixed by it.
+      oauth_provider: string
+      oauth_label: string
     }>("/api/settings/models"),
 
   saveModels: (

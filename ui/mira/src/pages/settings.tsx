@@ -84,6 +84,9 @@ export function SettingsPage() {
   const [thinkingOptions, setThinkingOptions] = useState<ModelOption[]>([])
   const [apiStyle, setApiStyle] = useState("chat")
   const [apiStyleOptions, setApiStyleOptions] = useState<ModelOption[]>([])
+  // Non-empty when a signed-in account serves reviews: the model lists then
+  // come from that provider and the protocol is not ours to pick.
+  const [oauthLabel, setOauthLabel] = useState("")
   const [savingModels, setSavingModels] = useState(false)
   const [modelsSaved, setModelsSaved] = useState(false)
 
@@ -126,6 +129,7 @@ export function SettingsPage() {
       setThinkingOptions(m.thinking_options)
       setApiStyle(m.api_style ?? "chat")
       setApiStyleOptions(m.api_style_options ?? [])
+      setOauthLabel(m.oauth_provider ? m.oauth_label || m.oauth_provider : "")
     })
     api.getGlobalSettings().then((s) => {
       setEffective(
@@ -440,15 +444,28 @@ export function SettingsPage() {
             <CardTitle>Models</CardTitle>
             <CardDescription>
               Choose models for indexing and PR reviews
-              {backend &&
-                ` — listed from ${
-                  { openrouter: "OpenRouter", bedrock: "AWS Bedrock" }[
-                    backend
-                  ] ?? "your configured endpoint"
-                }`}
+              {oauthLabel
+                ? ` — listed from your ${oauthLabel} account`
+                : backend &&
+                  ` — listed from ${
+                    { openrouter: "OpenRouter", bedrock: "AWS Bedrock" }[
+                      backend
+                    ] ?? "your configured endpoint"
+                  }`}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {oauthLabel && (
+              <p className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+                Reviews run through your {oauthLabel} session, so these are that
+                account's models and the endpoint and protocol come with it.
+                Manage the session under{" "}
+                <a className="underline" href="/settings/connections">
+                  Connections
+                </a>
+                .
+              </p>
+            )}
             <div className="space-y-2">
               <label className="text-sm font-medium">Indexing Model</label>
               <ModelCombobox
@@ -512,7 +529,7 @@ export function SettingsPage() {
                 automatically when unsupported.
               </p>
             </div>
-            {backend !== "bedrock" && (
+            {backend !== "bedrock" && !oauthLabel && (
               <div className="space-y-2">
                 <label className="text-sm font-medium">API Protocol</label>
                 <Select value={apiStyle} onValueChange={setApiStyle}>
