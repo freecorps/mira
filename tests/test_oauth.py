@@ -582,12 +582,20 @@ class TestLoopbackListener:
     """The CLI's localhost listener, driven over a real socket."""
 
     def _serve(self, port: int, timeout: float = 5.0):
+        import threading
         from concurrent.futures import ThreadPoolExecutor
 
         from mira.oauth.loopback import _serve_once
 
+        ready = threading.Event()
         pool = ThreadPoolExecutor(max_workers=1)
-        return pool, pool.submit(_serve_once, port, "/auth/callback", timeout)
+        pending = pool.submit(_serve_once, port, "/auth/callback", timeout, ready=ready)
+        # A connection made before the bind is refused, not served — the
+        # listener runs on its own thread, so wait for it to be listening.
+        if not ready.wait(timeout=5):
+            pending.result(timeout=0)  # surfaces the bind failure, if that is why
+            raise AssertionError("the listener never bound its port")
+        return pool, pending
 
     def _get(self, port: int, path: str) -> None:
         import contextlib

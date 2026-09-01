@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -80,7 +81,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         """Silence the default stderr access log — the CLI prints its own."""
 
 
-def _serve_once(port: int, path: str, timeout: float) -> dict[str, str]:
+def _serve_once(
+    port: int, path: str, timeout: float, *, ready: threading.Event | None = None
+) -> dict[str, str]:
     """Serve until the callback arrives, or ``timeout`` seconds pass.
 
     Deliberately not one `handle_request()`: a browser aims more than the
@@ -89,10 +92,15 @@ def _serve_once(port: int, path: str, timeout: float) -> dict[str, str]:
     listener and fail a login the user had already approved. So requests keep
     being served until one of them is the callback, against a wall-clock
     deadline that an abandoned tab still runs out.
+
+    ``ready`` is set once the port is bound, for a caller on another thread
+    that wants to connect without racing the bind.
     """
     _CallbackHandler.result = {}
     _CallbackHandler.callback_path = path
     server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    if ready is not None:
+        ready.set()
     deadline = time.monotonic() + timeout
     try:
         while not _CallbackHandler.result:
