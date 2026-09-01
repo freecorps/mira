@@ -502,6 +502,12 @@ CREATE INDEX IF NOT EXISTS idx_app_logs_trace
 
 SESSION_DURATION = 86400 * 7  # 7 days
 
+# The most log lines one call can return. Exported so the dashboard's export
+# route shares the ceiling instead of declaring its own: a route that asks for
+# more than the store will hand over truncates silently, and a truncated export
+# is worse than a refused one because nothing about it says it is short.
+MAX_APP_LOG_ROWS = 5_000
+
 
 @dataclass
 class User:
@@ -640,6 +646,11 @@ class AppDatabase:
         self._pg_conn = None
         self._pg_lock = threading.Lock()
         self._sqlite_conn: sqlite3.Connection | None = None
+        self._sqlite_path = ""
+        # A second SQLite connection, for the log writer thread alone. See
+        # `_log_writer_conn` for why it is not the shared one.
+        self._sqlite_log_conn: sqlite3.Connection | None = None
+        self._sqlite_log_lock = threading.Lock()
 
         if url.startswith("postgresql://") or url.startswith("postgres://"):
             self._init_postgres(url)
@@ -660,6 +671,7 @@ class AppDatabase:
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        self._sqlite_path = db_path
         self._sqlite_conn = sqlite3.connect(db_path, check_same_thread=False)
         self._sqlite_conn.execute("PRAGMA journal_mode=WAL")
         self._sqlite_conn.execute("PRAGMA foreign_keys=ON")
@@ -1756,6 +1768,35 @@ class AppDatabase:
         "func_name, lineno, trace_id, repo, pr_number, thread"
     )
 
+    def _log_writer_conn(self) -> sqlite3.Connection:
+        """A second SQLite connection, used only by the log writer thread.
+
+        `sqlite3.connect(check_same_thread=False)` makes individual statements
+        safe across threads but leaves the *transaction* shared: a `commit()`
+        from one thread commits whatever another thread has half-written, and a
+        `rollback()` discards it. Every other caller here runs on a request and
+        is transient; the log writer is a permanent background thread committing
+        on a timer, so sharing a connection with it means the dashboard's
+        multi-statement writes are interleaved with a commit at any moment.
+
+        A second connection gives it its own transaction. Both are in WAL mode,
+        where a reader never blocks a writer, and `sqlite3.connect` already
+        applies a five-second busy timeout, so the one case they contend for —
+        two writers at once — waits rather than failing. If it does fail, the
+        handler counts it and the dashboard says the trail has gaps.
+
+        This deliberately does not touch the shared connection's other users.
+        Whatever races exist between two request threads predate the log trail
+        and are not this method's to fix quietly.
+        """
+        with self._sqlite_log_lock:
+            if self._sqlite_log_conn is None:
+                conn = sqlite3.connect(self._sqlite_path, check_same_thread=False)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                self._sqlite_log_conn = conn
+            return self._sqlite_log_conn
+
     def record_app_logs(self, entries: list[dict[str, Any]]) -> int:
         """Append a batch of captured log lines. Returns how many were written.
 
@@ -1788,13 +1829,13 @@ class AppDatabase:
             for e in entries
         ]
         if self._backend == "sqlite":
-            assert self._sqlite_conn is not None
-            self._sqlite_conn.executemany(
+            conn = self._log_writer_conn()
+            conn.executemany(
                 f"INSERT INTO app_logs ({self._APP_LOG_COLUMNS}) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
-            self._sqlite_conn.commit()
+            conn.commit()
         else:
             with self._pg_cursor() as cur:
                 cur.executemany(
@@ -1866,7 +1907,7 @@ class AppDatabase:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Captured log lines matching the filters, newest first."""
-        limit = max(1, min(int(limit), 2000))
+        limit = max(1, min(int(limit), MAX_APP_LOG_ROWS))
         offset = max(0, int(offset))
         where, params = self._app_log_filters(
             min_level=min_level,
@@ -1951,19 +1992,24 @@ class AppDatabase:
         the cutoff id and deletes below it rather than using
         ``NOT IN (SELECT …)``, which rescans the whole table every pass.
         """
+        # Called from the log writer thread, so it uses that thread's own
+        # connection for the same reason the inserts do.
+        conn = self._log_writer_conn() if self._backend == "sqlite" else None
         deleted = 0
         if max_age_days > 0:
             cutoff = time.time() - max_age_days * 86400
             deleted += self._delete_returning_count(
-                "DELETE FROM app_logs WHERE created_at < ?", (cutoff,)
+                "DELETE FROM app_logs WHERE created_at < ?", (cutoff,), conn=conn
             )
         if max_rows > 0:
             rows = self._rows(
-                "SELECT id FROM app_logs ORDER BY id DESC LIMIT 1 OFFSET ?", (int(max_rows),)
+                "SELECT id FROM app_logs ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (int(max_rows),),
+                conn=conn,
             )
             if rows:
                 deleted += self._delete_returning_count(
-                    "DELETE FROM app_logs WHERE id <= ?", (int(rows[0][0]),)
+                    "DELETE FROM app_logs WHERE id <= ?", (int(rows[0][0]),), conn=conn
                 )
         return deleted
 
@@ -1971,12 +2017,19 @@ class AppDatabase:
         """Delete every captured line. Behind the dashboard's Clear button."""
         return self._delete_returning_count("DELETE FROM app_logs", ())
 
-    def _delete_returning_count(self, sql: str, params: tuple) -> int:
-        """Run a DELETE written with ``?`` placeholders, returning the count."""
+    def _delete_returning_count(
+        self, sql: str, params: tuple, *, conn: sqlite3.Connection | None = None
+    ) -> int:
+        """Run a DELETE written with ``?`` placeholders, returning the count.
+
+        ``conn`` overrides the shared SQLite connection; the log writer passes
+        its own so its pruning is not interleaved with a request's transaction.
+        """
         if self._backend == "sqlite":
-            assert self._sqlite_conn is not None
-            cur = self._sqlite_conn.execute(sql, params)
-            self._sqlite_conn.commit()
+            target = conn if conn is not None else self._sqlite_conn
+            assert target is not None
+            cur = target.execute(sql, params)
+            target.commit()
             return max(0, cur.rowcount)
         with self._pg_cursor() as cur:
             cur.execute(sql.replace("?", "%s"), params)
@@ -2328,12 +2381,18 @@ class AppDatabase:
         """Boolean false literal for the active backend (SQLite stores 0/1)."""
         return "0" if self._backend == "sqlite" else "FALSE"
 
-    def _rows(self, sql: str, params: tuple = ()) -> list[tuple]:
+    def _rows(
+        self, sql: str, params: tuple = (), *, conn: sqlite3.Connection | None = None
+    ) -> list[tuple]:
         """Run a read-only SELECT written with ``?`` placeholders against
-        either backend (``?`` → ``%s`` for Postgres). Read path only."""
+        either backend (``?`` → ``%s`` for Postgres). Read path only.
+
+        ``conn`` overrides the shared SQLite connection, for the log writer.
+        """
         if self._backend == "sqlite":
-            assert self._sqlite_conn is not None
-            return self._sqlite_conn.execute(sql, params).fetchall()
+            target = conn if conn is not None else self._sqlite_conn
+            assert target is not None
+            return target.execute(sql, params).fetchall()
         assert self._pg_conn is not None
         with self._pg_conn.cursor() as cur:
             cur.execute(sql.replace("?", "%s"), params)

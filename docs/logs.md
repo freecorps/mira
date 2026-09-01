@@ -23,8 +23,8 @@ The code review failed to complete due to an unexpected error.
 Stage: Code review
 Error type: LLMError
 Message: LLM tool-call failed
-Trace ID: 9f2c41ab — search this on the Logs page of your Mira dashboard
-          for the full diagnostics.
+Trace ID: 9f2c41ab7d3e5106 — search this on the Logs page of your Mira
+          dashboard for the full diagnostics.
 ```
 
 The trace ID is the handle. Every log line that review emitted carries it —
@@ -84,6 +84,14 @@ so in a banner rather than showing a quietly incomplete trail.
 Retention is two limits, because either alone has a failure mode: an age limit
 lets one loud afternoon fill the disk, and a row limit lets a quiet install
 keep lines from a year ago that nobody will read.
+
+On SQLite the writer holds **its own connection**. `sqlite3` makes individual
+statements safe across threads but leaves the transaction shared, so a writer
+committing on a timer would commit whatever the dashboard had half-written at
+that moment — and the rollback that should have discarded it would find nothing
+left to discard. With a separate connection the two never share a transaction;
+if they contend for the write lock, the writer waits and then drops the batch,
+which the gaps banner reports.
 
 ## Configuration
 

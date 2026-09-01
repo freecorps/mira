@@ -25,11 +25,15 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from mira.dashboard.api import _require_admin, router
+from mira.dashboard.db import MAX_APP_LOG_ROWS
 
 logger = logging.getLogger(__name__)
 
 _MAX_PAGE = 500
-_MAX_EXPORT = 5_000
+# Taken from the store rather than declared here. The two used to disagree —
+# the export offered 5,000 lines and the query clamped at 2,000 — and the
+# result was an export that silently stopped short of what it promised.
+_MAX_EXPORT = MAX_APP_LOG_ROWS
 
 # Level names the API accepts, and the numeric floor each one selects. "ALL"
 # is spelled out rather than left as an empty string: a filter that means
