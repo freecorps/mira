@@ -45,6 +45,16 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
     return database
 
 
+@pytest.fixture
+def unused_port() -> int:
+    """A free localhost port, so the listener tests never fight for 1455."""
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _jwt(claims: dict) -> str:
     """An unsigned JWT carrying ``claims`` — enough for the client-side read."""
 
@@ -252,13 +262,62 @@ class TestStore:
         with pytest.raises(OAuthError, match="not connected"):
             await store.valid_tokens("chatgpt", db)
 
+    @pytest.mark.asyncio
+    async def test_force_renews_a_token_that_has_not_expired(self, db, monkeypatch):
+        # The 401 path: the endpoint has said the token is dead, which its
+        # expiry cannot say. Without `force` the store hands back the same one
+        # and the retry repeats the rejected request.
+        store.save(_tokens(expires_at=time.time() + 3600), db)
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider,
+            "refresh",
+            classmethod(lambda cls, t: _async(_tokens(access_token="at_2"))),
+        )
+        assert (await store.valid_tokens("chatgpt", db)).access_token == "at_1"
+        assert (await store.valid_tokens("chatgpt", db, force=True)).access_token == "at_2"
+
+    @pytest.mark.asyncio
+    async def test_a_grant_rotated_elsewhere_is_picked_up(self, db, monkeypatch):
+        # The refresh lock is per-process. Another worker rotating this grant
+        # leaves ours refused — but its replacement is already in the store, so
+        # a refusal must not be reported as a lost session.
+        store.save(_tokens(expires_at=time.time() + 10), db)
+
+        def _rotated(cls, tokens):
+            store.save(_tokens(access_token="at_elsewhere"), db)
+            raise OAuthError("invalid_grant")
+
+        monkeypatch.setattr(ChatGPTOAuthProvider, "refresh", classmethod(_rotated))
+        fresh = await store.valid_tokens("chatgpt", db)
+        assert fresh.access_token == "at_elsewhere"
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_dead_grant_still_raises(self, db, monkeypatch):
+        store.save(_tokens(expires_at=time.time() + 10), db)
+
+        def _dead(cls, tokens):
+            raise OAuthError("invalid_grant")
+
+        monkeypatch.setattr(ChatGPTOAuthProvider, "refresh", classmethod(_dead))
+        with pytest.raises(OAuthError, match="invalid_grant"):
+            await store.valid_tokens("chatgpt", db)
+
 
 class TestManager:
     def test_start_records_the_attempt(self, db: AppDatabase):
         started = manager.start_login("chatgpt", db=db)
         assert started["manual_exchange"] is True
         assert started["redirect_uri"] == "http://localhost:1455/auth/callback"
-        assert started["state"] in json.loads(db.get_setting("oauth_pending_logins"))
+        assert db.get_setting(f"oauth_pending:{started['state']}")
+
+    def test_concurrent_logins_do_not_evict_each_other(self, db: AppDatabase):
+        # One row per attempt: with a shared JSON document, whichever login
+        # was started first would be dropped by the second one's write and its
+        # redirect — already approved by the user — would be unredeemable.
+        first = manager.start_login("chatgpt", db=db)
+        second = manager.start_login("chatgpt", db=db)
+        assert db.get_setting(f"oauth_pending:{first['state']}")
+        assert db.get_setting(f"oauth_pending:{second['state']}")
 
     def test_parse_redirect_extracts_code_and_state(self):
         parsed = manager.parse_redirect("http://localhost:1455/auth/callback?code=abc&state=xyz")
@@ -298,13 +357,19 @@ class TestManager:
             await manager.complete_login(code="c", state="not-ours", db=db)
 
     @pytest.mark.asyncio
-    async def test_expired_attempts_are_pruned(self, db: AppDatabase, monkeypatch):
+    async def test_an_expired_attempt_is_refused(self, db: AppDatabase):
         started = manager.start_login("chatgpt", db=db)
-        stale = json.loads(db.get_setting("oauth_pending_logins"))
-        stale[started["state"]]["created_at"] = time.time() - manager.PENDING_TTL_SECONDS - 1
-        db.set_setting("oauth_pending_logins", json.dumps(stale))
+        _age_attempt(db, started["state"])
         with pytest.raises(OAuthError, match="expired"):
             await manager.complete_login(code="c", state=started["state"], db=db)
+
+    def test_abandoned_attempts_are_pruned_on_the_next_start(self, db: AppDatabase):
+        # Otherwise every login anybody walked away from leaves its verifier in
+        # the database indefinitely.
+        stale = manager.start_login("chatgpt", db=db)
+        _age_attempt(db, stale["state"])
+        manager.start_login("chatgpt", db=db)
+        assert not db.get_setting(f"oauth_pending:{stale['state']}")
 
     def test_list_status_covers_every_provider(self, db: AppDatabase):
         state = manager.list_status(db)
@@ -345,6 +410,30 @@ class TestConfigResolution:
         assert resolved.model == "gpt-5-codex"
         assert resolved.api_style == "responses"
 
+    def test_a_foreign_model_id_is_not_sent_to_the_endpoint(self):
+        # Indexing and the security sweep are usually pinned to a cheap model
+        # in mira.yaml. Those ids belong to another backend and this endpoint
+        # has never served one.
+        bound = apply_oauth_binding(
+            LLMConfig(model="anthropic/claude-haiku-4-5"), "chatgpt", model_is_explicit=True
+        )
+        assert bound.model == "gpt-5-codex"
+
+    def test_an_unfamiliar_bare_id_is_left_alone(self):
+        # A model released after this build is the user's call, not ours.
+        bound = apply_oauth_binding(
+            LLMConfig(model="gpt-5.2-codex-max"), "chatgpt", model_is_explicit=True
+        )
+        assert bound.model == "gpt-5.2-codex-max"
+
+    def test_indexing_does_not_inherit_a_model_the_endpoint_cannot_serve(self, db: AppDatabase):
+        store.save(_tokens(), db)
+        db.set_setting("llm_oauth_provider", "chatgpt")
+        db.set_setting("indexing_model", "anthropic/claude-haiku-4-5")
+        resolved = llm_config_for("indexing", LLMConfig())
+        assert resolved.model == "gpt-5-codex"
+        assert resolved.base_url == "https://chatgpt.com/backend-api/codex"
+
     def test_llm_config_for_keeps_a_dashboard_model(self, db: AppDatabase):
         store.save(_tokens(), db)
         db.set_setting("llm_oauth_provider", "chatgpt")
@@ -364,6 +453,64 @@ class TestConfigResolution:
         )
         assert [o["value"] for o in options][0] == "gpt-5-codex"
         assert all("recommended" in o for o in options)
+
+
+class TestLoopbackListener:
+    """The CLI's localhost listener, driven over a real socket."""
+
+    def _serve(self, port: int, timeout: float = 5.0):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from mira.oauth.loopback import _serve_once
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        return pool, pool.submit(_serve_once, port, "/auth/callback", timeout)
+
+    def _get(self, port: int, path: str) -> None:
+        import contextlib
+        import urllib.error
+        import urllib.request
+
+        # A 404 for the wrong path is the point of the test, not a failure.
+        with contextlib.suppress(urllib.error.HTTPError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).read()
+
+    def test_a_stray_request_does_not_consume_the_listener(self, unused_port: int):
+        # A browser aims more than the redirect at a port it has open. Serving
+        # exactly one request means a favicon probe fails a login the user has
+        # already approved.
+        pool, pending = self._serve(unused_port)
+        try:
+            self._get(unused_port, "/favicon.ico")
+            self._get(unused_port, "/auth/callback?code=abc&state=xyz")
+            assert pending.result(timeout=10) == {"code": "abc", "state": "xyz"}
+        finally:
+            pool.shutdown(wait=True)
+
+    def test_a_silent_client_cannot_hold_the_listener(self, unused_port, monkeypatch):
+        # HTTPServer.timeout bounds the wait for a *connection*; a client that
+        # connects and then says nothing is a different hang, and connections
+        # are served one at a time — so without a read timeout on the accepted
+        # socket that one client holds the login open forever.
+        import socket
+
+        from mira.oauth.loopback import _CallbackHandler
+
+        monkeypatch.setattr(_CallbackHandler, "timeout", 0.5)
+        pool, pending = self._serve(unused_port)
+        try:
+            with socket.create_connection(("127.0.0.1", unused_port), timeout=5):
+                self._get(unused_port, "/auth/callback?code=abc&state=xyz")
+                assert pending.result(timeout=20) == {"code": "abc", "state": "xyz"}
+        finally:
+            pool.shutdown(wait=True)
+
+    def test_it_gives_up_when_nobody_comes_back(self, unused_port: int):
+        pool, pending = self._serve(unused_port, timeout=0.3)
+        try:
+            assert pending.result(timeout=10) == {}
+        finally:
+            pool.shutdown(wait=True)
 
 
 class TestConfigValidation:
@@ -435,6 +582,48 @@ class TestRoutes:
         assert models.oauth_provider == "chatgpt"
         assert "gpt-5-codex" in [o.value for o in models.review_options]
 
+    @pytest.mark.asyncio
+    async def test_models_endpoint_reports_what_calls_will_carry(self, db: AppDatabase):
+        # The page must not name a model next to a catalog that cannot serve
+        # it: the mismatch is invisible until a review fails on that id.
+        from mira.dashboard.routers.admin import get_models
+
+        store.save(_tokens(), db)
+        db.set_setting("llm_oauth_provider", "chatgpt")
+        models = await get_models()
+        offered = {o.value for o in models.review_options}
+        for reported in (models.review_model, models.indexing_model, models.security_model):
+            assert reported in offered
+        assert models.config_review_model in offered
+        assert llm_config_for("review", LLMConfig()).model == models.review_model
+
+    @pytest.mark.asyncio
+    async def test_the_callback_page_escapes_what_it_renders(self, db: AppDatabase):
+        # `error` is a query parameter: whoever crafts the link the admin
+        # follows writes it, and the admin is the one account that can change
+        # these settings.
+        from mira.dashboard.routers.oauth import oauth_callback
+
+        page = await oauth_callback(_admin(), error="<script>alert(1)</script>")
+        body = page.body.decode()
+        assert "<script>alert(1)</script>" not in body
+        assert "&lt;script&gt;" in body
+
+    @pytest.mark.asyncio
+    async def test_the_callback_page_escapes_the_account_label(self, db, monkeypatch):
+        from mira.dashboard.routers.oauth import oauth_callback
+
+        started = manager.start_login("chatgpt", db=db)
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider,
+            "exchange_code",
+            classmethod(
+                lambda cls, **kw: _async(_tokens(account_label="<img src=x onerror=alert(1)>"))
+            ),
+        )
+        page = await oauth_callback(_admin(), code="c", state=started["state"])
+        assert "<img src=x" not in page.body.decode()
+
 
 class TestRequestShaping:
     def test_codex_body_drops_what_the_endpoint_rejects(self):
@@ -499,6 +688,22 @@ class TestOAuthProvider:
         assert exc.value.code == "oauth_not_connected"
 
     @pytest.mark.asyncio
+    async def test_a_401_retry_renews_rather_than_replaying(self, db, monkeypatch):
+        # Dropping only the cached copy would reload the same rejected token
+        # from the store and send the identical request again.
+        store.save(_tokens(expires_at=time.time() + 3600), db)
+        provider = create_llm(LLMConfig(oauth_provider="chatgpt"))
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider,
+            "refresh",
+            classmethod(lambda cls, t: _async(_tokens(access_token="at_2"))),
+        )
+        await provider._ensure_token()
+        assert provider._build_headers()["Authorization"] == "Bearer at_1"
+        await provider._ensure_token(force_refresh=True)
+        assert provider._build_headers()["Authorization"] == "Bearer at_2"
+
+    @pytest.mark.asyncio
     async def test_a_missing_session_is_reported_before_the_call(self, db: AppDatabase):
         provider = create_llm(LLMConfig(oauth_provider="chatgpt"))
         with pytest.raises(LLMError) as exc:
@@ -557,6 +762,14 @@ class TestStreamCollection:
 
 
 # ── helpers ─────────────────────────────────────────────────────────
+
+
+def _age_attempt(db: AppDatabase, state: str) -> None:
+    """Backdate a pending attempt past its TTL."""
+    key = f"oauth_pending:{state}"
+    attempt = json.loads(db.get_setting(key))
+    attempt["created_at"] = time.time() - manager.PENDING_TTL_SECONDS - 1
+    db.set_setting(key, json.dumps(attempt))
 
 
 def _admin():

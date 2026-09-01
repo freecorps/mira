@@ -1,10 +1,11 @@
 """The login state machine: start an attempt, finish it, hand back a session.
 
 An attempt is the PKCE verifier plus the redirect URI it was started with,
-remembered under its ``state`` until the user comes back with a code. It is
-persisted (one JSON row in ``settings``) rather than held in memory so a
-dashboard restart — or a second worker process — between "Connect" and the
-redirect does not strand a login the user has already approved.
+stored in its own ``settings`` row under its ``state`` until the user comes
+back with a code. Persisted rather than held in memory so a dashboard restart —
+or a second worker process — between "Connect" and the redirect does not strand
+a login the user has already approved, and one row per attempt so two logins
+in flight at once cannot overwrite each other.
 
 Two ways an attempt finishes, both landing in :func:`complete_login`:
 
@@ -32,7 +33,12 @@ from mira.oauth.store import SettingsStore
 
 logger = logging.getLogger(__name__)
 
-_PENDING_KEY = "oauth_pending_logins"
+# One settings row per attempt, keyed by state. Deliberately not one JSON
+# document holding all of them: that turns every start and every completion
+# into a read-modify-write of the same row, and two logins overlapping — two
+# admins, two tabs, a second worker — then drop each other's entries and
+# strand a login the user has already approved. Separate rows never collide.
+_PENDING_PREFIX = "oauth_pending:"
 # How long an approved login may sit before the code is redeemed. Long enough
 # to walk through a consent screen and paste a URL, short enough that an
 # abandoned attempt is not a verifier sitting in the database for a week.
@@ -42,24 +48,54 @@ PENDING_TTL_SECONDS = 900
 # ── Pending-attempt bookkeeping ─────────────────────────────────────
 
 
-def _read_pending(db: SettingsStore) -> dict[str, dict[str, Any]]:
-    raw = db.get_setting(_PENDING_KEY)
-    if not raw:
-        return {}
+def _expired(attempt: dict[str, Any]) -> bool:
     try:
-        data = json.loads(raw)
+        created = float(attempt.get("created_at", 0))
+    except (TypeError, ValueError):
+        return True
+    return created <= time.time() - PENDING_TTL_SECONDS
+
+
+def _write_attempt(db: SettingsStore, state: str, attempt: dict[str, Any]) -> None:
+    db.set_setting(_PENDING_PREFIX + state, json.dumps(attempt))
+
+
+def _take_attempt(db: SettingsStore, state: str) -> dict[str, Any] | None:
+    """Read an attempt and remove it, whether or not it turns out to be usable.
+
+    Removed before the caller redeems it, not after: an authorization code is
+    single-use, so a retry has to start a fresh login rather than replay this
+    verifier against a code the issuer has already burned.
+    """
+    raw = db.get_setting(_PENDING_PREFIX + state)
+    db.delete_setting(_PENDING_PREFIX + state)
+    if not raw:
+        return None
+    try:
+        attempt = json.loads(raw)
     except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
+        return None
+    if not isinstance(attempt, dict) or _expired(attempt):
+        return None
+    return attempt
 
 
-def _write_pending(db: SettingsStore, attempts: dict[str, dict[str, Any]]) -> None:
-    db.set_setting(_PENDING_KEY, json.dumps(attempts))
+def _prune(db: SettingsStore) -> None:
+    """Drop attempts nobody came back for. Best-effort, and safe to race.
 
-
-def _prune(attempts: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    cutoff = time.time() - PENDING_TTL_SECONDS
-    return {s: a for s, a in attempts.items() if float(a.get("created_at", 0)) > cutoff}
+    Each row is deleted on its own, so two callers pruning at once delete the
+    same expired rows rather than fighting over a shared document.
+    """
+    lister = getattr(db, "list_settings", None)
+    if lister is None:  # pragma: no cover - stores that can't enumerate
+        return
+    for key, raw in lister(_PENDING_PREFIX).items():
+        try:
+            attempt = json.loads(raw)
+        except json.JSONDecodeError:
+            attempt = {}
+        if not isinstance(attempt, dict) or _expired(attempt):
+            db.delete_setting(key)
 
 
 # ── Flow ────────────────────────────────────────────────────────────
@@ -93,14 +129,17 @@ def start_login(
 
     pkce = PkcePair.generate()
     state = new_state()
-    attempts = _prune(_read_pending(resolved_db))
-    attempts[state] = {
-        "provider": spec.id,
-        "verifier": pkce.verifier,
-        "redirect_uri": redirect_uri,
-        "created_at": time.time(),
-    }
-    _write_pending(resolved_db, attempts)
+    _prune(resolved_db)
+    _write_attempt(
+        resolved_db,
+        state,
+        {
+            "provider": spec.id,
+            "verifier": pkce.verifier,
+            "redirect_uri": redirect_uri,
+            "created_at": time.time(),
+        },
+    )
 
     return {
         "provider": spec.id,
@@ -167,9 +206,7 @@ async def complete_login(
     if not state:
         raise OAuthError("The redirect carried no state value — start the sign-in again")
 
-    attempts = _prune(_read_pending(resolved_db))
-    attempt = attempts.pop(state, None)
-    _write_pending(resolved_db, attempts)
+    attempt = _take_attempt(resolved_db, state)
     if attempt is None:
         raise OAuthError("This sign-in expired or was already completed — start it again")
 

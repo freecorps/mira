@@ -60,13 +60,20 @@ class OAuthResponsesProvider(ResponsesProvider):
     # ── Auth ───────────────────────────────────────────────────────
 
     async def _ensure_token(self, force_refresh: bool = False) -> OAuthTokens:
-        """Load (and if needed renew) the grant backing this provider."""
+        """Load (and if needed renew) the grant backing this provider.
+
+        ``force_refresh`` renews against the issuer rather than just dropping
+        the cached copy. The caller reaches for it after a 401, which means the
+        token the endpoint just rejected — and re-reading the store would hand
+        back that same token, since "the server revoked it" and "it expired"
+        are not the same condition and only the second one is visible here.
+        """
         if force_refresh:
             self._tokens = None
-        if self._tokens is not None and not self._tokens.is_expired():
+        elif self._tokens is not None and not self._tokens.is_expired():
             return self._tokens
         try:
-            self._tokens = await store.valid_tokens(self._spec.id)
+            self._tokens = await store.valid_tokens(self._spec.id, force=force_refresh)
         except OAuthError as exc:
             if store.load(self._spec.id) is None:
                 raise LLMError(

@@ -8,6 +8,8 @@ which is everything it needs to render the page.
 
 from __future__ import annotations
 
+from html import escape
+
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -144,17 +146,25 @@ async def oauth_callback(
     """
     _require_admin(request)
     if error:
-        return HTMLResponse(
-            _CALLBACK_HTML.format(heading="Sign-in failed", detail=error), status_code=200
-        )
+        return _callback_page("Sign-in failed", error)
     try:
         status = await manager.complete_login(code=code, state=state, db=_api._app_db)
     except OAuthError as exc:
-        return HTMLResponse(
-            _CALLBACK_HTML.format(heading="Sign-in failed", detail=str(exc)), status_code=200
-        )
+        return _callback_page("Sign-in failed", str(exc))
     account = status.get("account_label") or status.get("label") or "your account"
+    return _callback_page("Connected", f"Signed in as {account}.")
+
+
+def _callback_page(heading: str, detail: str) -> HTMLResponse:
+    """Render the callback page with every interpolated value escaped.
+
+    Both values reach this page from outside: ``detail`` carries either a query
+    parameter the provider (or anyone who can hand an admin a link) put in the
+    redirect, or an error message quoting one, and the account label comes from
+    a token payload. Interpolated raw, either one is script running in the
+    browser of the one person on the instance who can change these settings.
+    """
     return HTMLResponse(
-        _CALLBACK_HTML.format(heading="Connected", detail=f"Signed in as {account}."),
+        _CALLBACK_HTML.format(heading=escape(heading), detail=escape(detail)),
         status_code=200,
     )

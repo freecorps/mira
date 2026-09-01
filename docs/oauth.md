@@ -110,8 +110,9 @@ the expiry, and the account id and plan.
   is connected and when the session expires — nothing you could sign a request
   with.
 * Every OAuth route is admin-only.
-* In-flight logins (the PKCE verifier and its redirect URI) are stored under
-  `oauth_pending_logins` and expire after 15 minutes.
+* In-flight logins (the PKCE verifier and its redirect URI) get a row each
+  under `oauth_pending:<state>`, expire after 15 minutes, and are removed when
+  redeemed or on the next login attempt.
 
 Sessions are renewed a few minutes before they expire, and refreshes are
 serialised per provider: several review passes run at once, and an issuer that
