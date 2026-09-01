@@ -1470,6 +1470,31 @@ class AppDatabase:
             with self._pg_cursor() as cur:
                 cur.execute("DELETE FROM settings WHERE key=%s", (key,))
 
+    def take_setting(self, key: str) -> str | None:
+        """Delete a setting and return what it held, in one statement.
+
+        For values that may only be used once. Reading and then deleting is two
+        statements, and two callers racing between them both come away holding
+        the value — which for a single-use secret (an OAuth login's PKCE
+        verifier) is exactly the thing storing it once was meant to prevent.
+        ``DELETE ... RETURNING`` gives it to whichever statement runs first and
+        nothing to the other.
+        """
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            # fetchall, not fetchone: the statement has to be stepped to
+            # completion or the implicit transaction stays open on this shared
+            # connection. The key is a primary key, so it is one row at most.
+            rows = self._sqlite_conn.execute(
+                "DELETE FROM settings WHERE key=? RETURNING value", (key,)
+            ).fetchall()
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute("DELETE FROM settings WHERE key=%s RETURNING value", (key,))
+                rows = cur.fetchall()
+        return rows[0][0] if rows else None
+
     def list_settings(self, prefix: str) -> dict[str, str]:
         """Every setting whose key starts with ``prefix``.
 

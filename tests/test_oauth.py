@@ -303,6 +303,34 @@ class TestStore:
             await store.valid_tokens("chatgpt", db)
 
 
+class TestSettingsStore:
+    """The settings primitives the OAuth package relies on."""
+
+    def test_take_returns_the_value_and_removes_it(self, db: AppDatabase):
+        db.set_setting("k", "v")
+        assert db.take_setting("k") == "v"
+        assert db.get_setting("k") is None
+
+    def test_taking_a_missing_key_is_none(self, db: AppDatabase):
+        assert db.take_setting("nope") is None
+
+    def test_list_settings_matches_only_the_prefix(self, db: AppDatabase):
+        db.set_setting("oauth_pending:a", "1")
+        db.set_setting("oauth_pending:b", "2")
+        db.set_setting("other", "3")
+        assert db.list_settings("oauth_pending:") == {
+            "oauth_pending:a": "1",
+            "oauth_pending:b": "2",
+        }
+
+    def test_list_settings_does_not_treat_the_prefix_as_a_pattern(self, db: AppDatabase):
+        # `_` is a single-character wildcard in LIKE; unescaped, "a_b" would
+        # also match "axb".
+        db.set_setting("a_b", "1")
+        db.set_setting("axb", "2")
+        assert db.list_settings("a_b") == {"a_b": "1"}
+
+
 class TestManager:
     def test_start_records_the_attempt(self, db: AppDatabase):
         started = manager.start_login("chatgpt", db=db)
@@ -370,6 +398,45 @@ class TestManager:
         _age_attempt(db, stale["state"])
         manager.start_login("chatgpt", db=db)
         assert not db.get_setting(f"oauth_pending:{stale['state']}")
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_from_another_login_is_refused(self, db: AppDatabase):
+        # The dashboard passes the state it started. Letting that stand in for
+        # the one in the pasted URL is exactly the mismatch the state parameter
+        # exists to catch — and would burn the attempt on screen.
+        mine = manager.start_login("chatgpt", db=db)
+        theirs = manager.start_login("chatgpt", db=db)
+        url = f"http://localhost:1455/auth/callback?code=c&state={theirs['state']}"
+        with pytest.raises(OAuthError, match="different sign-in"):
+            await manager.complete_login(redirect_url=url, state=mine["state"], db=db)
+        # Refused, not consumed: the attempt on screen is still redeemable.
+        assert db.get_setting(f"oauth_pending:{mine['state']}")
+
+    def test_an_attempt_can_only_be_claimed_once(self, db: AppDatabase):
+        # Two workers handling the same callback must not both come away with
+        # the verifier and both go redeem the single-use code.
+        started = manager.start_login("chatgpt", db=db)
+        first = manager._take_attempt(db, started["state"])
+        second = manager._take_attempt(db, started["state"])
+        assert first is not None
+        assert second is None
+
+    def test_a_dashboard_provider_needs_a_configured_origin(self, db, monkeypatch):
+        # Where a code gets delivered is deployment configuration. A provider
+        # that redirects to us cannot start without one.
+        monkeypatch.setattr(ChatGPTOAuthProvider, "redirect_mode", "dashboard")
+        with pytest.raises(OAuthError, match="MIRA_DASHBOARD_URL"):
+            manager.start_login("chatgpt", dashboard_origin="", db=db)
+        with pytest.raises(OAuthError, match="MIRA_DASHBOARD_URL"):
+            manager.start_login("chatgpt", dashboard_origin="mira.example.com", db=db)
+
+    def test_a_configured_origin_becomes_the_callback(self, db, monkeypatch):
+        monkeypatch.setattr(ChatGPTOAuthProvider, "redirect_mode", "dashboard")
+        started = manager.start_login(
+            "chatgpt", dashboard_origin="https://mira.example.com/", db=db
+        )
+        assert started["redirect_uri"] == "https://mira.example.com/api/oauth/callback"
+        assert started["manual_exchange"] is False
 
     def test_list_status_covers_every_provider(self, db: AppDatabase):
         state = manager.list_status(db)
@@ -552,6 +619,33 @@ class TestRoutes:
         assert set_active_oauth(OAuthActiveRequest(provider="chatgpt"), _admin())["ok"]
         assert db.get_setting("llm_oauth_provider") == "chatgpt"
         assert db.setup_complete
+
+    def test_start_ignores_any_origin_the_caller_offers(self, db, monkeypatch):
+        # The request must not be able to name where the code is delivered.
+        from mira.dashboard.routers.oauth import start_oauth
+
+        monkeypatch.setattr(ChatGPTOAuthProvider, "redirect_mode", "dashboard")
+        monkeypatch.setenv("MIRA_DASHBOARD_URL", "https://mira.example.com")
+        request = _admin()
+        request.base_url = "https://attacker.example/"
+        started = start_oauth("chatgpt", request)
+        assert started["redirect_uri"] == "https://mira.example.com/api/oauth/callback"
+
+    @pytest.mark.asyncio
+    async def test_manual_refresh_goes_to_the_issuer(self, db, monkeypatch):
+        # The button exists for the case an expiry cannot describe: a grant
+        # revoked upstream that still looks valid here.
+        from mira.dashboard.routers.oauth import refresh_oauth
+
+        store.save(_tokens(expires_at=time.time() + 3600), db)
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider,
+            "refresh",
+            classmethod(lambda cls, t: _async(_tokens(access_token="at_renewed"))),
+        )
+        await refresh_oauth("chatgpt", _admin())
+        stored = store.load("chatgpt", db)
+        assert stored is not None and stored.access_token == "at_renewed"
 
     def test_unknown_provider_is_a_404(self, db: AppDatabase):
         from fastapi import HTTPException

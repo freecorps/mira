@@ -61,14 +61,16 @@ def _write_attempt(db: SettingsStore, state: str, attempt: dict[str, Any]) -> No
 
 
 def _take_attempt(db: SettingsStore, state: str) -> dict[str, Any] | None:
-    """Read an attempt and remove it, whether or not it turns out to be usable.
+    """Claim an attempt: return it and remove it in the same statement.
 
     Removed before the caller redeems it, not after: an authorization code is
     single-use, so a retry has to start a fresh login rather than replay this
-    verifier against a code the issuer has already burned.
+    verifier against a code the issuer has already burned. And claimed
+    atomically, so two requests carrying the same state cannot both come away
+    with the verifier and both go redeem it — which is the one-time consumption
+    the state parameter is for.
     """
-    raw = db.get_setting(_PENDING_PREFIX + state)
-    db.delete_setting(_PENDING_PREFIX + state)
+    raw = db.take_setting(_PENDING_PREFIX + state)
     if not raw:
         return None
     try:
@@ -98,6 +100,29 @@ def _prune(db: SettingsStore) -> None:
             db.delete_setting(key)
 
 
+def _dashboard_redirect_uri(spec: Any, origin: str) -> str:
+    """Where a dashboard-mode provider should send the code back to.
+
+    ``origin`` is deployment configuration — the caller reads it from
+    ``MIRA_DASHBOARD_URL``, never from a request. This value tells the provider
+    where to deliver an authorization code, so it is checked rather than
+    trusted: an absolute http(s) URL with a host, and nothing else. A relative
+    or scheme-less value would otherwise be pasted into a redirect URI that
+    resolves somewhere nobody intended.
+    """
+    parsed = urlsplit((origin or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise OAuthError(
+            f"{spec.label} needs the dashboard's public URL — set MIRA_DASHBOARD_URL "
+            "to the absolute address this dashboard is reached at "
+            "(e.g. https://mira.example.com)"
+        )
+    if parsed.scheme not in ("http", "https"):
+        raise OAuthError(f"MIRA_DASHBOARD_URL must be an http(s) URL, got {origin!r}")
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+    return base + spec.dashboard_callback_path
+
+
 # ── Flow ────────────────────────────────────────────────────────────
 
 
@@ -119,11 +144,7 @@ def start_login(
         raise OAuthError("No dashboard database available to track the login")
 
     if spec.redirect_mode == "dashboard":
-        if not dashboard_origin:
-            raise OAuthError(
-                f"{spec.label} needs the dashboard's public URL — set MIRA_DASHBOARD_URL"
-            )
-        redirect_uri = dashboard_origin.rstrip("/") + spec.dashboard_callback_path
+        redirect_uri = _dashboard_redirect_uri(spec, dashboard_origin)
     else:
         redirect_uri = spec.loopback_redirect_uri()
 
@@ -192,6 +213,12 @@ async def complete_login(
     The attempt is removed before the exchange runs, not after: an
     authorization code is single-use, so a retry must start a fresh login
     rather than replay a verifier against a code the issuer has already burned.
+
+    ``state`` from the caller is the attempt it *expects* this redirect to
+    belong to — the dashboard passes the one it started. It is checked against
+    the redirect rather than allowed to stand in for it: taking the caller's
+    word would redeem a pasted URL from some other login against the attempt on
+    screen, which is the mismatch the state parameter exists to catch.
     """
     resolved_db = db or store.default_db()
     if resolved_db is None:
@@ -200,7 +227,9 @@ async def complete_login(
     if redirect_url:
         parsed = parse_redirect(redirect_url)
         code = code or parsed["code"]
-        state = state or parsed["state"]
+        if state and parsed["state"] and parsed["state"] != state:
+            raise OAuthError("That redirect belongs to a different sign-in — start this one again")
+        state = parsed["state"] or state
     if not code:
         raise OAuthError("No authorization code to redeem")
     if not state:
