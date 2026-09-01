@@ -8,7 +8,9 @@ routes (admin-only, and an export that matches the table it came from).
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -104,10 +106,15 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
 
 
 class TestTraceContext:
-    def test_trace_id_is_short_and_hex(self):
+    def test_trace_id_is_64_bits_of_hex(self):
+        """Width is the whole point: at 32 bits a week's worth of reviews
+        collide often enough to interleave two of them behind one filter."""
         trace = new_trace_id()
-        assert len(trace) == 8
+        assert len(trace) == 16
         int(trace, 16)  # raises if it is not hex
+
+    def test_trace_ids_do_not_repeat(self):
+        assert len({new_trace_id() for _ in range(1000)}) == 1000
 
     def test_context_sets_and_restores(self):
         assert current_trace_id() == ""
@@ -532,3 +539,94 @@ class TestFailureNoticeCarriesTheTrace:
 
         notice = ReviewEngine._format_failure_notice(RuntimeError("nope"))
         assert "Trace ID" not in notice
+
+
+class TestWriterIsolation:
+    """The log writer is a permanent background thread committing on a timer.
+    Sharing a SQLite connection with the request path means its commits land in
+    the middle of the dashboard's multi-statement writes."""
+
+    def test_the_writer_gets_its_own_sqlite_connection(self, db: AppDatabase):
+        db.record_app_logs([{"created_at": 1.0, "level": "INFO", "level_no": 20}])
+        assert db._sqlite_log_conn is not None
+        assert db._sqlite_log_conn is not db._sqlite_conn
+
+    def test_a_writer_commit_cannot_commit_a_request_transaction(self, db: AppDatabase):
+        """The failure this fixes: on a shared connection the log writer's
+        `commit()` makes a half-written dashboard row durable, and the rollback
+        that should have discarded it finds nothing left to discard.
+
+        Separated, the writer either waits for the request or gives up on the
+        batch — and a dropped batch is counted and reported, where a wrongly
+        committed row is not.
+        """
+        assert db._sqlite_conn is not None
+        db._sqlite_conn.execute(
+            "INSERT INTO global_rules (title, content) VALUES ('half written', '')"
+        )
+        with contextlib.suppress(sqlite3.OperationalError):
+            db.record_app_logs([{"created_at": 1.0, "level": "INFO", "level_no": 20}])
+        db._sqlite_conn.rollback()
+        assert [r.title for r in db.list_global_rules()] == []
+
+    def test_the_writer_recovers_once_the_request_transaction_ends(self, db: AppDatabase):
+        """A blocked batch is not a broken writer: the next one goes in."""
+        assert db._sqlite_conn is not None
+        db._sqlite_conn.execute(
+            "INSERT INTO global_rules (title, content) VALUES ('half written', '')"
+        )
+        db._sqlite_conn.rollback()
+        db.record_app_logs([{"created_at": 1.0, "level": "INFO", "level_no": 20}])
+        assert db.count_app_logs(since=0) == 1
+
+    def test_concurrent_writes_and_reads_stay_consistent(self, db: AppDatabase):
+        """A smoke test for the shape the race actually takes: the writer
+        inserting while request threads read and write other tables."""
+        errors: list[Exception] = []
+
+        def write_logs() -> None:
+            try:
+                for i in range(40):
+                    db.record_app_logs([{"created_at": float(i), "level": "INFO", "level_no": 20}])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def use_dashboard() -> None:
+            try:
+                for i in range(40):
+                    db.set_setting(f"key{i}", str(i))
+                    db.get_setting(f"key{i}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write_logs), threading.Thread(target=use_dashboard)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert errors == []
+        assert db.count_app_logs(since=0) == 40
+        assert db.get_setting("key39") == "39"
+
+
+class TestExportCeiling:
+    def test_the_export_ceiling_is_the_store_ceiling(self):
+        """These two used to disagree — the route offered 5,000 lines and the
+        query clamped at 2,000 — so an export stopped short without saying so."""
+        from mira.dashboard.db import MAX_APP_LOG_ROWS
+        from mira.dashboard.routers.logs import _MAX_EXPORT
+
+        assert _MAX_EXPORT == MAX_APP_LOG_ROWS
+
+    def test_a_request_at_the_ceiling_is_not_silently_trimmed(self, db: AppDatabase):
+        from mira.dashboard.db import MAX_APP_LOG_ROWS
+
+        wanted = 2_500  # above the old 2,000 clamp, below the ceiling
+        assert wanted < MAX_APP_LOG_ROWS
+        db.record_app_logs(
+            [
+                {"created_at": float(i), "level": "INFO", "level_no": 20, "message": f"m{i}"}
+                for i in range(wanted)
+            ]
+        )
+        assert len(db.list_app_logs(since=0, limit=wanted)) == wanted

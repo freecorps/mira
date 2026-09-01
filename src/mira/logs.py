@@ -120,13 +120,20 @@ _trace_pr: ContextVar[int] = ContextVar("mira_trace_pr", default=0)
 def new_trace_id() -> str:
     """A short, copy-pasteable correlation id.
 
-    Eight hex characters, not a UUID: this id is printed in a pull request
-    comment for a human to retype or paste into a filter box, and a 36-character
-    one gets truncated by whoever passes it on. The collision risk that buys is
-    irrelevant — ids only ever need to be distinct among the lines still in the
-    retention window, not globally unique.
+    Sixteen hex characters — 64 bits — and not a UUID: this id is printed in a
+    pull request comment for a human to paste into a filter box, and a
+    36-character one with dashes in it invites being truncated by whoever
+    passes it on.
+
+    The width is not cosmetic. Ids only need to be distinct among the traces
+    still inside the retention window, but that window holds a week, and at 32
+    bits a birthday collision arrives at around 1% for ten thousand reviews and
+    is more likely than not by a hundred thousand. A collision here is not a
+    crash; it is a filter that quietly returns two reviews' log lines
+    interleaved, which is precisely the confusion this id exists to remove. At
+    64 bits the same hundred thousand traces collide with probability 3e-10.
     """
-    return secrets.token_hex(4)
+    return secrets.token_hex(8)
 
 
 def current_trace_id() -> str:
