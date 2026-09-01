@@ -8,6 +8,7 @@ which is everything it needs to render the page.
 
 from __future__ import annotations
 
+import os
 from html import escape
 
 from fastapi import HTTPException, Request
@@ -26,12 +27,6 @@ _CALLBACK_HTML = """<!doctype html>
 <p>{detail}</p>
 <p><a href="/settings/connections">Back to Mira</a></p>
 </body></html>"""
-
-
-class OAuthStartRequest(BaseModel):
-    # Public origin to send the provider back to, for providers that accept
-    # our own callback. Ignored by loopback-only providers (ChatGPT).
-    dashboard_origin: str = ""
 
 
 class OAuthCompleteRequest(BaseModel):
@@ -61,13 +56,25 @@ def list_oauth_providers(request: Request) -> dict:
 
 
 @router.post("/api/oauth/{provider_id}/start")
-def start_oauth(provider_id: str, body: OAuthStartRequest, request: Request) -> dict:
-    """Begin a login and hand back the URL to send the operator to."""
+def start_oauth(provider_id: str, request: Request) -> dict:
+    """Begin a login and hand back the URL to send the operator to.
+
+    The callback origin is deployment configuration and is read from
+    ``MIRA_DASHBOARD_URL`` alone — never from the request. It decides where the
+    provider sends the authorization code, so anything that reaches it from
+    outside (a request body, a Host header a proxy did not pin) is a way to
+    have that code delivered somewhere else. It also has to match what was
+    registered with the provider, which a per-request value cannot promise.
+    Providers with a fixed loopback redirect, ChatGPT among them, ignore it.
+    """
     _require_admin(request)
     _spec_or_404(provider_id)
-    origin = body.dashboard_origin or str(request.base_url).rstrip("/")
     try:
-        return manager.start_login(provider_id, dashboard_origin=origin, db=_api._app_db)
+        return manager.start_login(
+            provider_id,
+            dashboard_origin=os.environ.get("MIRA_DASHBOARD_URL", ""),
+            db=_api._app_db,
+        )
     except OAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -99,11 +106,16 @@ def disconnect_oauth(provider_id: str, request: Request) -> dict:
 
 @router.post("/api/oauth/{provider_id}/refresh")
 async def refresh_oauth(provider_id: str, request: Request) -> dict:
-    """Renew a session now, so a stale one is fixed here and not mid-review."""
+    """Renew a session now, so a stale one is fixed here and not mid-review.
+
+    Always goes to the issuer, expiry or not: this button exists for the case
+    the expiry cannot describe — a grant revoked upstream, which still looks
+    valid here until something tries to use it.
+    """
     _require_admin(request)
     _spec_or_404(provider_id)
     try:
-        tokens = await store.valid_tokens(provider_id, _api._app_db)
+        tokens = await store.valid_tokens(provider_id, _api._app_db, force=True)
     except OAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     logger.info("Refreshed OAuth session for %s", tokens.provider)

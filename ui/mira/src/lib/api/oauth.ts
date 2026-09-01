@@ -39,10 +39,11 @@ export const oauthApi = {
       "/api/oauth/providers"
     ),
 
+  // No callback origin from here: where a provider may send an authorization
+  // code is deployment configuration (MIRA_DASHBOARD_URL), not something the
+  // page gets to name.
   startOAuth: (provider: string) =>
-    postJson<OAuthStart>(`/api/oauth/${provider}/start`, {
-      dashboard_origin: window.location.origin,
-    }),
+    postJson<OAuthStart>(`/api/oauth/${provider}/start`, {}),
 
   completeOAuth: (provider: string, redirect_url: string, state: string) =>
     postJson<OAuthProvider>(`/api/oauth/${provider}/complete`, {

@@ -96,7 +96,12 @@ the paste entirely.
 
 A provider that accepts an arbitrary redirect URI does not need any of this.
 Set `redirect_mode = "dashboard"` on its spec and the browser comes straight
-back to `/api/oauth/callback`, which finishes the login by itself.
+back to `/api/oauth/callback`, which finishes the login by itself. Those
+providers need `MIRA_DASHBOARD_URL` set to the absolute address this dashboard
+is reached at. That value decides where a provider delivers an authorization
+code, so it is read from configuration only — never from the request, and never
+from a `Host` header — and it has to match what was registered with the
+provider anyway, which a per-request value could not promise.
 
 ## What is stored, and where
 
