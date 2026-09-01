@@ -52,7 +52,10 @@ trap cleanup EXIT
 
 wait_for_health() {
   local label="$1"
-  for _ in $(seq 1 36); do
+  # Same three-minute ceiling as before, polled every second: the server is
+  # up in a couple of seconds on a native runner, and this waits for four
+  # separate starts, so a coarse poll was paying up to five seconds each.
+  for _ in $(seq 1 180); do
     if curl --fail --silent --show-error --max-time 3 \
       "http://127.0.0.1:${host_port}/health" >/dev/null 2>&1; then
       return 0
@@ -60,7 +63,7 @@ wait_for_health() {
     if ! docker inspect "$container_name" >/dev/null 2>&1; then
       break
     fi
-    sleep 5
+    sleep 1
   done
   echo "${label} image did not become healthy" >&2
   docker logs "$container_name" >&2 || true

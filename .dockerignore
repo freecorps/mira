@@ -25,6 +25,22 @@ ui/mira/node_modules/
 ui/mira/dist/
 ui/mira/.vite/
 
+# Not part of the image — the Dockerfile copies only src/, ui/mira/,
+# pyproject.toml, uv.lock and README.md. Keeping the rest out of the build
+# context makes the context upload (and cache-key hashing) cheaper.
+tests/
+docs/
+deploy/
+scripts/
+*.md
+!README.md
+.mira.yaml.example
+.pre-commit-config.yaml
+.editorconfig
+fly.toml
+railway.toml
+render.yaml
+
 # Local state — never bake into image
 data/
 *.pem
