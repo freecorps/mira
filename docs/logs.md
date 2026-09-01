@@ -85,13 +85,23 @@ Retention is two limits, because either alone has a failure mode: an age limit
 lets one loud afternoon fill the disk, and a row limit lets a quiet install
 keep lines from a year ago that nobody will read.
 
-On SQLite the writer holds **its own connection**. `sqlite3` makes individual
-statements safe across threads but leaves the transaction shared, so a writer
-committing on a timer would commit whatever the dashboard had half-written at
-that moment — and the rollback that should have discarded it would find nothing
-left to discard. With a separate connection the two never share a transaction;
-if they contend for the write lock, the writer waits and then drops the batch,
-which the gaps banner reports.
+On SQLite the writer holds **its own connection**, and a lock around each
+transaction on it. `sqlite3` makes individual statements safe across threads
+but leaves the transaction shared, so a writer committing on a timer would
+commit whatever the dashboard had half-written at that moment — and the
+rollback that should have discarded it would find nothing left to discard. With
+a separate connection the two never share a transaction; if they contend for
+the write lock, the writer waits and then drops the batch, which the gaps
+banner reports. A batch that fails is rolled back before the error is raised,
+so one transient `database is locked` costs one batch rather than poisoning
+every batch after it.
+
+At shutdown the writer is told to stop by a flag rather than by a queued
+sentinel — the queue can be full at exactly that moment, and a stop signal that
+can be dropped eventually is. It flushes what is queued within a short deadline
+and whatever is left is counted as dropped, because a shutdown that insists on
+writing twenty thousand records against a slow disk is a container that gets
+killed instead of exiting.
 
 ## Configuration
 

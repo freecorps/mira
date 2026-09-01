@@ -630,3 +630,173 @@ class TestExportCeiling:
             ]
         )
         assert len(db.list_app_logs(since=0, limit=wanted)) == wanted
+
+
+class _CommitFailsOnce:
+    """A connection proxy whose first `commit()` raises, to prove the batch is
+    rolled back rather than left open for the next one to inherit."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.fail_next_commit = True
+        self.rollbacks = 0
+
+    def executemany(self, *args, **kwargs):
+        return self._conn.executemany(*args, **kwargs)
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def commit(self):
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.commit()
+
+    def rollback(self):
+        self.rollbacks += 1
+        return self._conn.rollback()
+
+
+class _ConcurrencyProbe:
+    """A connection proxy that records how many threads are inside a write at
+    the same time, and holds the window open long enough for them to collide."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._inside = 0
+        self._counter = threading.Lock()
+        self.max_concurrent = 0
+
+    def executemany(self, *args, **kwargs):
+        with self._counter:
+            self._inside += 1
+            self.max_concurrent = max(self.max_concurrent, self._inside)
+        try:
+            time.sleep(0.15)  # widen the window so a missing lock is visible
+            return self._conn.executemany(*args, **kwargs)
+        finally:
+            with self._counter:
+                self._inside -= 1
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+
+def _log_row(message: str = "m") -> dict:
+    return {"created_at": 1.0, "level": "INFO", "level_no": 20, "message": message}
+
+
+class TestWriterTransactions:
+    def test_a_failed_batch_does_not_poison_the_next_one(self, db: AppDatabase):
+        """A failed `executemany`/`commit` leaves the transaction open. Without
+        a rollback the next batch joins the wreckage, and one transient
+        `database is locked` costs every batch after it rather than just one."""
+        db._log_writer_conn()
+        proxy = _CommitFailsOnce(db._sqlite_log_conn)
+        db._sqlite_log_conn = proxy  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            db.record_app_logs([_log_row("poisoned")])
+        assert proxy.rollbacks == 1
+
+        db.record_app_logs([_log_row("good")])
+        # "poisoned" must not have been resurrected by the second commit.
+        assert [r["message"] for r in db.list_app_logs(since=0)] == ["good"]
+
+    def test_only_one_thread_is_inside_the_transaction_at_a_time(self, db: AppDatabase):
+        """Splitting the connection only moves the interleaving problem if two
+        threads then share the new one, and nothing structurally stops a second
+        caller: these are public methods, and a handler installed twice runs
+        two writer threads. The probe counts how many threads are inside
+        `executemany` at once; with the lock guarding only the connection
+        lookup rather than the transaction, it is more than one.
+        """
+        db._log_writer_conn()
+        probe = _ConcurrencyProbe(db._sqlite_log_conn)
+        db._sqlite_log_conn = probe  # type: ignore[assignment]
+
+        threads = [
+            threading.Thread(target=db.record_app_logs, args=([_log_row(f"t{i}")],))
+            for i in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert probe.max_concurrent == 1, (
+            f"{probe.max_concurrent} threads were inside the log transaction at once"
+        )
+        assert db.count_app_logs(since=0) == 4
+
+    def test_concurrent_writers_lose_nothing(self, db: AppDatabase):
+        errors: list[Exception] = []
+
+        def write(tag: str) -> None:
+            try:
+                for i in range(25):
+                    db.record_app_logs([_log_row(f"{tag}-{i}")])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(t,)) for t in ("a", "b", "c")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert errors == []
+        assert db.count_app_logs(since=0) == 75
+
+
+class _SlowSink(_FakeSink):
+    """A sink that is merely slow, not broken — the shape that made shutdown
+    return while the writer was still running."""
+
+    def record_app_logs(self, entries: list[dict]) -> int:
+        time.sleep(0.2)
+        return super().record_app_logs(entries)
+
+
+class TestShutdown:
+    def test_a_full_queue_cannot_swallow_the_stop_signal(self):
+        """The sentinel enqueue is best-effort, so it must not be the signal.
+        A queue that is full at shutdown — which is when a busy process shuts
+        down — used to leave a live thread holding the database connection
+        behind a handler nobody had a reference to any more."""
+        handler = LogCaptureHandler(_SlowSink(), level=logging.INFO, capacity=2)
+        for _ in range(50):
+            handler.emit(_record(msg="burst"))
+        assert handler._queue.full()
+        handler.close()
+        assert not handler._thread.is_alive()
+
+    def test_queued_records_are_flushed_on_close(self):
+        sink = _FakeSink()
+        handler = LogCaptureHandler(sink, level=logging.INFO)
+        for i in range(20):
+            handler.emit(_record(msg=f"line {i}"))
+        handler.close()
+        assert len(sink.entries) == 20
+
+    def test_close_is_idempotent(self):
+        handler = LogCaptureHandler(_FakeSink(), level=logging.INFO)
+        handler.close()
+        handler.close()
+        assert not handler._thread.is_alive()
+
+    def test_uninstall_leaves_no_writer_thread_behind(self, monkeypatch: pytest.MonkeyPatch):
+        """Repeated install/uninstall must not accumulate writers: each one
+        owns a thread and a database connection."""
+        monkeypatch.delenv("MIRA_LOG_CAPTURE", raising=False)
+        before = sum(t.name == "mira-log-writer" for t in threading.enumerate())
+        for _ in range(3):
+            install_log_capture(_FakeSink())
+            uninstall_log_capture()
+        assert sum(t.name == "mira-log-writer" for t in threading.enumerate()) == before
