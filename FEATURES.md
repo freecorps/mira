@@ -197,6 +197,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Review page (admin): stale/waiting PRs, reviewer-responsiveness leaderboard, throughput trends, rubber-stamp detection, open-PR status board
 - Contributor analytics: authoring stats, year-long contribution heatmap, and Mira's review-quality signal per contributor
 - Pending-uninstall review queue
+- Logs page (admin): Mira's own log output captured into the app database, filterable by level, module, trace ID, repo and time window, with copy and plain-text export — every failed review prints a trace ID that pulls up exactly the lines it emitted
 
 ## Configuration
 

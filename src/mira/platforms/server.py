@@ -58,6 +58,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Log capture first, so the startup work below is itself on the record.
+        # Tied to the lifespan rather than to import: the handler owns a thread
+        # and a database connection, and neither should exist because somebody
+        # imported this module to read a type off it.
+        from mira.dashboard.api import _log_capture_lifespan_sync
+
+        with _log_capture_lifespan_sync():
+            async with _serve(app):
+                yield
+
+    @asynccontextmanager
+    async def _serve(app: FastAPI) -> AsyncIterator[None]:
         # Backfill is a GitHub-installation concept; skip it on GitLab-only.
         backfill_task = (
             asyncio.create_task(backfill_missing_indexes(app_auth))

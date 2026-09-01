@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Generator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -47,9 +47,33 @@ def register_dashboard(app: FastAPI) -> None:
     app.include_router(router)
 
 
+@contextmanager
+def _log_capture_lifespan_sync() -> Generator[None, None, None]:
+    """Start log capture for the life of a served app, and stop it after.
+
+    Tied to the server's lifespan rather than to importing this module. The
+    handler owns a background thread and a database connection, and a library
+    import that spawns one of each is a surprise to every test and script that
+    only wanted a Pydantic model from here.
+    """
+    from mira.logs import install_log_capture, uninstall_log_capture
+
+    install_log_capture(_app_db)
+    try:
+        yield
+    finally:
+        uninstall_log_capture()
+
+
+@asynccontextmanager
+async def _dashboard_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    with _log_capture_lifespan_sync():
+        yield
+
+
 # Standalone app — initialized at module load, but routes are registered at
 # the bottom of this file, *after* all @router decorators have run.
-app = FastAPI(title="Mira Dashboard API", version="0.8.0")
+app = FastAPI(title="Mira Dashboard API", version="0.8.0", lifespan=_dashboard_lifespan)
 
 _INDEX_DIR = os.environ.get("MIRA_INDEX_DIR", "/data/indexes")
 
@@ -1332,6 +1356,7 @@ import mira.dashboard.routers.autofix  # noqa: E402,F401
 import mira.dashboard.routers.checks  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
 import mira.dashboard.routers.gate  # noqa: E402,F401
+import mira.dashboard.routers.logs  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.repos  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401

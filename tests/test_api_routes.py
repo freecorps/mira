@@ -40,6 +40,13 @@ EXPECTED_ROUTES = {
     ("/api/gate/decisions/{owner}/{repo}/{decision_id}", "GET"),
     ("/api/gate/decisions/{owner}/{repo}/{decision_id}/override", "POST"),
     ("/api/gate/summary", "GET"),
+    # Mira's own captured log trail. Admin-only including the reads: a log
+    # line is the least structured thing stored anywhere here, and a review of
+    # a private repository logs its name.
+    ("/api/logs", "GET"),
+    ("/api/logs", "DELETE"),
+    ("/api/logs/export", "GET"),
+    ("/api/logs/loggers", "GET"),
     # Phase 5 — assisted correction (all admin-only; the cancel route
     # additionally requires the cancel permission). There is deliberately no
     # route that *starts* a fix: that is a repository write permission, not a

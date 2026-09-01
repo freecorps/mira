@@ -243,6 +243,42 @@ CREATE INDEX IF NOT EXISTS idx_mcp_audit_created
     ON mcp_audit_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_mcp_audit_repository
     ON mcp_audit_events(repository, created_at);
+
+-- Every log line the process emitted, kept so a failed review can be traced
+-- from the dashboard rather than from a container's stdout. Container logs are
+-- the one record that is reliably gone by the time somebody goes looking: a
+-- restart takes them, and the person who needs them is usually not the person
+-- who can reach the host.
+--
+-- `trace_id` is what makes the table worth more than `docker logs`: every line
+-- a review emitted carries the same id, and the review's failure comment
+-- prints it, so "this pull request failed" turns into one filter instead of a
+-- timestamp hunt through interleaved concurrent reviews.
+CREATE TABLE IF NOT EXISTS app_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL DEFAULT 0,
+    level TEXT NOT NULL DEFAULT 'INFO',
+    -- The numeric level too, so "WARNING and above" is a range scan rather
+    -- than a five-way IN over strings.
+    level_no INTEGER NOT NULL DEFAULT 20,
+    logger TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    traceback TEXT NOT NULL DEFAULT '',
+    module TEXT NOT NULL DEFAULT '',
+    func_name TEXT NOT NULL DEFAULT '',
+    lineno INTEGER NOT NULL DEFAULT 0,
+    trace_id TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    thread TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_logs_created
+    ON app_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_app_logs_level
+    ON app_logs(level_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_app_logs_trace
+    ON app_logs(trace_id, created_at);
 """
 
 _PG_SCHEMA = """
@@ -426,6 +462,42 @@ CREATE INDEX IF NOT EXISTS idx_mcp_audit_created
     ON mcp_audit_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_mcp_audit_repository
     ON mcp_audit_events(repository, created_at);
+
+-- Every log line the process emitted, kept so a failed review can be traced
+-- from the dashboard rather than from a container's stdout. Container logs are
+-- the one record that is reliably gone by the time somebody goes looking: a
+-- restart takes them, and the person who needs them is usually not the person
+-- who can reach the host.
+--
+-- `trace_id` is what makes the table worth more than `docker logs`: every line
+-- a review emitted carries the same id, and the review's failure comment
+-- prints it, so "this pull request failed" turns into one filter instead of a
+-- timestamp hunt through interleaved concurrent reviews.
+CREATE TABLE IF NOT EXISTS app_logs (
+    id BIGSERIAL PRIMARY KEY,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    level TEXT NOT NULL DEFAULT 'INFO',
+    -- The numeric level too, so "WARNING and above" is a range scan rather
+    -- than a five-way IN over strings.
+    level_no INTEGER NOT NULL DEFAULT 20,
+    logger TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    traceback TEXT NOT NULL DEFAULT '',
+    module TEXT NOT NULL DEFAULT '',
+    func_name TEXT NOT NULL DEFAULT '',
+    lineno INTEGER NOT NULL DEFAULT 0,
+    trace_id TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    thread TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_logs_created
+    ON app_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_app_logs_level
+    ON app_logs(level_no, created_at);
+CREATE INDEX IF NOT EXISTS idx_app_logs_trace
+    ON app_logs(trace_id, created_at);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -1671,6 +1743,246 @@ class AppDatabase:
             }
             for row in rows
         ]
+
+    # ── Captured application logs ──
+    #
+    # The one table here whose rows the process writes about itself. Two things
+    # follow from that and shape every method below: the volume is unbounded (a
+    # busy install writes more log lines than it does anything else), and a
+    # failure on this path feeds itself if it is reported through logging.
+
+    _APP_LOG_COLUMNS = (
+        "created_at, level, level_no, logger, message, traceback, module, "
+        "func_name, lineno, trace_id, repo, pr_number, thread"
+    )
+
+    def record_app_logs(self, entries: list[dict[str, Any]]) -> int:
+        """Append a batch of captured log lines. Returns how many were written.
+
+        Unlike the audit trails, this one *raises* on failure instead of
+        swallowing. Swallowing would mean logging the failure, and that log
+        line is itself captured, queued, and written by the same failing path —
+        a write error would generate the traffic that keeps it erroring. The
+        caller is the capture handler, whose own logger is excluded from
+        capture, so it can report the failure once and drop the batch without
+        the loop closing.
+        """
+        if not entries:
+            return 0
+        rows = [
+            (
+                float(e.get("created_at") or 0.0),
+                str(e.get("level") or "INFO"),
+                int(e.get("level_no") or 0),
+                str(e.get("logger") or ""),
+                str(e.get("message") or ""),
+                str(e.get("traceback") or ""),
+                str(e.get("module") or ""),
+                str(e.get("func_name") or ""),
+                int(e.get("lineno") or 0),
+                str(e.get("trace_id") or ""),
+                str(e.get("repo") or ""),
+                int(e.get("pr_number") or 0),
+                str(e.get("thread") or ""),
+            )
+            for e in entries
+        ]
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.executemany(
+                f"INSERT INTO app_logs ({self._APP_LOG_COLUMNS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                cur.executemany(
+                    f"INSERT INTO app_logs ({self._APP_LOG_COLUMNS}) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    rows,
+                )
+            self._pg_commit()
+        return len(rows)
+
+    def _app_log_filters(
+        self,
+        *,
+        min_level: int,
+        logger_name: str,
+        query: str,
+        trace_id: str,
+        repo: str,
+        since: float,
+        until: float,
+    ) -> tuple[str, list[Any]]:
+        """WHERE clause + params for the log filters, in ``?`` placeholder form.
+
+        Matching is lower-cased on both sides rather than left to ``LIKE``:
+        SQLite folds ASCII case and Postgres does not, and a filter that finds
+        a line on a laptop and not in production is worse than one that finds
+        neither.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if min_level > 0:
+            clauses.append("level_no >= ?")
+            params.append(int(min_level))
+        if logger_name:
+            clauses.append("LOWER(logger) LIKE ?")
+            params.append(f"%{logger_name.lower()}%")
+        if query:
+            # Tracebacks are searched too: the exception type somebody pastes
+            # in from a failure notice appears there, not in the message.
+            clauses.append("(LOWER(message) LIKE ? OR LOWER(traceback) LIKE ?)")
+            needle = f"%{query.lower()}%"
+            params.extend([needle, needle])
+        if trace_id:
+            clauses.append("trace_id = ?")
+            params.append(trace_id)
+        if repo:
+            clauses.append("LOWER(repo) = ?")
+            params.append(repo.lower())
+        if since > 0:
+            clauses.append("created_at >= ?")
+            params.append(float(since))
+        if until > 0:
+            clauses.append("created_at <= ?")
+            params.append(float(until))
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        return where, params
+
+    def list_app_logs(
+        self,
+        *,
+        min_level: int = 0,
+        logger_name: str = "",
+        query: str = "",
+        trace_id: str = "",
+        repo: str = "",
+        since: float = 0.0,
+        until: float = 0.0,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Captured log lines matching the filters, newest first."""
+        limit = max(1, min(int(limit), 2000))
+        offset = max(0, int(offset))
+        where, params = self._app_log_filters(
+            min_level=min_level,
+            logger_name=logger_name,
+            query=query,
+            trace_id=trace_id,
+            repo=repo,
+            since=since,
+            until=until,
+        )
+        sql = (
+            f"SELECT id, {self._APP_LOG_COLUMNS} FROM app_logs {where}"
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
+        rows = self._rows(sql, (*params, limit, offset))
+        return [
+            {
+                "id": int(row[0]),
+                "created_at": float(row[1] or 0.0),
+                "level": str(row[2] or ""),
+                "level_no": int(row[3] or 0),
+                "logger": str(row[4] or ""),
+                "message": str(row[5] or ""),
+                "traceback": str(row[6] or ""),
+                "module": str(row[7] or ""),
+                "func_name": str(row[8] or ""),
+                "lineno": int(row[9] or 0),
+                "trace_id": str(row[10] or ""),
+                "repo": str(row[11] or ""),
+                "pr_number": int(row[12] or 0),
+                "thread": str(row[13] or ""),
+            }
+            for row in rows
+        ]
+
+    def count_app_logs(
+        self,
+        *,
+        min_level: int = 0,
+        logger_name: str = "",
+        query: str = "",
+        trace_id: str = "",
+        repo: str = "",
+        since: float = 0.0,
+        until: float = 0.0,
+    ) -> int:
+        """How many lines match the filters, ignoring paging."""
+        where, params = self._app_log_filters(
+            min_level=min_level,
+            logger_name=logger_name,
+            query=query,
+            trace_id=trace_id,
+            repo=repo,
+            since=since,
+            until=until,
+        )
+        rows = self._rows(f"SELECT COUNT(*) FROM app_logs {where}", tuple(params))
+        return int(rows[0][0]) if rows else 0
+
+    def list_app_log_loggers(self, limit: int = 60) -> list[dict[str, Any]]:
+        """The logger names actually present, busiest first — the filter menu.
+
+        Built from the data rather than from a hard-coded list of Mira's
+        modules, because the names worth filtering on include the ones Mira
+        does not own (``httpx``, ``uvicorn.error``) and a fixed list would
+        silently stop offering a module the day it is renamed.
+        """
+        limit = max(1, min(int(limit), 200))
+        rows = self._rows(
+            "SELECT logger, COUNT(*) FROM app_logs GROUP BY logger "
+            "ORDER BY COUNT(*) DESC, logger ASC LIMIT ?",
+            (limit,),
+        )
+        return [{"logger": str(r[0] or ""), "count": int(r[1] or 0)} for r in rows]
+
+    def prune_app_logs(self, *, max_age_days: float = 7.0, max_rows: int = 200_000) -> int:
+        """Drop lines older than ``max_age_days``, then trim to ``max_rows``.
+
+        Two limits, because either alone has a failure mode: an age limit lets
+        one loud afternoon fill the disk, and a row limit lets a quiet install
+        keep lines from a year ago that nobody will read. The row trim finds
+        the cutoff id and deletes below it rather than using
+        ``NOT IN (SELECT …)``, which rescans the whole table every pass.
+        """
+        deleted = 0
+        if max_age_days > 0:
+            cutoff = time.time() - max_age_days * 86400
+            deleted += self._delete_returning_count(
+                "DELETE FROM app_logs WHERE created_at < ?", (cutoff,)
+            )
+        if max_rows > 0:
+            rows = self._rows(
+                "SELECT id FROM app_logs ORDER BY id DESC LIMIT 1 OFFSET ?", (int(max_rows),)
+            )
+            if rows:
+                deleted += self._delete_returning_count(
+                    "DELETE FROM app_logs WHERE id <= ?", (int(rows[0][0]),)
+                )
+        return deleted
+
+    def clear_app_logs(self) -> int:
+        """Delete every captured line. Behind the dashboard's Clear button."""
+        return self._delete_returning_count("DELETE FROM app_logs", ())
+
+    def _delete_returning_count(self, sql: str, params: tuple) -> int:
+        """Run a DELETE written with ``?`` placeholders, returning the count."""
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(sql, params)
+            self._sqlite_conn.commit()
+            return max(0, cur.rowcount)
+        with self._pg_cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            count = max(0, cur.rowcount)
+        self._pg_commit()
+        return count
 
     # Outbound webhooks live in their own settings row (not in the review
     # overrides blob) so their secret URLs never leak into the effective-config

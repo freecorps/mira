@@ -51,6 +51,7 @@ Most AI reviewers are SaaS: your diffs (and often the full surrounding code) lea
   - **CVE alerts on every dependency**: hourly OSV.dev poll, severity + advisory link + fix version surfaced inline next to the package.
   - **Dependency + blast-radius graphs**: see exactly which files and repos depend on a symbol before you change it.
   - **Per-repo review event stream**: every webhook, every chunk, every cost figure, in one place for live troubleshooting.
+  - **Traceable failures**: Mira's own logs, captured into your database and searchable from the dashboard. A failed review prints a trace ID; pasting it in returns every line that review emitted, so "it broke" stops being a `docker logs` archaeology exercise.
   - **Cost & token telemetry**: actual spend per repo and per model, not estimates, because you control the LLM key.
   - **Review-health page**: stale/waiting PRs, a reviewer-responsiveness leaderboard, throughput trends, and rubber-stamp detection (approvals with no substantive review) — plus per-contributor analytics with a year-long heatmap and Mira's review-quality signal.
   - **Coming soon, change-frequency heatmaps**: surface the files that bug fixes keep landing on so you can target review attention.
@@ -285,6 +286,19 @@ and a lookup that fails is reported as Mira's failure rather than as "nobody is
 available". Runs, evidence and policy live at `/triage` (admin only).
 
 → [Reviewer triage docs](docs/triage.md)
+
+## When something goes wrong
+
+A failed review used to tell you one sanitised line on the pull request and
+keep the rest on a container's stdout — the one record that is reliably gone by
+the time anybody goes looking. Mira now captures its own log output into your
+database, and every review tags its lines with a trace ID that the failure
+notice prints. Paste that ID into **Dashboard → Logs** and you get exactly the
+lines that review emitted: which model was tried, what each retry came back
+with, and the stack that ended it. Filter by level, module, repo or free text,
+then copy or export what you're looking at.
+
+→ [Logs docs](docs/logs.md)
 
 → Full schema and every key: [Configuration docs](https://docs.miracode.ai/configuration).
 
