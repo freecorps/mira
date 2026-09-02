@@ -73,10 +73,12 @@ _USAGE_TIMEOUT = 15.0
 # left out on purpose: the backend describes it as "maximum reasoning with
 # automatic task delegation", a Codex-agent behaviour, not a deeper think.
 _EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
-# What each model accepts, by slug, as last reported by ``/codex/models``:
-# every entry the backend listed, hidden ones included, since an operator can
-# type an id the picker does not show. Filled by :meth:`fetch_models`.
-_model_levels: dict[str, tuple[str, ...]] = {}
+# What each model accepts, per account key then by slug, as last reported by
+# ``/codex/models`` for that account: every entry the backend listed, hidden
+# ones included, since an operator can type an id the picker does not show.
+# Replaced wholesale on each answer, so a model the backend stops listing
+# stops being known. Filled by :meth:`fetch_models`.
+_model_levels: dict[str, dict[str, tuple[str, ...]]] = {}
 # When the levels were last asked for, per account key — so a review pass
 # does not re-ask on every call, and a failed ask is retried soon after.
 _levels_asked_at: dict[str, float] = {}
@@ -237,7 +239,7 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
     # ── Reasoning levels ───────────────────────────────────────────
 
     @classmethod
-    def reasoning_effort(cls, model: str, effort: str) -> str:
+    def reasoning_effort(cls, model: str, effort: str, account: str = "") -> str:
         """The level to send ``model`` when ``effort`` was asked for.
 
         The backend's own list says what each model takes, and the answer is
@@ -246,13 +248,13 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
         400. A model the list has not described yet goes through the static
         map, and a level outside the known scale is sent as written.
         """
-        levels = _model_levels.get(model)
+        levels = cls.reasoning_levels(model, account)
         if not levels:
-            return super().reasoning_effort(model, effort)
+            return super().reasoning_effort(model, effort, account)
         if effort in levels:
             return effort
         if effort not in _EFFORT_ORDER:
-            return super().reasoning_effort(model, effort)
+            return super().reasoning_effort(model, effort, account)
         rank = _EFFORT_ORDER.index(effort)
         for candidate in reversed(_EFFORT_ORDER[:rank]):
             if candidate in levels:
@@ -263,17 +265,33 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
         return effort
 
     @classmethod
-    def reasoning_levels(cls, model: str) -> tuple[str, ...]:
-        """What the backend last said ``model`` accepts (empty if never told)."""
-        return _model_levels.get(model, ())
+    def reasoning_levels(cls, model: str, account: str = "") -> tuple[str, ...]:
+        """What the backend last said ``model`` accepts for ``account``.
+
+        An account the backend has described answers for itself only — a
+        model it no longer lists is unknown, whatever another account says.
+        One it has not described yet borrows any account's answer, which
+        beats the static map for a slug the backend has named at all.
+        Empty when nobody has been told.
+        """
+        if account in _model_levels:
+            return _model_levels[account].get(model, ())
+        for known in _model_levels.values():
+            if model in known:
+                return known[model]
+        return ()
 
     @classmethod
     async def prepare(cls, tokens: OAuthTokens) -> None:
-        """Learn the account's models, and their levels, once an hour."""
-        key = tokens.account_key or tokens.account_id or ""
+        """Learn the account's models, and their levels, once an hour.
+
+        A miss is retried much sooner — judged for this account, not by
+        whether some other account's answer happens to be in hand.
+        """
+        key = _account_key(tokens)
         asked = _levels_asked_at.get(key)
         if asked is not None:
-            ttl = _LEVELS_TTL if _model_levels else _LEVELS_RETRY
+            ttl = _LEVELS_TTL if key in _model_levels else _LEVELS_RETRY
             if time.time() - asked < ttl:
                 return
         _levels_asked_at[key] = time.time()
@@ -360,7 +378,7 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
             payload = resp.json()
         except ValueError:
             return None
-        remember_reasoning_levels(payload)
+        remember_reasoning_levels(payload, _account_key(tokens))
         return models_from_payload(payload)
 
 
@@ -451,25 +469,33 @@ def models_from_payload(payload: Any) -> list[dict[str, Any]] | None:
     return [{k: v for k, v in m.items() if k != "priority"} for m in out]
 
 
-def remember_reasoning_levels(payload: Any) -> None:
-    """Note which reasoning levels each listed model takes, hidden ones too.
+def _account_key(tokens: OAuthTokens) -> str:
+    return tokens.account_key or tokens.account_id or ""
 
-    Kept apart from :func:`models_from_payload` so the dropdown's filtering
-    (hidden models out) does not decide what :meth:`reasoning_effort` knows:
-    an operator can type a hidden id, and it still needs the right level.
+
+def remember_reasoning_levels(payload: Any, account: str = "") -> None:
+    """Note which reasoning levels each model listed for ``account`` takes.
+
+    Hidden models are noted too: the dropdown's filtering must not decide
+    what :meth:`ChatGPTOAuthProvider.reasoning_effort` knows, since an
+    operator can type a hidden id and it still needs the right level. The
+    account's whole map is replaced, not merged, so a model the backend has
+    since dropped — or now lists without levels — is forgotten with it.
     """
     if not isinstance(payload, dict):
         return
     entries = payload.get("models")
     if not isinstance(entries, list):
         return
+    known: dict[str, tuple[str, ...]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         slug = str(entry.get("slug", "") or "").strip()
         levels = _reasoning_levels(entry)
         if slug and levels:
-            _model_levels[slug] = levels
+            known[slug] = levels
+    _model_levels[account] = known
 
 
 def _reasoning_levels(entry: dict[str, Any]) -> tuple[str, ...]:
