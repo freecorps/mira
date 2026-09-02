@@ -118,10 +118,17 @@ class UsageSnapshot:
         now = now if now is not None else time.time()
         if self.exhausted_until > now:
             return False
-        return not any(
-            window is not None and window.exhausted(now)
-            for window in (self.primary, self.secondary)
-        )
+        windows = [w for w in (self.primary, self.secondary) if w is not None]
+        if any(w.exhausted(now) for w in windows):
+            return False
+        if self.limit_reached:
+            # The backend said a limit was hit even though no window reads
+            # 100% (rounding, or a limit the windows do not meter). Believe
+            # it until the next window reset; with no reset known, until a
+            # fresh report says otherwise.
+            resets = [w.resets_at for w in windows if w.resets_at]
+            return bool(resets) and now >= min(resets)
+        return True
 
     def headroom(self) -> float:
         """Percent of allowance left in the tightest window (100 = untouched)."""

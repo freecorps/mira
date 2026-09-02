@@ -141,6 +141,7 @@ class OAuthTokens:
 
 
 _KEY_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
+_KEY_MAX = 48
 
 
 def account_key_for(account_id: str) -> str:
@@ -148,14 +149,20 @@ def account_key_for(account_id: str) -> str:
 
     Keys live inside settings-table row names and inside model routes, both
     colon-separated, so the id is reduced to a URL-safe alphabet and kept
-    short. An account with no id at all (a provider whose tokens carry none)
-    gets a random key, which still serves as a slot — it just cannot be
-    matched on a second sign-in.
+    short. An id that loses characters to that, or is cut to length, gets a
+    digest of the original appended so two ids that differ only in what was
+    dropped still get their own slots. An account with no id at all (a
+    provider whose tokens carry none) gets a random key, which still serves
+    as a slot — it just cannot be matched on a second sign-in.
     """
-    cleaned = _KEY_CHARS.sub("", (account_id or "").strip())
-    if cleaned:
-        return cleaned[:48]
-    return secrets.token_hex(6)
+    raw = (account_id or "").strip()
+    cleaned = _KEY_CHARS.sub("", raw)
+    if not cleaned:
+        return secrets.token_hex(6)
+    if cleaned == raw and len(cleaned) <= _KEY_MAX:
+        return cleaned
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned[: _KEY_MAX - len(digest) - 1]}-{digest}"
 
 
 def decode_jwt_claims(token: str) -> dict[str, Any]:

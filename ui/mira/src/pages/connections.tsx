@@ -141,8 +141,14 @@ function AccountRow({
                 {account.plan}
               </Badge>
             )}
-            {account.is_default && (
+            {account.is_pinned ? (
               <Badge variant="default">Default for bare model ids</Badge>
+            ) : (
+              account.is_default && (
+                <Badge variant="secondary">
+                  In rotation for bare model ids
+                </Badge>
+              )
             )}
             {limited && (
               <Badge variant="destructive">
@@ -210,22 +216,24 @@ function AccountRow({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        {provider.serves_models && !account.is_default && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={working}
-            title="Send bare model ids (ones that do not name a backend) to this account only"
-            onClick={() =>
-              onAct(
-                () => api.setActiveOAuth(provider.id, account.key),
-                `Bare model ids now go to ${account.account_label || account.key}`
-              )
-            }
-          >
-            Use this account
-          </Button>
-        )}
+        {provider.serves_models &&
+          !account.is_pinned &&
+          (!account.is_default || provider.accounts.length > 1) && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={working}
+              title="Send bare model ids (ones that do not name a backend) to this account only"
+              onClick={() =>
+                onAct(
+                  () => api.setActiveOAuth(provider.id, account.key),
+                  `Bare model ids now go to ${account.account_label || account.key}`
+                )
+              }
+            >
+              Use this account
+            </Button>
+          )}
         {account.can_refresh && (
           <Button
             size="sm"
@@ -248,9 +256,11 @@ function AccountRow({
           disabled={working}
           dialogTitle={`Disconnect ${account.account_label || account.key}?`}
           dialogDescription={
-            account.is_default
+            account.is_pinned
               ? "Bare model ids go to this account. Disconnecting it sends them back to the configured API key (or to the provider's other accounts, if you pick one)."
-              : "Mira will forget this session. You can sign in again at any time."
+              : account.is_default
+                ? "Bare model ids can land on this account. Disconnecting it leaves them to the provider's other accounts, or to the configured API key if this was the last one."
+                : "Mira will forget this session. You can sign in again at any time."
           }
           confirmLabel="Disconnect"
           onConfirm={() =>
