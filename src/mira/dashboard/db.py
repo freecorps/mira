@@ -1460,6 +1460,28 @@ class AppDatabase:
                     (key, value),
                 )
 
+    def add_setting(self, key: str, value: str) -> bool:
+        """Store a setting only if the key is not there yet; True if it was stored.
+
+        One statement, so two writers racing for the same key cannot both
+        believe they created it — the second one is told the row exists and
+        leaves whatever the first (or a plain ``set_setting``) put there.
+        """
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            )
+            self._sqlite_conn.commit()
+            return cur.rowcount > 0
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
+                (key, value),
+            )
+            return cur.rowcount > 0
+
     def delete_setting(self, key: str) -> None:
         """Remove a setting row. No-op when the key isn't stored."""
         if self._backend == "sqlite":

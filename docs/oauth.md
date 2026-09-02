@@ -52,8 +52,11 @@ A model can be picked in two ways under **Settings → Models**:
   **Stop using** sends them back to the API key.
 * **A route** names its backend and does not depend on the default. The
   picker builds these for you: every signed-in account is a section of its
-  own, so is "any account (rotate)" when a provider has more than one, and so
-  is the API-key endpoint. Under each picker a line says exactly where that
+  own, so is "any account (rotate)" when a provider has more than one — it
+  lists only the models every one of those accounts can serve, since
+  rotation picks the account by allowance rather than by model — and so is
+  the API-key endpoint. A route to a provider or account that is not
+  connected fails with a clear error rather than falling back to the key. Under each picker a line says exactly where that
   choice sends calls — backend, account, protocol, endpoint and the model id
   on the wire.
 

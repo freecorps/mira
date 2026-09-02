@@ -261,6 +261,8 @@ class TestCLI:
         assert data["summary"] == "JSON output."
 
     def test_review_overrides(self):
+        from mira.config import LLMConfig
+
         review_result = _make_result()
 
         with (
@@ -268,6 +270,9 @@ class TestCLI:
             patch("mira.cli.load_config") as mock_load,
         ):
             mock_load.return_value = MagicMock()
+            # A real LLM config: a mock's every attribute is truthy, and a
+            # truthy `oauth_provider` that names no provider is refused.
+            mock_load.return_value.llm = LLMConfig()
             mock_engine = MagicMock()
             mock_engine.review_diff = AsyncMock(return_value=review_result)
             mock_engine_cls.return_value = mock_engine
