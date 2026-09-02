@@ -44,7 +44,7 @@ account is added alongside. Each account has its own **Refresh usage**,
 
 A model can be picked in two ways under **Settings → Models**:
 
-* **A bare id** — `gpt-5-codex`, the way models were always picked — goes to
+* **A bare id** — `gpt-5.6-sol`, the way models were always picked — goes to
   the *default backend*: the provider marked as such on the Connections page,
   or the API-key endpoint when none is. On the card, **Rotate across
   accounts** makes bare ids go to any of the provider's accounts (by remaining
@@ -64,10 +64,10 @@ Routes are plain strings, accepted anywhere a model id is:
 
 | Value | Meaning |
 | --- | --- |
-| `oauth:chatgpt:<key>:gpt-5-codex` | that one account (its key is shown on the card and by `mira auth status`) |
-| `oauth:chatgpt:*:gpt-5-codex` | any ChatGPT account, rotating by remaining allowance |
+| `oauth:chatgpt:<key>:gpt-5.6-sol` | that one account (its key is shown on the card and by `mira auth status`) |
+| `oauth:chatgpt:*:gpt-5.6-sol` | any ChatGPT account, rotating by remaining allowance |
 | `api:openai/gpt-5.1` | the configured API-key endpoint, whatever the default is |
-| `gpt-5-codex` | the default backend |
+| `gpt-5.6-sol` | the default backend |
 
 The last two are how one purpose stays on a key while another uses a
 signed-in account: indexing every file through a cheap key-based model, say,
@@ -112,9 +112,9 @@ for a CLI-only install or an image that ships pre-configured:
 llm:
   oauth_provider: "chatgpt"     # bare ids go to ChatGPT, rotating across accounts
   oauth_account: "<key>"        # optional: one account only
-  model: "gpt-5-codex"
+  model: "gpt-5.6-sol"
   indexing_model: "api:openai/gpt-5-nano"          # a route works here too
-  security_model: "oauth:chatgpt:*:gpt-5-codex"
+  security_model: "oauth:chatgpt:*:gpt-5.6-sol"
 ```
 
 You still have to connect the account once; this only says *which* session to
@@ -242,8 +242,10 @@ are for:
 | --- | --- | --- |
 | `identify` | Pull the account out of a token payload | The account id is inside the id_token, under an OpenAI-specific claim |
 | `llm_headers` | Headers every request needs | The account id, plus the Codex client's beta headers |
-| `adapt_llm_body` | Reshape the request for the endpoint | Force `stream`, drop `temperature`/`max_output_tokens`, hoist the system message into `instructions` |
-| `requires_stream` | The endpoint only answers as an event stream | Yes — `mira/llm/oauth.py` collapses it back into one response |
+| `adapt_llm_body` | Reshape the request for the endpoint | Force `stream`, drop `temperature`/`max_output_tokens`, always ask for the encrypted reasoning trace |
+| `requires_stream` | The endpoint only answers as an event stream | Yes — `mira/llm/oauth.py` collapses it back into one response, stitching the `output` from the per-item `response.output_item.done` events, since the closing `response.completed` event carries none |
+| `reasoning_effort` | Pick the thinking level to send for a model | Clamps our level to what `GET /codex/models` says that model accepts — "max" is sent as `max` where the model has it, `xhigh` where it stops there |
+| `prepare` | Learn what the account needs before its first call | Fetches the model list (once an hour per account) so the levels above are known |
 | `usage_from_headers` | Read the allowance off a response | The `x-codex-primary-*` / `x-codex-secondary-*` headers |
 | `fetch_usage` | Ask where the allowance stands | `GET /wham/usage` |
 | `fetch_models` | Ask which models the account may use | `GET /codex/models` |

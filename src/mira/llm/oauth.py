@@ -66,6 +66,12 @@ class OAuthResponsesProvider(ResponsesProvider):
                 provider=self._spec.label,
                 provider_id=self._spec.id,
             )
+        # The endpoint is the spec's, full stop. The base class derived it from
+        # `config.base_url`, which is the API-key endpoint (OpenRouter by
+        # default) — a config that names the provider but was never run
+        # through the dashboard's binding would send a ChatGPT bearer token
+        # to OpenRouter and get a 401 that reads as a broken session.
+        self._url = f"{self._spec.llm.base_url.rstrip('/')}/responses"
         pinned = (config.oauth_account or "").strip()
         self._pinned: str = "" if pinned == ANY_ACCOUNT else pinned
         # The account the next call goes to. Chosen lazily, and kept for the
@@ -76,10 +82,10 @@ class OAuthResponsesProvider(ResponsesProvider):
         self._tokens: OAuthTokens | None = None
         # Accounts this instance has seen refused; rotation skips them.
         self._refused: set[str] = set()
-        # `_apply_reasoning` reads the effort map off `self.profile`, which the
-        # base class resolves from `base_url`. An OAuth endpoint has no entry in
-        # providers.json, so give it the spec's map here rather than asking
-        # operators to register a profile for a URL they never typed.
+        # The base class resolves `self.profile` from `base_url`, and an OAuth
+        # endpoint has no entry in providers.json. Name it after the spec and
+        # carry the spec's effort map so anything reading the profile sees
+        # this backend rather than a generic one.
         self.profile = {
             **self.profile,
             "name": f"oauth:{self._spec.id}",
@@ -156,7 +162,30 @@ class OAuthResponsesProvider(ResponsesProvider):
             raise LLMError(
                 "oauth_session_failed", provider=self._spec.label, error=str(exc)
             ) from exc
+        # Let the spec learn what it wants about the account (ChatGPT: which
+        # reasoning levels each model takes). It caches, so this costs one
+        # request an hour per account; a failure is its problem, not the call's.
+        try:
+            await self._spec.prepare(self._tokens)
+        except Exception as exc:  # pragma: no cover - never worth failing a call
+            logger.debug("%s prepare hook failed: %s", self._spec.label, exc)
         return self._tokens
+
+    def _apply_reasoning(self, body: dict) -> None:
+        """Ask for extended thinking at the level this model accepts.
+
+        The base class maps our level through a static per-endpoint table;
+        here the spec gets to decide per model, since a backend that serves
+        several generations at once accepts different top levels on each.
+        """
+        effort = self.config.reasoning_effort
+        if not effort or effort == "off":
+            return
+        model = str(body.get("model") or "")
+        if model in self._no_reasoning:
+            return
+        body["reasoning"] = {"effort": self._spec.reasoning_effort(model, effort)}
+        body.pop("temperature", None)
 
     def _build_headers(self) -> dict[str, str]:
         """Headers for the current grant.
@@ -304,15 +333,28 @@ def _kept_headers(headers: httpx.Headers) -> dict[str, str]:
 
 
 async def _collect_stream(resp: httpx.Response, label: str) -> dict[str, Any]:
-    """Reduce an SSE stream to the final ``response`` object it carried.
+    """Reduce an SSE stream to one Responses-API payload.
 
     The stream is a running commentary — deltas, item lifecycle, usage — and
-    every event that matters here also ships the whole response object, so we
-    keep the last one we see and return it when the stream ends. That tolerates
-    a provider adding event types without this parser needing to know them.
+    the closing ``response.completed`` event carries the response object with
+    its id, status and usage. What it does *not* reliably carry is the
+    output: the Codex backend sends that object with ``output: []``, and each
+    finished item — the function call, the message, the encrypted reasoning —
+    arrives exactly once, in its own ``response.output_item.done`` event.
+    So the items are collected from those events and stitched into the
+    completed object. A backend that does fill ``output`` in the completed
+    event is left alone; text deltas are kept as a last resort for a stream
+    that ends with neither.
     """
     latest: dict[str, Any] | None = None
+    indexed: dict[int, dict[str, Any]] = {}
+    unindexed: list[dict[str, Any]] = []
+    text_parts: list[str] = []
     failure: str = ""
+
+    def assembled() -> dict[str, Any]:
+        items = [indexed[i] for i in sorted(indexed)] + unindexed
+        return _assemble_response(latest or {}, items, "".join(text_parts))
 
     async for line in resp.aiter_lines():
         if not line.startswith("data:"):
@@ -330,20 +372,59 @@ async def _collect_stream(resp: httpx.Response, label: str) -> dict[str, Any]:
         response = event.get("response")
         if isinstance(response, dict):
             latest = response
+        if kind == "response.output_item.done":
+            item = event.get("item")
+            if isinstance(item, dict):
+                index = event.get("output_index")
+                if isinstance(index, int) and not isinstance(index, bool):
+                    indexed[index] = item
+                else:
+                    unindexed.append(item)
+        elif kind == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                text_parts.append(delta)
         if kind == "response.completed":
-            return latest or {}
+            return assembled()
         if kind in ("response.failed", "error", "response.incomplete"):
             failure = _stream_error_detail(event) or kind
 
     if failure:
         raise LLMError("oauth_stream_failed", provider=label, detail=failure)
-    if latest is not None:
+    if latest is not None or indexed or unindexed or text_parts:
         # Stream cut off after the response was described but before it said
-        # "completed". The object we have is still the model's answer; letting
-        # the normal parser judge it beats failing on a missing event.
+        # "completed". What we have is still the model's answer; letting the
+        # normal parser judge it beats failing on a missing event.
         logger.warning("%s stream ended without a completion event", label)
-        return latest
+        return assembled()
     raise LLMError("oauth_stream_failed", provider=label, detail="no response events")
+
+
+def _assemble_response(
+    response: dict[str, Any], items: list[dict[str, Any]], text: str
+) -> dict[str, Any]:
+    """The response object with its ``output`` filled from what streamed past.
+
+    The object's own non-empty ``output`` wins (a backend that repeats the
+    items there has nothing to add); otherwise the items delivered one by one
+    stand in; failing both, the text deltas are folded into a single message
+    so a plain answer is not lost either.
+    """
+    payload = dict(response)
+    output = payload.get("output")
+    if isinstance(output, list) and output:
+        return payload
+    if items:
+        payload["output"] = items
+    elif text:
+        payload["output"] = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ]
+    return payload
 
 
 def _stream_error_detail(event: dict[str, Any]) -> str:

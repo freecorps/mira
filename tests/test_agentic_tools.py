@@ -243,3 +243,57 @@ class TestAgenticLoopFallback:
         tool_reply = provider.last_messages[-1]
         assert tool_reply["role"] == "tool"
         assert "not valid JSON" in tool_reply["content"]
+
+
+class TestAgenticLoopReplay:
+    @pytest.mark.asyncio
+    async def test_raw_items_ride_along_on_the_next_hop(self):
+        """A Responses-protocol provider hands back its raw output items
+        (encrypted reasoning, the call with the id the endpoint issued); the
+        loop must send them back with the tool output or the next request
+        is refused."""
+        seen: list[list[dict]] = []
+        raw = [
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc"},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file"},
+        ]
+
+        class _Provider:
+            async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+                seen.append(list(messages))
+                if len(seen) == 1:
+                    return {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+                            }
+                        ],
+                        "items": raw,
+                    }
+                return {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "submit_review", "arguments": '{"comments": []}'},
+                        }
+                    ],
+                }
+
+        class _Executor:
+            async def execute(self, name, args):  # type: ignore[no-untyped-def]
+                return "x = 1"
+
+        result = await agentic_review_loop(
+            _Provider(), [{"role": "user", "content": "go"}], _Executor()
+        )  # type: ignore[arg-type]
+
+        assert result == '{"comments": []}'
+        assistant = seen[1][1]
+        assert assistant["role"] == "assistant"
+        assert assistant["items"] == raw
+        assert seen[1][2]["role"] == "tool"

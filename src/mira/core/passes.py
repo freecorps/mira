@@ -100,13 +100,18 @@ async def agentic_review_loop(
             )
             return ""
 
-        convo.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            }
-        )
+        assistant: dict = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+        }
+        # A Responses-protocol provider hands back its raw output items too;
+        # they go back with the next turn so the model keeps its reasoning
+        # and the endpoint sees the call ids it issued.
+        raw_items = msg.get("items")
+        if isinstance(raw_items, list) and raw_items:
+            assistant["items"] = raw_items
+        convo.append(assistant)
 
         for call in tool_calls:
             fn = call.get("function") or {}

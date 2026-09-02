@@ -402,10 +402,10 @@ class TestModelRoutes:
     def test_parsing(self):
         from mira.oauth.routes import ModelRoute, parse_route
 
-        assert parse_route("gpt-5-codex") is None
+        assert parse_route("gpt-5.6-sol") is None
         assert parse_route("anthropic/claude-sonnet-4-6") is None
-        assert parse_route("oauth:chatgpt:acct_1:gpt-5-codex") == ModelRoute(
-            backend="oauth", model="gpt-5-codex", provider="chatgpt", account="acct_1"
+        assert parse_route("oauth:chatgpt:acct_1:gpt-5.6-sol") == ModelRoute(
+            backend="oauth", model="gpt-5.6-sol", provider="chatgpt", account="acct_1"
         )
         assert parse_route("oauth:chatgpt:*:gpt-5").rotates
         assert parse_route("oauth:chatgpt::gpt-5").account == "*"
@@ -440,7 +440,7 @@ class TestModelRoutes:
 
     def test_a_rotating_route_leaves_the_account_open(self, db: AppDatabase):
         store.save(_tokens(), db)
-        db.set_setting("review_model", "oauth:chatgpt:*:gpt-5-codex")
+        db.set_setting("review_model", "oauth:chatgpt:*:gpt-5.6-sol")
         resolved = llm_config_for("review", LLMConfig())
         assert resolved.oauth_provider == "chatgpt"
         assert resolved.oauth_account is None
@@ -513,7 +513,7 @@ class TestModelRoutes:
     @pytest.mark.asyncio
     async def test_a_route_to_a_disconnected_account_fails_on_that_account(self, db):
         store.save(_tokens(), db)
-        db.set_setting("review_model", "oauth:chatgpt:acct_gone:gpt-5-codex")
+        db.set_setting("review_model", "oauth:chatgpt:acct_gone:gpt-5.6-sol")
         config = llm_config_for("review", LLMConfig())
         assert (config.oauth_provider, config.oauth_account) == ("chatgpt", "acct_gone")
         provider = create_llm(config)
@@ -549,7 +549,7 @@ class TestRotation:
         # Make the first account the ranked pick so the test is deterministic.
         store.mark_used("chatgpt", "acct_456", db)
         async with httpx.AsyncClient() as client:
-            resp = await provider._post(client, {"model": "gpt-5-codex", "input": []})
+            resp = await provider._post(client, {"model": "gpt-5.6-sol", "input": []})
         assert resp.status_code == 200
         assert provider.account_key == "acct_456"
         refused = store.load_usage("chatgpt", "acct_123", db)
@@ -563,7 +563,7 @@ class TestRotation:
         limited = httpx.Response(429, text="slow down", headers={"retry-after": "5"})
         provider = self._provider(monkeypatch, {"at_1": [limited]})
         async with httpx.AsyncClient() as client:
-            resp = await provider._post(client, {"model": "gpt-5-codex", "input": []})
+            resp = await provider._post(client, {"model": "gpt-5.6-sol", "input": []})
         assert resp.status_code == 429
 
     @pytest.mark.asyncio
@@ -578,7 +578,7 @@ class TestRotation:
 
         monkeypatch.setattr(OAuthResponsesProvider, "_send", _send)
         async with httpx.AsyncClient() as client:
-            resp = await provider._post(client, {"model": "gpt-5-codex", "input": []})
+            resp = await provider._post(client, {"model": "gpt-5.6-sol", "input": []})
         assert resp.status_code == 429
         assert provider.account_key == "acct_123"
 
@@ -595,7 +595,7 @@ class TestRotation:
         )
         provider = self._provider(monkeypatch, {"at_1": [ok]})
         async with httpx.AsyncClient() as client:
-            await provider._post(client, {"model": "gpt-5-codex", "input": []})
+            await provider._post(client, {"model": "gpt-5.6-sol", "input": []})
         usage = store.load_usage("chatgpt", "acct_123", db)
         assert usage is not None
         assert usage.primary.used_percent == 61
@@ -729,8 +729,8 @@ class TestAccountRoutes:
         assert any("ops@example.com" in g for g in groups)
         assert any("any account" in g for g in groups)
         values = {o.value for o in models.review_options}
-        assert "oauth:chatgpt:*:gpt-5-codex" in values
-        assert "oauth:chatgpt:acct_456:gpt-5-codex" in values
+        assert "oauth:chatgpt:*:gpt-5.6-sol" in values
+        assert "oauth:chatgpt:acct_456:gpt-5.6-sol" in values
         # The API key's options are bare here; no `api:` prefix is needed.
         assert not any(v.startswith("api:") for v in values)
 
@@ -766,7 +766,7 @@ class TestAccountRoutes:
         models = await get_models()
         values = {o.value for o in models.review_options}
         assert "oauth:chatgpt:acct_123:gpt-5.6-codex" in values
-        assert "oauth:chatgpt:acct_123:gpt-5-codex" not in values
+        assert "oauth:chatgpt:acct_123:gpt-5.6-sol" not in values
 
     @pytest.mark.asyncio
     async def test_signing_in_again_refetches_the_model_list(self, db, monkeypatch):

@@ -327,6 +327,26 @@ class OAuthProviderSpec:
         """True when the endpoint only answers as a server-sent event stream."""
         return False
 
+    @classmethod
+    def reasoning_effort(cls, model: str, effort: str) -> str:
+        """The effort level to put on the wire when ``effort`` was asked for.
+
+        Default: the binding's static map (our "max" → whatever the endpoint
+        calls its top level). A provider that knows which levels each model
+        accepts overrides this to pick per model.
+        """
+        if cls.llm is None:
+            return effort
+        return cls.llm.reasoning_effort_map.get(effort, effort)
+
+    @classmethod
+    async def prepare(cls, tokens: OAuthTokens) -> None:
+        """Warm anything a call needs to know about the account first.
+
+        Called before the first call an account serves; must not raise on
+        failure — nothing here is worth failing a review over.
+        """
+
     # ── Usage and model discovery (optional) ───────────────────────
 
     # True when the provider reports how much of a plan's allowance is spent.
