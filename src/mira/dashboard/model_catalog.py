@@ -177,7 +177,16 @@ async def account_models(spec: Any, tokens: Any, db: Any = None) -> list[dict]:
     """
     from mira.oauth import store
 
-    key = f"{spec.id}:{tokens.account_key}"
+    # The entry is tied to this grant, not just the account: signing in again
+    # under the same key, or a grant that now carries another plan, must not
+    # keep serving the list the previous grant was entitled to.
+    slot = f"{spec.id}:{tokens.account_key}:"
+    key = f"{slot}{tokens.obtained_at}:{tokens.plan}"
+
+    def remember(options: list[dict], from_provider: bool) -> None:
+        for stale in [k for k in _account_model_cache if k.startswith(slot) and k != key]:
+            del _account_model_cache[stale]
+        _account_model_cache[key] = (time.time(), options, from_provider)
 
     def cached() -> list[dict] | None:
         hit = _account_model_cache.get(key)
@@ -208,7 +217,7 @@ async def account_models(spec: Any, tokens: Any, db: Any = None) -> list[dict]:
             )
         if models is None:
             fallback = [{"recommended": False, **dict(m)} for m in spec.llm.models]
-            _account_model_cache[key] = (time.time(), fallback, False)
+            remember(fallback, False)
             return fallback
         default = spec.llm.default_model
         options = [
@@ -218,7 +227,7 @@ async def account_models(spec: Any, tokens: Any, db: Any = None) -> list[dict]:
             }
             for m in models
         ]
-        _account_model_cache[key] = (time.time(), options, True)
+        remember(options, True)
         return options
 
 

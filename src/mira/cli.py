@@ -1152,6 +1152,25 @@ def _usage_line(usage: dict | None) -> str:
     return " · ".join(parts)
 
 
+def _bare_fallback() -> str:
+    """Where bare model ids go once the dashboard's choice is cleared.
+
+    Clearing the stored pointer hands the decision back to mira.yaml, which
+    may still name a provider — so the message must say that rather than
+    promise the API key.
+    """
+    try:
+        llm = load_config().llm
+    except Exception:  # noqa: BLE001 - a broken config is not this command's problem
+        return "use the configured API key"
+    if llm.oauth_provider:
+        target = (
+            f"{llm.oauth_provider}:{llm.oauth_account}" if llm.oauth_account else llm.oauth_provider
+        )
+        return f"run through {target}, as mira.yaml's llm.oauth_provider says"
+    return "use the configured API key"
+
+
 @auth_group.command("status")
 @click.option(
     "--refresh",
@@ -1205,7 +1224,7 @@ def auth_status(refresh: bool) -> None:
         target = f"{active_provider}:{active_account}" if active_account else active_provider
         click.echo(f"\nBare model ids run through: {target}")
     else:
-        click.echo("\nBare model ids run through the configured API key.")
+        click.echo(f"\nBare model ids {_bare_fallback()}.")
     click.echo(
         "A model may also name its backend directly: oauth:<provider>:<key>:<model>, "
         "oauth:<provider>:*:<model> (rotate), or api:<model> (the API key)."
@@ -1224,7 +1243,7 @@ def auth_use(target: str | None) -> None:
 
     if not target:
         store.set_active("", "")
-        click.echo("Bare model ids will use the configured API key.")
+        click.echo(f"Bare model ids will {_bare_fallback()}.")
         return
     provider, key = _split_account_ref(target)
     spec = registry.get(provider)

@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from collections import defaultdict
 from typing import Any, Protocol
@@ -134,11 +135,17 @@ def _migrate_legacy(provider_id: str, store: SettingsStore) -> None:
     if not raw:
         return
     tokens = _parse(raw, provider_id)
-    store.delete_setting(legacy_key)
     if tokens is None:
+        # Nothing the previous build could have used either; drop it.
+        store.delete_setting(legacy_key)
         return
     tokens.ensure_key()
+    # The slot is written before the old row goes, so a reader in between
+    # sees the session under one name or the other, never neither — and a
+    # failed write leaves the old row where it was instead of losing the
+    # session. A second migrator racing this one writes the same slot.
     store.set_setting(_slot(provider_id, tokens.account_key), json.dumps(tokens.to_dict()))
+    store.delete_setting(legacy_key)
     logger.info("Moved the %s session into account slot %s", provider_id, tokens.account_key)
 
 
@@ -310,6 +317,23 @@ def active_binding(db: SettingsStore | None = None) -> tuple[str, str] | None:
 
 # ── Usage ───────────────────────────────────────────────────────────
 
+# One lock per usage row. Every write below is a read-modify-write, and two
+# responses for the same account can finish together (a review runs its
+# calls concurrently); without this the later write drops what the earlier
+# one learned — a refusal, most costly of all, since rotation then sends the
+# next call straight back to the account that just said no.
+_usage_locks: dict[str, threading.Lock] = {}
+_usage_locks_guard = threading.Lock()
+
+
+def _usage_lock(provider_id: str, account_key: str) -> threading.Lock:
+    name = _usage_slot(provider_id, account_key)
+    with _usage_locks_guard:
+        lock = _usage_locks.get(name)
+        if lock is None:
+            lock = _usage_locks[name] = threading.Lock()
+    return lock
+
 
 def load_usage(
     provider_id: str, account_key: str, db: SettingsStore | None = None
@@ -335,31 +359,48 @@ def save_usage(
     """Record what the backend just said about an account's allowance.
 
     Mira's own notes on the previous snapshot (a refusal, the last use) are
-    carried over: the report does not know about them.
+    carried over: the report does not know about them. A report older than
+    the one already stored (responses finish out of order) only contributes
+    those notes; the newer report stays.
     """
     store = _resolve(db)
-    merged = snapshot.merge_bookkeeping(load_usage(provider_id, account_key, store))
-    store.set_setting(_usage_slot(provider_id, account_key), json.dumps(merged.to_dict()))
+    with _usage_lock(provider_id, account_key):
+        previous = load_usage(provider_id, account_key, store)
+        if (
+            previous is not None
+            and previous.has_data()
+            and previous.fetched_at > snapshot.fetched_at
+        ):
+            merged = previous.merge_bookkeeping(snapshot)
+        else:
+            merged = snapshot.merge_bookkeeping(previous)
+        store.set_setting(_usage_slot(provider_id, account_key), json.dumps(merged.to_dict()))
     return merged
 
 
 def mark_used(provider_id: str, account_key: str, db: SettingsStore | None = None) -> None:
     """Note that a call just went to this account (for round-robin ties)."""
     store = _resolve(db)
-    snapshot = load_usage(provider_id, account_key, store) or UsageSnapshot(fetched_at=0.0)
-    snapshot.last_used_at = time.time()
-    store.set_setting(_usage_slot(provider_id, account_key), json.dumps(snapshot.to_dict()))
+    with _usage_lock(provider_id, account_key):
+        snapshot = load_usage(provider_id, account_key, store) or UsageSnapshot(fetched_at=0.0)
+        snapshot.last_used_at = time.time()
+        store.set_setting(_usage_slot(provider_id, account_key), json.dumps(snapshot.to_dict()))
 
 
 def mark_exhausted(
     provider_id: str, account_key: str, until: float, db: SettingsStore | None = None
 ) -> None:
-    """Note that the backend refused this account until ``until``."""
+    """Note that the backend refused this account until ``until``.
+
+    Only ``exhausted_until`` is written: it is Mira's own note, with its own
+    expiry. ``limit_reached`` stays whatever the backend last reported, so a
+    burst 429 does not read as a spent window that outlives the cooldown.
+    """
     store = _resolve(db)
-    snapshot = load_usage(provider_id, account_key, store) or UsageSnapshot(fetched_at=0.0)
-    snapshot.exhausted_until = max(snapshot.exhausted_until, until)
-    snapshot.limit_reached = True
-    store.set_setting(_usage_slot(provider_id, account_key), json.dumps(snapshot.to_dict()))
+    with _usage_lock(provider_id, account_key):
+        snapshot = load_usage(provider_id, account_key, store) or UsageSnapshot(fetched_at=0.0)
+        snapshot.exhausted_until = max(snapshot.exhausted_until, until)
+        store.set_setting(_usage_slot(provider_id, account_key), json.dumps(snapshot.to_dict()))
 
 
 def pick_account(
@@ -431,6 +472,11 @@ def account_status(
     """One account's connection state. Never includes token material."""
     usage = load_usage(provider_id, tokens.account_key, db)
     active_provider, active_key = parse_ref(get_active_ref(db))
+    # Pinned: bare ids go to this account and no other. In rotation: the
+    # provider is the default with no account named, so bare ids may land
+    # here. Either way this account is one bare ids reach — "is_default".
+    pinned = active_provider == provider_id and active_key == tokens.account_key
+    in_rotation = active_provider == provider_id and not active_key
     return {
         "key": tokens.account_key,
         "account_label": tokens.account_label,
@@ -439,7 +485,8 @@ def account_status(
         "expires_at": tokens.expires_at,
         "connected_at": tokens.obtained_at,
         "can_refresh": bool(tokens.refresh_token),
-        "is_default": active_provider == provider_id and active_key == tokens.account_key,
+        "is_default": pinned or in_rotation,
+        "is_pinned": pinned,
         "usage": usage.to_dict() if usage else None,
         "available": usage.available() if usage else True,
     }

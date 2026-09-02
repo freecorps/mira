@@ -86,7 +86,17 @@ class TestAccountSlots:
     def test_slot_key_is_safe_for_routes_and_row_keys(self):
         from mira.oauth.base import account_key_for
 
-        assert account_key_for("acct 12:3/x") == "acct123x"
+        assert account_key_for("acct_123") == "acct_123"
+        assert account_key_for("a0b1c2d3-e4f5-6789-abcd-ef0123456789") == (
+            "a0b1c2d3-e4f5-6789-abcd-ef0123456789"
+        )
+        # Characters that cannot live in a route are dropped, and a digest of
+        # the original keeps ids that differ only in those apart.
+        cleaned = account_key_for("acct 12:3/x")
+        assert cleaned.startswith("acct123x-") and ":" not in cleaned
+        assert cleaned != account_key_for("acct12:3/x")
+        long_a, long_b = account_key_for("x" * 60 + "a"), account_key_for("x" * 60 + "b")
+        assert len(long_a) <= 48 and long_a != long_b
         assert account_key_for("") != account_key_for("")  # random, never empty
 
     @pytest.mark.asyncio
@@ -145,6 +155,40 @@ class TestAccountSlots:
         assert status["default_mode"] == "pinned"
         marks = {a["key"]: a["is_default"] for a in status["accounts"]}
         assert marks == {"acct_123": False, "acct_456": True}
+        assert [a["is_pinned"] for a in status["accounts"]] == [False, True]
+
+    def test_under_rotation_every_account_is_a_default_but_none_is_pinned(self, db: AppDatabase):
+        store.save(_tokens(), db)
+        store.save(_second_tokens(), db)
+        store.set_active("chatgpt", "", db)
+        status = store.status("chatgpt", db)
+        assert status["default_mode"] == "rotate"
+        assert [a["is_default"] for a in status["accounts"]] == [True, True]
+        assert [a["is_pinned"] for a in status["accounts"]] == [False, False]
+
+    def test_the_legacy_row_is_moved_after_its_slot_is_written(self, db: AppDatabase):
+        writes: list[str] = []
+        real_set = db.set_setting
+
+        def observed_set(key: str, value: str) -> None:
+            writes.append(f"set {key}")
+            real_set(key, value)
+
+        real_delete = db.delete_setting
+
+        def observed_delete(key: str) -> None:
+            writes.append(f"delete {key}")
+            real_delete(key)
+
+        db.set_setting("oauth_credentials:chatgpt", json.dumps(_tokens().to_dict()))
+        db.set_setting = observed_set  # type: ignore[method-assign]
+        db.delete_setting = observed_delete  # type: ignore[method-assign]
+        assert list(store.accounts("chatgpt", db)) == ["acct_123"]
+        assert writes == [
+            "set oauth_credentials:chatgpt:acct_123",
+            "delete oauth_credentials:chatgpt",
+        ]
+        assert db.get_setting("oauth_credentials:chatgpt") is None
 
 
 class TestUsage:
@@ -248,6 +292,44 @@ class TestUsage:
         loaded = store.load_usage("chatgpt", "acct_123", db)
         assert loaded is not None and loaded.primary.used_percent == 10
         assert not loaded.available()
+
+    def test_a_reported_limit_counts_even_when_no_window_reads_full(self):
+        from mira.oauth.usage import UsageSnapshot, UsageWindow
+
+        now = time.time()
+        limited = UsageSnapshot(
+            primary=UsageWindow(used_percent=99.6, resets_at=now + 600),
+            secondary=UsageWindow(used_percent=40, resets_at=now + 86400),
+            limit_reached=True,
+        )
+        assert not limited.available(now)
+        # ...until the nearest window has reset.
+        assert limited.available(now + 601)
+        # With no reset known, only a fresh report can clear it.
+        assert not UsageSnapshot(
+            primary=UsageWindow(used_percent=50), limit_reached=True
+        ).available()
+        assert UsageSnapshot(primary=UsageWindow(used_percent=50)).available()
+
+    def test_an_older_report_does_not_overwrite_a_newer_one(self, db: AppDatabase):
+        from mira.oauth.usage import UsageSnapshot, UsageWindow
+
+        store.save(_tokens(), db)
+        now = time.time()
+        newer = UsageSnapshot(primary=UsageWindow(used_percent=60), fetched_at=now)
+        older = UsageSnapshot(
+            primary=UsageWindow(used_percent=20), fetched_at=now - 5, last_used_at=now - 5
+        )
+        store.save_usage("chatgpt", "acct_123", newer, db)
+        merged = store.save_usage("chatgpt", "acct_123", older, db)
+        assert merged.primary is not None and merged.primary.used_percent == 60
+        assert merged.last_used_at == now - 5  # the note still lands
+
+    def test_a_refusal_note_expires_on_its_own(self, db: AppDatabase):
+        store.save(_tokens(), db)
+        store.mark_exhausted("chatgpt", "acct_123", time.time() - 1, db)
+        loaded = store.load_usage("chatgpt", "acct_123", db)
+        assert loaded is not None and not loaded.limit_reached and loaded.available()
 
     def test_choose_account_prefers_headroom_then_least_recently_used(self):
         from mira.oauth.usage import UsageSnapshot, UsageWindow, choose_account
@@ -634,8 +716,45 @@ class TestAccountRoutes:
         assert "oauth:chatgpt:acct_123:gpt-5.6-codex" in values
         assert "oauth:chatgpt:acct_123:gpt-5-codex" not in values
 
+    @pytest.mark.asyncio
+    async def test_signing_in_again_refetches_the_model_list(self, db, monkeypatch):
+        from mira.dashboard import model_catalog
+        from mira.dashboard.routers.admin import get_models
+
+        answers = iter(
+            [
+                [{"value": "gpt-old", "label": "Old"}],
+                [{"value": "gpt-new", "label": "New"}],
+            ]
+        )
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider, "fetch_models", classmethod(lambda cls, t: _async(next(answers)))
+        )
+        store.save(_tokens(), db)
+        first = {o.value for o in (await get_models()).review_options}
+        assert "oauth:chatgpt:acct_123:gpt-old" in first
+        # The same account signs in again under the same key: the list it is
+        # entitled to now is asked for, not served from the hour-long cache.
+        store.save(_tokens(obtained_at=time.time() + 1), db)
+        second = {o.value for o in (await get_models()).review_options}
+        assert "oauth:chatgpt:acct_123:gpt-new" in second
+        assert "oauth:chatgpt:acct_123:gpt-old" not in second
+        assert len(model_catalog._account_model_cache) == 1
+
 
 class TestAuthCli:
+    def test_use_with_no_target_clears_the_pointer(self, db: AppDatabase):
+        from click.testing import CliRunner
+
+        from mira.cli import main
+
+        store.save(_tokens(), db)
+        store.set_active("chatgpt", "acct_123", db)
+        result = CliRunner().invoke(main, ["auth", "use"])
+        assert result.exit_code == 0, result.output
+        assert result.output.startswith("Bare model ids will ")
+        assert store.get_active_ref(db) == ""
+
     def test_use_pins_an_account_and_logout_forgets_it(self, db: AppDatabase):
         from click.testing import CliRunner
 

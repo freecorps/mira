@@ -36,8 +36,11 @@ export type OAuthAccount = {
   expires_at: number
   connected_at: number
   can_refresh: boolean
-  // Bare model ids go to this account specifically.
+  // Bare model ids can reach this account: it is pinned, or its provider is
+  // the default and rotates across its accounts.
   is_default: boolean
+  // Bare model ids go to this account and no other.
+  is_pinned: boolean
   usage: UsageSnapshot | null
   available: boolean
 }
