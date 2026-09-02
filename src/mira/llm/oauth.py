@@ -58,20 +58,17 @@ class OAuthResponsesProvider(ResponsesProvider):
     """Talks to a provider the operator signed into rather than paid per token."""
 
     def __init__(self, config: LLMConfig) -> None:
-        super().__init__(config)
-        self._spec: type[OAuthProviderSpec] = registry.require(config.oauth_provider or "")
-        if self._spec.llm is None:
-            raise LLMError(
-                "oauth_not_connected",
-                provider=self._spec.label,
-                provider_id=self._spec.id,
-            )
-        # The endpoint is the spec's, full stop. The base class derived it from
-        # `config.base_url`, which is the API-key endpoint (OpenRouter by
-        # default) — a config that names the provider but was never run
-        # through the dashboard's binding would send a ChatGPT bearer token
-        # to OpenRouter and get a 401 that reads as a broken session.
-        self._url = f"{self._spec.llm.base_url.rstrip('/')}/responses"
+        spec: type[OAuthProviderSpec] = registry.require(config.oauth_provider or "")
+        if spec.llm is None:
+            raise LLMError("oauth_not_connected", provider=spec.label, provider_id=spec.id)
+        # The endpoint is the spec's, full stop. `config.base_url` is the
+        # API-key endpoint (OpenRouter by default), and the base class derives
+        # the URL, the provider profile and the model-prefix policy from it —
+        # a config that names the provider but was never run through the
+        # dashboard's binding would send a ChatGPT bearer token to OpenRouter,
+        # or keep a vendor prefix on an id this backend does not know.
+        super().__init__(config.model_copy(update={"base_url": spec.llm.base_url}))
+        self._spec = spec
         pinned = (config.oauth_account or "").strip()
         self._pinned: str = "" if pinned == ANY_ACCOUNT else pinned
         # The account the next call goes to. Chosen lazily, and kept for the
@@ -184,7 +181,9 @@ class OAuthResponsesProvider(ResponsesProvider):
         model = str(body.get("model") or "")
         if model in self._no_reasoning:
             return
-        body["reasoning"] = {"effort": self._spec.reasoning_effort(model, effort)}
+        body["reasoning"] = {
+            "effort": self._spec.reasoning_effort(model, effort, account=self._account_key)
+        }
         body.pop("temperature", None)
 
     def _build_headers(self) -> dict[str, str]:

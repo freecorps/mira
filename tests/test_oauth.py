@@ -875,6 +875,11 @@ class TestOAuthProvider:
             LLMConfig(oauth_provider="chatgpt", base_url="https://openrouter.ai/api/v1")
         )
         assert provider._url == "https://chatgpt.com/backend-api/codex/responses"
+        # ...and the model-prefix policy follows the endpoint too: OpenRouter's
+        # "keep the vendor prefix" must not apply to ids this backend serves.
+        from mira.llm.base import _strip_model_prefix
+
+        assert _strip_model_prefix("openai/gpt-5.5", provider.config.base_url) == "gpt-5.5"
 
     def test_reasoning_effort_map_comes_from_the_spec(self, monkeypatch):
         # A model the backend has not described yet goes through the static
@@ -898,26 +903,80 @@ class TestOAuthProvider:
             chatgpt,
             "_model_levels",
             {
-                "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
-                "gpt-5.5": ("low", "medium", "high", "xhigh"),
-                "tiny": ("medium",),
+                "acct_123": {
+                    "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
+                    "gpt-5.5": ("low", "medium", "high", "xhigh"),
+                    "tiny": ("medium",),
+                }
             },
         )
         spec = ChatGPTOAuthProvider
-        assert spec.reasoning_effort("gpt-5.6-sol", "max") == "max"
-        assert spec.reasoning_effort("gpt-5.5", "max") == "xhigh"
-        assert spec.reasoning_effort("gpt-5.5", "high") == "high"
+        assert spec.reasoning_effort("gpt-5.6-sol", "max", "acct_123") == "max"
+        assert spec.reasoning_effort("gpt-5.5", "max", "acct_123") == "xhigh"
+        assert spec.reasoning_effort("gpt-5.5", "high", "acct_123") == "high"
         # Below the model's floor: the lowest it has, not a level it lacks.
-        assert spec.reasoning_effort("tiny", "low") == "medium"
+        assert spec.reasoning_effort("tiny", "low", "acct_123") == "medium"
         # A level outside the known scale is not second-guessed.
-        assert spec.reasoning_effort("gpt-5.5", "ultra") == "ultra"
+        assert spec.reasoning_effort("gpt-5.5", "ultra", "acct_123") == "ultra"
         # Unknown model: the static map.
-        assert spec.reasoning_effort("gpt-9", "max") == "xhigh"
+        assert spec.reasoning_effort("gpt-9", "max", "acct_123") == "xhigh"
+        # An account not yet described borrows what another was told.
+        assert spec.reasoning_effort("gpt-5.6-sol", "max", "acct_new") == "max"
 
-        provider = create_llm(LLMConfig(oauth_provider="chatgpt", reasoning_effort="max"))
+        provider = create_llm(
+            LLMConfig(oauth_provider="chatgpt", oauth_account="acct_123", reasoning_effort="max")
+        )
         body: dict = {"model": "gpt-5.6-sol", "temperature": 0.1}
         provider._apply_reasoning(body)
         assert body["reasoning"] == {"effort": "max"}
+
+    def test_levels_are_kept_per_account_and_replaced_on_each_answer(self, monkeypatch):
+        # One account's answer must not rewrite another's, and a model the
+        # backend stops listing for an account must stop being known there —
+        # merging would keep sending a level it no longer takes.
+        from mira.oauth import chatgpt
+
+        monkeypatch.setattr(chatgpt, "_model_levels", {})
+        chatgpt.remember_reasoning_levels(
+            {"models": [{"slug": "m", "supported_reasoning_levels": [{"effort": "max"}]}]},
+            "acct_a",
+        )
+        chatgpt.remember_reasoning_levels(
+            {"models": [{"slug": "m", "supported_reasoning_levels": [{"effort": "high"}]}]},
+            "acct_b",
+        )
+        spec = ChatGPTOAuthProvider
+        assert spec.reasoning_levels("m", "acct_a") == ("max",)
+        assert spec.reasoning_levels("m", "acct_b") == ("high",)
+
+        chatgpt.remember_reasoning_levels({"models": [{"slug": "other"}]}, "acct_a")
+        assert spec.reasoning_levels("m", "acct_a") == ()
+        assert spec.reasoning_effort("m", "max", "acct_a") == "xhigh"
+        # ...while an account that was never described still borrows.
+        assert spec.reasoning_levels("m", "acct_c") == ("high",)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_model_fetch_is_retried_soon_for_that_account(self, monkeypatch):
+        # Another account's answer being in hand is no reason to wait an
+        # hour before asking again for this one.
+        from mira.oauth import chatgpt
+
+        monkeypatch.setattr(chatgpt, "_model_levels", {"acct_other": {"m": ("high",)}})
+        monkeypatch.setattr(chatgpt, "_levels_asked_at", {})
+        calls: list[str] = []
+
+        async def fetch(tokens):  # type: ignore[no-untyped-def]
+            calls.append(tokens.account_key)
+
+        monkeypatch.setattr(ChatGPTOAuthProvider, "fetch_models", fetch)
+        tokens = _tokens()
+        key = tokens.ensure_key()
+        await ChatGPTOAuthProvider.prepare(tokens)
+        await ChatGPTOAuthProvider.prepare(tokens)
+        assert calls == [key]
+        chatgpt._levels_asked_at[key] -= chatgpt._LEVELS_RETRY + 1
+        await ChatGPTOAuthProvider.prepare(tokens)
+        assert calls == [key, key]
 
     def test_the_model_list_teaches_the_levels(self, monkeypatch):
         # Hidden models are kept out of the picker but an operator can still
@@ -939,9 +998,9 @@ class TestOAuthProvider:
                 },
             ]
         }
-        chatgpt.remember_reasoning_levels(payload)
-        assert ChatGPTOAuthProvider.reasoning_levels("gpt-5.6-sol") == ("low", "max")
-        assert ChatGPTOAuthProvider.reasoning_levels("gpt-reserve") == ("medium",)
+        chatgpt.remember_reasoning_levels(payload, "acct_123")
+        assert ChatGPTOAuthProvider.reasoning_levels("gpt-5.6-sol", "acct_123") == ("low", "max")
+        assert ChatGPTOAuthProvider.reasoning_levels("gpt-reserve", "acct_123") == ("medium",)
         assert [m["value"] for m in chatgpt.models_from_payload(payload)] == ["gpt-5.6-sol"]
 
     def test_the_encrypted_reasoning_trace_is_always_requested(self):

@@ -328,12 +328,13 @@ class OAuthProviderSpec:
         return False
 
     @classmethod
-    def reasoning_effort(cls, model: str, effort: str) -> str:
+    def reasoning_effort(cls, model: str, effort: str, account: str = "") -> str:
         """The effort level to put on the wire when ``effort`` was asked for.
 
         Default: the binding's static map (our "max" → whatever the endpoint
         calls its top level). A provider that knows which levels each model
-        accepts overrides this to pick per model.
+        accepts overrides this to pick per model — and per ``account``, since
+        what a model takes can depend on the plan behind the grant.
         """
         if cls.llm is None:
             return effort
