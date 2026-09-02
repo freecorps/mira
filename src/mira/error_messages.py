@@ -77,6 +77,13 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         ),
         safe="LLM provider is not connected",
     ),
+    "oauth_unknown_provider": ErrorMessage(
+        full=(
+            "The model route names OAuth provider '{provider_id}', which this build does "
+            "not know — pick the model again under Settings → Models"
+        ),
+        safe="LLM model route names an unknown provider",
+    ),
     "oauth_session_failed": ErrorMessage(
         full="{provider} session could not be renewed: {error}",
         safe="LLM provider session expired",

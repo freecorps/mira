@@ -210,11 +210,16 @@ def bind_model(
             account="" if route.rotates else route.account,
         )
         if bound is config:
-            logger.warning(
-                "Model route %r names an OAuth provider that is not registered; "
-                "sending %r to the configured endpoint instead",
-                value,
-                route.model,
+            # The route named a backend that does not exist here. It stays an
+            # OAuth binding all the same — the factory refuses it with a clear
+            # error — rather than quietly billing the API key for a call the
+            # operator pointed somewhere else on purpose.
+            logger.warning("Model route %r names an OAuth provider that is not registered", value)
+            return config.model_copy(
+                update={
+                    "oauth_provider": route.provider,
+                    "oauth_account": None if route.rotates else route.account,
+                }
             )
         return bound
     update["model"] = value
@@ -262,6 +267,21 @@ def describe_call(config: LLMConfig) -> dict:
                 "endpoint": spec.llm.base_url,
                 "connected": bool(found) and (not account or account in found),
             }
+        # An explicit route to a provider this build does not know. Shown as
+        # what it is — a dead OAuth route — not as the API key it will never use.
+        return {
+            "backend": "oauth",
+            "provider": config.oauth_provider,
+            "provider_label": f"{config.oauth_provider} (not a known provider)",
+            "account": config.oauth_account or "",
+            "account_label": config.oauth_account or "",
+            "model": config.model,
+            "api_style": "",
+            "protocol": "",
+            "transport": "",
+            "endpoint": "",
+            "connected": False,
+        }
     if config.provider == "bedrock":
         return {
             "backend": "bedrock",

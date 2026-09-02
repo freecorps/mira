@@ -168,11 +168,11 @@ class TestAccountSlots:
 
     def test_the_legacy_row_is_moved_after_its_slot_is_written(self, db: AppDatabase):
         writes: list[str] = []
-        real_set = db.set_setting
+        real_add = db.add_setting
 
-        def observed_set(key: str, value: str) -> None:
+        def observed_set(key: str, value: str) -> bool:
             writes.append(f"set {key}")
-            real_set(key, value)
+            return real_add(key, value)
 
         real_delete = db.delete_setting
 
@@ -181,7 +181,7 @@ class TestAccountSlots:
             real_delete(key)
 
         db.set_setting("oauth_credentials:chatgpt", json.dumps(_tokens().to_dict()))
-        db.set_setting = observed_set  # type: ignore[method-assign]
+        db.add_setting = observed_set  # type: ignore[method-assign]
         db.delete_setting = observed_delete  # type: ignore[method-assign]
         assert list(store.accounts("chatgpt", db)) == ["acct_123"]
         assert writes == [
@@ -189,6 +189,31 @@ class TestAccountSlots:
             "delete oauth_credentials:chatgpt",
         ]
         assert db.get_setting("oauth_credentials:chatgpt") is None
+
+    def test_migration_never_overwrites_a_slot_that_was_signed_in_meanwhile(self, db):
+        # The old row and a fresh sign-in name the same account: the fresh
+        # grant is what the slot must hold once the old row has been moved.
+        db.set_setting(
+            "oauth_credentials:chatgpt", json.dumps(_tokens(access_token="old").to_dict())
+        )
+        store.save(_tokens(access_token="fresh"), db)
+        found = store.accounts("chatgpt", db)
+        assert found["acct_123"].access_token == "fresh"
+        assert db.get_setting("oauth_credentials:chatgpt") is None
+
+    def test_the_row_suffix_is_the_key_whatever_the_blob_says(self, db: AppDatabase):
+        # A stored blob whose embedded key disagrees with its row (edited by
+        # hand, or stale) must not steer a later save into another slot.
+        blob = _tokens(account_key="other:key").to_dict()
+        db.set_setting("oauth_credentials:chatgpt:safe", json.dumps(blob))
+        found = store.accounts("chatgpt", db)
+        assert list(found) == ["safe"] and found["safe"].account_key == "safe"
+        loaded = store.load("chatgpt", "safe", db)
+        assert loaded is not None and loaded.account_key == "safe"
+        loaded.access_token = "at_saved"
+        store.save(loaded, db)
+        assert set(store.accounts("chatgpt", db)) == {"safe"}
+        assert db.get_setting("oauth_credentials:chatgpt:other:key") is None
 
 
 class TestUsage:
@@ -469,6 +494,33 @@ class TestModelRoutes:
         assert plain["provider_label"] == "OpenRouter"
         assert plain["api_style"] == "chat"
 
+    def test_a_route_to_an_unknown_provider_is_refused_not_sent_to_the_key(self, db):
+        db.set_setting("review_model", "oauth:ghost:acct_1:gpt-9")
+        config = llm_config_for("review", LLMConfig())
+        # The binding is kept as written, so nothing downstream treats it as
+        # the API-key path…
+        assert config.oauth_provider == "ghost"
+        assert config.oauth_account == "acct_1"
+        # …and the factory refuses it outright instead of billing the key.
+        with pytest.raises(LLMError) as err:
+            create_llm(config)
+        assert err.value.code == "oauth_unknown_provider"
+        from mira.dashboard.models_config import describe_call
+
+        described = describe_call(config)
+        assert described["backend"] == "oauth" and not described["connected"]
+
+    @pytest.mark.asyncio
+    async def test_a_route_to_a_disconnected_account_fails_on_that_account(self, db):
+        store.save(_tokens(), db)
+        db.set_setting("review_model", "oauth:chatgpt:acct_gone:gpt-5-codex")
+        config = llm_config_for("review", LLMConfig())
+        assert (config.oauth_provider, config.oauth_account) == ("chatgpt", "acct_gone")
+        provider = create_llm(config)
+        with pytest.raises(LLMError) as err:
+            await provider._ensure_token()
+        assert err.value.code == "oauth_not_connected"
+
 
 class TestRotation:
     """The client moving between accounts when one is refused."""
@@ -740,6 +792,39 @@ class TestAccountRoutes:
         assert "oauth:chatgpt:acct_123:gpt-new" in second
         assert "oauth:chatgpt:acct_123:gpt-old" not in second
         assert len(model_catalog._account_model_cache) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_rotating_group_offers_only_what_every_account_can_serve(
+        self, db, monkeypatch
+    ):
+        from mira.dashboard.routers.admin import get_models
+
+        per_account = {
+            "acct_123": [
+                {"value": "gpt-shared", "label": "Shared"},
+                {"value": "gpt-only-a", "label": "Only A"},
+            ],
+            "acct_456": [
+                {"value": "gpt-only-b", "label": "Only B"},
+                {"value": "gpt-shared", "label": "Shared"},
+            ],
+        }
+        monkeypatch.setattr(
+            ChatGPTOAuthProvider,
+            "fetch_models",
+            classmethod(lambda cls, t: _async(per_account[t.account_key])),
+        )
+        store.save(_tokens(), db)
+        store.save(_second_tokens(), db)
+        values = {o.value for o in (await get_models()).review_options}
+        # Rotation picks the account by allowance, not by model, so the
+        # "any account" group cannot offer a model one of them lacks…
+        assert "oauth:chatgpt:*:gpt-shared" in values
+        assert "oauth:chatgpt:*:gpt-only-a" not in values
+        assert "oauth:chatgpt:*:gpt-only-b" not in values
+        # …while each account's own group still lists all of its models.
+        assert "oauth:chatgpt:acct_123:gpt-only-a" in values
+        assert "oauth:chatgpt:acct_456:gpt-only-b" in values
 
 
 class TestAuthCli:

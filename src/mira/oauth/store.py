@@ -64,6 +64,8 @@ class SettingsStore(Protocol):
 
     def set_setting(self, key: str, value: str) -> None: ...
 
+    def add_setting(self, key: str, value: str) -> bool: ...
+
     def delete_setting(self, key: str) -> None: ...
 
     def take_setting(self, key: str) -> str | None: ...
@@ -143,10 +145,17 @@ def _migrate_legacy(provider_id: str, store: SettingsStore) -> None:
     # The slot is written before the old row goes, so a reader in between
     # sees the session under one name or the other, never neither — and a
     # failed write leaves the old row where it was instead of losing the
-    # session. A second migrator racing this one writes the same slot.
-    store.set_setting(_slot(provider_id, tokens.account_key), json.dumps(tokens.to_dict()))
+    # session. The write is create-only: a slot that already exists holds
+    # something newer (a sign-in that landed while this row was being read,
+    # or another migrator's copy), and the old grant must not replace it.
+    slot = _slot(provider_id, tokens.account_key)
+    if store.add_setting(slot, json.dumps(tokens.to_dict())):
+        logger.info("Moved the %s session into account slot %s", provider_id, tokens.account_key)
+    else:
+        logger.info(
+            "Slot %s already holds a newer %s session; dropping the old row", slot, provider_id
+        )
     store.delete_setting(legacy_key)
-    logger.info("Moved the %s session into account slot %s", provider_id, tokens.account_key)
 
 
 def accounts(provider_id: str, db: SettingsStore | None = None) -> dict[str, OAuthTokens]:
@@ -164,7 +173,10 @@ def accounts(provider_id: str, db: SettingsStore | None = None) -> dict[str, OAu
         tokens = _parse(raw, provider_id)
         if tokens is None:
             continue
-        tokens.account_key = tokens.account_key or account_key
+        # The row suffix is the key, whatever the blob says: it is what the
+        # routes name, and a blob that carried another value (a hand-edited
+        # or stale one) must not steer a later save into a different slot.
+        tokens.account_key = account_key
         out[account_key] = tokens
     return dict(sorted(out.items(), key=lambda item: (item[1].obtained_at, item[0])))
 
@@ -185,7 +197,7 @@ def load(
         _migrate_legacy(provider_id, store)
         tokens = _parse(store.get_setting(_slot(provider_id, account_key)), provider_id)
         if tokens is not None:
-            tokens.account_key = tokens.account_key or account_key
+            tokens.account_key = account_key
         return tokens
     found = accounts(provider_id, db)
     if len(found) == 1:

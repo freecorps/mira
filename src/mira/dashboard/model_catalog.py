@@ -232,18 +232,18 @@ async def account_models(spec: Any, tokens: Any, db: Any = None) -> list[dict]:
 
 
 async def provider_models(spec: Any, accounts: dict[str, Any], db: Any = None) -> list[dict]:
-    """The union of every account's list, in first-seen order.
+    """The models every one of the accounts can serve, in the first's order.
 
-    What "any account" can be asked for: a model one account has and another
-    lacks is still offered, and rotation then lands on the one that has it or
-    fails on the one that does not — which is the account's answer to give,
-    not the dropdown's to pre-empt.
+    What "any account" can be asked for: rotation picks an account by
+    allowance, not by model, so a model only some accounts have would be sent
+    to one that lacks it and fail there. Such a model is still reachable —
+    through that account's own group, which pins it.
     """
-    seen: dict[str, dict] = {}
-    for tokens in accounts.values():
-        for option in await account_models(spec, tokens, db):
-            seen.setdefault(option["value"], option)
-    return list(seen.values())
+    lists = [await account_models(spec, tokens, db) for tokens in accounts.values()]
+    if not lists:
+        return []
+    common = set.intersection(*(({o["value"] for o in options}) for options in lists))
+    return [o for o in lists[0] if o["value"] in common]
 
 
 async def oauth_option_groups(default: tuple[str, str], db: Any = None) -> list[dict]:
