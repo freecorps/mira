@@ -45,6 +45,19 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
     return database
 
 
+@pytest.fixture(autouse=True)
+def _no_live_model_list(monkeypatch: pytest.MonkeyPatch):
+    """Keep the account model list off the network: the curated list stands in."""
+    from mira.dashboard import model_catalog
+
+    model_catalog._account_model_cache.clear()
+    monkeypatch.setattr(
+        ChatGPTOAuthProvider, "fetch_models", classmethod(lambda cls, tokens: _async(None))
+    )
+    yield
+    model_catalog._account_model_cache.clear()
+
+
 @pytest.fixture
 def unused_port() -> int:
     """A free localhost port, so the listener tests never fight for 1455."""
@@ -208,28 +221,41 @@ class TestExpiry:
 class TestStore:
     def test_round_trip(self, db: AppDatabase):
         store.save(_tokens(), db)
-        loaded = store.load("chatgpt", db)
+        loaded = store.load("chatgpt", "acct_123", db)
         assert loaded is not None
         assert loaded.access_token == "at_1"
         assert loaded.account_label == "dev@example.com"
+        assert loaded.account_key == "acct_123"
+        # With one account, asking for "any" finds it too.
+        assert store.load("chatgpt", db=db) is not None
 
     def test_unknown_fields_in_a_stored_blob_are_ignored(self, db: AppDatabase):
         db.set_setting(
-            "oauth_credentials:chatgpt",
+            "oauth_credentials:chatgpt:k1",
             json.dumps({"provider": "chatgpt", "access_token": "at", "future_field": 1}),
         )
-        loaded = store.load("chatgpt", db)
+        loaded = store.load("chatgpt", "k1", db)
         assert loaded is not None and loaded.access_token == "at"
 
+    def test_a_row_from_the_previous_build_is_moved_into_a_slot(self, db: AppDatabase):
+        # The previous build stored one account per provider under a bare
+        # key. It is read once, moved into its slot, and never left behind
+        # where a downgrade could resurrect a disconnected account.
+        db.set_setting("oauth_credentials:chatgpt", json.dumps(_tokens().to_dict()))
+        found = store.accounts("chatgpt", db)
+        assert list(found) == ["acct_123"]
+        assert db.get_setting("oauth_credentials:chatgpt") is None
+        assert db.get_setting("oauth_credentials:chatgpt:acct_123")
+
     def test_corrupt_blob_reads_as_not_connected(self, db: AppDatabase):
-        db.set_setting("oauth_credentials:chatgpt", "{not json")
-        assert store.load("chatgpt", db) is None
+        db.set_setting("oauth_credentials:chatgpt:k1", "{not json")
+        assert store.load("chatgpt", "k1", db) is None
 
     def test_disconnect_clears_the_active_pointer(self, db: AppDatabase):
         store.save(_tokens(), db)
         store.set_active_provider("chatgpt", db)
-        store.delete("chatgpt", db)
-        assert store.load("chatgpt", db) is None
+        store.delete("chatgpt", "acct_123", db)
+        assert store.load("chatgpt", "acct_123", db) is None
         assert store.get_active_provider(db) == ""
 
     def test_active_binding_ignores_a_disconnected_provider(self, db: AppDatabase):
@@ -242,7 +268,9 @@ class TestStore:
         assert "at_1" not in json.dumps(status)
         assert "rt_1" not in json.dumps(status)
         assert status["connected"] is True
-        assert status["plan"] == "pro"
+        assert status["accounts"][0]["plan"] == "pro"
+        assert status["accounts"][0]["key"] == "acct_123"
+        assert status["protocol"]["api_style"] == "responses"
 
     @pytest.mark.asyncio
     async def test_valid_tokens_refreshes_and_persists(self, db: AppDatabase, monkeypatch):
@@ -252,15 +280,15 @@ class TestStore:
             "refresh",
             classmethod(lambda cls, t: _async(_tokens(access_token="at_2"))),
         )
-        fresh = await store.valid_tokens("chatgpt", db)
+        fresh = await store.valid_tokens("chatgpt", db=db)
         assert fresh.access_token == "at_2"
-        stored = store.load("chatgpt", db)
+        stored = store.load("chatgpt", "acct_123", db)
         assert stored is not None and stored.access_token == "at_2"
 
     @pytest.mark.asyncio
     async def test_valid_tokens_without_a_session_explains_itself(self, db: AppDatabase):
         with pytest.raises(OAuthError, match="not connected"):
-            await store.valid_tokens("chatgpt", db)
+            await store.valid_tokens("chatgpt", db=db)
 
     @pytest.mark.asyncio
     async def test_force_renews_a_token_that_has_not_expired(self, db, monkeypatch):
@@ -273,8 +301,8 @@ class TestStore:
             "refresh",
             classmethod(lambda cls, t: _async(_tokens(access_token="at_2"))),
         )
-        assert (await store.valid_tokens("chatgpt", db)).access_token == "at_1"
-        assert (await store.valid_tokens("chatgpt", db, force=True)).access_token == "at_2"
+        assert (await store.valid_tokens("chatgpt", db=db)).access_token == "at_1"
+        assert (await store.valid_tokens("chatgpt", db=db, force=True)).access_token == "at_2"
 
     @pytest.mark.asyncio
     async def test_a_grant_rotated_elsewhere_is_picked_up(self, db, monkeypatch):
@@ -288,7 +316,7 @@ class TestStore:
             raise OAuthError("invalid_grant")
 
         monkeypatch.setattr(ChatGPTOAuthProvider, "refresh", classmethod(_rotated))
-        fresh = await store.valid_tokens("chatgpt", db)
+        fresh = await store.valid_tokens("chatgpt", db=db)
         assert fresh.access_token == "at_elsewhere"
 
     @pytest.mark.asyncio
@@ -300,7 +328,7 @@ class TestStore:
 
         monkeypatch.setattr(ChatGPTOAuthProvider, "refresh", classmethod(_dead))
         with pytest.raises(OAuthError, match="invalid_grant"):
-            await store.valid_tokens("chatgpt", db)
+            await store.valid_tokens("chatgpt", db=db)
 
 
 class TestSettingsStore:
@@ -699,7 +727,7 @@ class TestRoutes:
     async def test_manual_refresh_goes_to_the_issuer(self, db, monkeypatch):
         # The button exists for the case an expiry cannot describe: a grant
         # revoked upstream that still looks valid here.
-        from mira.dashboard.routers.oauth import refresh_oauth
+        from mira.dashboard.routers.oauth import refresh_oauth_account
 
         store.save(_tokens(expires_at=time.time() + 3600), db)
         monkeypatch.setattr(
@@ -707,8 +735,8 @@ class TestRoutes:
             "refresh",
             classmethod(lambda cls, t: _async(_tokens(access_token="at_renewed"))),
         )
-        await refresh_oauth("chatgpt", _admin())
-        stored = store.load("chatgpt", db)
+        await refresh_oauth_account("chatgpt", "acct_123", _admin())
+        stored = store.load("chatgpt", "acct_123", db)
         assert stored is not None and stored.access_token == "at_renewed"
 
     def test_unknown_provider_is_a_404(self, db: AppDatabase):
@@ -738,7 +766,16 @@ class TestRoutes:
         models = await get_models()
         assert models.backend == "oauth:chatgpt"
         assert models.oauth_provider == "chatgpt"
-        assert "gpt-5-codex" in [o.value for o in models.review_options]
+        assert models.default_backend["provider"] == "chatgpt"
+        values = [o.value for o in models.review_options]
+        # The bare id (default backend), the same account named explicitly,
+        # and the API key's own list kept reachable under its prefix.
+        assert "gpt-5-codex" in values
+        assert "oauth:chatgpt:acct_123:gpt-5-codex" in values
+        assert any(v.startswith("api:") for v in values)
+        groups = {o.group for o in models.review_options}
+        assert any(g.startswith("Default — ChatGPT (Codex)") for g in groups)
+        assert any(g.startswith("API key — ") for g in groups)
 
     @pytest.mark.asyncio
     async def test_models_endpoint_reports_what_calls_will_carry(self, db: AppDatabase):

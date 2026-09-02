@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from typing import Any
 
 import httpx
 
@@ -27,6 +28,11 @@ _CATALOG_TTL = 3600.0
 _FAILURE_TTL = 60.0
 _cache: dict[str, tuple[float, list[dict] | None]] = {}
 _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Per-account model lists from OAuth providers that can be asked for one:
+# ``{provider:account: (fetched_at, options, from_provider)}``. Same TTLs as
+# the key-based catalog — an hour for the provider's own list, a minute for
+# the curated fallback that stands in when the provider did not answer.
+_account_model_cache: dict[str, tuple[float, list[dict], bool]] = {}
 
 
 # Prefix marking a backend served by a signed-in account rather than a key.
@@ -149,6 +155,133 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
             models = None
         _cache[cache_key] = (time.time(), models)
         return models
+
+
+def endpoint_host(url: str) -> str:
+    """``https://chatgpt.com/backend-api/codex`` → ``chatgpt.com/backend-api/codex``."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url or "")
+    if not parts.netloc:
+        return url or ""
+    return f"{parts.netloc}{parts.path}".rstrip("/")
+
+
+async def account_models(spec: Any, tokens: Any, db: Any = None) -> list[dict]:
+    """The models one signed-in account may use, from the provider if it can say.
+
+    Asked once an hour per account. When the provider has no such endpoint,
+    or it did not answer, the spec's curated list stands in — and the miss is
+    not cached, so a transient failure costs one page load, not an hour of a
+    frozen list.
+    """
+    from mira.oauth import store
+
+    key = f"{spec.id}:{tokens.account_key}"
+
+    def cached() -> list[dict] | None:
+        hit = _account_model_cache.get(key)
+        if hit is None:
+            return None
+        # A miss (the curated list standing in) is kept only briefly: long
+        # enough that one page load — which asks for this account several
+        # times — does not hit a dead endpoint repeatedly, short enough that
+        # a transient failure does not freeze the list for an hour.
+        ttl = _CATALOG_TTL if hit[2] else _FAILURE_TTL
+        return hit[1] if time.time() - hit[0] < ttl else None
+
+    if (found := cached()) is not None:
+        return found
+    async with _locks[f"oauth-models:{key}"]:
+        if (found := cached()) is not None:
+            return found
+        models: list[dict] | None = None
+        try:
+            fresh = await store.valid_tokens(spec.id, tokens.account_key, db)
+            models = await spec.fetch_models(fresh)
+        except Exception as exc:
+            logger.warning(
+                "Could not list %s models for %s: %s",
+                spec.label,
+                tokens.account_label or tokens.account_key,
+                exc,
+            )
+        if models is None:
+            fallback = [{"recommended": False, **dict(m)} for m in spec.llm.models]
+            _account_model_cache[key] = (time.time(), fallback, False)
+            return fallback
+        default = spec.llm.default_model
+        options = [
+            {
+                "recommended": m.get("value") == default or bool(m.get("recommended")),
+                **m,
+            }
+            for m in models
+        ]
+        _account_model_cache[key] = (time.time(), options, True)
+        return options
+
+
+async def provider_models(spec: Any, accounts: dict[str, Any], db: Any = None) -> list[dict]:
+    """The union of every account's list, in first-seen order.
+
+    What "any account" can be asked for: a model one account has and another
+    lacks is still offered, and rotation then lands on the one that has it or
+    fails on the one that does not — which is the account's answer to give,
+    not the dropdown's to pre-empt.
+    """
+    seen: dict[str, dict] = {}
+    for tokens in accounts.values():
+        for option in await account_models(spec, tokens, db):
+            seen.setdefault(option["value"], option)
+    return list(seen.values())
+
+
+async def oauth_option_groups(default: tuple[str, str], db: Any = None) -> list[dict]:
+    """Explicit-route options for every signed-in account, grouped by account.
+
+    Every option's value is a route (``oauth:chatgpt:<key>:<model>``), so
+    picking it says which account as well as which model — the whole point,
+    when two backends serve a model of the same name. A provider with more
+    than one account also gets an "any account" group whose routes rotate;
+    it is left out when that provider is already the default for bare ids,
+    since the bare group above it then says the same thing.
+    """
+    from mira.oauth import registry, store
+    from mira.oauth.routes import oauth_route
+
+    out: list[dict] = []
+    for provider_id, spec in registry.llm_providers().items():
+        accounts = store.accounts(provider_id, db)
+        if not accounts or spec.llm is None:
+            continue
+        protocol = spec.llm.describe()
+        detail = f"{protocol['protocol']} · {endpoint_host(protocol['endpoint'])}"
+        if len(accounts) > 1 and default != (provider_id, ""):
+            group = f"{spec.label} · any account (rotate across {len(accounts)})"
+            for option in await provider_models(spec, accounts, db):
+                out.append(
+                    {
+                        **option,
+                        "value": oauth_route(provider_id, "*", option["value"]),
+                        "group": group,
+                        "detail": detail,
+                    }
+                )
+        for key, tokens in accounts.items():
+            who = tokens.account_label or key
+            plan = f" · {tokens.plan}" if tokens.plan else ""
+            group = f"{spec.label} · {who}{plan}"
+            for option in await account_models(spec, tokens, db):
+                out.append(
+                    {
+                        **option,
+                        "value": oauth_route(provider_id, key, option["value"]),
+                        "group": group,
+                        "detail": detail,
+                    }
+                )
+    return out
 
 
 def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> list[dict]:

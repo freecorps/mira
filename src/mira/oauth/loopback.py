@@ -164,6 +164,6 @@ async def login_via_loopback(
     tokens = await spec.exchange_code(
         code=params["code"], verifier=pkce.verifier, redirect_uri=redirect_uri
     )
-    store.save(tokens, db)
-    logger.info("Connected %s account %s", spec.label, tokens.account_label or tokens.account_id)
-    return store.status(spec.id, db)
+    from mira.oauth.manager import store_session
+
+    return store_session(tokens, db)

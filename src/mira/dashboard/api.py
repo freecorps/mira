@@ -377,6 +377,12 @@ class ModelOption(BaseModel):
     value: str
     label: str
     recommended: bool = False
+    # Which backend serves this option, for the picker to show as a section
+    # header — the same model name can appear under two of them.
+    group: str = ""
+    # Protocol and endpoint, one line, shown under the group header.
+    detail: str = ""
+    description: str = ""
 
 
 class ModelsResponse(BaseModel):
@@ -384,6 +390,13 @@ class ModelsResponse(BaseModel):
     review_model: str
     security_model: str
     backend: str  # "openrouter" | "bedrock" | "openai-compatible" | "oauth:<id>"
+    # What each purpose's calls will actually do — backend, account, protocol,
+    # endpoint and the model id on the wire (see models_config.describe_call).
+    indexing_route: dict = {}
+    review_route: dict = {}
+    security_route: dict = {}
+    # Where a bare model id goes: the Connections page's default, if any.
+    default_backend: dict = {}
     indexing_source: str  # "dashboard" (DB override) | "config" (mira.yaml)
     review_source: str
     security_source: str
