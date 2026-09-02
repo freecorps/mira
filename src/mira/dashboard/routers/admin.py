@@ -152,85 +152,156 @@ async def register_forgejo_repo(body: ForgejoRepoRegister, request: Request) -> 
 @router.get("/api/settings/models", response_model=ModelsResponse)
 async def get_models() -> ModelsResponse:
     from mira.config import load_config
-    from mira.dashboard.model_catalog import active_backend, build_options, fetch_catalog
+    from mira.dashboard.model_catalog import (
+        account_models,
+        active_backend,
+        build_options,
+        endpoint_host,
+        fetch_catalog,
+        oauth_option_groups,
+        provider_models,
+    )
     from mira.dashboard.models_config import (
         API_STYLES,
         THINKING_MODES,
-        apply_oauth_binding,
-        effective_model,
+        describe_call,
+        effective_route,
         get_indexing_model,
         get_review_model,
         get_review_thinking_mode,
         get_security_model,
         resolve_api_style,
-        resolve_oauth_provider,
+        resolve_oauth_default,
     )
+    from mira.oauth import registry, store
+    from mira.oauth.routes import api_route
 
     config = load_config()
     llm = config.llm
-    db_indexing = _api._app_db.get_setting("indexing_model")
-    db_review = _api._app_db.get_setting("review_model")
-    db_security = _api._app_db.get_setting("security_model")
-    thinking = get_review_thinking_mode(llm, _api._app_db.get_setting("review_thinking_mode"))
-    api_style = resolve_api_style(llm, _api._app_db.get_setting("api_style"))
+    db = _api._app_db
+    db_indexing = db.get_setting("indexing_model")
+    db_review = db.get_setting("review_model")
+    db_security = db.get_setting("security_model")
+    thinking = get_review_thinking_mode(llm, db.get_setting("review_thinking_mode"))
+    api_style = resolve_api_style(llm, db.get_setting("api_style"))
 
-    # Every model this endpoint reports has to be read through the binding a
-    # review would use. With a ChatGPT session connected the dropdown must offer
-    # that account's models, and the *selected* values must be the ids the calls
-    # will actually carry — reporting the OpenRouter-side resolution next to a
-    # ChatGPT catalog names a model no call will ever make.
-    oauth_provider = resolve_oauth_provider(llm, _api._app_db.get_setting("llm_oauth_provider"))
-    catalog_config = llm
-    if oauth_provider:
-        catalog_config = apply_oauth_binding(llm, oauth_provider, model_is_explicit=True)
-        api_style = catalog_config.api_style
-    backend = active_backend(catalog_config)
-    catalog = await fetch_catalog(catalog_config)
+    # Where a bare model id goes. Every value this endpoint reports is read
+    # through the same binding a review uses, so the *selected* values are
+    # the ids the calls will actually carry — reporting the OpenRouter-side
+    # resolution next to a ChatGPT catalog names a model no call will make.
+    default = resolve_oauth_default(llm, db.get_setting("llm_oauth_provider"))
+    default_provider, default_account = default
 
-    def effective(resolved: str, chosen: str | None) -> str:
-        """``resolved`` as the call will carry it. ``chosen`` = who picked it."""
-        return effective_model(llm, resolved, chosen, oauth_provider)
+    # The API-key endpoint's own catalog, with any mira.yaml OAuth choice set
+    # aside: this is the list for the key path whether or not it is the default.
+    api_config = llm.model_copy(
+        update={"oauth_provider": None, "oauth_account": None, "api_style": api_style}
+    )
+    api_backend = active_backend(api_config)
+    api_catalog = await fetch_catalog(api_config)
+    api_desc = describe_call(api_config)
+    api_group = f"{api_desc['provider_label']} · {endpoint_host(api_desc['endpoint'])}"
+    api_detail = f"{api_desc['protocol']} · API key"
+
+    def api_options(purpose: str, *, explicit: bool) -> list[dict]:
+        """The key path's models: bare when it is the default, ``api:`` otherwise."""
+        return [
+            {
+                **m,
+                "value": api_route(m["value"]) if explicit else m["value"],
+                "group": ("API key — " if explicit else "") + api_group,
+                "detail": api_detail,
+            }
+            for m in build_options(api_backend, api_catalog, purpose)
+        ]
+
+    default_backend: dict = {}
+    bare_options: list[dict] = []
+    if default_provider:
+        spec = registry.require(default_provider)
+        assert spec.llm is not None  # resolve_oauth_default only names LLM providers
+        accounts = store.accounts(default_provider, db)
+        protocol = spec.llm.describe()
+        detail = f"{protocol['protocol']} · {endpoint_host(protocol['endpoint'])}"
+        if default_account:
+            tokens = accounts[default_account]
+            who = tokens.account_label or default_account
+            models = await account_models(spec, tokens, db)
+            mode = "pinned"
+        elif len(accounts) == 1:
+            only = next(iter(accounts.values()))
+            who = only.account_label or only.account_key
+            models = await account_models(spec, only, db)
+            mode = "rotate"
+        else:
+            who = f"any account (rotate across {len(accounts)})"
+            models = await provider_models(spec, accounts, db)
+            mode = "rotate"
+        bare_options = [
+            {**m, "group": f"Default — {spec.label} · {who}", "detail": detail} for m in models
+        ]
+        default_backend = {
+            "provider": spec.id,
+            "provider_label": spec.label,
+            "account": default_account,
+            "account_label": who,
+            "mode": mode,
+            "accounts": len(accounts),
+        }
+        backend = f"oauth:{spec.id}"
+        api_style = spec.llm.api_style
+    else:
+        backend = api_backend
+
+    explicit_oauth = await oauth_option_groups(default, db)
+
+    def options(purpose: str) -> list[ModelOption]:
+        if default_provider:
+            merged = bare_options + api_options(purpose, explicit=True)
+        else:
+            merged = api_options(purpose, explicit=False)
+        return [ModelOption(**m) for m in merged + explicit_oauth]
+
+    def route(resolved: str, chosen: str | None) -> dict:
+        """What a call for ``resolved`` does. ``chosen`` = who picked it."""
+        return effective_route(llm, resolved, chosen, default)
+
+    indexing = route(get_indexing_model(llm, db_indexing), db_indexing or llm.indexing_model)
+    review = route(get_review_model(llm, db_review), db_review or llm.review_model)
+    security = route(
+        get_security_model(llm, db_security, db_review),
+        db_security or llm.security_model or db_review or llm.review_model,
+    )
 
     return ModelsResponse(
-        indexing_model=effective(
-            get_indexing_model(llm, db_indexing), db_indexing or llm.indexing_model
-        ),
-        review_model=effective(get_review_model(llm, db_review), db_review or llm.review_model),
-        security_model=effective(
-            get_security_model(llm, db_security, db_review),
-            db_security or llm.security_model or db_review or llm.review_model,
-        ),
+        indexing_model=indexing["value"],
+        review_model=review["value"],
+        security_model=security["value"],
         backend=backend,
+        indexing_route=indexing,
+        review_route=review,
+        security_route=security,
+        default_backend=default_backend,
         indexing_source="dashboard" if db_indexing else "config",
         review_source="dashboard" if db_review else "config",
         security_source="dashboard" if db_security else "config",
         # The "inherit from deployment config" targets: what each purpose would
         # resolve to with its dashboard override cleared.
-        config_indexing_model=effective(get_indexing_model(llm), llm.indexing_model),
-        config_review_model=effective(get_review_model(llm), llm.review_model),
-        config_security_model=effective(
+        config_indexing_model=route(get_indexing_model(llm), llm.indexing_model)["value"],
+        config_review_model=route(get_review_model(llm), llm.review_model)["value"],
+        config_security_model=route(
             get_security_model(llm), llm.security_model or llm.review_model
-        ),
-        indexing_options=[ModelOption(**m) for m in build_options(backend, catalog, "indexing")],
-        review_options=[ModelOption(**m) for m in build_options(backend, catalog, "review")],
-        security_options=[ModelOption(**m) for m in build_options(backend, catalog, "review")],
+        )["value"],
+        indexing_options=options("indexing"),
+        review_options=options("review"),
+        security_options=options("review"),
         review_thinking_mode=thinking or "off",
         thinking_options=[ModelOption(**m) for m in THINKING_MODES],
         api_style=api_style,
         api_style_options=[ModelOption(**m) for m in API_STYLES],
-        oauth_provider=oauth_provider,
-        oauth_label=_oauth_label(oauth_provider),
+        oauth_provider=default_provider,
+        oauth_label=default_backend.get("provider_label", ""),
     )
-
-
-def _oauth_label(provider_id: str) -> str:
-    """Display name for a connected OAuth provider, or "" if none."""
-    if not provider_id:
-        return ""
-    from mira.oauth import registry
-
-    spec = registry.get(provider_id)
-    return spec.label if spec else provider_id
 
 
 @router.get("/api/admin/settings", response_model=GlobalSettingsResponse)

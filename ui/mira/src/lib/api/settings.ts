@@ -1,5 +1,40 @@
 import { fetchJson, putJson } from "./http"
 
+export type ModelOptionDto = {
+  value: string
+  label: string
+  recommended?: boolean
+  group?: string
+  detail?: string
+  description?: string
+}
+
+// Where one purpose's calls actually go: the backend, the account, the
+// protocol, the endpoint and the model id on the wire.
+export type ModelRoute = {
+  value: string
+  backend: "oauth" | "api" | "bedrock"
+  provider: string
+  provider_label: string
+  account: string
+  account_label: string
+  model: string
+  api_style: string
+  protocol: string
+  transport: string
+  endpoint: string
+  connected: boolean
+}
+
+export type DefaultBackend = {
+  provider?: string
+  provider_label?: string
+  account?: string
+  account_label?: string
+  mode?: "rotate" | "pinned" | ""
+  accounts?: number
+}
+
 // Model selection, cost estimate, and admin review-config overrides.
 export const settingsApi = {
   getModels: () =>
@@ -8,38 +43,26 @@ export const settingsApi = {
       review_model: string
       security_model: string
       backend: string
+      indexing_route: ModelRoute
+      review_route: ModelRoute
+      security_route: ModelRoute
+      default_backend: DefaultBackend
       indexing_source: "dashboard" | "config"
       review_source: "dashboard" | "config"
       security_source: "dashboard" | "config"
       config_indexing_model: string
       config_review_model: string
       config_security_model: string
-      indexing_options: {
-        value: string
-        label: string
-        recommended?: boolean
-      }[]
-      review_options: { value: string; label: string; recommended?: boolean }[]
-      security_options: {
-        value: string
-        label: string
-        recommended?: boolean
-      }[]
+      indexing_options: ModelOptionDto[]
+      review_options: ModelOptionDto[]
+      security_options: ModelOptionDto[]
       review_thinking_mode: string
-      thinking_options: {
-        value: string
-        label: string
-        recommended?: boolean
-      }[]
+      thinking_options: ModelOptionDto[]
       api_style: string
-      api_style_options: {
-        value: string
-        label: string
-        recommended?: boolean
-      }[]
-      // Set when a signed-in account (Settings → Connections) is serving
-      // reviews: the options above then come from that provider, and the
-      // endpoint/protocol are fixed by it.
+      api_style_options: ModelOptionDto[]
+      // Set when a signed-in provider (Settings → Connections) is the default
+      // for bare model ids. Options that name a backend explicitly
+      // (`oauth:…`, `api:…`) are unaffected by it.
       oauth_provider: string
       oauth_label: string
     }>("/api/settings/models"),

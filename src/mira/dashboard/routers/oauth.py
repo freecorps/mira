@@ -1,9 +1,13 @@
 """Dashboard routes for OAuth connections.
 
-Admin-only, and deliberately narrow: start a login, finish one, disconnect, and
-choose which connected session serves reviews. No route ever returns token
-material — the dashboard shows who is connected and when the session expires,
-which is everything it needs to render the page.
+Admin-only, and deliberately narrow: start a login, finish one, disconnect an
+account, ask where its allowance stands, and choose which signed-in backend
+serves bare model ids. No route ever returns token material — the dashboard
+shows who is connected, when the session expires and how much of the plan is
+spent, which is everything it needs to render the page.
+
+A provider holds any number of accounts, each named by a key; the routes
+under ``/accounts/{account_key}`` act on one of them.
 """
 
 from __future__ import annotations
@@ -37,8 +41,10 @@ class OAuthCompleteRequest(BaseModel):
 
 
 class OAuthActiveRequest(BaseModel):
-    # "" routes reviews back through the API-key path.
+    # "" routes bare model ids back through the API-key path.
     provider: str = ""
+    # One of the provider's account keys, or "" / "*" for any of them.
+    account: str = ""
 
 
 def _spec_or_404(provider_id: str):  # type: ignore[no-untyped-def]
@@ -48,9 +54,19 @@ def _spec_or_404(provider_id: str):  # type: ignore[no-untyped-def]
     return spec
 
 
+def _account_or_404(provider_id: str, account_key: str):  # type: ignore[no-untyped-def]
+    spec = _spec_or_404(provider_id)
+    tokens = store.load(spec.id, account_key, _api._app_db)
+    if tokens is None or not account_key:
+        raise HTTPException(
+            status_code=404, detail=f"{spec.label} has no connected account {account_key!r}"
+        )
+    return spec, tokens
+
+
 @router.get("/api/oauth/providers")
 def list_oauth_providers(request: Request) -> dict:
-    """Every provider, whether it is connected, and which one serves reviews."""
+    """Every provider, its accounts, and which backend bare model ids go to."""
     _require_admin(request)
     return manager.list_status(_api._app_db)
 
@@ -81,7 +97,11 @@ def start_oauth(provider_id: str, request: Request) -> dict:
 
 @router.post("/api/oauth/{provider_id}/complete")
 async def complete_oauth(provider_id: str, body: OAuthCompleteRequest, request: Request) -> dict:
-    """Redeem the code the operator came back with and store the session."""
+    """Redeem the code the operator came back with and store the account.
+
+    Signing in to an account that is already connected lands in the same
+    slot — a reconnect, not a twin. Any other account is added alongside.
+    """
     _require_admin(request)
     _spec_or_404(provider_id)
     try:
@@ -97,52 +117,95 @@ async def complete_oauth(provider_id: str, body: OAuthCompleteRequest, request: 
 
 @router.delete("/api/oauth/{provider_id}")
 def disconnect_oauth(provider_id: str, request: Request) -> dict:
-    """Forget a session (and stop routing reviews at it, if it was active)."""
+    """Forget every account of a provider (and stop routing at it)."""
     _require_admin(request)
     _spec_or_404(provider_id)
-    manager.disconnect(provider_id, _api._app_db)
+    manager.disconnect(provider_id, db=_api._app_db)
     return {"ok": True}
 
 
-@router.post("/api/oauth/{provider_id}/refresh")
-async def refresh_oauth(provider_id: str, request: Request) -> dict:
-    """Renew a session now, so a stale one is fixed here and not mid-review.
+@router.delete("/api/oauth/{provider_id}/accounts/{account_key}")
+def disconnect_oauth_account(provider_id: str, account_key: str, request: Request) -> dict:
+    """Forget one account. The default pointer is cleared only if it named it."""
+    _require_admin(request)
+    _account_or_404(provider_id, account_key)
+    manager.disconnect(provider_id, account_key, db=_api._app_db)
+    return {"ok": True}
+
+
+@router.post("/api/oauth/{provider_id}/accounts/{account_key}/refresh")
+async def refresh_oauth_account(provider_id: str, account_key: str, request: Request) -> dict:
+    """Renew an account's session now, so a stale one is fixed here and not mid-review.
 
     Always goes to the issuer, expiry or not: this button exists for the case
     the expiry cannot describe — a grant revoked upstream, which still looks
     valid here until something tries to use it.
     """
     _require_admin(request)
-    _spec_or_404(provider_id)
+    spec, _tokens = _account_or_404(provider_id, account_key)
     try:
-        tokens = await store.valid_tokens(provider_id, _api._app_db, force=True)
+        tokens = await store.valid_tokens(spec.id, account_key, _api._app_db, force=True)
     except OAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    logger.info("Refreshed OAuth session for %s", tokens.provider)
-    return store.status(provider_id, _api._app_db)
+    logger.info("Refreshed OAuth session for %s account %s", spec.label, account_key)
+    return store.account_status(spec.id, tokens, _api._app_db)
+
+
+@router.post("/api/oauth/{provider_id}/accounts/{account_key}/usage")
+async def refresh_oauth_usage(provider_id: str, account_key: str, request: Request) -> dict:
+    """Ask the provider where this account's allowance stands, and record it.
+
+    Reviews keep the snapshot current on their own (every response reports
+    it); this is for looking before a review runs, or after a quiet spell.
+    """
+    _require_admin(request)
+    spec, _tokens = _account_or_404(provider_id, account_key)
+    if not spec.reports_usage:
+        raise HTTPException(status_code=400, detail=f"{spec.label} does not report usage")
+    try:
+        return await manager.refresh_usage(spec.id, account_key, _api._app_db)
+    except OAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.put("/api/oauth/active")
 def set_active_oauth(body: OAuthActiveRequest, request: Request) -> dict:
-    """Choose which connected session serves reviews.
+    """Choose which signed-in backend serves bare model ids.
 
-    Selecting a provider that is not connected is rejected rather than stored:
-    the pointer would resolve back to the API-key path on every review, and the
-    page would show a choice that quietly does nothing.
+    ``account`` pins one of the provider's accounts; empty (or ``*``) lets
+    every call go to whichever account has the most allowance left. Selecting
+    a provider or account that is not connected is rejected rather than
+    stored: the pointer would resolve back to the API-key path on every
+    review, and the page would show a choice that quietly does nothing.
     """
     _require_admin(request)
     provider_id = (body.provider or "").strip()
+    account_key = (body.account or "").strip()
+    if account_key == "*":
+        account_key = ""
     if provider_id:
         spec = _spec_or_404(provider_id)
         if spec.llm is None:
             raise HTTPException(status_code=400, detail=f"{spec.label} cannot serve models")
-        if store.load(provider_id, _api._app_db) is None:
+        accounts = store.accounts(spec.id, _api._app_db)
+        if not accounts:
             raise HTTPException(status_code=400, detail=f"{spec.label} is not connected")
+        if account_key and account_key not in accounts:
+            raise HTTPException(
+                status_code=400, detail=f"{spec.label} has no connected account {account_key!r}"
+            )
         provider_id = spec.id
-    store.set_active_provider(provider_id, _api._app_db)
+    else:
+        account_key = ""
+    store.set_active(provider_id, account_key, _api._app_db)
     # Reviews are configured now; don't send the operator back through setup.
     _api._app_db.mark_setup_complete()
-    return {"ok": True, "active_provider": provider_id}
+    return {
+        "ok": True,
+        "active_provider": provider_id,
+        "active_account": account_key,
+        "active_ref": store.format_ref(provider_id, account_key),
+    }
 
 
 @router.get("/api/oauth/callback", response_class=HTMLResponse)

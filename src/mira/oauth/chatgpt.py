@@ -15,6 +15,17 @@ and all three are captured here rather than in the provider class:
 * it rejects several fields a stock Responses request would send
   (``temperature``, ``max_output_tokens``, ``store: true``).
 
+Two more things the backend offers that a key-based endpoint does not, and
+which the dashboard and the account rotation lean on:
+
+* **usage.** Every response carries ``x-codex-primary-*`` / ``x-codex-
+  secondary-*`` headers saying how much of the plan's 5-hour and weekly
+  windows is spent and when each resets, and ``GET /wham/usage`` answers the
+  same question on demand. Both are read into a :class:`UsageSnapshot`.
+* **models.** ``GET /codex/models`` lists what this account may use, so the
+  dropdown offers the account's real list rather than a list frozen at
+  build time. The curated list below is the fallback when that call fails.
+
 The client id and loopback port are the Codex CLI's own public values: this is
 a public OAuth client with PKCE, so there is no secret to keep, and the
 redirect URI is fixed by OpenAI's registration — which is why the dashboard
@@ -24,12 +35,34 @@ flow asks the user to paste the redirect URL back (see
 
 from __future__ import annotations
 
+import logging
+import os
+import time
 from typing import Any, ClassVar
 
+import httpx
+
 from mira.oauth.base import LLMBinding, OAuthProviderSpec, OAuthTokens, decode_jwt_claims
+from mira.oauth.usage import UsageSnapshot, UsageWindow
+
+logger = logging.getLogger(__name__)
 
 # Claim namespace OpenAI uses inside the id_token for ChatGPT account data.
 _AUTH_CLAIM = "https://api.openai.com/auth"
+
+# The ChatGPT backend root. The Codex responses endpoint hangs off
+# ``/codex``; the account-level usage endpoint hangs off ``/wham`` (the
+# backend's own name for the Codex service). Both are the paths the Codex CLI
+# calls.
+_BACKEND = "https://chatgpt.com/backend-api"
+_USAGE_URL = f"{_BACKEND}/wham/usage"
+_MODELS_URL = f"{_BACKEND}/codex/models"
+# The models endpoint filters by the client version asking, hiding models a
+# too-old CLI could not drive. Mira drives them all the same way, so it asks
+# as the newest client there is; override for a backend that objects.
+_CLIENT_VERSION = os.environ.get("MIRA_CODEX_CLIENT_VERSION", "99.0.0")
+_ORIGINATOR = "codex_cli_rs"
+_USAGE_TIMEOUT = 15.0
 
 
 def _hoist_instructions(body: dict[str, Any]) -> None:
@@ -75,8 +108,10 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
     loopback_port: ClassVar[int] = 1455
     loopback_path: ClassVar[str] = "/auth/callback"
 
+    reports_usage: ClassVar[bool] = True
+
     llm: ClassVar[LLMBinding | None] = LLMBinding(
-        base_url="https://chatgpt.com/backend-api/codex",
+        base_url=f"{_BACKEND}/codex",
         api_style="responses",
         default_model="gpt-5-codex",
         models=(
@@ -89,6 +124,8 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
         # The backend takes minimal/low/medium/high; our "max" has no
         # equivalent, so it lands on the highest level it does accept.
         reasoning_effort_map={"max": "high"},
+        protocol_label="Responses API (Codex backend)",
+        transport_label="server-sent events",
     )
 
     @classmethod
@@ -133,8 +170,21 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
         headers = {
             "Authorization": f"Bearer {tokens.access_token}",
             "OpenAI-Beta": "responses=experimental",
-            "originator": "codex_cli_rs",
+            "originator": _ORIGINATOR,
             "Accept": "text/event-stream",
+        }
+        if tokens.account_id:
+            headers["chatgpt-account-id"] = tokens.account_id
+        return headers
+
+    @classmethod
+    def _api_headers(cls, tokens: OAuthTokens) -> dict[str, str]:
+        """Headers for the backend's JSON endpoints (usage, models)."""
+        headers = {
+            "Authorization": f"Bearer {tokens.access_token}",
+            "originator": _ORIGINATOR,
+            "User-Agent": f"codex_cli_rs/{_CLIENT_VERSION} (mira)",
+            "Accept": "application/json",
         }
         if tokens.account_id:
             headers["chatgpt-account-id"] = tokens.account_id
@@ -171,3 +221,244 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
                 include.append("reasoning.encrypted_content")
             body["include"] = include
         return body
+
+    # ── Usage ──────────────────────────────────────────────────────
+
+    @classmethod
+    def usage_from_headers(cls, headers: Any) -> UsageSnapshot | None:
+        """The rate-limit headers the Codex backend puts on every response.
+
+        ``x-codex-primary-*`` is the short (5-hour) window, ``x-codex-
+        secondary-*`` the long (weekly) one; each reports a used percentage,
+        the window length in minutes and a unix reset time. A response with
+        none of them (an error page from a proxy, say) yields None rather
+        than a snapshot that says "0% used".
+        """
+        if headers is None:
+            return None
+        primary = _window_from_headers(headers, "x-codex-primary")
+        secondary = _window_from_headers(headers, "x-codex-secondary")
+        credits = _credits_from_headers(headers)
+        if primary is None and secondary is None and credits is None:
+            return None
+        reached = _header(headers, "x-codex-rate-limit-reached-type")
+        return UsageSnapshot(
+            primary=primary,
+            secondary=secondary,
+            credits=credits,
+            limit_reached=bool(reached),
+            source="headers",
+            fetched_at=time.time(),
+        )
+
+    @classmethod
+    async def fetch_usage(cls, tokens: OAuthTokens) -> UsageSnapshot | None:
+        """``GET /wham/usage``: the account's windows, plan and credits.
+
+        The same call the Codex CLI makes for its ``/status`` screen. A
+        failure is logged and answered with None — a usage meter that cannot
+        be drawn is not a reason to fail a settings page.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=_USAGE_TIMEOUT) as client:
+                resp = await client.get(_USAGE_URL, headers=cls._api_headers(tokens))
+        except httpx.HTTPError as exc:
+            logger.warning("%s usage lookup failed: %s", cls.label, exc)
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "%s usage lookup answered HTTP %s: %s",
+                cls.label,
+                resp.status_code,
+                resp.text[:200],
+            )
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            logger.warning("%s usage lookup returned a non-JSON body", cls.label)
+            return None
+        return usage_from_payload(payload)
+
+    # ── Models ─────────────────────────────────────────────────────
+
+    @classmethod
+    async def fetch_models(cls, tokens: OAuthTokens) -> list[dict[str, Any]] | None:
+        """``GET /codex/models``: what this account may use, in the backend's order."""
+        params = {"client_version": _CLIENT_VERSION}
+        try:
+            async with httpx.AsyncClient(timeout=_USAGE_TIMEOUT) as client:
+                resp = await client.get(
+                    _MODELS_URL, params=params, headers=cls._api_headers(tokens)
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("%s model list failed: %s", cls.label, exc)
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "%s model list answered HTTP %s: %s", cls.label, resp.status_code, resp.text[:200]
+            )
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        return models_from_payload(payload)
+
+
+# ── Payload parsing (module-level so it is testable without a network) ──
+
+
+def usage_from_payload(payload: Any) -> UsageSnapshot | None:
+    """Read the ``/wham/usage`` document into a snapshot.
+
+    The document (as the Codex CLI reads it)::
+
+        {"plan_type": "plus",
+         "rate_limit": {"primary_window": {"used_percent": 42,
+                                           "limit_window_seconds": 18000,
+                                           "reset_after_seconds": 3600,
+                                           "reset_at": 1704069000},
+                        "secondary_window": {...}},
+         "credits": {"has_credits": true, "unlimited": false, "balance": "9.99"},
+         "rate_limit_reached_type": {...} | null}
+
+    Anything missing is left None; a document with none of it is still a
+    snapshot, so the plan name alone can be shown.
+    """
+    if not isinstance(payload, dict):
+        return None
+    limits = payload.get("rate_limit")
+    if not isinstance(limits, dict):
+        limits = {}
+    credits_raw = payload.get("credits")
+    credits: dict[str, Any] | None = None
+    if isinstance(credits_raw, dict):
+        credits = {
+            "has_credits": bool(credits_raw.get("has_credits", False)),
+            "unlimited": bool(credits_raw.get("unlimited", False)),
+            "balance": credits_raw.get("balance"),
+        }
+    reached = payload.get("rate_limit_reached_type")
+    return UsageSnapshot(
+        primary=_window_from_payload(limits.get("primary_window")),
+        secondary=_window_from_payload(limits.get("secondary_window")),
+        credits=credits,
+        plan=str(payload.get("plan_type", "") or ""),
+        limit_reached=bool(reached) or bool(limits.get("limit_reached", False)),
+        source="endpoint",
+        fetched_at=time.time(),
+    )
+
+
+def models_from_payload(payload: Any) -> list[dict[str, Any]] | None:
+    """Read the ``/codex/models`` document into dropdown options.
+
+    Each entry carries a ``slug`` (the id to send), a ``display_name``, a
+    ``visibility`` ("list" for the picker, "hide" for reachable-but-unlisted)
+    and a ``priority`` the backend orders by. Hidden models are kept out of
+    the dropdown but nothing stops an operator typing one: the endpoint
+    accepts ids the list omits.
+    """
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("models")
+    if not isinstance(entries, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug", "") or "").strip()
+        if not slug:
+            continue
+        visibility = str(entry.get("visibility", "list") or "list").lower()
+        if visibility not in ("list", ""):
+            continue
+        levels = entry.get("supported_reasoning_levels")
+        efforts = []
+        if isinstance(levels, list):
+            for level in levels:
+                effort = level.get("effort") if isinstance(level, dict) else level
+                if isinstance(effort, str) and effort:
+                    efforts.append(effort.lower())
+        try:
+            priority = int(entry.get("priority", 0) or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        out.append(
+            {
+                "value": slug,
+                "label": str(entry.get("display_name") or slug),
+                "description": str(entry.get("description") or ""),
+                "reasoning_levels": efforts,
+                "priority": priority,
+            }
+        )
+    out.sort(key=lambda m: m["priority"])
+    return [{k: v for k, v in m.items() if k != "priority"} for m in out]
+
+
+def _window_from_payload(raw: Any) -> UsageWindow | None:
+    if not isinstance(raw, dict):
+        return None
+    used = _number(raw.get("used_percent"))
+    if used is None:
+        return None
+    seconds = _number(raw.get("limit_window_seconds"))
+    minutes = int(seconds // 60) if seconds else None
+    resets = _number(raw.get("reset_at"))
+    if resets is None:
+        after = _number(raw.get("reset_after_seconds"))
+        if after is not None:
+            resets = time.time() + after
+    return UsageWindow(used_percent=float(used), window_minutes=minutes, resets_at=resets)
+
+
+def _window_from_headers(headers: Any, prefix: str) -> UsageWindow | None:
+    used = _number(_header(headers, f"{prefix}-used-percent"))
+    if used is None:
+        return None
+    minutes = _number(_header(headers, f"{prefix}-window-minutes"))
+    resets = _number(_header(headers, f"{prefix}-reset-at"))
+    return UsageWindow(
+        used_percent=float(used),
+        window_minutes=int(minutes) if minutes is not None else None,
+        resets_at=resets,
+    )
+
+
+def _credits_from_headers(headers: Any) -> dict[str, Any] | None:
+    has = _header(headers, "x-codex-credits-has-credits")
+    if has is None:
+        return None
+    return {
+        "has_credits": has.strip().lower() in ("true", "1"),
+        "unlimited": (_header(headers, "x-codex-credits-unlimited") or "").strip().lower()
+        in ("true", "1"),
+        "balance": (_header(headers, "x-codex-credits-balance") or "").strip() or None,
+    }
+
+
+def _header(headers: Any, name: str) -> str | None:
+    """Case-insensitive header read that works on httpx headers and plain dicts."""
+    try:
+        value = headers.get(name)
+        if value is None and isinstance(headers, dict):
+            lowered = {str(k).lower(): v for k, v in headers.items()}
+            value = lowered.get(name.lower())
+    except Exception:
+        return None
+    return str(value) if value is not None else None
+
+
+def _number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return parsed

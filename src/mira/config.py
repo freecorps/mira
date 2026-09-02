@@ -90,6 +90,11 @@ class LLMConfig(BaseModel):
     # `provider`/`base_url`/`api_key_env`: the endpoint and auth both come from
     # the provider spec in `mira.oauth`.
     oauth_provider: str | None = None
+    # Which of that provider's signed-in accounts to use: an account key as
+    # shown on the Connections page (or by `mira auth status`). Empty means
+    # any of them — each call goes to the account with the most allowance
+    # left, and one the backend refuses is set aside until its window resets.
+    oauth_account: str | None = None
     # Endpoint configuration. Defaults to OpenRouter but any OpenAI-compatible
     # chat-completions endpoint works — vLLM, Ollama, LiteLLM proxy, LocalAI,
     # llama.cpp server, Together, Fireworks, Groq, etc. Set api_key_env to ""
@@ -148,6 +153,13 @@ class LLMConfig(BaseModel):
             known = ", ".join(sorted(registry.llm_providers())) or "none"
             raise ValueError(f"llm.oauth_provider {v!r} is not a known provider (have: {known})")
         return spec.id
+
+    @field_validator("oauth_account")
+    @classmethod
+    def _validate_oauth_account(cls, v: str | None) -> str | None:
+        """Empty and ``*`` both mean "any account"; anything else is a key."""
+        text = (v or "").strip()
+        return text if text and text != "*" else None
 
 
 class FilterConfig(BaseModel):

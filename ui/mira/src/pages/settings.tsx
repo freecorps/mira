@@ -21,8 +21,18 @@ import {
 import { useParams } from "react-router"
 
 import { api } from "@/lib/api"
+import type { DefaultBackend, ModelRoute } from "@/lib/api/settings"
 import { useAuth } from "@/lib/auth"
 import { useDocumentTitle } from "@/lib/hooks"
+
+function endpointHost(url: string): string {
+  try {
+    const u = new URL(url)
+    return `${u.host}${u.pathname}`.replace(/\/$/, "")
+  } catch {
+    return url
+  }
+}
 
 // A settings key is a *path*: `verdict.mode` lives under a `verdict` object,
 // because the override blob mirrors the shape of the config tree rather than
@@ -84,9 +94,18 @@ export function SettingsPage() {
   const [thinkingOptions, setThinkingOptions] = useState<ModelOption[]>([])
   const [apiStyle, setApiStyle] = useState("chat")
   const [apiStyleOptions, setApiStyleOptions] = useState<ModelOption[]>([])
-  // Non-empty when a signed-in account serves reviews: the model lists then
-  // come from that provider and the protocol is not ours to pick.
-  const [oauthLabel, setOauthLabel] = useState("")
+  // Where a bare model id goes: a signed-in provider chosen under
+  // Connections, or the API key when none is. Options that name a backend
+  // themselves (`oauth:…`, `api:…`) do not depend on it.
+  const [defaultBackend, setDefaultBackend] = useState<DefaultBackend>({})
+  // What each purpose's *saved* value does, as the server resolves it.
+  const [routes, setRoutes] = useState<{
+    indexing?: ModelRoute
+    review?: ModelRoute
+    security?: ModelRoute
+  }>({})
+  // The values as loaded, to know when a draft still matches the saved one.
+  const [saved, setSaved] = useState({ indexing: "", review: "", security: "" })
   const [savingModels, setSavingModels] = useState(false)
   const [modelsSaved, setModelsSaved] = useState(false)
 
@@ -115,9 +134,19 @@ export function SettingsPage() {
   useEffect(() => {
     if (!currentUser?.is_admin) return
     api.getModels().then((m) => {
-      setIndexingModel(m.indexing_source === "config" ? "" : m.indexing_model)
-      setReviewModel(m.review_source === "config" ? "" : m.review_model)
-      setSecurityModel(m.security_source === "config" ? "" : m.security_model)
+      const indexing = m.indexing_source === "config" ? "" : m.indexing_model
+      const review = m.review_source === "config" ? "" : m.review_model
+      const security = m.security_source === "config" ? "" : m.security_model
+      setIndexingModel(indexing)
+      setReviewModel(review)
+      setSecurityModel(security)
+      setSaved({ indexing, review, security })
+      setRoutes({
+        indexing: m.indexing_route,
+        review: m.review_route,
+        security: m.security_route,
+      })
+      setDefaultBackend(m.default_backend ?? {})
       setConfigIndexingModel(m.config_indexing_model)
       setConfigReviewModel(m.config_review_model)
       setConfigSecurityModel(m.config_security_model)
@@ -129,7 +158,6 @@ export function SettingsPage() {
       setThinkingOptions(m.thinking_options)
       setApiStyle(m.api_style ?? "chat")
       setApiStyleOptions(m.api_style_options ?? [])
-      setOauthLabel(m.oauth_provider ? m.oauth_label || m.oauth_provider : "")
     })
     api.getGlobalSettings().then((s) => {
       setEffective(
@@ -165,6 +193,53 @@ export function SettingsPage() {
     setSavingModels(false)
     setModelsSaved(true)
     setTimeout(() => setModelsSaved(false), 2000)
+    // The server's resolution is for the saved values; reload it so the
+    // "will call" lines describe what was just written.
+    api.getModels().then((m) => {
+      setSaved({
+        indexing: m.indexing_source === "config" ? "" : m.indexing_model,
+        review: m.review_source === "config" ? "" : m.review_model,
+        security: m.security_source === "config" ? "" : m.security_model,
+      })
+      setRoutes({
+        indexing: m.indexing_route,
+        review: m.review_route,
+        security: m.security_route,
+      })
+    })
+  }
+
+  const defaultLabel = defaultBackend.provider_label
+    ? `${defaultBackend.provider_label} · ${defaultBackend.account_label ?? ""}`
+    : "the API-key endpoint"
+
+  // One line under each picker saying where that choice sends calls. For a
+  // draft that still matches the saved value the server's resolution is
+  // authoritative; for an edited one, the option's own group says it.
+  const routeLine = (
+    draft: string,
+    savedValue: string,
+    configValue: string,
+    options: ModelOption[],
+    route?: ModelRoute
+  ): string => {
+    if (draft === savedValue && route) {
+      const who = route.account_label ? ` · ${route.account_label}` : ""
+      return `${route.model} via ${route.provider_label}${who} · ${route.protocol} · ${endpointHost(route.endpoint)}`
+    }
+    const effective = draft === "" ? configValue : draft
+    const option = options.find((o) => o.value === effective)
+    if (option?.group) {
+      return `${option.label} via ${option.group}${option.detail ? ` · ${option.detail}` : ""}`
+    }
+    if (effective.startsWith("oauth:")) {
+      const [provider, account, ...rest] = effective.slice(6).split(":")
+      return `${rest.join(":")} via ${provider} account ${account === "*" ? "(any, rotating)" : account} — not currently connected`
+    }
+    if (effective.startsWith("api:")) {
+      return `${effective.slice(4)} via the API-key endpoint`
+    }
+    return `${effective} via ${defaultLabel} (bare id: goes to the default backend)`
   }
 
   const setOverride = (
@@ -443,29 +518,38 @@ export function SettingsPage() {
           <CardHeader>
             <CardTitle>Models</CardTitle>
             <CardDescription>
-              Choose models for indexing and PR reviews
-              {oauthLabel
-                ? ` — listed from your ${oauthLabel} account`
-                : backend &&
-                  ` — listed from ${
-                    { openrouter: "OpenRouter", bedrock: "AWS Bedrock" }[
-                      backend
-                    ] ?? "your configured endpoint"
-                  }`}
+              Choose models for indexing and PR reviews. Each backend is its own
+              section in the picker — the API-key endpoint and every signed-in
+              account — so the same model name never stands for two places.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {oauthLabel && (
-              <p className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
-                Reviews run through your {oauthLabel} session, so these are that
-                account's models and the endpoint and protocol come with it.
-                Manage the session under{" "}
-                <a className="underline" href="/settings/connections">
-                  Connections
-                </a>
-                .
-              </p>
-            )}
+            <p className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+              {defaultBackend.provider_label ? (
+                <>
+                  A model picked without a backend (a bare id) goes to{" "}
+                  <strong>{defaultLabel}</strong>
+                  {defaultBackend.mode === "rotate" &&
+                  (defaultBackend.accounts ?? 0) > 1
+                    ? ", rotating by remaining allowance"
+                    : ""}
+                  . Sections marked <em>API key</em> keep a purpose on the
+                  configured endpoint instead, and each account&apos;s section
+                  pins it there.
+                </>
+              ) : (
+                <>
+                  A model picked without a backend (a bare id) goes to the
+                  configured API-key endpoint. Signed-in accounts appear as
+                  their own sections once connected.
+                </>
+              )}{" "}
+              Manage accounts and the default under{" "}
+              <a className="underline" href="/settings/connections">
+                Connections
+              </a>
+              .
+            </p>
             <div className="space-y-2">
               <label className="text-sm font-medium">Indexing Model</label>
               <ModelCombobox
@@ -474,6 +558,16 @@ export function SettingsPage() {
                 options={indexingOptions}
                 configModel={configIndexingModel}
               />
+              <p className="font-mono text-[0.7rem] text-muted-foreground">
+                →{" "}
+                {routeLine(
+                  indexingModel,
+                  saved.indexing,
+                  configIndexingModel,
+                  indexingOptions,
+                  routes.indexing
+                )}
+              </p>
               <p className="text-xs text-muted-foreground">
                 Used to summarize files when building the code index. A cheaper
                 model is recommended since it runs over every file.
@@ -487,6 +581,16 @@ export function SettingsPage() {
                 options={reviewOptions}
                 configModel={configReviewModel}
               />
+              <p className="font-mono text-[0.7rem] text-muted-foreground">
+                →{" "}
+                {routeLine(
+                  reviewModel,
+                  saved.review,
+                  configReviewModel,
+                  reviewOptions,
+                  routes.review
+                )}
+              </p>
               <p className="text-xs text-muted-foreground">
                 Used to analyze PRs and post review comments. A more powerful
                 model gives better review quality.
@@ -500,6 +604,16 @@ export function SettingsPage() {
                 options={securityOptions}
                 configModel={configSecurityModel}
               />
+              <p className="font-mono text-[0.7rem] text-muted-foreground">
+                →{" "}
+                {routeLine(
+                  securityModel,
+                  saved.security,
+                  configSecurityModel,
+                  securityOptions,
+                  routes.security
+                )}
+              </p>
               <p className="text-xs text-muted-foreground">
                 Used for the dedicated security pass. Defaults to the review
                 model — set a cheaper one only if you accept lower security
@@ -529,9 +643,11 @@ export function SettingsPage() {
                 automatically when unsupported.
               </p>
             </div>
-            {backend !== "bedrock" && !oauthLabel && (
+            {backend !== "bedrock" && (
               <div className="space-y-2">
-                <label className="text-sm font-medium">API Protocol</label>
+                <label className="text-sm font-medium">
+                  API Protocol (API-key endpoint)
+                </label>
                 <Select value={apiStyle} onValueChange={setApiStyle}>
                   <SelectTrigger>
                     <SelectValue />
@@ -545,9 +661,10 @@ export function SettingsPage() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  Protocol used to talk to this endpoint. Responses API requires
-                  a server exposing /responses (OpenAI and compatible proxies);
-                  Chat Completions works everywhere.
+                  Protocol used to talk to the configured API-key endpoint.
+                  Responses API requires a server exposing /responses (OpenAI
+                  and compatible proxies); Chat Completions works everywhere.
+                  Signed-in accounts bring their own protocol and ignore this.
                 </p>
               </div>
             )}

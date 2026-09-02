@@ -183,6 +183,8 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Sign in with a ChatGPT account instead of an API key and review with the models that plan includes, through the same backend the Codex CLI uses — the session is stored server-side and renewed automatically, and switching back to a key is one setting
 - Generic OAuth layer under it: a provider is a spec class, so the dashboard page, API routes, CLI and model dropdown pick up a new one with no other change
 - OAuth logins from either side — `mira auth login` on the machine with the browser, or the dashboard's Connections page anywhere else — reading and writing the same store
+- Several accounts per provider, each with its plan and its 5-hour / weekly allowance on the card (read off every review call, or asked for on demand), and rotation across them by remaining allowance — a 429 sets an account aside until its window resets and the call moves to the next
+- A model picker that says which backend a choice means: every signed-in account and the API-key endpoint are their own sections, and a stored choice is a route (`oauth:chatgpt:<account>:<model>`, `oauth:chatgpt:*:<model>`, `api:<model>`) that works in `mira.yaml` too
 - Separate model configuration for indexing (cheap) vs review (powerful)
 - Fallback-model chain
 - Adjustable review thinking mode (`llm.review_reasoning_effort`) for models with extended reasoning

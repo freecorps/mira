@@ -54,8 +54,11 @@ EXPECTED_ROUTES = {
     ("/api/oauth/callback", "GET"),
     ("/api/oauth/{provider_id}", "DELETE"),
     ("/api/oauth/{provider_id}/complete", "POST"),
-    ("/api/oauth/{provider_id}/refresh", "POST"),
     ("/api/oauth/{provider_id}/start", "POST"),
+    # A provider holds any number of accounts; these act on one of them.
+    ("/api/oauth/{provider_id}/accounts/{account_key}", "DELETE"),
+    ("/api/oauth/{provider_id}/accounts/{account_key}/refresh", "POST"),
+    ("/api/oauth/{provider_id}/accounts/{account_key}/usage", "POST"),
     # Phase 5 — assisted correction (all admin-only; the cancel route
     # additionally requires the cancel permission). There is deliberately no
     # route that *starts* a fix: that is a repository write permission, not a

@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from typing import Any, ClassVar
 from urllib.parse import urlencode
 
 import httpx
+
+from mira.oauth.usage import UsageSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +94,24 @@ class OAuthTokens:
     account_label: str = ""
     plan: str = ""
     obtained_at: float = field(default_factory=time.time)
+    # The slot this grant occupies under its provider. A provider can hold
+    # several accounts at once; the key is what the dashboard, the CLI and a
+    # model route (``oauth:chatgpt:<key>:…``) use to name one of them. Derived
+    # from the account id when the issuer gives us one, so signing in to the
+    # same account again lands in the same slot instead of adding a twin.
+    account_key: str = ""
 
     def is_expired(self, skew: float = REFRESH_SKEW_SECONDS) -> bool:
         """True when the access token is gone or about to be."""
         if not self.expires_at:
             return False  # No expiry advertised — assume it lives until a 401.
         return time.time() >= (self.expires_at - skew)
+
+    def ensure_key(self) -> str:
+        """Assign the slot key if the grant has none yet, and return it."""
+        if not self.account_key:
+            self.account_key = account_key_for(self.account_id)
+        return self.account_key
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +126,7 @@ class OAuthTokens:
             "account_label": self.account_label,
             "plan": self.plan,
             "obtained_at": self.obtained_at,
+            "account_key": self.account_key,
         }
 
     @classmethod
@@ -122,6 +138,24 @@ class OAuthTokens:
         """
         known = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+_KEY_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def account_key_for(account_id: str) -> str:
+    """A slot key for an account: its id made safe for keys and routes.
+
+    Keys live inside settings-table row names and inside model routes, both
+    colon-separated, so the id is reduced to a URL-safe alphabet and kept
+    short. An account with no id at all (a provider whose tokens carry none)
+    gets a random key, which still serves as a slot — it just cannot be
+    matched on a second sign-in.
+    """
+    cleaned = _KEY_CHARS.sub("", (account_id or "").strip())
+    if cleaned:
+        return cleaned[:48]
+    return secrets.token_hex(6)
 
 
 def decode_jwt_claims(token: str) -> dict[str, Any]:
@@ -156,10 +190,25 @@ class LLMBinding:
     base_url: str
     api_style: str = "responses"
     default_model: str = ""
+    # The curated list — what the dropdown offers when the provider cannot be
+    # asked for its live list (see ``OAuthProviderSpec.fetch_models``).
     models: tuple[dict[str, Any], ...] = ()
     # Maps our thinking-mode values onto whatever the endpoint accepts,
     # mirroring ``provider_profiles``' ``reasoning_effort_map``.
     reasoning_effort_map: dict[str, str] = field(default_factory=dict)
+    # How the endpoint is spoken to, in words the dashboard can show next to
+    # the account so an operator knows what "use this" means: which protocol,
+    # whether the answer streams, and where it goes.
+    protocol_label: str = "Responses API"
+    transport_label: str = "HTTPS"
+
+    def describe(self) -> dict[str, str]:
+        return {
+            "api_style": self.api_style,
+            "protocol": self.protocol_label,
+            "transport": self.transport_label,
+            "endpoint": self.base_url,
+        }
 
 
 class OAuthProviderSpec:
@@ -271,6 +320,33 @@ class OAuthProviderSpec:
         """True when the endpoint only answers as a server-sent event stream."""
         return False
 
+    # ── Usage and model discovery (optional) ───────────────────────
+
+    # True when the provider reports how much of a plan's allowance is spent.
+    # Drives whether the dashboard shows usage meters and whether rotation
+    # has anything to go on beyond "it answered 429".
+    reports_usage: ClassVar[bool] = False
+
+    @classmethod
+    def usage_from_headers(cls, headers: Any) -> UsageSnapshot | None:
+        """Read a usage snapshot off an LLM response's headers, if it carries one."""
+        return None
+
+    @classmethod
+    async def fetch_usage(cls, tokens: OAuthTokens) -> UsageSnapshot | None:
+        """Ask the provider where this account's allowance stands right now."""
+        return None
+
+    @classmethod
+    async def fetch_models(cls, tokens: OAuthTokens) -> list[dict[str, Any]] | None:
+        """The models this account can use, from the provider itself.
+
+        None means "no such endpoint, or it did not answer" — the caller
+        falls back to the curated ``llm.models`` list. A list, even an empty
+        one, is the provider's word.
+        """
+        return None
+
     # ── Public flow API ────────────────────────────────────────────
 
     @classmethod
@@ -305,6 +381,9 @@ class OAuthProviderSpec:
             refreshed.account_id = tokens.account_id
             refreshed.account_label = tokens.account_label
             refreshed.plan = tokens.plan
+        # The slot is the grant's identity in the store; a refresh must land
+        # in the same one whatever the new payload says about itself.
+        refreshed.account_key = tokens.account_key or refreshed.ensure_key()
         return refreshed
 
     @classmethod
@@ -329,7 +408,7 @@ class OAuthProviderSpec:
         except (TypeError, ValueError):
             expires_at = 0.0
         identity = cls.identify(payload)
-        return OAuthTokens(
+        tokens = OAuthTokens(
             provider=cls.id,
             access_token=str(payload.get("access_token", "")),
             refresh_token=str(payload.get("refresh_token", "") or ""),
@@ -341,6 +420,8 @@ class OAuthProviderSpec:
             account_label=identity.get("account_label", ""),
             plan=identity.get("plan", ""),
         )
+        tokens.ensure_key()
+        return tokens
 
 
 def _token_error(label: str, resp: httpx.Response) -> str:

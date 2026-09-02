@@ -1110,67 +1110,155 @@ def auth_login(provider: str | None, manual: bool, no_browser: bool, timeout: in
 
     account = status.get("account_label") or "(account)"
     plan = f" [{status['plan']}]" if status.get("plan") else ""
-    click.echo(f"Connected {spec.label} as {account}{plan}.")
-    click.echo(f"Route reviews through it with: mira auth use {spec.id}")
+    key = status.get("key", "")
+    click.echo(f"Connected {spec.label} as {account}{plan} (account key: {key}).")
+    if status.get("is_default"):
+        click.echo("Reviews with a bare model id now run through it.")
+    else:
+        click.echo(
+            f"Route reviews through it with: mira auth use {spec.id}:{key}  "
+            f"(or `mira auth use {spec.id}` to rotate across every {spec.label} account)"
+        )
+
+
+def _split_account_ref(value: str) -> tuple[str, str]:
+    """``chatgpt`` / ``chatgpt:<key>`` / ``chatgpt:*`` → (provider, key or "")."""
+    from mira.oauth import store
+
+    return store.parse_ref(value)
+
+
+def _usage_line(usage: dict | None) -> str:
+    """One line of allowance: ``5-hour 42% (resets 13:05) · weekly 80% (resets Mon)``."""
+    if not usage:
+        return ""
+    from datetime import UTC, datetime
+
+    parts: list[str] = []
+    for window in (usage.get("primary"), usage.get("secondary")):
+        if not window:
+            continue
+        used = window.get("used_percent", 0)
+        resets = window.get("resets_at")
+        when = ""
+        if resets:
+            stamp = datetime.fromtimestamp(float(resets), UTC)
+            when = f", resets {stamp.strftime('%a %H:%M')} UTC"
+        parts.append(f"{window.get('name', 'window')} {used:.0f}% used{when}")
+    exhausted = float(usage.get("exhausted_until") or 0)
+    if exhausted > datetime.now(UTC).timestamp():
+        stamp = datetime.fromtimestamp(exhausted, UTC)
+        parts.append(f"rate-limited until {stamp.strftime('%a %H:%M')} UTC")
+    return " · ".join(parts)
 
 
 @auth_group.command("status")
-def auth_status() -> None:
-    """Show which providers are connected, and which one serves reviews."""
+@click.option(
+    "--refresh",
+    is_flag=True,
+    help="Ask each provider where every account's allowance stands right now.",
+)
+def auth_status(refresh: bool) -> None:
+    """Show every connected account, its allowance, and where bare model ids go."""
     from datetime import UTC, datetime
 
     from mira.oauth import manager
 
+    if refresh:
+        import asyncio
+
+        from mira.oauth import store
+        from mira.oauth.base import OAuthError
+
+        for provider_id, accounts in store.connected().items():
+            for key in accounts:
+                try:
+                    asyncio.run(manager.refresh_usage(provider_id, key))
+                except OAuthError as exc:
+                    click.echo(f"  ({provider_id}:{key}: {exc})", err=True)
+
     state = manager.list_status()
-    active = state["active_provider"]
+    active_provider = state["active_provider"]
+    active_account = state["active_account"]
     for entry in state["providers"]:
-        mark = "*" if entry["id"] == active else " "
         if not entry["connected"]:
-            click.echo(f"{mark} {entry['id']:<10} not connected")
+            click.echo(f"  {entry['id']:<10} not connected")
             continue
-        expires = entry.get("expires_at") or 0
-        when = (
-            datetime.fromtimestamp(expires, UTC).strftime("%Y-%m-%d %H:%M UTC")
-            if expires
-            else "no expiry"
-        )
-        plan = f" [{entry['plan']}]" if entry.get("plan") else ""
-        account = entry.get("account_label") or "(account)"
-        click.echo(f"{mark} {entry['id']:<10} {account}{plan} — session valid until {when}")
-    if active:
-        click.echo(f"\nReviews run through: {active}")
+        is_default = entry["id"] == active_provider
+        mode = f" — default for bare model ids ({entry['default_mode']})" if is_default else ""
+        click.echo(f"  {entry['id']:<10} {entry['label']}{mode}")
+        for account in entry["accounts"]:
+            mark = "*" if is_default and active_account in ("", account["key"]) else " "
+            expires = account.get("expires_at") or 0
+            when = (
+                datetime.fromtimestamp(expires, UTC).strftime("%Y-%m-%d %H:%M UTC")
+                if expires
+                else "no expiry"
+            )
+            plan = f" [{account['plan']}]" if account.get("plan") else ""
+            who = account.get("account_label") or "(account)"
+            click.echo(f"    {mark} {account['key']:<20} {who}{plan} — session until {when}")
+            usage = _usage_line(account.get("usage"))
+            if usage:
+                click.echo(f"      {' ' * 20} {usage}")
+    if active_provider:
+        target = f"{active_provider}:{active_account}" if active_account else active_provider
+        click.echo(f"\nBare model ids run through: {target}")
     else:
-        click.echo("\nReviews run through the configured API key.")
+        click.echo("\nBare model ids run through the configured API key.")
+    click.echo(
+        "A model may also name its backend directly: oauth:<provider>:<key>:<model>, "
+        "oauth:<provider>:*:<model> (rotate), or api:<model> (the API key)."
+    )
 
 
 @auth_group.command("use")
-@click.argument("provider", required=False)
-def auth_use(provider: str | None) -> None:
-    """Route reviews through PROVIDER. Pass nothing to go back to the API key."""
+@click.argument("target", required=False)
+def auth_use(target: str | None) -> None:
+    """Route bare model ids through TARGET: PROVIDER, PROVIDER:KEY, or PROVIDER:*.
+
+    PROVIDER alone (or PROVIDER:*) rotates across every account signed in to
+    it; PROVIDER:KEY pins one. Pass nothing to go back to the API key.
+    """
     from mira.oauth import registry, store
 
-    if not provider:
-        store.set_active_provider("")
-        click.echo("Reviews will use the configured API key.")
+    if not target:
+        store.set_active("", "")
+        click.echo("Bare model ids will use the configured API key.")
         return
+    provider, key = _split_account_ref(target)
     spec = registry.get(provider)
     if spec is None or spec.llm is None:
         raise click.UsageError(f"{provider!r} is not a provider that can serve models")
-    if store.load(spec.id) is None:
+    accounts = store.accounts(spec.id)
+    if not accounts:
         raise click.ClickException(
             f"{spec.label} is not connected — run: mira auth login {spec.id}"
         )
-    store.set_active_provider(spec.id)
-    click.echo(f"Reviews will run through {spec.label}.")
+    if key and key not in accounts:
+        known = ", ".join(accounts) or "none"
+        raise click.ClickException(f"{spec.label} has no account {key!r} (connected: {known})")
+    store.set_active(spec.id, key)
+    if key:
+        who = accounts[key].account_label or key
+        click.echo(f"Bare model ids will run through {spec.label} as {who}.")
+    else:
+        click.echo(
+            f"Bare model ids will run through {spec.label}, rotating across "
+            f"{len(accounts)} account(s) by remaining allowance."
+        )
 
 
 @auth_group.command("logout")
-@click.argument("provider")
-def auth_logout(provider: str) -> None:
-    """Forget PROVIDER's stored session."""
-    from mira.oauth import manager, registry
+@click.argument("target")
+def auth_logout(target: str) -> None:
+    """Forget a stored session: PROVIDER:KEY for one account, PROVIDER for all."""
+    from mira.oauth import manager, registry, store
 
+    provider, key = _split_account_ref(target)
     if registry.get(provider) is None:
         raise click.UsageError(f"Unknown provider {provider!r}")
-    manager.disconnect(provider)
-    click.echo(f"Disconnected {provider}.")
+    if key and key not in store.accounts(provider):
+        raise click.ClickException(f"{provider} has no account {key!r}")
+    manager.disconnect(provider, key)
+    click.echo(f"Disconnected {provider}{':' + key if key else ' (every account)'}.")

@@ -81,6 +81,14 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="{provider} session could not be renewed: {error}",
         safe="LLM provider session expired",
     ),
+    "oauth_accounts_exhausted": ErrorMessage(
+        full=(
+            "Every connected {provider} account ({count}) is rate-limited right now — "
+            "wait for a window to reset, or connect another account under "
+            "Settings → Connections"
+        ),
+        safe="Every connected account is rate-limited",
+    ),
     "oauth_stream_failed": ErrorMessage(
         full="{provider} ended the response stream without completing it: {detail}",
         safe="LLM response stream ended early",

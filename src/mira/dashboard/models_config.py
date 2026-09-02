@@ -49,40 +49,68 @@ def resolve_api_style(config: LLMConfig, db_value: str | None = None) -> str:
     return config.api_style if config.api_style in API_STYLE_VALUES else "chat"
 
 
-def resolve_oauth_provider(config: LLMConfig, db_value: str | None = None) -> str:
-    """Resolve which OAuth session serves reviews: DB → config → none.
+def resolve_oauth_default(config: LLMConfig, db_value: str | None = None) -> tuple[str, str]:
+    """Where a *bare* model id goes: ``(provider, account)``, or ``("", "")``.
 
-    A stored "" means "not set" (the same convention the model settings use),
-    so clearing the dashboard's choice hands the decision back to mira.yaml
-    rather than pinning it off forever.
+    DB → config → none. The stored value is the Connections page's choice —
+    ``"chatgpt"`` (any of that provider's accounts, rotating) or
+    ``"chatgpt:<key>"`` (one of them). A stored "" means "not set" (the same
+    convention the model settings use), so clearing the dashboard's choice
+    hands the decision back to mira.yaml rather than pinning it off forever.
 
-    An id we do not recognise, or one whose session has been disconnected,
-    resolves to "" — a stale pointer must degrade to the API-key path instead
-    of failing every review with an unexplainable provider error.
+    An id we do not recognise, or one whose accounts have all been
+    disconnected, resolves to none — a stale pointer must degrade to the
+    API-key path instead of failing every review with an unexplainable
+    provider error. A pinned account that is gone degrades one step less, to
+    "any account", since the provider itself is still usable.
     """
     from mira.oauth import registry, store
 
-    chosen = (db_value or "").strip() or (config.oauth_provider or "").strip()
-    if not chosen:
-        return ""
-    spec = registry.get(chosen)
+    chosen = db_value.strip() if isinstance(db_value, str) else ""
+    if chosen:
+        provider, account = store.parse_ref(chosen)
+    else:
+        provider = (config.oauth_provider or "").strip()
+        account = (config.oauth_account or "").strip()
+    if not provider:
+        return "", ""
+    spec = registry.get(provider)
     if spec is None or spec.llm is None:
-        logger.warning("Ignoring unknown OAuth provider %r", chosen)
-        return ""
-    if store.load(spec.id) is None:
+        logger.warning("Ignoring unknown OAuth provider %r", provider)
+        return "", ""
+    found = store.accounts(spec.id)
+    if not found:
         logger.warning("OAuth provider %s is selected but not connected", spec.id)
-        return ""
-    return spec.id
+        return "", ""
+    if account and account not in found:
+        logger.warning(
+            "OAuth account %s:%s is selected but not connected; using any account",
+            spec.id,
+            account,
+        )
+        account = ""
+    return spec.id, account
+
+
+def resolve_oauth_provider(config: LLMConfig, db_value: str | None = None) -> str:
+    """The provider bare model ids go to, or "" (see :func:`resolve_oauth_default`)."""
+    return resolve_oauth_default(config, db_value)[0]
 
 
 def apply_oauth_binding(
-    config: LLMConfig, provider_id: str, *, model_is_explicit: bool
+    config: LLMConfig,
+    provider_id: str,
+    *,
+    model_is_explicit: bool,
+    account: str = "",
 ) -> LLMConfig:
     """Point an LLMConfig at an OAuth provider's endpoint.
 
     The endpoint and protocol come from the provider spec, not from
     ``base_url``/``api_style``: those describe the API-key path, and leaving
-    them in place would send an OAuth bearer token to OpenRouter.
+    them in place would send an OAuth bearer token to OpenRouter. ``account``
+    names one of the provider's signed-in accounts; empty lets the client
+    rotate across all of them.
 
     A model somebody typed is sent as-is, since the dropdown is a guide and
     these endpoints accept ids the registry has never heard of. Two kinds of id
@@ -105,6 +133,7 @@ def apply_oauth_binding(
         return config
     update: dict = {
         "oauth_provider": spec.id,
+        "oauth_account": account or None,
         "base_url": spec.llm.base_url,
         "api_style": spec.llm.api_style,
     }
@@ -134,6 +163,137 @@ def _is_foreign_model(model: str, binding: LLMBinding) -> bool:
         binding.default_model,
     )
     return True
+
+
+def bind_model(
+    base: LLMConfig,
+    value: str,
+    *,
+    model_is_explicit: bool,
+    default: tuple[str, str],
+    thinking_mode: str | None = None,
+    api_style: str | None = None,
+) -> LLMConfig:
+    """The LLMConfig a call for ``value`` is made with.
+
+    ``value`` is whatever the DB → config chain produced for a purpose: a
+    bare model id, or a route naming its backend (see
+    :mod:`mira.oauth.routes`). Three cases, in order:
+
+    * ``api:<model>`` — the configured API-key endpoint, whatever the
+      default backend is. This is how one purpose stays on a key while the
+      others use a signed-in account.
+    * ``oauth:<provider>:<account>:<model>`` — that account (or any of the
+      provider's, for ``*``). The model is sent as written: the route was
+      chosen from that account's own list, so there is nothing to second-guess.
+    * a bare id — the default backend: the OAuth provider ``default`` names,
+      or the API-key endpoint when it names none. The same rules as before
+      apply to the model (see :func:`apply_oauth_binding`).
+    """
+    from mira.oauth.routes import parse_route
+
+    route = parse_route(value)
+    update: dict = {
+        "reasoning_effort": thinking_mode,
+        "api_style": api_style if api_style is not None else base.api_style,
+    }
+    if route is not None and route.backend == "api":
+        update.update({"model": route.model, "oauth_provider": None, "oauth_account": None})
+        return base.model_copy(update=update)
+    if route is not None:
+        update["model"] = route.model
+        config = base.model_copy(update=update)
+        bound = apply_oauth_binding(
+            config,
+            route.provider,
+            model_is_explicit=True,
+            account="" if route.rotates else route.account,
+        )
+        if bound is config:
+            logger.warning(
+                "Model route %r names an OAuth provider that is not registered; "
+                "sending %r to the configured endpoint instead",
+                value,
+                route.model,
+            )
+        return bound
+    update["model"] = value
+    config = base.model_copy(update=update)
+    provider_id, account = default
+    if provider_id:
+        config = apply_oauth_binding(
+            config, provider_id, model_is_explicit=model_is_explicit, account=account
+        )
+    return config
+
+
+def describe_call(config: LLMConfig) -> dict:
+    """Where a bound LLMConfig's calls go, in words the dashboard can show.
+
+    Answers the question the Models page exists for: for the value that is
+    selected, which backend, which account, which protocol, and which model
+    id will actually be on the wire.
+    """
+    from mira.oauth import registry, store
+
+    if config.oauth_provider:
+        spec = registry.get(config.oauth_provider)
+        if spec is not None and spec.llm is not None:
+            account = config.oauth_account or ""
+            found = store.accounts(spec.id)
+            if account:
+                tokens = found.get(account)
+                account_label = tokens.account_label if tokens else f"{account} (disconnected)"
+            elif len(found) == 1:
+                only = next(iter(found.values()))
+                account, account_label = only.account_key, only.account_label
+            else:
+                account_label = f"any of {len(found)} accounts (rotating)"
+            return {
+                "backend": "oauth",
+                "provider": spec.id,
+                "provider_label": spec.label,
+                "account": account,
+                "account_label": account_label,
+                "model": config.model,
+                "api_style": spec.llm.api_style,
+                "protocol": spec.llm.protocol_label,
+                "transport": spec.llm.transport_label,
+                "endpoint": spec.llm.base_url,
+                "connected": bool(found) and (not account or account in found),
+            }
+    if config.provider == "bedrock":
+        return {
+            "backend": "bedrock",
+            "provider": "bedrock",
+            "provider_label": "AWS Bedrock",
+            "account": "",
+            "account_label": "",
+            "model": config.model,
+            "api_style": "converse",
+            "protocol": "Bedrock Converse API",
+            "transport": "HTTPS",
+            "endpoint": f"bedrock:{config.region}",
+            "connected": True,
+        }
+    from mira.llm import provider_profiles as profiles
+
+    profile = profiles.resolve(config.base_url)
+    label = "OpenRouter" if profile.get("name") == "openrouter" else "API-key endpoint"
+    style = config.api_style if config.api_style in API_STYLE_VALUES else "chat"
+    return {
+        "backend": "api",
+        "provider": profile.get("name") or "openai-compatible",
+        "provider_label": label,
+        "account": "",
+        "account_label": config.api_key_env or "",
+        "model": config.model,
+        "api_style": style,
+        "protocol": next(s["label"] for s in API_STYLES if s["value"] == style),
+        "transport": "HTTPS",
+        "endpoint": config.base_url,
+        "connected": True,
+    }
 
 
 def estimate_indexing_cost(file_count: int, model: str) -> dict:
@@ -230,6 +390,10 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     Reads the DB setting first (via _app_db), falls back to config fields.
     Logs the effective model and where it came from, so a dashboard override
     shadowing mira.yaml is visible instead of silent (issue #124).
+
+    The value may be a route as well as a model id — ``oauth:chatgpt:*:gpt-
+    5-codex`` sends this purpose through a signed-in account whatever the
+    others do, ``api:…`` keeps it on the key — see :func:`bind_model`.
     """
     db_model: str | None = None
     db_thinking: str | None = None
@@ -254,11 +418,11 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     except Exception:
         pass  # DB not available — resolve from config fields alone
 
-    oauth_provider = resolve_oauth_provider(base, db_oauth)
+    default = resolve_oauth_default(base, db_oauth)
+    resolved_style = resolve_api_style(base, db_style)
 
     # Thinking mode only applies to reviews; other purposes leave it off.
     thinking_mode: str | None = None
-    resolved_style = resolve_api_style(base, db_style)
     if purpose == "indexing":
         resolved = get_indexing_model(base, db_model)
         config_model = base.indexing_model
@@ -271,25 +435,31 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
         config_model = base.review_model
         thinking_mode = get_review_thinking_mode(base, db_thinking)
     else:
-        config = base.model_copy(update={"reasoning_effort": None, "api_style": resolved_style})
-        if oauth_provider:
-            config = apply_oauth_binding(
-                config, oauth_provider, model_is_explicit=_model_is_explicit(base, None)
-            )
-        return config
+        return bind_model(
+            base,
+            base.model,
+            model_is_explicit=_model_is_explicit(base, None),
+            default=default,
+            api_style=resolved_style,
+        )
 
     source = "dashboard setting" if db_model else ("mira.yaml" if config_model else "default")
     logger.info("%s model: %s (source: %s)", purpose.capitalize(), resolved, source)
-    config = base.model_copy(
-        update={"model": resolved, "reasoning_effort": thinking_mode, "api_style": resolved_style}
+    config = bind_model(
+        base,
+        resolved,
+        model_is_explicit=_model_is_explicit(base, db_model or config_model),
+        default=default,
+        thinking_mode=thinking_mode,
+        api_style=resolved_style,
     )
-    if oauth_provider:
-        config = apply_oauth_binding(
-            config,
-            oauth_provider,
-            model_is_explicit=_model_is_explicit(base, db_model or config_model),
+    if config.oauth_provider:
+        logger.info(
+            "%s calls go through the %s OAuth session (%s)",
+            purpose.capitalize(),
+            config.oauth_provider,
+            config.oauth_account or "any account",
         )
-        logger.info("Reviewing through the %s OAuth session", oauth_provider)
     return config
 
 
@@ -305,22 +475,37 @@ def _model_is_explicit(base: LLMConfig, per_purpose: str | None) -> bool:
     return base.model != default
 
 
+def effective_route(
+    base: LLMConfig, resolved: str, per_purpose: str | None, default: tuple[str, str]
+) -> dict:
+    """What a call for this purpose will actually do, for the Models page.
+
+    ``resolved`` is what the DB → config chain produced. The answer carries
+    ``value`` — the option the picker should show as selected, which is
+    ``resolved`` unless the binding replaced its model — and the backend,
+    account, protocol and model id the call will carry. The dashboard has to
+    report the same answer the review path computes, or the Models page names
+    a model that no call will ever use.
+    """
+    from mira.oauth.routes import parse_route
+
+    bound = bind_model(
+        base, resolved, model_is_explicit=_model_is_explicit(base, per_purpose), default=default
+    )
+    described = describe_call(bound)
+    # A route is shown as written; a bare id shows whatever the binding
+    # settled on (its default, when the id could not be sent).
+    value = resolved if parse_route(resolved) is not None else bound.model
+    return {"value": value, **described}
+
+
 def effective_model(
     base: LLMConfig, resolved: str, per_purpose: str | None, oauth_provider: str
 ) -> str:
-    """The model id a call for this purpose will actually be made with.
+    """The picker value a call for this purpose will be made with.
 
-    ``resolved`` is what the DB → config chain produced; with an OAuth session
-    connected, the binding may still replace it (see :func:`apply_oauth_binding`).
-    The dashboard has to report the same answer the review path computes, or the
-    Models page names a model that no call will ever use — the mismatch is
-    invisible until a review fails on an id the endpoint has never served.
+    Kept for callers that only need the id; :func:`effective_route` is the
+    full answer.
     """
-    if not oauth_provider:
-        return resolved
-    bound = apply_oauth_binding(
-        base.model_copy(update={"model": resolved}),
-        oauth_provider,
-        model_is_explicit=_model_is_explicit(base, per_purpose),
-    )
-    return bound.model
+    default = (oauth_provider, "") if oauth_provider else ("", "")
+    return effective_route(base, resolved, per_purpose, default)["value"]

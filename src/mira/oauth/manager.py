@@ -252,31 +252,71 @@ async def complete_login(
         verifier=str(attempt.get("verifier", "")),
         redirect_uri=str(attempt.get("redirect_uri", "")),
     )
-    _store_session(tokens, spec.label, resolved_db)
-    return store.status(spec.id, resolved_db)
+    return store_session(tokens, resolved_db)
 
 
-def _store_session(tokens: OAuthTokens, label: str, db: SettingsStore) -> None:
-    """Persist a fresh grant and log who it belongs to (never the token)."""
-    store.save(tokens, db)
+def store_session(tokens: OAuthTokens, db: SettingsStore | None = None) -> dict[str, Any]:
+    """Persist a fresh grant into its account slot and describe the result.
+
+    The first account a provider gets also becomes the default backend for
+    bare model ids, so "connect" alone is enough to start reviewing with it;
+    a second account joins the rotation without changing anybody's choice.
+    Logged by account, never by token.
+    """
+    spec = registry.require(tokens.provider)
+    resolved_db = store._resolve(db)
+    had_accounts = bool(store.accounts(spec.id, resolved_db))
+    store.save(tokens, resolved_db)
     logger.info(
         "Connected %s account %s%s",
-        label,
+        spec.label,
         tokens.account_label or tokens.account_id or "(unknown)",
         f" [{tokens.plan}]" if tokens.plan else "",
     )
+    if spec.llm is not None and not had_accounts and not store.get_active_ref(resolved_db):
+        store.set_active(spec.id, "", resolved_db)
+    return {
+        **store.account_status(spec.id, tokens, resolved_db),
+        "provider": spec.id,
+        "label": spec.label,
+        "connected": True,
+    }
 
 
-def disconnect(provider_id: str, db: SettingsStore | None = None) -> None:
-    """Forget a provider's session."""
+def disconnect(provider_id: str, account_key: str = "", db: SettingsStore | None = None) -> None:
+    """Forget one of a provider's accounts, or all of them with no key."""
     spec = registry.require(provider_id)
-    store.delete(spec.id, db)
-    logger.info("Disconnected %s", spec.label)
+    if account_key:
+        store.delete(spec.id, account_key, db)
+        logger.info("Disconnected %s account %s", spec.label, account_key)
+    else:
+        store.delete_all(spec.id, db)
+        logger.info("Disconnected every %s account", spec.label)
 
 
 def list_status(db: SettingsStore | None = None) -> dict[str, Any]:
-    """Every provider's connection state plus which one is serving reviews."""
+    """Every provider's accounts, plus which backend bare model ids go to."""
+    ref = store.get_active_ref(db)
+    provider_id, account_key = store.parse_ref(ref)
     return {
-        "active_provider": store.get_active_provider(db),
+        "active_provider": provider_id,
+        "active_account": account_key,
+        "active_ref": ref,
         "providers": [store.status(pid, db) for pid in sorted(registry.all_providers())],
     }
+
+
+async def refresh_usage(
+    provider_id: str, account_key: str, db: SettingsStore | None = None
+) -> dict[str, Any]:
+    """Ask the provider where an account's allowance stands, and record it."""
+    spec = registry.require(provider_id)
+    tokens = await store.valid_tokens(spec.id, account_key, db)
+    snapshot = await spec.fetch_usage(tokens)
+    if snapshot is None:
+        raise OAuthError(f"{spec.label} did not report usage for this account")
+    if snapshot.plan and snapshot.plan != tokens.plan:
+        tokens.plan = snapshot.plan
+        store.save(tokens, db)
+    store.save_usage(spec.id, tokens.account_key, snapshot, db)
+    return store.account_status(spec.id, tokens, db)

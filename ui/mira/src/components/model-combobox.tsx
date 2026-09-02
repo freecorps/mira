@@ -1,12 +1,9 @@
 import { useRef, useState, type ReactNode } from "react"
 
 import { Input } from "@/components/ui/input"
+import { describeSelection, type ModelOption } from "@/lib/model-options"
 
-export type ModelOption = {
-  value: string
-  label: string
-  recommended?: boolean
-}
+export type { ModelOption } from "@/lib/model-options"
 
 function ComboboxItem({
   onPick,
@@ -41,8 +38,21 @@ function ComboboxItem({
   )
 }
 
+function GroupHeader({ group, detail }: { group: string; detail?: string }) {
+  return (
+    <div
+      role="presentation"
+      className="sticky top-0 z-10 border-b bg-popover px-2 py-1 text-[0.7rem] text-muted-foreground"
+    >
+      <span className="font-medium text-foreground">{group}</span>
+      {detail && <span className="ml-1.5">· {detail}</span>}
+    </div>
+  )
+}
+
 // Searchable model picker. Typing filters the backend's catalog; arrows +
-// Enter or click select; free-form ids commit via the "Use …" row. When
+// Enter or click select; free-form ids commit via the "Use …" row. Options
+// are shown under their group headers (one per backend/account). When
 // `configModel` is set, an "Inherit from deployment config" row is pinned
 // first and selecting it yields value "".
 export function ModelCombobox({
@@ -63,11 +73,13 @@ export function ModelCombobox({
 
   const selected =
     value === "" && configModel !== undefined
-      ? `Inherit from deployment config (${configModel})`
-      : (options.find((o) => o.value === value)?.label ?? value)
+      ? `Inherit from deployment config (${describeSelection(configModel, options)})`
+      : describeSelection(value, options)
   const q = query.trim().toLowerCase()
   const filtered = q
-    ? options.filter((o) => `${o.label} ${o.value}`.toLowerCase().includes(q))
+    ? options.filter((o) =>
+        `${o.label} ${o.value} ${o.group ?? ""}`.toLowerCase().includes(q)
+      )
     : options
   const showInherit = configModel !== undefined
   const custom =
@@ -130,7 +142,7 @@ export function ModelCombobox({
       {open && (
         <div
           role="listbox"
-          className="absolute z-50 mt-1 max-h-64 w-full overflow-y-auto rounded-md border bg-popover text-popover-foreground shadow-md"
+          className="absolute z-50 mt-1 max-h-72 w-full overflow-y-auto rounded-md border bg-popover text-popover-foreground shadow-md"
           onMouseDown={(e) => e.preventDefault()}
         >
           {showInherit && (
@@ -140,30 +152,35 @@ export function ModelCombobox({
               onHover={() => setHighlight(0)}
             >
               Inherit from deployment config
-              <span className="ml-2 font-mono text-xs text-muted-foreground">
+              <span className="ml-2 truncate font-mono text-xs text-muted-foreground">
                 {configModel}
               </span>
             </ComboboxItem>
           )}
           {filtered.map((opt, i) => (
-            <ComboboxItem
-              key={opt.value}
-              onPick={() => pick(opt.value)}
-              highlighted={highlight === firstOption + i}
-              onHover={() => setHighlight(firstOption + i)}
-            >
-              <span className="truncate">{opt.label}</span>
-              {opt.value !== opt.label && (
-                <span className="ml-2 truncate font-mono text-xs text-muted-foreground">
-                  {opt.value}
-                </span>
-              )}
-              {opt.recommended && (
-                <span className="ml-auto pl-2 text-xs text-muted-foreground">
-                  Recommended
-                </span>
-              )}
-            </ComboboxItem>
+            <div key={`${opt.group ?? ""} ${opt.value}`}>
+              {opt.group &&
+                (i === 0 || filtered[i - 1].group !== opt.group) && (
+                  <GroupHeader group={opt.group} detail={opt.detail} />
+                )}
+              <ComboboxItem
+                onPick={() => pick(opt.value)}
+                highlighted={highlight === firstOption + i}
+                onHover={() => setHighlight(firstOption + i)}
+              >
+                <span className="truncate">{opt.label}</span>
+                {opt.value !== opt.label && (
+                  <span className="ml-2 truncate font-mono text-xs text-muted-foreground">
+                    {opt.value}
+                  </span>
+                )}
+                {opt.recommended && (
+                  <span className="ml-auto pl-2 text-xs text-muted-foreground">
+                    Recommended
+                  </span>
+                )}
+              </ComboboxItem>
+            </div>
           ))}
           {custom && (
             <ComboboxItem
