@@ -563,3 +563,87 @@ class TestOutputText:
 
         data = {"output": []}
         assert _output_text(data) == ""
+
+
+class TestConversationReplay:
+    """What a Responses endpoint gets back on the next turn of a tool loop."""
+
+    def test_rebuilt_function_calls_carry_no_item_id(self):
+        # ``id`` names the endpoint's own ``fc_…`` item; the chat-shaped call
+        # id is not one, and the endpoint refuses the request over it.
+        from mira.llm.responses import _responses_input
+
+        items = _responses_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "x = 1"},
+            ]
+        )
+        assert items[0] == {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": '{"path": "a"}',
+        }
+        assert items[1] == {"type": "function_call_output", "call_id": "call_1", "output": "x = 1"}
+
+    def test_raw_items_are_replayed_verbatim(self):
+        # A reasoning model wants its encrypted reasoning back, in front of
+        # the call it led to, with the ids the endpoint issued.
+        from mira.llm.responses import _responses_input
+
+        raw = [
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc", "summary": []},
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{}",
+                "status": "completed",
+            },
+        ]
+        items = _responses_input(
+            [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {}}],
+                    "items": raw,
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "x"},
+            ]
+        )
+        assert items[1:3] == raw
+        assert items[3]["type"] == "function_call_output"
+
+    def test_response_message_hands_back_the_replayable_items(self):
+        from mira.llm.responses import _response_message
+
+        data = {
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc"},
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{}",
+                },
+                {"type": "web_search_call", "id": "ws_1"},
+            ]
+        }
+        msg = _response_message(data)
+        assert msg["tool_calls"][0]["id"] == "call_1"
+        assert [i["type"] for i in msg["items"]] == ["reasoning", "function_call"]

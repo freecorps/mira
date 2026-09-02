@@ -35,8 +35,10 @@ def _responses_input(messages: list[dict]) -> list[dict]:
     """Convert chat-shaped messages to Responses API input items.
 
     system/user -> {"role": role, "content": <str>} (simple form).
-    assistant   -> output-text message item, PLUS one {"type": "function_call",
-                  "id"/"call_id" = call id, "name", "arguments"} item per tool call.
+    assistant   -> its raw ``items`` replayed verbatim when it carries them;
+                  otherwise an output-text message item, PLUS one
+                  {"type": "function_call", "call_id", "name", "arguments"}
+                  item per tool call.
     tool        -> {"type": "function_call_output", "call_id": msg["tool_call_id"]
                   or "call_0", "output": <str>}.
     Assistant items with empty content AND no tool_calls are skipped.
@@ -55,6 +57,16 @@ def _responses_input(messages: list[dict]) -> list[dict]:
             continue
 
         if role == "assistant":
+            raw_items = msg.get("items")
+            if isinstance(raw_items, list) and raw_items:
+                # The endpoint's own output items from an earlier turn (see
+                # ``_response_message``), replayed as they came. A reasoning
+                # model needs them back verbatim: the encrypted reasoning item
+                # must precede the function call it led to, and the call must
+                # carry the ``fc_…`` id the endpoint gave it — a rebuilt item
+                # has neither, and the request is refused with a 400.
+                items.extend(dict(item) for item in raw_items if isinstance(item, dict))
+                continue
             content = msg.get("content")
             tool_calls = msg.get("tool_calls") or []
             if not content and not tool_calls:
@@ -65,10 +77,13 @@ def _responses_input(messages: list[dict]) -> list[dict]:
                 args = tc.get("function", {}).get("arguments", "{}")
                 if isinstance(args, dict):
                     args = json.dumps(args)
+                # No ``id``: that field names the endpoint's own ``fc_…`` item,
+                # and the chat-shaped call id (``call_…``) is not one — the
+                # endpoint rejects it. ``call_id`` is what pairs the call with
+                # its output.
                 items.append(
                     {
                         "type": "function_call",
-                        "id": tc.get("id", ""),
                         "call_id": tc.get("id", ""),
                         "name": tc.get("function", {}).get("name", ""),
                         "arguments": args,
@@ -121,18 +136,32 @@ def _output_text(data: dict) -> str:
     return data.get("output_text", "")
 
 
+# Output item types worth handing back to the endpoint on the next turn.
+_REPLAYED_ITEM_TYPES = ("reasoning", "function_call", "message")
+
+
 def _response_message(data: dict) -> dict:
     """Normalize a Responses response to the chat-shaped assistant dict the
     agentic loop reads: {"role":"assistant","content": <str or None>,
     "tool_calls": [{"id","type":"function","function":{"name","arguments"}}]}.
     content None when only tool calls are present (match chat shape).
-    tool_calls empty list when none."""
+    tool_calls empty list when none.
+
+    ``items`` carries the raw output items (reasoning, function calls,
+    messages) so a caller that continues the conversation can hand them back
+    as they were — see ``_responses_input``. Chat-protocol callers ignore it.
+    """
     output = data.get("output", [])
     text_parts: list[str] = []
     tool_calls: list[dict] = []
+    replay: list[dict] = []
 
     for item in output:
+        if not isinstance(item, dict):
+            continue
         itype = item.get("type", "")
+        if itype in _REPLAYED_ITEM_TYPES:
+            replay.append(item)
         if itype == "message" and item.get("role") == "assistant":
             content = item.get("content", [])
             if isinstance(content, list):
@@ -153,7 +182,7 @@ def _response_message(data: dict) -> dict:
             )
 
     content = "".join(text_parts) if text_parts else (None if tool_calls else "")
-    return {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    return {"role": "assistant", "content": content, "tool_calls": tool_calls, "items": replay}
 
 
 # ── Provider class ──────────────────────────────────────────────────

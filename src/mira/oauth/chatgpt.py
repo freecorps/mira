@@ -10,10 +10,15 @@ and all three are captured here rather than in the provider class:
 
 * every request carries the ChatGPT account id, which arrives inside the
   id_token rather than as a top-level field;
-* it answers as a server-sent event stream only, so ``stream`` is forced on
-  (:mod:`mira.llm.oauth` reassembles the final response from the stream);
+* it answers as a server-sent event stream only, so ``stream`` is forced on,
+  and its closing ``response.completed`` event carries an empty ``output`` —
+  each finished item arrives once, in ``response.output_item.done``
+  (:mod:`mira.llm.oauth` reassembles the final response from those);
 * it rejects several fields a stock Responses request would send
-  (``temperature``, ``max_output_tokens``, ``store: true``).
+  (``temperature``, ``max_output_tokens``, ``store: true``);
+* it serves several model generations at once, and each takes a different
+  set of reasoning levels (``low`` … ``xhigh``, ``max``, ``ultra``), so the
+  level asked for is clamped per model to what that model accepts.
 
 Two more things the backend offers that a key-based endpoint does not, and
 which the dashboard and the account rotation lean on:
@@ -64,27 +69,19 @@ _CLIENT_VERSION = os.environ.get("MIRA_CODEX_CLIENT_VERSION", "99.0.0")
 _ORIGINATOR = "codex_cli_rs"
 _USAGE_TIMEOUT = 15.0
 
-
-def _hoist_instructions(body: dict[str, Any]) -> None:
-    """Move a leading system message into the top-level ``instructions`` field.
-
-    The Codex backend expects the system prompt where its own client puts it,
-    and this is the same prompt either way — the field is what the Responses
-    API calls a system message, not an extra one.
-    """
-    if body.get("instructions"):
-        return
-    items = body.get("input")
-    if not isinstance(items, list) or not items:
-        return
-    first = items[0]
-    if not isinstance(first, dict) or first.get("role") != "system":
-        return
-    content = first.get("content")
-    if not isinstance(content, str) or not content:
-        return
-    body["instructions"] = content
-    body["input"] = items[1:]
+# Reasoning levels from least to most, as the backend names them. "ultra" is
+# left out on purpose: the backend describes it as "maximum reasoning with
+# automatic task delegation", a Codex-agent behaviour, not a deeper think.
+_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+# What each model accepts, by slug, as last reported by ``/codex/models``:
+# every entry the backend listed, hidden ones included, since an operator can
+# type an id the picker does not show. Filled by :meth:`fetch_models`.
+_model_levels: dict[str, tuple[str, ...]] = {}
+# When the levels were last asked for, per account key — so a review pass
+# does not re-ask on every call, and a failed ask is retried soon after.
+_levels_asked_at: dict[str, float] = {}
+_LEVELS_TTL = 3600.0
+_LEVELS_RETRY = 60.0
 
 
 class ChatGPTOAuthProvider(OAuthProviderSpec):
@@ -113,17 +110,25 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
     llm: ClassVar[LLMBinding | None] = LLMBinding(
         base_url=f"{_BACKEND}/codex",
         api_style="responses",
-        default_model="gpt-5-codex",
+        default_model="gpt-5.6-sol",
+        # The fallback when ``/codex/models`` cannot be asked: what the backend
+        # listed for a Plus account when this was last refreshed, in its own
+        # order. The live list is always preferred, so this only has to be
+        # roughly right — an id here that the plan no longer carries fails at
+        # the endpoint with the id in the error.
         models=(
-            {"value": "gpt-5-codex", "label": "GPT-5 Codex", "recommended": True},
-            {"value": "gpt-5", "label": "GPT-5"},
-            {"value": "gpt-5.1-codex", "label": "GPT-5.1 Codex"},
-            {"value": "gpt-5.1", "label": "GPT-5.1"},
-            {"value": "codex-mini-latest", "label": "Codex Mini"},
+            {"value": "gpt-5.6-sol", "label": "GPT-5.6-Sol", "recommended": True},
+            {"value": "gpt-5.6-terra", "label": "GPT-5.6-Terra"},
+            {"value": "gpt-5.6-luna", "label": "GPT-5.6-Luna"},
+            {"value": "gpt-5.5", "label": "GPT-5.5"},
+            {"value": "gpt-5.4", "label": "GPT-5.4"},
+            {"value": "gpt-5.4-mini", "label": "GPT-5.4-Mini"},
         ),
-        # The backend takes minimal/low/medium/high; our "max" has no
-        # equivalent, so it lands on the highest level it does accept.
-        reasoning_effort_map={"max": "high"},
+        # Used only for a model whose levels the backend has not told us:
+        # every model it currently serves takes "xhigh", and our "max" means
+        # "as deep as it goes". A model known to take "max" itself gets it —
+        # see :meth:`reasoning_effort`.
+        reasoning_effort_map={"max": "xhigh"},
         protocol_label="Responses API (Codex backend)",
         transport_label="server-sent events",
     )
@@ -201,13 +206,20 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
         Sampling knobs and output caps are rejected outright here rather than
         ignored, so they are dropped instead of passed through; ``store`` must
         be false because this endpoint does not persist responses for us; and
-        the encrypted reasoning trace has to be requested explicitly or a
-        multi-turn tool loop loses the model's thinking between calls.
+        the encrypted reasoning trace is always requested, as the Codex client
+        does — with nothing stored server-side, a reasoning item handed back
+        on the next turn of a tool loop is only usable if it carries its
+        content, and the model reasons whether or not an effort was asked for.
+
+        The system message stays in ``input``, where a stock Responses request
+        puts it. The backend takes it there, and JSON mode depends on it: the
+        rule that some input message must say "json" does not count the
+        top-level ``instructions`` field, so hoisting the system prompt into
+        it turned every JSON-mode call whose only mention was there into a 400.
         """
         body = dict(body)
         body["stream"] = True
         body["store"] = False
-        _hoist_instructions(body)
         body.pop("temperature", None)
         body.pop("max_output_tokens", None)
         body.pop("top_p", None)
@@ -216,11 +228,56 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
         reasoning = body.get("reasoning")
         if isinstance(reasoning, dict):
             reasoning.setdefault("summary", "auto")
-            include = list(body.get("include") or [])
-            if "reasoning.encrypted_content" not in include:
-                include.append("reasoning.encrypted_content")
-            body["include"] = include
+        include = list(body.get("include") or [])
+        if "reasoning.encrypted_content" not in include:
+            include.append("reasoning.encrypted_content")
+        body["include"] = include
         return body
+
+    # ── Reasoning levels ───────────────────────────────────────────
+
+    @classmethod
+    def reasoning_effort(cls, model: str, effort: str) -> str:
+        """The level to send ``model`` when ``effort`` was asked for.
+
+        The backend's own list says what each model takes, and the answer is
+        the requested level when the model has it, else the highest it has
+        below it — "max" on a model that stops at "xhigh" is "xhigh", not a
+        400. A model the list has not described yet goes through the static
+        map, and a level outside the known scale is sent as written.
+        """
+        levels = _model_levels.get(model)
+        if not levels:
+            return super().reasoning_effort(model, effort)
+        if effort in levels:
+            return effort
+        if effort not in _EFFORT_ORDER:
+            return super().reasoning_effort(model, effort)
+        rank = _EFFORT_ORDER.index(effort)
+        for candidate in reversed(_EFFORT_ORDER[:rank]):
+            if candidate in levels:
+                return candidate
+        for candidate in _EFFORT_ORDER:
+            if candidate in levels:
+                return candidate
+        return effort
+
+    @classmethod
+    def reasoning_levels(cls, model: str) -> tuple[str, ...]:
+        """What the backend last said ``model`` accepts (empty if never told)."""
+        return _model_levels.get(model, ())
+
+    @classmethod
+    async def prepare(cls, tokens: OAuthTokens) -> None:
+        """Learn the account's models, and their levels, once an hour."""
+        key = tokens.account_key or tokens.account_id or ""
+        asked = _levels_asked_at.get(key)
+        if asked is not None:
+            ttl = _LEVELS_TTL if _model_levels else _LEVELS_RETRY
+            if time.time() - asked < ttl:
+                return
+        _levels_asked_at[key] = time.time()
+        await cls.fetch_models(tokens)
 
     # ── Usage ──────────────────────────────────────────────────────
 
@@ -303,6 +360,7 @@ class ChatGPTOAuthProvider(OAuthProviderSpec):
             payload = resp.json()
         except ValueError:
             return None
+        remember_reasoning_levels(payload)
         return models_from_payload(payload)
 
 
@@ -375,13 +433,7 @@ def models_from_payload(payload: Any) -> list[dict[str, Any]] | None:
         visibility = str(entry.get("visibility", "list") or "list").lower()
         if visibility not in ("list", ""):
             continue
-        levels = entry.get("supported_reasoning_levels")
-        efforts = []
-        if isinstance(levels, list):
-            for level in levels:
-                effort = level.get("effort") if isinstance(level, dict) else level
-                if isinstance(effort, str) and effort:
-                    efforts.append(effort.lower())
+        efforts = list(_reasoning_levels(entry))
         try:
             priority = int(entry.get("priority", 0) or 0)
         except (TypeError, ValueError):
@@ -397,6 +449,39 @@ def models_from_payload(payload: Any) -> list[dict[str, Any]] | None:
         )
     out.sort(key=lambda m: m["priority"])
     return [{k: v for k, v in m.items() if k != "priority"} for m in out]
+
+
+def remember_reasoning_levels(payload: Any) -> None:
+    """Note which reasoning levels each listed model takes, hidden ones too.
+
+    Kept apart from :func:`models_from_payload` so the dropdown's filtering
+    (hidden models out) does not decide what :meth:`reasoning_effort` knows:
+    an operator can type a hidden id, and it still needs the right level.
+    """
+    if not isinstance(payload, dict):
+        return
+    entries = payload.get("models")
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug", "") or "").strip()
+        levels = _reasoning_levels(entry)
+        if slug and levels:
+            _model_levels[slug] = levels
+
+
+def _reasoning_levels(entry: dict[str, Any]) -> tuple[str, ...]:
+    raw = entry.get("supported_reasoning_levels")
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for level in raw:
+        effort = level.get("effort") if isinstance(level, dict) else level
+        if isinstance(effort, str) and effort:
+            out.append(effort.lower())
+    return tuple(out)
 
 
 def _window_from_payload(raw: Any) -> UsageWindow | None:

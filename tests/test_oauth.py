@@ -549,7 +549,7 @@ class TestConfigResolution:
         # The default id is an OpenRouter-style Claude model this endpoint
         # cannot serve; an id somebody typed is theirs to keep.
         inherited = apply_oauth_binding(LLMConfig(), "chatgpt", model_is_explicit=False)
-        assert inherited.model == "gpt-5-codex"
+        assert inherited.model == "gpt-5.6-sol"
         chosen = apply_oauth_binding(LLMConfig(model="gpt-5"), "chatgpt", model_is_explicit=True)
         assert chosen.model == "gpt-5"
 
@@ -558,7 +558,7 @@ class TestConfigResolution:
         db.set_setting("llm_oauth_provider", "chatgpt")
         resolved = llm_config_for("review", LLMConfig())
         assert resolved.oauth_provider == "chatgpt"
-        assert resolved.model == "gpt-5-codex"
+        assert resolved.model == "gpt-5.6-sol"
         assert resolved.api_style == "responses"
 
     def test_a_foreign_model_id_is_not_sent_to_the_endpoint(self):
@@ -568,7 +568,7 @@ class TestConfigResolution:
         bound = apply_oauth_binding(
             LLMConfig(model="anthropic/claude-haiku-4-5"), "chatgpt", model_is_explicit=True
         )
-        assert bound.model == "gpt-5-codex"
+        assert bound.model == "gpt-5.6-sol"
 
     def test_an_unfamiliar_bare_id_is_left_alone(self):
         # A model released after this build is the user's call, not ours.
@@ -582,7 +582,7 @@ class TestConfigResolution:
         db.set_setting("llm_oauth_provider", "chatgpt")
         db.set_setting("indexing_model", "anthropic/claude-haiku-4-5")
         resolved = llm_config_for("indexing", LLMConfig())
-        assert resolved.model == "gpt-5-codex"
+        assert resolved.model == "gpt-5.6-sol"
         assert resolved.base_url == "https://chatgpt.com/backend-api/codex"
 
     def test_llm_config_for_keeps_a_dashboard_model(self, db: AppDatabase):
@@ -602,7 +602,7 @@ class TestConfigResolution:
         options = build_options(
             backend, [dict(m) for m in ChatGPTOAuthProvider.llm.models], "review"
         )
-        assert [o["value"] for o in options][0] == "gpt-5-codex"
+        assert [o["value"] for o in options][0] == "gpt-5.6-sol"
         assert all("recommended" in o for o in options)
 
 
@@ -770,8 +770,8 @@ class TestRoutes:
         values = [o.value for o in models.review_options]
         # The bare id (default backend), the same account named explicitly,
         # and the API key's own list kept reachable under its prefix.
-        assert "gpt-5-codex" in values
-        assert "oauth:chatgpt:acct_123:gpt-5-codex" in values
+        assert "gpt-5.6-sol" in values
+        assert "oauth:chatgpt:acct_123:gpt-5.6-sol" in values
         assert any(v.startswith("api:") for v in values)
         groups = {o.group for o in models.review_options}
         assert any(g.startswith("Default — ChatGPT (Codex)") for g in groups)
@@ -824,7 +824,7 @@ class TestRequestShaping:
     def test_codex_body_drops_what_the_endpoint_rejects(self):
         body = ChatGPTOAuthProvider.adapt_llm_body(
             {
-                "model": "gpt-5-codex",
+                "model": "gpt-5.6-sol",
                 "input": [{"role": "user", "content": "hi"}],
                 "temperature": 0.2,
                 "max_output_tokens": 4096,
@@ -835,17 +835,16 @@ class TestRequestShaping:
         assert "temperature" not in body
         assert "max_output_tokens" not in body
 
-    def test_system_message_becomes_instructions(self):
-        body = ChatGPTOAuthProvider.adapt_llm_body(
-            {
-                "input": [
-                    {"role": "system", "content": "You review code."},
-                    {"role": "user", "content": "diff"},
-                ]
-            }
-        )
-        assert body["instructions"] == "You review code."
-        assert body["input"] == [{"role": "user", "content": "diff"}]
+    def test_system_message_stays_in_the_input(self):
+        # The backend takes it there, and JSON mode needs it there: the
+        # "some input message must say json" rule ignores `instructions`.
+        messages = [
+            {"role": "system", "content": "You review code. Answer in JSON."},
+            {"role": "user", "content": "diff"},
+        ]
+        body = ChatGPTOAuthProvider.adapt_llm_body({"input": messages})
+        assert body["input"] == messages
+        assert "instructions" not in body
 
     def test_reasoning_requests_the_encrypted_trace(self):
         body = ChatGPTOAuthProvider.adapt_llm_body({"input": [], "reasoning": {"effort": "high"}})
@@ -868,13 +867,90 @@ class TestOAuthProvider:
         provider = create_llm(LLMConfig(oauth_provider="chatgpt"))
         assert isinstance(provider, OAuthResponsesProvider)
 
-    def test_reasoning_effort_map_comes_from_the_spec(self):
-        # "max" has no equivalent on this backend and must land on "high"
-        # rather than being sent through as an unknown level.
+    def test_the_endpoint_is_the_specs_whatever_base_url_says(self):
+        # A config that names the provider but kept the API-key endpoint
+        # (mira.yaml with only `oauth_provider` set, or a test config) must
+        # not send a ChatGPT token to OpenRouter.
+        provider = create_llm(
+            LLMConfig(oauth_provider="chatgpt", base_url="https://openrouter.ai/api/v1")
+        )
+        assert provider._url == "https://chatgpt.com/backend-api/codex/responses"
+
+    def test_reasoning_effort_map_comes_from_the_spec(self, monkeypatch):
+        # A model the backend has not described yet goes through the static
+        # map: "max" means "as deep as it goes", which on this backend is
+        # "xhigh" for every model it serves.
+        from mira.oauth import chatgpt
+
+        monkeypatch.setattr(chatgpt, "_model_levels", {})
         provider = create_llm(LLMConfig(oauth_provider="chatgpt", reasoning_effort="max"))
-        body: dict = {"model": "gpt-5-codex"}
+        body: dict = {"model": "gpt-5.6-sol"}
         provider._apply_reasoning(body)
-        assert body["reasoning"] == {"effort": "high"}
+        assert body["reasoning"] == {"effort": "xhigh"}
+        assert "temperature" not in body
+
+    def test_reasoning_effort_is_clamped_to_what_the_model_takes(self, monkeypatch):
+        # The backend serves several generations at once; "max" is a real
+        # level on one and a 400 on another. The list it gave us decides.
+        from mira.oauth import chatgpt
+
+        monkeypatch.setattr(
+            chatgpt,
+            "_model_levels",
+            {
+                "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
+                "gpt-5.5": ("low", "medium", "high", "xhigh"),
+                "tiny": ("medium",),
+            },
+        )
+        spec = ChatGPTOAuthProvider
+        assert spec.reasoning_effort("gpt-5.6-sol", "max") == "max"
+        assert spec.reasoning_effort("gpt-5.5", "max") == "xhigh"
+        assert spec.reasoning_effort("gpt-5.5", "high") == "high"
+        # Below the model's floor: the lowest it has, not a level it lacks.
+        assert spec.reasoning_effort("tiny", "low") == "medium"
+        # A level outside the known scale is not second-guessed.
+        assert spec.reasoning_effort("gpt-5.5", "ultra") == "ultra"
+        # Unknown model: the static map.
+        assert spec.reasoning_effort("gpt-9", "max") == "xhigh"
+
+        provider = create_llm(LLMConfig(oauth_provider="chatgpt", reasoning_effort="max"))
+        body: dict = {"model": "gpt-5.6-sol", "temperature": 0.1}
+        provider._apply_reasoning(body)
+        assert body["reasoning"] == {"effort": "max"}
+
+    def test_the_model_list_teaches_the_levels(self, monkeypatch):
+        # Hidden models are kept out of the picker but an operator can still
+        # type one, so its levels are remembered all the same.
+        from mira.oauth import chatgpt
+
+        monkeypatch.setattr(chatgpt, "_model_levels", {})
+        payload = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "visibility": "list",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}],
+                },
+                {
+                    "slug": "gpt-reserve",
+                    "visibility": "hide",
+                    "supported_reasoning_levels": [{"effort": "medium"}],
+                },
+            ]
+        }
+        chatgpt.remember_reasoning_levels(payload)
+        assert ChatGPTOAuthProvider.reasoning_levels("gpt-5.6-sol") == ("low", "max")
+        assert ChatGPTOAuthProvider.reasoning_levels("gpt-reserve") == ("medium",)
+        assert [m["value"] for m in chatgpt.models_from_payload(payload)] == ["gpt-5.6-sol"]
+
+    def test_the_encrypted_reasoning_trace_is_always_requested(self):
+        # With nothing stored server-side, a reasoning item handed back on
+        # the next turn is only usable if it carries its content — and the
+        # model reasons whether or not an effort was asked for.
+        body = ChatGPTOAuthProvider.adapt_llm_body({"model": "gpt-5.6-sol", "input": []})
+        assert body["include"] == ["reasoning.encrypted_content"]
+        assert "reasoning" not in body
 
     def test_headers_without_a_session_explain_what_to_do(self, db: AppDatabase):
         provider = create_llm(LLMConfig(oauth_provider="chatgpt"))
@@ -921,6 +997,74 @@ class TestStreamCollection:
         )
         payload = await _collect_stream(resp, "ChatGPT")
         assert payload["usage"] == {"input_tokens": 5}
+
+    @pytest.mark.asyncio
+    async def test_items_are_stitched_from_their_done_events(self):
+        # The Codex backend's completion event carries ``output: []``; the
+        # function call the whole review hangs on is only ever delivered in
+        # its own ``output_item.done`` event. Reading just the completion
+        # object made every tool call look like an empty answer.
+        resp = _sse(
+            [
+                {"type": "response.created", "response": {"id": "r1", "output": []}},
+                {"type": "response.output_item.added", "output_index": 0, "item": {}},
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "submit_review",
+                        "arguments": '{"comments": []}',
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "x"},
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"id": "r1", "output": [], "usage": {"input_tokens": 5}},
+                },
+            ]
+        )
+        payload = await _collect_stream(resp, "ChatGPT")
+        assert payload["id"] == "r1"
+        assert payload["usage"] == {"input_tokens": 5}
+        assert [i["type"] for i in payload["output"]] == ["reasoning", "function_call"]
+        assert payload["output"][1]["arguments"] == '{"comments": []}'
+
+    @pytest.mark.asyncio
+    async def test_a_completion_that_carries_its_output_is_left_alone(self):
+        resp = _sse(
+            [
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "message", "role": "assistant", "content": []},
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"id": "r1", "output": [{"type": "message", "id": "m1"}]},
+                },
+            ]
+        )
+        payload = await _collect_stream(resp, "ChatGPT")
+        assert payload["output"] == [{"type": "message", "id": "m1"}]
+
+    @pytest.mark.asyncio
+    async def test_text_deltas_stand_in_when_no_item_arrived(self):
+        resp = _sse(
+            [
+                {"type": "response.output_text.delta", "delta": "hel"},
+                {"type": "response.output_text.delta", "delta": "lo"},
+                {"type": "response.completed", "response": {"id": "r1", "output": []}},
+            ]
+        )
+        payload = await _collect_stream(resp, "ChatGPT")
+        assert payload["output"][0]["content"][0]["text"] == "hello"
 
     @pytest.mark.asyncio
     async def test_a_failure_event_raises_with_its_message(self):
