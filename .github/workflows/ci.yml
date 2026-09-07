@@ -28,7 +28,7 @@ jobs:
   # build and two image builds. Skipped jobs count as passing for `needs`.
   changes:
     name: Detect changes
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
       # paths-filter lists a PR's files through the API; pushes are diffed
@@ -71,7 +71,7 @@ jobs:
   # TOML, large files) cover files the other jobs never look at.
   lint:
     name: Lint (pre-commit)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -110,7 +110,7 @@ jobs:
     name: Test (Python ${{ matrix.python-version }})
     needs: changes
     if: needs.changes.outputs.python == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
@@ -143,7 +143,7 @@ jobs:
     name: UI build
     needs: changes
     if: needs.changes.outputs.ui == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: ui/mira
@@ -183,15 +183,15 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
           - platform: linux/arm64
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -204,14 +204,13 @@ jobs:
       # registry. Nothing is written from here, so this job never needs more
       # than `packages: read` and PRs cannot poison the cache.
       - name: Build image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           platforms: ${{ matrix.platform }}
           load: true
           tags: mira:ci
           provenance: false
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
 
       # Image ENTRYPOINT is `mira serve`, so anything after the image name
       # is appended as args to `serve`. Override the entrypoint for tests

@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   evals:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # The `production` environment (required reviewers) scopes the
     # OPENROUTER_API_KEY secret behind an explicit human approval, so a
     # compromised PR/action can't spend it or exfiltrate it.
