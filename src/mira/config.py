@@ -341,17 +341,23 @@ class ReviewStatusConfig(BaseModel):
 
 class ReviewConfig(BaseModel):
     context_lines: int = Field(default=3, ge=0)
-    # Total diff size cap. Above this, the diff is *not* truncated arbitrarily —
+    # Automatically drain all eligible changes, respecting explicit exclusions.
+    # The legacy file/size caps only apply when auto_complete is disabled.
+    auto_complete: bool = True
+    agent_token_budget: int = Field(default=24_000, ge=4000)
+    # Soft file-count target; a connected group that fits stays together.
+    agent_max_files: int = Field(default=12, ge=1)
+    # Retries per failed part, in addition to provider transport retries.
+    chunk_retries: int = Field(default=1, ge=0, le=3)
+    # Legacy total diff size cap (auto_complete: false). Above this, the diff is *not* truncated arbitrarily —
     # files are ranked by priority and the lowest-priority files are skipped
     # until the diff fits. Skipped files are listed in the walkthrough so the
     # user can invoke `@miracodeai review-rest` to review them.
     max_diff_size: int = 250_000
-    # Per-file size cap. A single huge file (lockfile, generated SDK, etc.)
+    # Legacy per-file size cap (auto_complete: false). A huge file (lockfile, generated SDK, etc.)
     # gets skipped before chunking even starts.
     max_file_size: int = 50_000
-    # Hard ceiling on chunks per single review pass. If the diff would split
-    # into more chunks, only the top-priority N are reviewed; the rest are
-    # listed as skipped.
+    # Maximum agent groups dispatched per wave; subsequent waves run automatically.
     max_chunks_per_review: int = Field(default=5, ge=1, le=20)
     include_summary: bool = True
     focus_only_on_problems: bool = False

@@ -168,6 +168,13 @@ every call, answered or refused, is written to an audit trail.
 
 ## Configuration
 
+Reviews automatically cover every eligible changed file, using dependency-aware
+agents and as many waves as needed. Related changes (such as a screen and its
+component) stay with one agent. Large groups continue in sequential parts with
+review notes carried forward; large files are split without dropping trailing
+hunks. Failed parts are retried, and persistent failures remain visibly incomplete.
+See [automatic review](docs/automatic-review.md) for grouping and configuration.
+
 `mira.yaml` (loaded via `--config`) holds deployment-wide defaults. Drop a `.mira.yaml` in any repo — or use the dashboard — to override per-repo; both deep-merge over `mira.yaml` for that repo only:
 
 ```yaml

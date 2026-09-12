@@ -93,7 +93,7 @@ def _coverage_line(result: ReviewResult) -> str:
     total = len(result.reviewed_paths) + len(result.skipped_paths)
     return (
         f"{len(result.reviewed_paths)} of {total} changed files were reviewed; "
-        f"{_plural(len(result.skipped_paths), 'file')} did not fit this pass "
+        f"{_plural(len(result.skipped_paths), 'file')} could not be fully reviewed "
         f"(comment `review-rest` to cover them)."
     )
 

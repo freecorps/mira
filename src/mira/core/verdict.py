@@ -96,7 +96,7 @@ def decide_verdict(
         return None
 
     if cfg.require_all_files_reviewed and result.skipped_paths:
-        # The diff blew past max_diff_size and files were dropped by priority.
+        # Failed parts or legacy selection limits left some files incomplete.
         # Approving a PR Mira only half-read is the worst failure mode here.
         return None
 

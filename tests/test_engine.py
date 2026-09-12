@@ -359,9 +359,9 @@ class TestReviewEngine:
         llm.complete = AsyncMock(return_value=good_response)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        # Force two chunks by setting a very low token limit
+        # Force two independent agent groups
         config = MiraConfig()
-        config.llm.max_context_tokens = 100
+        config.filter.max_files = 1
         config.filter.confidence_threshold = 0.0
 
         engine = ReviewEngine(config=config, llm=llm)
@@ -408,6 +408,7 @@ class TestReviewEngine:
 
         config = MiraConfig()
         # Cap small enough that only one file fits.
+        config.review.auto_complete = False
         config.review.max_diff_size = 600
         config.filter.confidence_threshold = 0.0
 
@@ -784,7 +785,7 @@ class TestReviewEngine:
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         config = MiraConfig()
-        config.llm.max_context_tokens = 100  # Force multiple chunks
+        config.filter.max_files = 1  # Force multiple independent agent groups
         config.filter.confidence_threshold = 0.0
 
         engine = ReviewEngine(config=config, llm=llm)
@@ -1874,10 +1875,10 @@ class TestSecurityReviewPass:
 
         with patch("mira.core.passes.load_config") as mock_cfg:
             cfg = MiraConfig()
-            cfg.llm.max_context_tokens = 500  # tiny budget forces chunking
+            cfg.llm.max_context_tokens = 2800  # 2100 after security reserve: one 100-token file
             mock_cfg.return_value = cfg
 
-            out = await security_review_pass(llm, files, files, "title")
+            out = await security_review_pass(llm, files, files, "title", security_llm=llm)
             assert out == []
             # Should have been called more than once (multiple chunks)
             assert llm.complete_with_tools.call_count >= 2
@@ -2033,9 +2034,12 @@ class TestManifestFileSelection:
         config.review.dependency_overlap = True
         # Small enough that the 200-line package.json diff is culled, but the
         # tiny source file survives (so we don't hit the no-files early return).
+        config.review.auto_complete = False
         config.review.max_file_size = 200
 
-        engine = ReviewEngine(config=config, llm=AsyncMock(), provider=None)
+        engine = ReviewEngine(
+            config=config, llm=MagicMock(count_tokens=lambda text: 100), provider=None
+        )
         result = await engine._review_diff_internal(diff)
 
         assert result.reviewed_paths == ["src/app.py"], "manifest should be culled"
@@ -2442,7 +2446,9 @@ class TestChunkFailureIsolation:
             ]
         )
 
-        result = await ReviewEngine(config=MiraConfig(), llm=mock_llm).review_diff(sample_diff_text)
+        config = MiraConfig()
+        config.review.chunk_retries = 0
+        result = await ReviewEngine(config=config, llm=mock_llm).review_diff(sample_diff_text)
 
         assert mock_llm.review.await_count == 2
         assert any(e.get("stage") == "chunk_failed" for e in result.audit)

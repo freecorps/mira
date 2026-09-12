@@ -35,12 +35,15 @@ class TestChunkFiles:
         chunks = chunk_files(files, max_tokens=5000)
         assert len(chunks) > 1
 
-    def test_oversized_file_gets_truncated(self):
+    def test_oversized_file_is_split_without_losing_content(self):
         large = _make_file("big.py", 100000)
         chunks = chunk_files([large], max_tokens=5000)
-        assert len(chunks) == 1
-        # File should still be included (truncated)
-        assert len(chunks[0].files) == 1
+        assert len(chunks) > 1
+        body = "".join(
+            h.content.split("\n", 1)[1] for c in chunks for f in c.files for h in f.hunks
+        )
+        assert body == large.hunks[0].content
+        assert all(c.token_estimate <= 3000 for c in chunks)
 
     def test_empty_input(self):
         chunks = chunk_files([], max_tokens=10000)
