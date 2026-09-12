@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,10 +17,10 @@ from pydantic import ValidationError
 
 from mira.dashboard.db import AppDatabase
 from mira.labels.engine import evaluate, matches, plan
-from mira.labels.models import Condition, LabelWorkflow, PRFacts
+from mira.labels.models import Condition, LabelWorkflow, PRFacts, WorkflowEdge
 from mira.labels.presets import presets, simple_preset, size_preset
 from mira.labels.service import reconcile
-from mira.labels.store import load_workflow, save_workflow
+from mira.labels.store import load_workflow, save_workflow, scope_key, workflow_revision
 from mira.labels.webhooks import schedule_labels
 from mira.models import FileChangeStat, PRInfo
 
@@ -356,8 +359,11 @@ def test_api_save_preview_copy_and_isolation(client, db):
     query = "?platform=github&owner=acme&repo=app"
     workflow = size_preset().model_dump()
     workflow["enabled"] = True
-    assert client.put("/api/labels/workflow" + query, json=workflow).status_code == 200
-    assert client.get("/api/labels/workflow" + query).json() == workflow
+    snapshot = client.get("/api/labels/workflow" + query).json()
+    saved = client.put("/api/labels/workflow" + query, json={**snapshot, "workflow": workflow})
+    assert saved.status_code == 200
+    assert client.get("/api/labels/workflow" + query).json() == saved.json()
+    assert saved.json()["workflow"] == workflow
     preview = client.post(
         "/api/labels/preview",
         json={
@@ -376,11 +382,12 @@ def test_api_save_preview_copy_and_isolation(client, db):
     copied["nodes"][2]["action"]["name"] = "tiny"
     assert (
         client.put(
-            "/api/labels/workflow?platform=github&owner=acme&repo=other", json=copied
+            "/api/labels/workflow?platform=github&owner=acme&repo=other",
+            json={"workflow": copied, "revision": workflow_revision(None)},
         ).status_code
         == 200
     )
-    assert client.get("/api/labels/workflow" + query).json() == workflow
+    assert client.get("/api/labels/workflow" + query).json() == saved.json()
     assert len(db.list_config_audit(section="labels")) == 2
 
 
@@ -389,7 +396,11 @@ def test_api_save_preview_copy_and_isolation(client, db):
     [
         ("get", "/api/labels/presets", None),
         ("get", "/api/labels/workflow?owner=acme&repo=app", None),
-        ("put", "/api/labels/workflow?owner=acme&repo=app", {}),
+        (
+            "put",
+            "/api/labels/workflow?owner=acme&repo=app",
+            {"workflow": {}, "revision": workflow_revision(None)},
+        ),
         ("post", "/api/labels/copy", {"owner": "acme", "repo": "app"}),
         ("post", "/api/labels/preview", {"workflow": {}, "facts": {}}),
     ],
@@ -405,7 +416,157 @@ def test_api_rejects_invalid_and_unknown_repos(client):
     assert client.get("/api/labels/workflow?owner=acme&repo=missing").status_code == 404
     graph = size_preset().model_dump()
     graph["edges"] = []
-    assert client.put("/api/labels/workflow?owner=acme&repo=app", json=graph).status_code == 422
+    assert (
+        client.put(
+            "/api/labels/workflow?owner=acme&repo=app",
+            json={"workflow": graph, "revision": workflow_revision(None)},
+        ).status_code
+        == 422
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["source", "target"])
+@pytest.mark.parametrize("value", ["", "x" * 81])
+def test_edge_endpoints_have_the_same_bounds_as_node_ids(endpoint, value):
+    edge = {"id": "edge", "source": "start", "target": "condition", endpoint: value}
+    with pytest.raises(ValidationError) as exc:
+        WorkflowEdge.model_validate(edge)
+    assert exc.value.errors()[0]["loc"] == (endpoint,)
+
+
+@pytest.mark.parametrize("method", ["get", "put"])
+@pytest.mark.parametrize("platform", ["unknown", "", "GitHub"])
+def test_platform_rejected_before_registry_lookup(client, db, monkeypatch, method, platform):
+    lookup = MagicMock(side_effect=AssertionError("Invalid platform reached registry"))
+    monkeypatch.setattr(db, "get_repo", lookup)
+    kwargs = (
+        {"json": {"workflow": {}, "revision": workflow_revision(None)}} if method == "put" else {}
+    )
+    response = getattr(client, method)(
+        f"/api/labels/workflow?owner=acme&repo=app&platform={platform}", **kwargs
+    )
+    assert response.status_code == 422
+    lookup.assert_not_called()
+
+
+def test_stale_admin_save_conflicts_without_overwriting_or_auditing(client, db):
+    url = "/api/labels/workflow?owner=acme&repo=app"
+    first = client.get(url).json()
+    second = client.get(url).json()
+    first["workflow"] = size_preset().model_dump()
+    saved = client.put(url, json=first)
+    assert saved.status_code == 200
+    second["workflow"] = simple_preset("author", "eq", "alice", "team").model_dump()
+    assert client.put(url, json=second).status_code == 409
+    assert client.get(url).json() == saved.json()
+    assert len(db.list_config_audit(section="labels")) == 1
+    # A fresh revision can save again; its audit names the actual overwritten workflow.
+    latest = {**saved.json(), "workflow": second["workflow"]}
+    assert client.put(url, json=latest).status_code == 200
+    audit = db.list_config_audit(section="labels")
+    assert len(audit) == 2
+    assert audit[0]["previous"]["workflow"] == first["workflow"]
+
+
+def test_atomic_save_catches_edit_between_revision_check_and_write(client, db, monkeypatch):
+    url = "/api/labels/workflow?owner=acme&repo=app"
+    snapshot = client.get(url).json()
+    other = size_preset()
+    cas = db.compare_and_set_setting
+
+    def racing_save(key, expected, value):
+        save_workflow(db, "github", "acme", "app", other)
+        return cas(key, expected, value)
+
+    monkeypatch.setattr(db, "compare_and_set_setting", racing_save)
+    assert client.put(url, json=snapshot).status_code == 409
+    assert load_workflow(db, "github", "acme", "app") == other
+    assert not db.list_config_audit(section="labels")
+
+
+@pytest.mark.parametrize("expected", [None, "original"])
+def test_setting_cas_has_one_winner_across_connections(db, expected):
+    other = AppDatabase(url="", admin_password="test-password")
+    try:
+        if expected is not None:
+            db.set_setting("race", expected)
+        barrier = Barrier(2)
+
+        def write(store, value):
+            barrier.wait(timeout=5)
+            return store.compare_and_set_setting("race", expected, value)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(write, db, "first")
+            second = pool.submit(write, other, "second")
+            outcomes = [first.result(), second.result()]
+        assert sum(outcomes) == 1
+        assert db.get_setting("race") == ("first" if outcomes[0] else "second")
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize("failure", ["remove", "add"])
+async def test_successfully_removed_retired_label_is_relinquished_on_partial_failure(db, failure):
+    activate(db)
+    provider = FakeProvider()
+    provider.labels.update({"retired-a", "retired-b"})
+    state_key = "label_state:" + scope_key("github", "acme", "app") + ":7"
+    db.set_setting(state_key, json.dumps(["retired-a", "retired-b"]))
+    original = provider.remove_label
+
+    async def fail_second_removal(pr, name):
+        if name == "retired-b":
+            raise RuntimeError("removal rejected")
+        await original(pr, name)
+
+    if failure == "remove":
+        provider.remove_label = fail_second_removal
+    else:
+        provider.fail_add = True
+    with pytest.raises(RuntimeError):
+        await run(provider, db)
+    owned = json.loads(db.get_setting(state_key))
+    assert "retired-a" not in owned
+    assert ("retired-b" in owned) == (failure == "remove")
+    # A user restoring a label from a retired rule must not lose it on retry.
+    provider.labels.add("retired-a")
+    provider.remove_label = original
+    provider.fail_add = False
+    await run(provider, db)
+    assert provider.labels == {"bug", "retired-a", "size/M"}
+
+
+@pytest.mark.parametrize("stage", ["ensure", "remove", "add"])
+@pytest.mark.parametrize("change", ["disable", "edit"])
+async def test_configuration_changes_stop_subsequent_provider_writes(db, stage, change):
+    activate(db)
+    provider = FakeProvider()
+    provider.labels.add("size/L")
+    method_name = {"ensure": "ensure_label", "remove": "remove_label", "add": "add_label"}[stage]
+    original = getattr(provider, method_name)
+
+    async def changing(*args):
+        await original(*args)
+        updated = size_preset()
+        if change == "disable":
+            save_workflow(db, "github", "acme", "app", updated)
+        else:
+            updated.nodes[2].action.name = "tiny"
+            activate(db, updated)
+
+    setattr(provider, method_name, changing)
+    result = await run(provider, db)
+    assert result == {"status": "configuration_changed"}
+    kinds = [kind for kind, name in provider.mutations]
+    assert (
+        kinds
+        == {
+            "ensure": ["ensure"],
+            "remove": ["ensure", "remove"],
+            "add": ["ensure", "remove", "add"],
+        }[stage]
+    )
 
 
 @pytest.mark.parametrize(

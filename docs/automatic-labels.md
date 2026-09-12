@@ -20,6 +20,10 @@ repository**, then **Copy into editor**. This replaces the editor's draft with
 an independent, disabled copy. Review it, enable it, and save for the destination.
 Subsequent edits to either repository do not change the other.
 
+Saving also checks the revision you loaded. If another administrator saved newer
+rules, the API returns a conflict and leaves both their saved rules and your local
+draft intact. Preserve your draft before reloading to compare with the latest rules.
+
 ## Size labels
 
 The default preset counts **additions + deletions for the complete PR**, including
@@ -73,6 +77,9 @@ Changing a synchronized action to Keep hands that label back to the user.
 The PR's previously managed labels are stored so renaming or deleting a rule can
 remove its old label on the next evaluation. Disabling the workflow pauses it and
 leaves labels as they are. Re-enabling resumes reconciliation on the next event.
+Ownership of a retired label is released immediately after its removal succeeds,
+even if a later write fails. Labels still configured as synchronized remain managed.
+The ownership record is not a success record: retries always read actual PR labels.
 Missing repository labels are created using the configured color and description;
 existing label definitions are preserved. Label names cannot contain commas,
 control characters or leading/trailing whitespace.
@@ -91,6 +98,9 @@ distributed across processes. If provider statistics are incomplete or a request
 fails, the failure is logged under `mira.labels`; the AI review still proceeds.
 Successful operations can be partial when a provider rejects a later write, and
 the next relevant event reconciles again. There is no periodic retry/backfill job.
+The workflow is checked before every provider mutation, so edits or disabling it
+stop subsequent writes in an active run. An HTTP request already in flight can
+still complete; disabling does not undo that remote operation.
 
 GitHub's changed-file API is capped, and GitLab can truncate large diffs; detected
 incomplete statistics stop evaluation instead of assigning a misleading size.
@@ -116,6 +126,16 @@ origin protection for mutations.
 | GET / PUT | `/api/labels/workflow?platform=github&owner=acme&repo=app` | Read/save one repository's workflow |
 | POST | `/api/labels/preview` | Simulate `{workflow, facts, current_labels}` without writes |
 | POST | `/api/labels/copy` | Fetch `{platform, owner, repo}` as a disabled draft |
+
+GET and PUT `/api/labels/workflow` return `{workflow, revision}`. PUT accepts the
+same envelope: send the revision from the destination repository's latest GET or
+successful PUT alongside the edited workflow. Missing/invalid revisions are
+rejected; stale revisions return HTTP 409 without overwriting rules or recording
+a successful edit. The update uses an atomic compare-and-set in SQLite/Postgres,
+including when two requests pass their initial revision checks concurrently.
+Copy and preset responses remain plain draft graphs; they do not replace the
+destination editor's revision. Platform queries accept only `github`, `gitlab`,
+and `forgejo`. Node IDs and edge IDs/endpoints are limited to 1–80 characters.
 
 Graphs contain `version: 1`, `enabled`, `nodes` and `edges`. Node kinds are `start`,
 `condition` and `label`; edge branches are `next`, `true` and `false`. The API

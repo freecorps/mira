@@ -25,7 +25,7 @@ import {
   Play,
   LayoutGrid,
 } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -291,7 +291,8 @@ function WorkflowLoader({
   return (
     <WorkflowEditor
       scope={scope}
-      initial={data[0]}
+      initial={data[0].workflow}
+      initialRevision={data[0].revision}
       presets={data[1]}
       repos={repos}
     />
@@ -301,11 +302,13 @@ function WorkflowLoader({
 function WorkflowEditor({
   scope,
   initial,
+  initialRevision,
   presets,
   repos,
 }: {
   scope: LabelScope
   initial: LabelWorkflow
+  initialRevision: string
   presets: LabelPreset[]
   repos: RepoListItem[]
 }) {
@@ -339,6 +342,7 @@ function WorkflowEditor({
   }
   const serialized = JSON.stringify(workflow)
   const [saved, setSaved] = useState(serialized)
+  const revision = useRef(initialRevision)
   const dirty = serialized !== saved
   const selected = nodes.find((node) => node.id === selectedId)?.data.rule
   const otherRepos = repos.filter(
@@ -460,7 +464,8 @@ function WorkflowEditor({
     setSaving(true)
     setError("")
     try {
-      await labelsApi.save(scope, workflow)
+      const snapshot = await labelsApi.save(scope, workflow, revision.current)
+      revision.current = snapshot.revision
       setSaved(serialized)
       toast.success("Label workflow saved")
     } catch (error) {

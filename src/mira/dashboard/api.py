@@ -1373,13 +1373,13 @@ import mira.dashboard.routers.autofix  # noqa: E402,F401
 import mira.dashboard.routers.checks  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
 import mira.dashboard.routers.gate  # noqa: E402,F401
+import mira.dashboard.routers.labels  # noqa: E402,F401
 import mira.dashboard.routers.logs  # noqa: E402,F401
 import mira.dashboard.routers.oauth  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.repos  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401
 import mira.dashboard.routers.triage  # noqa: E402,F401
-import mira.dashboard.routers.labels  # noqa: E402,F401
 import mira.dashboard.routers.vulnerabilities  # noqa: E402,F401
 
 

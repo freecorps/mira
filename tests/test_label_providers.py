@@ -148,8 +148,29 @@ async def test_forgejo_validates_file_count():
     provider._paginate = AsyncMock(
         return_value=[{"filename": "app.py", "additions": 250, "deletions": 251}]
     )
-    provider._request = AsyncMock(return_value=response({"changed_files": 1}))
+    provider._request = AsyncMock(
+        return_value=response({"changed_files": 1, "additions": 250, "deletions": 251})
+    )
     assert (await provider.get_label_change_stats(pr("forgejo")))[0].deleted_lines == 251
     provider._request = AsyncMock(return_value=response({"changed_files": 2}))
+    with pytest.raises(ProviderError):
+        await provider.get_label_change_stats(pr("forgejo"))
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"changed_files": 1, "additions": 251, "deletions": 251},
+        {"changed_files": 1, "additions": 250, "deletions": 252},
+        {"changed_files": 1},
+        {"changed_files": 1, "additions": None, "deletions": 251},
+    ],
+)
+async def test_forgejo_rejects_missing_or_inconsistent_totals_with_complete_file_count(summary):
+    provider = ForgejoProvider("token")
+    provider._paginate = AsyncMock(
+        return_value=[{"filename": "app.py", "additions": 250, "deletions": 251}]
+    )
+    provider._request = AsyncMock(return_value=response(summary))
     with pytest.raises(ProviderError):
         await provider.get_label_change_stats(pr("forgejo"))

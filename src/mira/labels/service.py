@@ -75,13 +75,26 @@ async def reconcile(
         actions = {label.name: label for label in evaluation.labels}
         # Prepare every missing definition before changing the PR itself.
         for name in result.add:
+            if load_workflow(db, platform, owner, repo) != workflow:
+                return {"status": "configuration_changed"}
             label = actions[name]
             await provider.ensure_label(pr, label.name, label.color, label.description)
         # Remove obsolete size labels first so no stable result has two size tiers.
         for name in result.remove:
+            if load_workflow(db, platform, owner, repo) != workflow:
+                return {"status": "configuration_changed"}
             await provider.remove_label(pr, name)
+            # A retired rule stops owning its label as soon as removal succeeds,
+            # even if a later write fails. Current sync rules still own their
+            # configured labels on subsequent evaluations by design.
+            managed = {owned for owned in managed if owned.casefold() != name.casefold()}
+            db.set_setting(state_key, json.dumps(sorted(managed)))
         for name in result.add:
+            if load_workflow(db, platform, owner, repo) != workflow:
+                return {"status": "configuration_changed"}
             await provider.add_label(pr, name)
+        if load_workflow(db, platform, owner, repo) != workflow:
+            return {"status": "configuration_changed"}
         db.set_setting(state_key, json.dumps(evaluation.managed_labels))
         logger.info(
             "PR labels synchronized for %s: added=%s removed=%s", url, result.add, result.remove

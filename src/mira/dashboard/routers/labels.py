@@ -10,11 +10,18 @@ from mira.dashboard.api import _require_admin, router
 from mira.labels.engine import evaluate, plan
 from mira.labels.models import LabelWorkflow, PreviewRequest, PreviewResponse, StrictModel
 from mira.labels.presets import presets
-from mira.labels.store import load_workflow, save_workflow
+from mira.labels.store import load_workflow, scope_key, workflow_revision
+
+Platform = Literal["github", "gitlab", "forgejo"]
+
+
+class WorkflowSnapshot(StrictModel):
+    workflow: LabelWorkflow
+    revision: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class RepoScope(StrictModel):
-    platform: Literal["github", "gitlab", "forgejo"] = "github"
+    platform: Platform = "github"
     owner: str = Field(min_length=1, max_length=500)
     repo: str = Field(min_length=1, max_length=200)
 
@@ -32,23 +39,37 @@ def label_presets(request: Request) -> list[dict]:
     return presets()
 
 
-@router.get("/api/labels/workflow", response_model=LabelWorkflow)
+@router.get("/api/labels/workflow", response_model=WorkflowSnapshot)
 def get_label_workflow(
-    request: Request, owner: str, repo: str, platform: str = "github"
-) -> LabelWorkflow:
+    request: Request, owner: str, repo: str, platform: Platform = "github"
+) -> WorkflowSnapshot:
     _require_admin(request)
     require_repo(platform, owner, repo)
-    return load_workflow(_api._app_db, platform, owner, repo)
+    raw = _api._app_db.get_setting("label_workflow:" + scope_key(platform, owner, repo))
+    return WorkflowSnapshot(
+        workflow=LabelWorkflow.model_validate_json(raw) if raw else LabelWorkflow(),
+        revision=workflow_revision(raw),
+    )
 
 
-@router.put("/api/labels/workflow", response_model=LabelWorkflow)
+@router.put("/api/labels/workflow", response_model=WorkflowSnapshot)
 def set_label_workflow(
-    body: LabelWorkflow, request: Request, owner: str, repo: str, platform: str = "github"
-) -> LabelWorkflow:
+    body: WorkflowSnapshot, request: Request, owner: str, repo: str, platform: Platform = "github"
+) -> WorkflowSnapshot:
     _require_admin(request)
     require_repo(platform, owner, repo)
-    previous = load_workflow(_api._app_db, platform, owner, repo)
-    save_workflow(_api._app_db, platform, owner, repo, body)
+    key = "label_workflow:" + scope_key(platform, owner, repo)
+    raw = _api._app_db.get_setting(key)
+    previous = LabelWorkflow.model_validate_json(raw) if raw else LabelWorkflow()
+    updated = body.workflow.model_dump_json()
+    if body.revision != workflow_revision(raw) or not _api._app_db.compare_and_set_setting(
+        key, raw, updated
+    ):
+        raise HTTPException(
+            409,
+            "These rules were changed by another administrator. Your draft has not been saved. "
+            "Copy your changes before reloading to review the latest rules.",
+        )
     _api._app_db.record_config_audit(
         section="labels",
         actor=request.state.user.username,
@@ -58,9 +79,14 @@ def set_label_workflow(
             "repo": repo,
             "workflow": previous.model_dump(),
         },
-        new={"platform": platform, "owner": owner, "repo": repo, "workflow": body.model_dump()},
+        new={
+            "platform": platform,
+            "owner": owner,
+            "repo": repo,
+            "workflow": body.workflow.model_dump(),
+        },
     )
-    return body
+    return WorkflowSnapshot(workflow=body.workflow, revision=workflow_revision(updated))
 
 
 @router.post("/api/labels/preview", response_model=PreviewResponse)
