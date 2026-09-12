@@ -625,14 +625,16 @@ impossible.
 ```python
 from mira.checks.external.tickets import TicketLookupError, register_adapter
 
+
 class JiraAdapter:
     name = "jira"
 
     async def fetch(self, ref, ctx):
         if ref.kind != "external":
             raise TicketLookupError("not a Jira reference")
-        ...   # return an IssueInfo, or None if Jira says there is no such issue
-              # raise TicketLookupError for anything that stopped you asking
+        ...  # return an IssueInfo, or None if Jira says there is no such issue
+        # raise TicketLookupError for anything that stopped you asking
+
 
 register_adapter("jira", JiraAdapter)
 ```

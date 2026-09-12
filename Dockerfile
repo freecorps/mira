@@ -5,7 +5,7 @@
 # a cross-platform build (e.g. `--platform linux/arm64` from an amd64 host)
 # runs node natively instead of emulating it — that emulation used to be the
 # single slowest part of the arm64 image build.
-FROM --platform=$BUILDPLATFORM node:20-slim AS ui-builder
+FROM --platform=$BUILDPLATFORM node:24-slim AS ui-builder
 WORKDIR /ui
 COPY ui/mira/package.json ui/mira/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -36,7 +36,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 # of wheels (per architecture).
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=from=ghcr.io/astral-sh/uv:0.12.8,source=/uv,target=/bin/uv \
+    --mount=from=ghcr.io/astral-sh/uv:0.12.13,source=/uv,target=/bin/uv \
     uv sync --locked --no-dev --no-install-project --extra serve --extra bedrock
 
 # Layer 2 — the package itself. Small, and the one layer that changes every
@@ -44,7 +44,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY README.md ./
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=from=ghcr.io/astral-sh/uv:0.12.8,source=/uv,target=/bin/uv \
+    --mount=from=ghcr.io/astral-sh/uv:0.12.13,source=/uv,target=/bin/uv \
     uv sync --locked --no-dev --no-editable --extra serve --extra bedrock
 
 # Pull the built UI in from stage 1. webhooks.create_app() picks this up
