@@ -358,3 +358,157 @@ async def test_cancellation_is_not_retried():
     with pytest.raises(asyncio.CancelledError):
         await ReviewEngine(config=engine_config(), llm=model).review_diff(diff(["a.py"]))
     assert model.review.await_count == 1
+
+
+@pytest.mark.parametrize("extension", ["vue", "svelte", "mjs", "cjs"])
+@pytest.mark.parametrize("import_path", ["./Button", "@/components/Button"])
+async def test_component_sources_resolve_imports_without_language_tag(extension, import_path):
+    from mira.core.diff_parser import parse_diff
+
+    source_path = f"src/components/Page.{extension}"
+    target_path = f"src/components/Button.{extension}"
+    source_diff = (
+        f"diff --git a/{source_path} b/{source_path}\n--- a/{source_path}\n+++ b/{source_path}\n"
+        f'@@ -0,0 +1,1 @@\n+<script>import Button from "{import_path}";</script>\n'
+    )
+    files = parse_diff(source_diff + diff([target_path])).files
+    edges = await discover_dependencies(files)
+    assert edges[source_path] == {target_path}
+
+
+@pytest.mark.parametrize("single_consumer", [False, True])
+async def test_barrel_reads_overlap_with_bounded_concurrency_and_shared_fetches(single_consumer):
+    from collections import Counter
+
+    files = [
+        file(f"src/page{i}.ts", f'+import {{ Leaf }} from "./barrel{i % 3}"') for i in range(4)
+    ]
+    if single_consumer:
+        files = [file("src/page0.ts", "\n".join(f.hunks[0].content for f in files))]
+    files.append(file("src/leaf.ts"))
+    tree = {f"src/barrel{i}.ts" for i in range(3)}
+    calls = Counter()
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+    active = peak = 0
+
+    async def fetch(path):
+        nonlocal active, peak
+        calls[path] += 1
+        if path not in tree:
+            return ""
+        active += 1
+        peak = max(peak, active)
+        if active == 2:
+            two_started.set()
+        try:
+            await release.wait()
+            return 'export { Leaf } from "./leaf";'
+        finally:
+            active -= 1
+
+    fetcher = MagicMock(fetch=AsyncMock(side_effect=fetch))
+    task = asyncio.create_task(discover_dependencies(files, fetcher, concurrency=2, repo_tree=tree))
+    try:
+        await asyncio.wait_for(two_started.wait(), timeout=2)
+        release.set()
+        edges = await asyncio.wait_for(task, timeout=2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert peak == 2
+    assert all(calls[path] == 1 for path in tree)
+    assert all(edges[f.path] == {"src/leaf.ts"} for f in files if f.path != "src/leaf.ts")
+
+
+async def test_barrel_cycle_terminates_without_waiting_on_itself():
+    files = [file("src/page.ts", '+import { Leaf } from "./a"'), file("src/leaf.ts")]
+    sources = {
+        "src/a.ts": 'export * from "./b";',
+        "src/b.ts": 'export * from "./a"; export { Leaf } from "./leaf";',
+    }
+    fetcher = MagicMock(fetch=AsyncMock(side_effect=lambda path: sources.get(path, "")))
+    edges = await asyncio.wait_for(discover_dependencies(files, fetcher, repo_tree=set(sources)), 2)
+    assert edges["src/page.ts"] == {"src/leaf.ts"}
+    assert sum(call.args[0] == "src/a.ts" for call in fetcher.fetch.call_args_list) == 1
+    assert sum(call.args[0] == "src/b.ts" for call in fetcher.fetch.call_args_list) == 1
+
+
+async def test_barrel_cache_retains_64_read_limit():
+    files = [file(f"src/page{i}.ts", f'+import {{ Leaf }} from "./barrel{i}"') for i in range(70)]
+    files.append(file("src/leaf.ts"))
+    tree = {f"src/barrel{i}.ts" for i in range(70)}
+    fetcher = MagicMock(
+        fetch=AsyncMock(
+            side_effect=lambda path: 'export { Leaf } from "./leaf";' if path in tree else ""
+        )
+    )
+    edges = await discover_dependencies(files, fetcher, repo_tree=tree)
+    assert sum(call.args[0] in tree for call in fetcher.fetch.call_args_list) == 64
+    assert sum(bool(value) for value in edges.values()) == 64
+
+
+async def test_cancelled_discovery_stops_shared_barrel_reads():
+    files = [file("src/page.ts", '+import { Leaf } from "./barrel"')]
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def fetch(path):
+        if path != "src/barrel.ts":
+            return ""
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    fetcher = MagicMock(fetch=AsyncMock(side_effect=fetch))
+    task = asyncio.create_task(discover_dependencies(files, fetcher, repo_tree={"src/barrel.ts"}))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stopped.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("head_sha", ["review-sha", ""])
+async def test_agentic_context_and_dependency_reads_share_revision(monkeypatch, head_sha):
+    import mira.core.engine as module
+    from mira.models import PRInfo
+
+    provider = MagicMock()
+    provider.get_file_content = AsyncMock(
+        side_effect=lambda info, path, ref: f'export const revision = "{ref}";'
+    )
+    provider.get_repo_tree = AsyncMock(return_value=["src/page.tsx", "src/verify.ts"])
+    provider.get_file_history = AsyncMock(return_value={})
+    monkeypatch.setattr(module, "build_code_context", AsyncMock(return_value=""))
+    verified = []
+
+    async def agentic_read(model, messages, executor):
+        verified.append(await executor.execute("read_file", {"path": "src/verify.ts"}))
+        return '{"comments": []}'
+
+    monkeypatch.setattr(module, "agentic_review_loop", agentic_read)
+    config = engine_config()
+    config.review.code_context = True
+    scope = PRInfo("title", "", "main", "feature", "url", 1, "test", "repo", head_sha=head_sha)
+    engine = ReviewEngine(config=config, llm=llm(), provider=provider)
+    result = await engine.review_diff(diff(["src/page.tsx"]), repo_scope=scope)
+    expected = head_sha or "feature"
+    assert result.reviewed_files == 1
+    assert len(verified) == 1 and expected in verified[0]
+    assert all(call.args[2] == expected for call in provider.get_file_content.call_args_list)
+    assert all(call.args[1] == expected for call in provider.get_repo_tree.call_args_list)
+
+    # Reuse the engine after the branch advances and context enrichment is off.
+    config.review.code_context = False
+    scope.head_sha = "next-sha"
+    await engine.review_diff(diff(["src/other.tsx"]), repo_scope=scope)
+    assert engine._agentic_source_fetcher is None
+    assert len(verified) == 1
+    assert provider.get_file_content.call_args.args[2] == "next-sha"
