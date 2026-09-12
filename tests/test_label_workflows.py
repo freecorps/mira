@@ -569,6 +569,42 @@ async def test_configuration_changes_stop_subsequent_provider_writes(db, stage, 
     )
 
 
+@pytest.mark.parametrize("mode", ["sync", "add"])
+@pytest.mark.parametrize("disable", [False, True])
+async def test_config_change_during_add_preserves_ownership_for_next_run(db, mode, disable):
+    workflow = simple_preset("author", "eq", "alice", "old-team")
+    workflow.nodes[-1].action.mode = mode
+    activate(db, workflow)
+    provider = FakeProvider()
+    state_key = "label_state:" + scope_key("github", "acme", "app") + ":7"
+    updated = simple_preset("author", "eq", "alice", "new-team")
+    updated.enabled = not disable
+    original = provider.add_label
+
+    async def changing(pr, name):
+        # Ownership must already exist before the provider completes the addition.
+        assert (name in json.loads(db.get_setting(state_key))) == (mode == "sync")
+        save_workflow(db, "github", "acme", "app", updated)
+        await original(pr, name)
+
+    provider.add_label = changing
+    assert await run(provider, db) == {"status": "configuration_changed"}
+    assert provider.labels == {"bug", "old-team"}
+    assert json.loads(db.get_setting(state_key)) == (["old-team"] if mode == "sync" else [])
+
+    provider.add_label = original
+    if disable:
+        mutations = list(provider.mutations)
+        assert await run(provider, db) == {"status": "disabled"}
+        assert provider.mutations == mutations
+        activate(db, updated)
+    assert (await run(provider, db))["status"] == "ok"
+    assert provider.labels == (
+        {"bug", "new-team"} if mode == "sync" else {"bug", "old-team", "new-team"}
+    )
+    assert json.loads(db.get_setting(state_key)) == ["new-team"]
+
+
 @pytest.mark.parametrize(
     "action,expected",
     [

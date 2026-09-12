@@ -70,6 +70,9 @@ async def reconcile(
         previous = [name for name in previous if name.casefold() not in additive]
         result = plan(evaluation, current, previous)
         # Retain ownership until each removal succeeds, including deleted/renamed rules.
+        # Pre-register every sync label, including pending additions, so an in-flight
+        # add remains tracked if configuration changes before the final state write.
+        # Add-only labels intentionally never acquire synchronization ownership.
         managed = set(previous) | set(evaluation.managed_labels)
         db.set_setting(state_key, json.dumps(sorted(managed)))
         actions = {label.name: label for label in evaluation.labels}
