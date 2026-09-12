@@ -154,6 +154,16 @@ class BaseProvider(abc.ABC):
         """Add a label to a pull request."""
         return
 
+    async def ensure_label(
+        self, pr_info: PRInfo, name: str, color: str, description: str = ""
+    ) -> None:
+        """Create a missing repository label without modifying an existing one."""
+        raise NotImplementedError("This provider cannot create repository labels")
+
+    async def get_label_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
+        """Complete change statistics for label rules; raise if unavailable."""
+        return await self.get_pr_change_stats(pr_info)
+
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
         """Remove a label from a pull request."""
         return

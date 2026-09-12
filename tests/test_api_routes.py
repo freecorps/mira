@@ -11,6 +11,11 @@ from __future__ import annotations
 from mira.dashboard.api import router
 
 EXPECTED_ROUTES = {
+    ("/api/labels/presets", "GET"),
+    ("/api/labels/workflow", "GET"),
+    ("/api/labels/workflow", "PUT"),
+    ("/api/labels/preview", "POST"),
+    ("/api/labels/copy", "POST"),
     ("/api/admin/settings", "GET"),
     ("/api/admin/settings", "PUT"),
     ("/api/admin/webhooks", "GET"),

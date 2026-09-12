@@ -25,6 +25,8 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { DependenciesTable } from "@/components/dashboard/dependencies-table"
+import { LabelWorkflowPanel } from "@/components/dashboard/label-workflow"
+import { useAuth } from "@/lib/auth"
 import { api, type ReviewContextModel } from "@/lib/api"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 
@@ -45,6 +47,7 @@ function formatRelativeTime(iso: string | null): string {
 }
 
 export function RepoDetailPage() {
+  const { user } = useAuth()
   const { owner, repo } = useParams<{ owner: string; repo: string }>()
   useDocumentTitle(owner && repo ? `${owner}/${repo}` : "Repository")
 
@@ -304,7 +307,10 @@ export function RepoDetailPage() {
           <TabsTrigger value="context">Review Context</TabsTrigger>
           <TabsTrigger value="dependencies">Dependencies</TabsTrigger>
           <TabsTrigger value="blast">Blast Radius</TabsTrigger>
+          {user?.is_admin && <TabsTrigger value="labels">Automatic Labels</TabsTrigger>}
         </TabsList>
+
+        {user?.is_admin && <TabsContent value="labels"><LabelWorkflowPanel key={`${owner}/${repo}`} owner={owner!} repo={repo!} /></TabsContent>}
 
         {/* Files */}
         <TabsContent value="files">

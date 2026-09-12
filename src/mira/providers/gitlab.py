@@ -36,6 +36,7 @@ from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     CIJobFailure,
+    FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
@@ -520,6 +521,43 @@ class GitLabProvider(BaseProvider):
 
     async def add_label(self, pr_info: PRInfo, label: str) -> None:
         await self._request("PUT", self._mr(pr_info), data={"add_labels": label})
+
+    async def ensure_label(
+        self, pr_info: PRInfo, name: str, color: str, description: str = ""
+    ) -> None:
+        url = f"{self._project(pr_info)}/labels"
+        existing = await self._paginate(url)
+        if any(label["name"].casefold() == name.casefold() for label in existing):
+            return
+        resp = await self._request(
+            "POST",
+            url,
+            data={"name": name, "color": f"#{color}", "description": description},
+            ok=(200, 201, 409),
+        )
+        if resp.status_code == 409:
+            existing = await self._paginate(url)
+            if not any(label["name"].casefold() == name.casefold() for label in existing):
+                raise ProviderError("Could not create repository label")
+
+    async def get_label_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
+        resp = await self._request("GET", f"{self._mr(pr_info)}/changes")
+        data = resp.json()
+        if data.get("overflow") or "changes" not in data:
+            raise ProviderError("Incomplete MR diff; labels were not changed")
+        stats = []
+        for change in data["changes"]:
+            if change.get("too_large") or change.get("collapsed"):
+                raise ProviderError("Incomplete MR file diff; labels were not changed")
+            lines = (change.get("diff") or "").splitlines()
+            stats.append(
+                FileChangeStat(
+                    path=change.get("new_path") or change["old_path"],
+                    added_lines=sum(line.startswith("+") for line in lines),
+                    deleted_lines=sum(line.startswith("-") for line in lines),
+                )
+            )
+        return stats
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
         await self._request("PUT", self._mr(pr_info), data={"remove_labels": label})
