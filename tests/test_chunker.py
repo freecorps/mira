@@ -54,3 +54,26 @@ class TestChunkFiles:
         est = _file_token_estimate(f)
         assert est > 0
         assert est < 400  # Should be roughly 100 tokens for 400 chars
+
+
+def test_fragmented_no_newline_marker_does_not_advance_source_coordinates():
+    from mira.core.chunker import _split_file
+
+    marker = "\\ No newline at end of file"
+    body = f"@@ -10,1 +20,1 @@\n-old\n{marker}\n+new\n"
+    file = FileDiff("f.py", FileChangeType.MODIFIED, [HunkInfo(10, 1, 20, 1, body)])
+
+    # Model an unusually expensive metadata line to exercise the fallback
+    # splitter, not the ordinary path that already excludes metadata offsets.
+    def count(text):
+        return len(text) + (1000 if marker in text else 0)
+
+    parts = _split_file(file, 180, count)
+    hunks = [h for part in parts for h in part.hunks]
+    final = next(h for h in hunks if "+new" in h.content)
+    assert (final.source_start, final.target_start) == (11, 20)
+    fragments = [h for h in hunks if "long line fragment" in h.content]
+    assert fragments
+    assert all((h.source_length, h.target_length) == (0, 0) for h in fragments)
+    rebuilt = "".join(h.content.split("\n", 1)[1] for h in hunks)
+    assert rebuilt == f"-old\n{marker}\n+new\n"

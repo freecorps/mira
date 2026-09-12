@@ -1477,6 +1477,9 @@ class ReviewEngine:
         # failure before rule retrieval must not leave the last review's
         # snapshot in place.
         self._reset_exposures()
+        # A reused engine must not carry another revision's source/tree cache.
+        self._agentic_source_fetcher = None
+        self._agentic_repo_tree = []
         import asyncio as _asyncio
 
         # Parse the full diff (not just the priority-selected subset) so the
@@ -1568,7 +1571,7 @@ class ReviewEngine:
                         from mira.index.context import ProviderSourceFetcher
 
                         source_fetcher = ProviderSourceFetcher(
-                            self.provider, pr_info, pr_info.head_branch
+                            self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
                         )
                     changed_paths = [f.path for f in filtered]
                     ctx = await build_code_context(
@@ -1597,7 +1600,9 @@ class ReviewEngine:
                         if hasattr(self.provider, "get_repo_tree"):
                             try:
                                 tree_paths = set(
-                                    await self.provider.get_repo_tree(pr_info, pr_info.head_branch)
+                                    await self.provider.get_repo_tree(
+                                        pr_info, pr_info.head_sha or pr_info.head_branch
+                                    )
                                 )
                             except Exception as exc:
                                 logger.debug("Repo tree fetch failed: %s", exc)
@@ -2073,7 +2078,7 @@ class ReviewEngine:
                     from mira.index.context import ProviderSourceFetcher
 
                     pr_source_fetcher = ProviderSourceFetcher(
-                        self.provider, pr_info, pr_info.head_branch
+                        self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
                     )
         dependency_task = _asyncio.create_task(
             dependency_review_pass(

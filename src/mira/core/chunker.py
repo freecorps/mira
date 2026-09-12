@@ -91,7 +91,10 @@ def _split_file(file: FileDiff, available: int, count: Callable[[str], int]) -> 
             line = lines[position]
             marker = line[0] if line[:1] in ("+", "-", " ") else ""
             remaining = line[len(marker) :]
-            a, b = int(marker != "+"), int(marker != "-")
+            # Metadata (e.g. "\ No newline at end of file") consumes no
+            # source lines, including when the marker itself needs fragments.
+            a = int(not line.startswith(("+", "\\")))
+            b = int(not line.startswith(("-", "\\")))
             part = 1
             while remaining:
                 lo, hi = 0, len(remaining)

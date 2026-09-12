@@ -39,7 +39,7 @@ def import_paths(source: str, file: FileDiff, paths: set[str]) -> set[str]:
     Other supported languages reuse Mira's JIT resolver.
     """
     result = set(extract_import_candidates(source, file.language, file.path, paths)) & paths
-    if file.language in ("javascript", "typescript"):
+    if file.language in ("javascript", "typescript") or file.path.endswith(_EXTENSIONS):
         for spec in _JS_IMPORT.findall(source):
             bases: list[str] = []
             parent = PurePosixPath(file.path).parent
@@ -99,8 +99,29 @@ async def discover_dependencies(
     changed = {f.path for f in files}
     paths = changed | set(aliases) | (repo_tree or set())
     sem = asyncio.Semaphore(concurrency)
-    reexports: dict[str, set[str]] = {}
+    reexports: dict[str, asyncio.Task[set[str]]] = {}
     bridge_lock = asyncio.Lock()
+
+    async def fetch_reexports(path: str) -> set[str]:
+        # Cache only the fetch, not recursive traversal: cycles cannot make
+        # tasks wait on one another. Independent paths share only the semaphore.
+        try:
+            assert source_fetcher is not None
+            async with sem:
+                content = await source_fetcher.fetch(path)
+            if isinstance(content, str):
+                exports = "\n".join(
+                    re.findall(
+                        r"\bexport\s+(?:type\s+)?(?:\*|\{[^}]*\})\s+from\s+['\"][^'\"]+['\"]",
+                        content,
+                    )
+                )
+                return import_paths(
+                    exports, FileDiff(path, FileChangeType.MODIFIED, language="typescript"), paths
+                )
+        except Exception as exc:
+            logger.debug("Barrel dependency unavailable for %s: %s", path, exc)
+        return set()
 
     async def bridge(path: str, depth: int = 0) -> set[str]:
         """Follow unchanged JS/TS barrel files, without walking the whole repo."""
@@ -112,29 +133,11 @@ async def discover_dependencies(
             if path not in reexports:
                 if len(reexports) >= 64:
                     return set()
-                reexports[path] = set()  # Also terminates cycles.
-                try:
-                    async with sem:
-                        content = await source_fetcher.fetch(path)
-                    if isinstance(content, str):
-                        exports = "\n".join(
-                            re.findall(
-                                r"\bexport\s+(?:type\s+)?(?:\*|\{[^}]*\})\s+from\s+['\"][^'\"]+['\"]",
-                                content,
-                            )
-                        )
-                        reexports[path] = import_paths(
-                            exports,
-                            FileDiff(path, FileChangeType.MODIFIED, language="typescript"),
-                            paths,
-                        )
-                except Exception as exc:
-                    logger.debug("Barrel dependency unavailable for %s: %s", path, exc)
-            edges = reexports[path]
-        found: set[str] = set()
-        for edge in sorted(edges):
-            found.update(await bridge(edge, depth + 1))
-        return found
+                reexports[path] = asyncio.create_task(fetch_reexports(path))
+            task = reexports[path]
+        edges = await task
+        connected = await asyncio.gather(*(bridge(edge, depth + 1) for edge in sorted(edges)))
+        return {path for related in connected for path in related}
 
     async def discover(file: FileDiff) -> tuple[str, set[str]]:
         # Keep old and new import edges: removed dependencies matter in a review.
@@ -156,9 +159,15 @@ async def discover_dependencies(
         for edge in (indexed_imports or {}).get(file.path, []):
             if edge in paths:
                 dependencies.add(edge)
-        resolved: set[str] = set()
-        for path in sorted(dependencies):
-            resolved.update(await bridge(path))
+        connected = await asyncio.gather(*(bridge(path) for path in sorted(dependencies)))
+        resolved = {path for related in connected for path in related}
         return file.path, resolved - {file.path}
 
-    return dict(await asyncio.gather(*(discover(f) for f in files)))
+    try:
+        return dict(await asyncio.gather(*(discover(f) for f in files)))
+    finally:
+        # Do not leave provider reads running when the review is cancelled.
+        for task in reexports.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*reexports.values(), return_exceptions=True)
