@@ -185,7 +185,7 @@ def _annotate_entries(diff: LocalDiff, result: ReviewResult | None) -> None:
         elif entry.path in binary:
             reason = reason or "binary file"
         elif entry.path in skipped:
-            reason = reason or "skipped: size or priority budget"
+            reason = reason or "incomplete: failed review part or configured limit"
         elif result is not None and entry.path not in reviewed:
             reason = reason or "excluded by the repository's file filters"
         annotated.append(

@@ -328,8 +328,8 @@ class WalkthroughResult:
             parts.append(f"### \ud83d\udccb Reviewed {reviewed_files} of {total} files")
             parts.append("")
             parts.append(
-                "This PR is large enough that some files were skipped to keep the "
-                "review focused on the highest-priority changes. To review the rest, "
+                "Some files could not be fully reviewed after this run "
+                "(failed review parts or configured limits). To retry the remaining files, "
                 f"comment `@{bot_name} review-rest` on this PR."
             )
             parts.append("")
@@ -578,6 +578,8 @@ class ReviewChunk:
 
     files: list[FileDiff] = field(default_factory=list)
     token_estimate: int = 0
+    group_id: int = -1
+    related_paths: list[str] = field(default_factory=list)
 
 
 @dataclass

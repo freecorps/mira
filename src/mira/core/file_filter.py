@@ -47,7 +47,9 @@ def _sort_priority(file_diff: FileDiff) -> tuple[int, int]:
     return (type_order.get(file_diff.change_type, 4), -file_diff.total_changes)
 
 
-def filter_files(files: list[FileDiff], config: FilterConfig) -> list[FileDiff]:
+def filter_files(
+    files: list[FileDiff], config: FilterConfig, *, cap_files: bool = True
+) -> list[FileDiff]:
     """Filter files based on configuration rules.
 
     Excludes binary files, pattern-matched files, deleted files (if configured),
@@ -67,7 +69,7 @@ def filter_files(files: list[FileDiff], config: FilterConfig) -> list[FileDiff]:
 
     result.sort(key=_sort_priority)
 
-    if len(result) > config.max_files:
+    if cap_files and len(result) > config.max_files:
         result = result[: config.max_files]
 
     return result

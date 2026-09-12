@@ -16,6 +16,7 @@ from mira.config import MiraConfig
 from mira.core.chunker import chunk_files
 from mira.core.commit_status import ReviewStatusReporter
 from mira.core.context import expand_context
+from mira.core.dependencies import discover_dependencies
 from mira.core.diff_parser import parse_diff
 from mira.core.ensemble import merge_ensemble_runs
 from mira.core.file_filter import filter_files
@@ -75,6 +76,7 @@ from mira.models import (
 from mira.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
+ReviewPartResult = tuple[list[ReviewComment], list[KeyIssue], str]
 
 
 def _build_review_finding(
@@ -1483,7 +1485,9 @@ class ReviewEngine:
         if not patch.files:
             return ReviewResult(summary="No files to review.")
 
-        filtered = filter_files(patch.files, self.config.filter)
+        filtered = filter_files(
+            patch.files, self.config.filter, cap_files=not self.config.review.auto_complete
+        )
         if not filtered:
             return ReviewResult(
                 summary="All files were filtered out.",
@@ -1491,12 +1495,18 @@ class ReviewEngine:
             )
 
         only_paths = getattr(self, "_review_only_paths", None)
-        selected, skipped = _select_files_by_priority(
-            filtered,
-            max_total_size=self.config.review.max_diff_size,
-            max_per_file_size=self.config.review.max_file_size,
-            only_paths=only_paths,
-        )
+        if self.config.review.auto_complete:
+            selected = [
+                f for f, _ in rank_files(filtered) if only_paths is None or f.path in only_paths
+            ]
+            skipped: list[tuple[str, str]] = []
+        else:
+            selected, skipped = _select_files_by_priority(
+                filtered,
+                max_total_size=self.config.review.max_diff_size,
+                max_per_file_size=self.config.review.max_file_size,
+                only_paths=only_paths,
+            )
         if not selected:
             return ReviewResult(
                 summary="No files were selected for review.",
@@ -1674,7 +1684,7 @@ class ReviewEngine:
             try:
                 paths = [f.path for f in filtered]
                 history = await self.provider.get_file_history(pr_info, paths, max_per_file=5)
-                return history
+                return history if isinstance(history, dict) else {}
             except Exception as exc:
                 logger.debug("File history fetch failed: %s", exc)
                 return {}
@@ -1685,12 +1695,6 @@ class ReviewEngine:
         )
 
         expanded = expand_context(filtered, self.config.review.context_lines)
-
-        chunks = chunk_files(
-            expanded,
-            max_tokens=self.config.llm.max_context_tokens,
-            provider=self.llm,
-        )
 
         learned_rules: list[str] = []
         custom_rules: list[dict[str, str]] = []
@@ -1750,10 +1754,89 @@ class ReviewEngine:
         except Exception:
             pass
 
-        valid_paths = {f.path for f in filtered}
+        # Dependency discovery also works when code-context enrichment is off.
+        # Pin source reads to the reviewed commit, including unchanged imports.
+        dependency_fetcher = None
+        dependency_tree = set(self._agentic_repo_tree)
+        indexed_imports: dict[str, list[str]] = {}
+        pr_info = getattr(self, "_pr_info", None)
+        if pr_info is not None:
+            if self.provider is not None:
+                from mira.index.context import ProviderSourceFetcher
+
+                dependency_fetcher = ProviderSourceFetcher(
+                    self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
+                )
+                if not dependency_tree and hasattr(self.provider, "get_repo_tree"):
+                    try:
+                        tree = await self.provider.get_repo_tree(
+                            pr_info, pr_info.head_sha or pr_info.head_branch
+                        )
+                        if isinstance(tree, (list, set, tuple)):
+                            dependency_tree = {p for p in tree if isinstance(p, str)}
+                    except Exception as exc:
+                        logger.debug("Dependency tree unavailable: %s", exc)
+            try:
+                dependency_store = IndexStore.open(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                )
+                try:
+                    indexed_imports = {
+                        path: summary.imports
+                        for path, summary in dependency_store.get_summaries(selected_paths).items()
+                    }
+                finally:
+                    dependency_store.close()
+            except Exception as exc:
+                logger.debug("Dependency index unavailable: %s", exc)
+        dependencies = await discover_dependencies(
+            expanded,
+            dependency_fetcher,
+            indexed_imports,
+            concurrency=self.config.review.max_concurrent_chunks,
+            repo_tree=dependency_tree,
+        )
+        overhead_messages = build_review_prompt(
+            files=[],
+            config=self.config,
+            pr_title=pr_title,
+            pr_description=pr_description,
+            existing_comments=existing_comments,
+            code_context=code_context_block,
+            learned_rules=learned_rules or None,
+            custom_rules=custom_rules or None,
+            # History is scoped and budgeted per part below, not per entire PR.
+            file_history=None,
+            review_round=review_round,
+            resolved_threads=resolved_threads,
+            team_conventions=team_conventions,
+        )
+        overhead = sum(self.llm.count_tokens(m["content"]) for m in overhead_messages)
+        # Reserve output, per-group notes, path lists and tool instructions too.
+        context_budget = (
+            self.config.llm.max_context_tokens - overhead - self.config.llm.max_tokens - 6000
+        )
+        chunks = chunk_files(
+            expanded,
+            max_tokens=min(self.config.review.agent_token_budget, context_budget),
+            provider=self.llm,
+            dependencies=dependencies,
+            max_files=max(1, min(self.config.review.agent_max_files, self.config.filter.max_files)),
+        )
+
         base_existing = list(existing_comments) if existing_comments else []
         semaphore = _asyncio.Semaphore(self.config.review.max_concurrent_chunks)
-        audit: list[dict] = []
+        audit: list[dict] = [
+            {
+                "stage": "review_plan",
+                "files": len(selected_paths),
+                "parts": len(chunks),
+                "groups": [
+                    {"part": i, "group": c.group_id, "paths": [f.path for f in c.files]}
+                    for i, c in enumerate(chunks)
+                ],
+            }
+        ]
 
         # Chunks that never produced a review, with the error that stopped
         # them, and the files that went unread with them. One dead chunk costs
@@ -1765,6 +1848,7 @@ class ReviewEngine:
         async def _review_chunk(
             idx: int,
             chunk: ReviewChunk,
+            group_notes: str = "",
         ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
             async with semaphore:
                 logger.info(
@@ -1773,131 +1857,184 @@ class ReviewEngine:
                     len(chunks),
                     len(chunk.files),
                 )
-                try:
-                    chunk_history = {
-                        f.path: file_history[f.path] for f in chunk.files if f.path in file_history
-                    }
-                    messages = build_review_prompt(
+                chunk_history = {
+                    f.path: file_history[f.path] for f in chunk.files if f.path in file_history
+                }
+
+                def _messages(history: dict) -> list[dict[str, str]]:
+                    return build_review_prompt(
                         files=chunk.files,
                         config=self.config,
                         pr_title=pr_title,
                         pr_description=pr_description,
                         existing_comments=base_existing or None,
-                        code_context=code_context_block,
+                        code_context=code_context_block + group_notes,
                         learned_rules=learned_rules or None,
                         custom_rules=custom_rules or None,
-                        file_history=chunk_history or None,
+                        file_history=history or None,
                         review_round=review_round,
                         resolved_threads=resolved_threads,
                         team_conventions=team_conventions,
                     )
 
-                    def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-                        parsed = parse_llm_response(raw)
-                        return (
-                            convert_to_review_comments(
-                                parsed,
-                                valid_paths,
-                                diff_files=chunk.files,
-                            ),
-                            [
-                                KeyIssue(issue=ki.issue, path=ki.path, line=ki.line)
-                                for ki in parsed.key_issues
-                            ],
-                            parsed.summary or "",
-                        )
+                messages = _messages(chunk_history)
+                prompt_limit = self.config.llm.max_context_tokens - self.config.llm.max_tokens
+                if sum(self.llm.count_tokens(m["content"]) for m in messages) > prompt_limit:
+                    # Optional commit history must not displace owned diff hunks.
+                    messages = _messages({})
+                if sum(self.llm.count_tokens(m["content"]) for m in messages) > prompt_limit:
+                    raise ValueError("Review prompt exceeds the configured context window")
 
-                    raw_response = ""
-                    use_agentic = (
-                        self.config.review.agentic_tools
-                        and self._agentic_source_fetcher is not None
+                def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+                    parsed = parse_llm_response(raw)
+                    return (
+                        convert_to_review_comments(
+                            parsed,
+                            {f.path for f in chunk.files},
+                            diff_files=chunk.files,
+                        ),
+                        [
+                            KeyIssue(issue=ki.issue, path=ki.path, line=ki.line)
+                            for ki in parsed.key_issues
+                        ],
+                        parsed.summary or "",
                     )
-                    if use_agentic:
-                        from mira.llm.agentic_tools import AgenticToolExecutor
 
-                        executor = AgenticToolExecutor(
-                            source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
-                            repo_tree=list(self._agentic_repo_tree),
-                        )
-                        raw_response = await agentic_review_loop(self.llm, messages, executor)
-                        audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
-                    if not raw_response:
-                        raw_response = await self.llm.review(messages)
-                    comments, key_issues, summary_text = _parse(raw_response)
+                raw_response = ""
+                use_agentic = (
+                    self.config.review.agentic_tools and self._agentic_source_fetcher is not None
+                )
+                if use_agentic:
+                    from mira.llm.agentic_tools import AgenticToolExecutor
 
-                    # Ensemble: fire the extra runs in parallel and keep
-                    # majority-vote findings. The agentic loop (if any) only
-                    # runs once; extras sample the plain review path.
-                    n_runs = self.config.review.ensemble_runs
-                    if n_runs > 1:
-                        extra_raws = await _asyncio.gather(
-                            *[
-                                self.llm.review(
-                                    messages,
-                                    temperature=self.config.review.ensemble_temperature,
-                                )
-                                for _ in range(n_runs - 1)
-                            ],
-                            return_exceptions=True,
+                    executor = AgenticToolExecutor(
+                        source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                        repo_tree=list(self._agentic_repo_tree),
+                    )
+                    raw_response = await agentic_review_loop(self.llm, messages, executor)
+                    audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
+                if not raw_response:
+                    raw_response = await self.llm.review(messages)
+                comments, key_issues, summary_text = _parse(raw_response)
+
+                # Ensemble: fire the extra runs in parallel and keep
+                # majority-vote findings. The agentic loop (if any) only
+                # runs once; extras sample the plain review path.
+                n_runs = self.config.review.ensemble_runs
+                if n_runs > 1:
+                    extra_raws = await _asyncio.gather(
+                        *[
+                            self.llm.review(
+                                messages,
+                                temperature=self.config.review.ensemble_temperature,
+                            )
+                            for _ in range(n_runs - 1)
+                        ],
+                        return_exceptions=True,
+                    )
+                    runs = [comments]
+                    for raw in extra_raws:
+                        if isinstance(raw, BaseException):
+                            logger.warning("Ensemble run failed: %s", raw)
+                            continue
+                        try:
+                            extra_comments, _, _ = _parse(raw)
+                            runs.append(extra_comments)
+                        except ResponseParseError as exc:
+                            logger.warning("Ensemble run failed to parse: %s", exc)
+                    if len(runs) > 1:
+                        before = sum(len(r) for r in runs)
+                        comments = merge_ensemble_runs(runs)
+                        audit.append(
+                            {
+                                "stage": "ensemble_vote",
+                                "chunk": idx,
+                                "runs": len(runs),
+                                "drafted": before,
+                                "kept": len(comments),
+                            }
                         )
-                        runs = [comments]
-                        for raw in extra_raws:
-                            if isinstance(raw, BaseException):
-                                logger.warning("Ensemble run failed: %s", raw)
-                                continue
-                            try:
-                                extra_comments, _, _ = _parse(raw)
-                                runs.append(extra_comments)
-                            except ResponseParseError as exc:
-                                logger.warning("Ensemble run failed to parse: %s", exc)
-                        if len(runs) > 1:
-                            before = sum(len(r) for r in runs)
-                            comments = merge_ensemble_runs(runs)
+                        logger.info(
+                            "Ensemble chunk %d: %d comments across %d runs -> %d consensus",
+                            idx + 1,
+                            before,
+                            len(runs),
+                            len(comments),
+                        )
+
+                return comments, key_issues, summary_text
+
+        def _bounded_group_text(value: str) -> str:
+            lo, hi = 0, len(value)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if self.llm.count_tokens(value[:mid]) <= 2000:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return value[:lo]
+
+        async def _run_group(
+            parts: list[tuple[int, ReviewChunk]],
+        ) -> list[tuple[int, ReviewPartResult]]:
+            results: list[tuple[int, ReviewPartResult]] = []
+            notes = ""
+            related = parts[0][1].related_paths
+            for idx, chunk in parts:
+                context = ""
+                if len(parts) > 1:
+                    context = (
+                        "\n\n## Your dependency group\n"
+                        "You own these related changes across sequential review parts. "
+                        "Check their contracts together; review every supplied hunk. "
+                        "Use repository tools to verify cross-file claims. File findings only "
+                        "on this part's paths. Long line fragments are incomplete lines.\n"
+                        + _bounded_group_text("\n".join(related))
+                        + "\nPrevious parts' review notes (context, not verified facts):\n"
+                        + _bounded_group_text(notes)
+                    )
+                for attempt in range(self.config.review.chunk_retries + 1):
+                    try:
+                        result = await _review_chunk(idx, chunk, context)
+                        break
+                    except Exception as exc:
+                        if attempt < self.config.review.chunk_retries:
+                            logger.warning("Retrying review part %d: %s", idx + 1, exc)
                             audit.append(
-                                {
-                                    "stage": "ensemble_vote",
-                                    "chunk": idx,
-                                    "runs": len(runs),
-                                    "drafted": before,
-                                    "kept": len(comments),
-                                }
+                                {"stage": "chunk_retry", "chunk": idx, "attempt": attempt + 1}
                             )
-                            logger.info(
-                                "Ensemble chunk %d: %d comments across %d runs -> %d consensus",
-                                idx + 1,
-                                before,
-                                len(runs),
-                                len(comments),
-                            )
+                            continue
+                        logger.warning("Review part %d failed: %s", idx + 1, exc)
+                        audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
+                        chunk_failures.append(exc)
+                        unread_paths.update(f.path for f in chunk.files)
+                        result = ([], [], "")
+                results.append((idx, result))
+                comments, _, summary_text = result
+                new_notes = (
+                    summary_text
+                    + "\n"
+                    + "\n".join(f"{c.path}:{c.line}: {c.title}: {c.body}" for c in comments)
+                )
+                notes = (notes + "\n" + new_notes)[-8000:]
+            return results
 
-                    return comments, key_issues, summary_text
-                except ResponseParseError as exc:
-                    logger.warning(
-                        "Chunk %d/%d failed to parse, skipping: %s",
-                        idx + 1,
-                        len(chunks),
-                        exc,
-                    )
-                    chunk_failures.append(exc)
-                    unread_paths.update(f.path for f in chunk.files)
-                    return [], [], ""
-                except Exception as exc:
-                    # An LLM that stays broken through every retry, re-roll and
-                    # fallback used to take the whole review down with it. Drop
-                    # the chunk instead: the other chunks still get reviewed,
-                    # and the all-chunks-failed case is raised after the gather.
-                    logger.warning(
-                        "Chunk %d/%d failed, skipping: %s",
-                        idx + 1,
-                        len(chunks),
-                        exc,
-                    )
-                    audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
-                    chunk_failures.append(exc)
-                    unread_paths.update(f.path for f in chunk.files)
-                    return [], [], ""
+        async def _run_review_groups() -> list[ReviewPartResult]:
+            groups: dict[int, list[tuple[int, ReviewChunk]]] = {}
+            for idx, chunk in enumerate(chunks):
+                key = chunk.group_id if chunk.group_id >= 0 else -(idx + 1)
+                groups.setdefault(key, []).append((idx, chunk))
+            pending = list(groups.values())
+            results: list[tuple[int, ReviewPartResult]] = []
+            wave_size = self.config.review.max_chunks_per_review
+            for start in range(0, len(pending), wave_size):
+                wave = await _asyncio.gather(
+                    *(_run_group(g) for g in pending[start : start + wave_size])
+                )
+                results.extend(item for group in wave for item in group)
+            return [result for _, result in sorted(results, key=lambda item: item[0])]
 
-        review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        review_task = _asyncio.create_task(_run_review_groups())
         security_task = _asyncio.create_task(
             security_review_pass(
                 self.llm,

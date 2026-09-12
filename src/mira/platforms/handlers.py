@@ -168,7 +168,7 @@ def _help_message(bot_name: str) -> str:
         f"| Command | What it does |\n"
         f"|---|---|\n"
         f"| `@{bot_name} review` | Re-run the full review on this PR. Useful after force-pushes or when you want a fresh pass. |\n"
-        f"| `@{bot_name} review-rest` | Review files that were skipped on the first pass because the PR was too large. Aliases: `rest`, `continue`. |\n"
+        f"| `@{bot_name} review-rest` | Retry files left incomplete by failed review parts or configured limits. Large PRs continue automatically by default. Aliases: `rest`, `continue`. |\n"
         f"| `@{bot_name} pause` | Pause Mira on this PR. No more reviews until you resume. Adds a `mira-paused` label. |\n"
         f"| `@{bot_name} resume` | Resume Mira on a paused PR and re-review the latest diff. |\n"
         f"| `@{bot_name} fix all` | Have Mira write fixes for the most serious open findings on this PR, each on its own branch and stacked PR. Bounded by a configured limit, and the reply lists whatever it left out. Disabled unless a maintainer turned autofix on. |\n"

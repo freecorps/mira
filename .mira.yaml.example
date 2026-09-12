@@ -75,13 +75,23 @@ filter:
   #   - app/dependabot
   # Skip deleted files
   exclude_deleted: true
-  # Maximum number of files to review
+  # File target per agent with auto_complete; total cap in legacy mode
   max_files: 50
 
 review:
+  # Automatically review every eligible file, across as many agents as needed.
+  auto_complete: true
+  # Diff token budget and soft file target per agent. Related files stay together.
+  agent_token_budget: 24000
+  agent_max_files: 12
+  # Parallel work and automatic waves (these do not limit total PR coverage).
+  max_concurrent_chunks: 5
+  max_chunks_per_review: 5
+  # Retry failed parts without re-running successful parts.
+  chunk_retries: 1
   # Lines of context around hunks
   context_lines: 3
-  # Maximum diff size in characters
+  # Legacy total diff cap in characters (only when auto_complete: false)
   max_diff_size: 50000
   # Only flag critical problems/bugs (false = also suggest improvements)
   focus_only_on_problems: false
