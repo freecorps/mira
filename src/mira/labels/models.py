@@ -88,8 +88,8 @@ class WorkflowNode(StrictModel):
 
 class WorkflowEdge(StrictModel):
     id: str = Field(min_length=1, max_length=80)
-    source: str
-    target: str
+    source: str = Field(min_length=1, max_length=80)
+    target: str = Field(min_length=1, max_length=80)
     branch: Literal["next", "true", "false"] = "next"
 
 

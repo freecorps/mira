@@ -545,11 +545,21 @@ class ForgejoProvider(BaseProvider):
     async def get_label_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
         files = await self._paginate(f"{self._pr(pr_info)}/files")
         response = await self._request("GET", self._pr(pr_info))
-        count = response.json().get("changed_files")
+        summary = response.json()
+        count = summary.get("changed_files")
         if count is None or len(files) != count:
             raise ProviderError("Incomplete PR file statistics; labels were not changed")
-        if any("additions" not in file or "deletions" not in file for file in files):
+        if any(
+            type(item.get(field)) is not int or item[field] < 0
+            for item in [summary, *files]
+            for field in ("additions", "deletions")
+        ):
             raise ProviderError("PR line statistics unavailable; labels were not changed")
+        if any(
+            sum(file[field] for file in files) != summary[field]
+            for field in ("additions", "deletions")
+        ):
+            raise ProviderError("Incomplete PR line statistics; labels were not changed")
         return [
             FileChangeStat(
                 path=f["filename"], added_lines=f["additions"], deleted_lines=f["deletions"]

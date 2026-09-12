@@ -52,6 +52,10 @@ export interface LabelWorkflow {
   nodes: LabelNode[]
   edges: LabelEdge[]
 }
+export interface LabelWorkflowSnapshot {
+  workflow: LabelWorkflow
+  revision: string
+}
 export interface LabelPreset {
   id: string
   name: string
@@ -89,9 +93,12 @@ const query = (scope: LabelScope) =>
   new URLSearchParams({ ...scope }).toString()
 export const labelsApi = {
   get: (scope: LabelScope) =>
-    fetchJson<LabelWorkflow>(`/api/labels/workflow?${query(scope)}`),
-  save: (scope: LabelScope, workflow: LabelWorkflow) =>
-    putJson<LabelWorkflow>(`/api/labels/workflow?${query(scope)}`, workflow),
+    fetchJson<LabelWorkflowSnapshot>(`/api/labels/workflow?${query(scope)}`),
+  save: (scope: LabelScope, workflow: LabelWorkflow, revision: string) =>
+    putJson<LabelWorkflowSnapshot>(`/api/labels/workflow?${query(scope)}`, {
+      workflow,
+      revision,
+    }),
   presets: () => fetchJson<LabelPreset[]>("/api/labels/presets"),
   copy: (source: LabelScope) =>
     postJson<LabelWorkflow>("/api/labels/copy", source),

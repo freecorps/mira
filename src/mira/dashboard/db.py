@@ -1482,6 +1482,23 @@ class AppDatabase:
             )
             return cur.rowcount > 0
 
+    def compare_and_set_setting(self, key: str, expected: str | None, value: str) -> bool:
+        """Replace only the exact value a caller read, atomically across workers."""
+        if expected is None:
+            return self.add_setting(key, value)
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(
+                "UPDATE settings SET value=? WHERE key=? AND value=?", (value, key, expected)
+            )
+            self._sqlite_conn.commit()
+            return cur.rowcount > 0
+        with self._pg_cursor() as cur:
+            cur.execute(
+                "UPDATE settings SET value=%s WHERE key=%s AND value=%s", (value, key, expected)
+            )
+            return cur.rowcount > 0
+
     def delete_setting(self, key: str) -> None:
         """Remove a setting row. No-op when the key isn't stored."""
         if self._backend == "sqlite":
