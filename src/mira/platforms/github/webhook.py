@@ -467,6 +467,9 @@ async def dispatch_github_event(
     Mirrors ``dispatch_gitlab_event`` — self-authored events are ignored to
     avoid review loops.
     """
+    from mira.labels.webhooks import schedule_labels
+
+    schedule_labels("github", event, payload, app_auth, background_tasks)
     action = payload.get("action", "")
     cfg = load_config()
 

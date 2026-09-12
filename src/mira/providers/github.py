@@ -984,6 +984,46 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to add label: {e}") from e
 
+    async def ensure_label(
+        self, pr_info: PRInfo, name: str, color: str, description: str = ""
+    ) -> None:
+        def _ensure() -> None:
+            repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            try:
+                repo.get_label(name)
+                return
+            except GithubException as exc:
+                if exc.status != 404:
+                    raise
+            try:
+                repo.create_label(name, color, description)
+            except GithubException as exc:
+                if exc.status != 422:
+                    raise
+                # Another PR may have created it while this one was reading.
+                repo.get_label(name)
+
+        await asyncio.to_thread(_ensure)
+
+    async def get_label_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
+        def _fetch() -> list[FileChangeStat]:
+            pr = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}").get_pull(pr_info.number)
+            files = list(pr.get_files())
+            if len(files) != pr.changed_files:
+                raise ProviderError("Incomplete PR file statistics; labels were not changed")
+            stats = [
+                FileChangeStat(path=f.filename, added_lines=f.additions, deleted_lines=f.deletions)
+                for f in files
+            ]
+            if (
+                sum(f.added_lines for f in stats) != pr.additions
+                or sum(f.deleted_lines for f in stats) != pr.deletions
+            ):
+                raise ProviderError("Incomplete PR line statistics; labels were not changed")
+            return stats
+
+        return await asyncio.to_thread(_fetch)
+
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
         @_retry_transient
         def _remove() -> None:

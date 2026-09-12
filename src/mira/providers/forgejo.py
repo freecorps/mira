@@ -41,6 +41,7 @@ from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     CIJobFailure,
+    FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
@@ -523,6 +524,39 @@ class ForgejoProvider(BaseProvider):
 
     # ── labels ──────────────────────────────────────────────────────
 
+    async def ensure_label(
+        self, pr_info: PRInfo, name: str, color: str, description: str = ""
+    ) -> None:
+        url = f"{self._repo(pr_info)}/labels"
+        labels = await self._paginate(url)
+        if any(label["name"].casefold() == name.casefold() for label in labels):
+            return
+        response = await self._request(
+            "POST",
+            url,
+            json={"name": name, "color": color, "description": description},
+            ok=(200, 201, 409, 422),
+        )
+        if response.status_code in {409, 422}:
+            labels = await self._paginate(url)
+            if not any(label["name"].casefold() == name.casefold() for label in labels):
+                raise ProviderError("Could not create repository label")
+
+    async def get_label_change_stats(self, pr_info: PRInfo) -> list[FileChangeStat]:
+        files = await self._paginate(f"{self._pr(pr_info)}/files")
+        response = await self._request("GET", self._pr(pr_info))
+        count = response.json().get("changed_files")
+        if count is None or len(files) != count:
+            raise ProviderError("Incomplete PR file statistics; labels were not changed")
+        if any("additions" not in file or "deletions" not in file for file in files):
+            raise ProviderError("PR line statistics unavailable; labels were not changed")
+        return [
+            FileChangeStat(
+                path=f["filename"], added_lines=f["additions"], deleted_lines=f["deletions"]
+            )
+            for f in files
+        ]
+
     async def add_label(self, pr_info: PRInfo, label: str) -> None:
         await self._request(
             "POST",
@@ -531,9 +565,14 @@ class ForgejoProvider(BaseProvider):
         )
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
+        labels = await self._paginate(f"{self._repo(pr_info)}/issues/{pr_info.number}/labels")
+        match = next((item for item in labels if item["name"].casefold() == label.casefold()), None)
+        if match is None:
+            return
         await self._request(
             "DELETE",
-            f"{self._repo(pr_info)}/issues/{pr_info.number}/labels?name={quote(label, safe='')}",
+            f"{self._repo(pr_info)}/issues/{pr_info.number}/labels/{match['id']}",
+            ok=(200, 204, 404),
         )
 
     async def get_discussion_root_body(self, pr_info: PRInfo, discussion_id: str) -> str:

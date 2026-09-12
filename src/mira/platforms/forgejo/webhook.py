@@ -443,6 +443,9 @@ async def dispatch_forgejo_event(
 
     Self-authored events (the bot's own comments) are ignored to avoid loops.
     """
+    from mira.labels.webhooks import schedule_labels
+
+    schedule_labels("forgejo", event, payload, auth, background_tasks)
     sender = payload.get("sender", {})
     actor = sender.get("login", "")
     bot_identity = await auth.get_bot_identity()

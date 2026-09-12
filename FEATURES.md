@@ -44,6 +44,16 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Both inject into the review prompt automatically
 - Rules UI at `/rules` in the dashboard
 
+## Automatic PR labels
+
+- Visual rule graphs per repository and hosting platform, with Yes/No branches and custom labels
+- Editable presets for PR size, author and documentation paths
+- Size labels update in both directions as the PR grows or shrinks (additions + deletions)
+- Copy workflows between repositories as independent drafts
+- Simulate label additions/removals before enabling; synchronized and add-only actions
+- Deterministic execution on GitHub, GitLab and Forgejo events, independent of AI review settings
+- Admin-only editing and audit trail; [configuration and behavior](docs/automatic-labels.md)
+
 ## Learning from feedback
 
 - Stable finding provenance for replies, explicit rejects, and supported 👍/👎 reactions

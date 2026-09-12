@@ -435,6 +435,9 @@ async def dispatch_gitlab_event(
 
     Self-authored events (the bot's own notes/MRs) are ignored to avoid loops.
     """
+    from mira.labels.webhooks import schedule_labels
+
+    schedule_labels("gitlab", event, payload, auth, background_tasks)
     actor = payload.get("user", {}).get("username", "") or payload.get("user_username", "")
     bot_identity = await auth.get_bot_identity()
     if actor and bot_identity and actor == bot_identity:
