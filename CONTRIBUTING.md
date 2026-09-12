@@ -25,7 +25,7 @@ cd mira
 uv sync --locked --extra dev --extra serve --extra bedrock
 ```
 
-For the dashboard UI:
+For the dashboard UI, use Node.js 24 LTS (Node.js >=22.22.0 is required):
 
 ```bash
 cd ui/mira
