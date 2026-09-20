@@ -67,6 +67,18 @@ Repository = "https://github.com/miracodeai/mira"
 Issues = "https://github.com/miracodeai/mira/issues"
 Changelog = "https://github.com/miracodeai/mira/blob/main/CHANGELOG.md"
 
+[tool.uv]
+# Version floors for transitive dependencies that shipped security fixes. We
+# never import these directly, so there is nothing to pin in [project]; the
+# constraint only stops a future re-resolution from landing back on a
+# vulnerable release.
+#   anyio >= 4.14.2 — pulled in by httpx, starlette and watchfiles. Fixes
+#   CVE-2026-63374 (TLSStream encoded host names with IDNA 2003, so an
+#   internationalized domain could match a certificate issued for a different
+#   name — TLS spoofing) and CVE-2026-64847 (process-pool workers deadlock on
+#   an undrained stderr pipe).
+constraint-dependencies = ["anyio>=4.14.2"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mira"]
 
