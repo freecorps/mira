@@ -198,6 +198,11 @@ class LLMConfig(BaseModel):
         """
         name = (self.provider or "").strip().lower()
         if name in ("", "openai", "bedrock"):
+            # These two are the backends themselves and always have been:
+            # "openai" is any OpenAI-compatible endpoint (whatever `base_url`
+            # says) and "bedrock" is the Converse API. A profile may not take
+            # either name — OpenAI's own API is the "openai-api" preset — so
+            # that neither meaning can shift under an existing config.
             return self
         from mira.llm import provider_profiles as profiles
 

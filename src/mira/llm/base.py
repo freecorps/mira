@@ -99,10 +99,12 @@ def _get_api_key(config: LLMConfig, profile: dict | None = None) -> str:
         stored = endpoints.get(named)
         if stored is not None:
             return endpoints.key_for(stored)
-        logger.warning(
-            "Endpoint %r is configured but not stored; falling back to the environment",
-            named,
-        )
+        # The endpoint was there when this client was built and is gone now
+        # — removed between the binding and the call. Falling back to the
+        # environment here would send the *config file's* key to the URL the
+        # deleted endpoint left behind, which is one provider's credential
+        # handed to another. Refuse instead; the caller reports it.
+        raise LLMError("unknown_endpoint", endpoint=named)
     if config.api_key_env == "":
         return ""
     key = os.environ.get(config.api_key_env, "")

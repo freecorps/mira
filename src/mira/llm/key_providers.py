@@ -398,6 +398,7 @@ def _card(
     api_style: str,
     key_source: str,
     key_hint: str,
+    key_variable: str,
     editable: bool,
     is_default: bool,
     preset: str,
@@ -415,6 +416,10 @@ def _card(
         "endpoint": base_url,
         "key_source": key_source,  # "stored" | "env:<VAR>" | ""
         "key_hint": key_hint,
+        # The variable this endpoint reads a key from, whether or not the
+        # server currently exports it. The form edits this; `key_source`
+        # only says where the key is coming from right now.
+        "key_variable": key_variable,
         "key_configured": bool(key_source),
         # Bare model ids go here (no signed-in account outranks it).
         "is_default": is_default,
@@ -447,6 +452,7 @@ async def endpoint_card(
         api_style=endpoint.api_style,
         key_source=endpoints.key_source(endpoint, db),
         key_hint=endpoints.key_hint(endpoint, db),
+        key_variable=endpoint.api_key_env,
         editable=True,
         is_default=is_default,
         preset=endpoint.preset,
@@ -477,6 +483,7 @@ async def config_card(config: LLMConfig | None, *, is_default: bool, db: Any = N
         # no row of its own to store one in.
         key_source=f"env:{env}" if api_key else "",
         key_hint=f"…{api_key[-4:]}" if len(api_key) >= 8 else "",
+        key_variable=env,
         editable=False,
         is_default=is_default,
         preset=profile.get("name") or "",

@@ -155,8 +155,13 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     else:
         # Per endpoint, not per URL: two endpoints may share a URL and open
         # it with different keys, which can be entitled to different models.
-        named = endpoints.name_of(config.endpoint)
-        cache_key = f"endpoint:{named}" if named else config.base_url
+        # The revision is in the key too, so editing an endpoint's URL, its
+        # preset, its protocol or its key shows the new list at once rather
+        # than the old one for the rest of the hour.
+        stored = endpoints.get(config.endpoint)
+        cache_key = (
+            f"endpoint:{stored.id}:{stored.updated_at}" if stored is not None else config.base_url
+        )
 
     def cached() -> tuple[float, list[dict] | None] | None:
         hit = _cache.get(cache_key)
@@ -286,7 +291,7 @@ async def endpoint_entries(base: LLMConfig, db: Any = None) -> list[dict]:
 
     entries = []
     for endpoint in store.all_endpoints(db).values():
-        config = apply_endpoint_binding(base, endpoint.id, model_is_explicit=True)
+        config = apply_endpoint_binding(base, endpoint.id, model_is_explicit=True, db=db)
         if config.endpoint != endpoint.id:  # it vanished between the two reads
             continue
         entries.append(

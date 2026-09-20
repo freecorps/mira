@@ -358,7 +358,9 @@ def delete(endpoint_id: str, db: Any = None) -> None:
 def set_secret(endpoint_id: str, api_key: str, db: Any = None) -> None:
     """Store (or clear) the key an endpoint's requests carry.
 
-    Its own row, so nothing that reads an endpoint reads a key by accident.
+    Its own row, so nothing that reads an endpoint reads a key by accident —
+    and the endpoint's own row is touched too, because a new key can mean a
+    different catalogue and anything cached against the old one is stale.
     """
     store = _require_db(db)
     text = (api_key or "").strip()
@@ -366,6 +368,10 @@ def set_secret(endpoint_id: str, api_key: str, db: Any = None) -> None:
         store.set_setting(_KEY_PREFIX + endpoint_id, text)
     else:
         store.delete_setting(_KEY_PREFIX + endpoint_id)
+    endpoint = get(endpoint_id, store)
+    if endpoint is not None:
+        endpoint.updated_at = time.time()
+        store.set_setting(_PREFIX + endpoint.id, json.dumps(endpoint.to_dict()))
 
 
 def secret(endpoint_id: str, db: Any = None) -> str:
@@ -399,13 +405,26 @@ def key_for(endpoint: Endpoint, db: Any = None) -> str:
     return ""
 
 
+def key_variable(endpoint: Endpoint) -> str:
+    """The variable this endpoint would read a key from, set or not.
+
+    What the form has to show: an endpoint pointed at a variable the server
+    does not currently export still *names* that variable, and a page that
+    reported only where the key comes from would show an empty field and
+    save the pointer away.
+    """
+    if endpoint.api_key_env:
+        return endpoint.api_key_env
+    if endpoint.preset:
+        return str((presets().get(endpoint.preset) or {}).get("api_key_env", "") or "")
+    return ""
+
+
 def key_source(endpoint: Endpoint, db: Any = None) -> str:
-    """Where the key comes from: "stored", "env:<VAR>", or "" for none."""
+    """Where the key actually comes from: "stored", "env:<VAR>", or "" for none."""
     if has_secret(endpoint.id, db):
         return "stored"
-    env = endpoint.api_key_env
-    if not env and endpoint.preset:
-        env = (presets().get(endpoint.preset) or {}).get("api_key_env", "")
+    env = key_variable(endpoint)
     if env and os.environ.get(env):
         return f"env:{env}"
     return ""
