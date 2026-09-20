@@ -145,12 +145,25 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
 
+      # `--format` is read by buildx as "print the whole manifest" for any
+      # template starting with `{{.Manifest`, so `{{.Manifest.Digest}}` returns
+      # the human-readable Name/MediaType/Digest/Manifests block rather than
+      # the digest, and the multi-line value is rejected by $GITHUB_OUTPUT.
+      # buildx narrowed that match to exactly `{{.Manifest}}` in v0.33.0, but
+      # the Blacksmith builder pins v0.23.0. `{{json .Manifest}}` avoids the
+      # match on every version, and jq reads the digest out of real JSON.
       - name: Resolve the manifest list digest
         id: digest
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          digest="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}" --format '{{.Manifest.Digest}}')"
+          digest="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          # A digest that is not a digest would otherwise reach actions/attest
+          # as a subject, so fail here where the cause is legible instead.
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Expected a sha256 digest from imagetools inspect, got: ${digest}"
+            exit 1
+          fi
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "Published ${REGISTRY}/${IMAGE_NAME}@${digest}"
 
