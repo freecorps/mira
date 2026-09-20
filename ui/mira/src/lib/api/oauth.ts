@@ -1,6 +1,7 @@
 import { deleteJson, fetchJson, postJson, putJson } from "./http"
 
-// One metered window of a plan's allowance (ChatGPT: 5-hour and weekly).
+// One metered window of a plan's allowance (ChatGPT: 5-hour and weekly;
+// OpenCode Go: 5-hour, weekly and monthly).
 export type UsageWindow = {
   used_percent: number
   window_minutes: number | null
@@ -11,6 +12,7 @@ export type UsageWindow = {
 export type UsageSnapshot = {
   primary: UsageWindow | null
   secondary: UsageWindow | null
+  tertiary: UsageWindow | null
   credits: {
     has_credits: boolean
     unlimited: boolean

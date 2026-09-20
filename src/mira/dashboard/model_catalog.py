@@ -40,13 +40,17 @@ OAUTH_BACKEND_PREFIX = "oauth:"
 
 
 def active_backend(config: LLMConfig) -> str:
-    """Return ``"oauth:<id>"``, "bedrock", "openrouter", or "openai-compatible"."""
+    """Which backend the config's calls go to, by name.
+
+    ``"oauth:<id>"`` for a signed-in account, ``"bedrock"``, the profile's
+    name for an endpoint ``providers.json`` knows (``"openrouter"``,
+    ``"opencode-go"``), or ``"openai-compatible"`` for any other endpoint.
+    """
     if config.oauth_provider:
         return f"{OAUTH_BACKEND_PREFIX}{config.oauth_provider}"
     if config.provider == "bedrock":
         return "bedrock"
-    profile = profiles.resolve(config.base_url)
-    return "openrouter" if profile.get("name") == "openrouter" else "openai-compatible"
+    return profiles.resolve(config.base_url).get("name") or "openai-compatible"
 
 
 def _oauth_models(backend: str) -> list[dict] | None:
@@ -72,7 +76,7 @@ async def _fetch_openai_style(config: LLMConfig, tools_only: bool) -> list[dict]
     tool-calling models — Mira's review pass needs tool calling."""
     headers = {}
     try:
-        key = _get_api_key(config)
+        key = _get_api_key(config, profiles.resolve(config.base_url))
     except Exception as exc:
         logger.warning("Could not retrieve API key for model catalog fetch: %s", exc)
         key = ""
@@ -293,28 +297,20 @@ async def oauth_option_groups(default: tuple[str, str], db: Any = None) -> list[
     return out
 
 
-def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> list[dict]:
-    """Dropdown options for ``purpose``: registry entries matching the backend
-    (carrying the recommended flags) merged with the dynamic catalog.
+def _registry_options(backend: str, purpose: str) -> list[dict]:
+    """The registry entries that belong on ``backend``, for ``purpose``.
 
-    Dynamic-only models have unknown capabilities, so they're offered for both
-    purposes. On a generic endpoint only its own list is trustworthy — registry
-    ids are OpenRouter-style — so the registry is used there only as fallback.
+    An entry naming an ``endpoint`` is served by that one profile and is
+    offered nowhere else: its id is bare (``kimi-k2.7-code``), and sent to
+    OpenRouter it would be a 404. The rest are OpenRouter-style ids, split
+    between Bedrock and everything else as before.
     """
-    if backend.startswith(OAUTH_BACKEND_PREFIX):
-        # The provider spec's own list, in its own order: it is short, curated,
-        # and already says which model to reach for first.
-        return [{"recommended": False, **d} for d in (dynamic or [])]
-
-    if backend == "openai-compatible" and dynamic is not None:
-        options = [{**d, "recommended": False} for d in dynamic]
-        options.sort(key=lambda m: m["label"].lower())
-        return options
-
-    wants_bedrock = backend == "bedrock"
     options = []
     for model_id, info in registry.all_models().items():
-        if (info.get("provider") == "bedrock") != wants_bedrock:
+        endpoint = info.get("endpoint")
+        if not endpoint:
+            endpoint = "bedrock" if info.get("provider") == "bedrock" else "openrouter"
+        if endpoint != backend:
             continue
         if purpose not in (info.get("purposes") or []):
             continue
@@ -325,8 +321,46 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
                 "recommended": purpose in (info.get("recommended_for") or []),
             }
         )
-    if dynamic is not None:
-        seen = {_norm(o["value"]) for o in options}
-        options += [{**d, "recommended": False} for d in dynamic if _norm(d["value"]) not in seen]
+    return options
+
+
+def _merge_dynamic(options: list[dict], dynamic: list[dict] | None) -> list[dict]:
+    """Add the live catalog's models the registry does not already name."""
+    if dynamic is None:
+        return options
+    seen = {_norm(o["value"]) for o in options}
+    return options + [{**d, "recommended": False} for d in dynamic if _norm(d["value"]) not in seen]
+
+
+def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> list[dict]:
+    """Dropdown options for ``purpose``: registry entries matching the backend
+    (carrying the recommended flags) merged with the dynamic catalog.
+
+    Dynamic-only models have unknown capabilities, so they're offered for both
+    purposes. On a generic endpoint only its own list is trustworthy — registry
+    ids are OpenRouter-style — so the registry is used there only as fallback.
+    An endpoint the registry has entries *for* (``endpoint: "opencode-go"``)
+    gets those, with their labels and Recommended badges, ahead of whatever
+    else its live list carries.
+    """
+    if backend.startswith(OAUTH_BACKEND_PREFIX):
+        # The provider spec's own list, in its own order: it is short, curated,
+        # and already says which model to reach for first.
+        return [{"recommended": False, **d} for d in (dynamic or [])]
+
+    if backend not in ("openrouter", "bedrock"):
+        own = _registry_options(backend, purpose)
+        if own:
+            options = _merge_dynamic(own, dynamic)
+        elif dynamic is not None:
+            options = [{**d, "recommended": False} for d in dynamic]
+        else:
+            # Nothing known about this endpoint and no live list either: the
+            # OpenRouter-style registry is the only list there is to offer.
+            options = _registry_options("openrouter", purpose)
+        options.sort(key=lambda m: (not m["recommended"], m["label"].lower()))
+        return options
+
+    options = _merge_dynamic(_registry_options(backend, purpose), dynamic)
     options.sort(key=lambda m: (not m["recommended"], m["label"].lower()))
     return options

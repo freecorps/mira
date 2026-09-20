@@ -93,15 +93,18 @@ class UsageWindow:
 class UsageSnapshot:
     """What is known about one account's allowance, and how current it is.
 
-    ``primary`` and ``secondary`` are the short and long windows. ``credits``
-    is whatever pay-as-you-go balance the plan carries, as the provider
-    reports it. ``exhausted_until`` is Mira's own note: the account answered
-    a 429, and this is when it is worth trying again — the windows alone
-    cannot say that, because a refusal can arrive before a window reads 100%.
+    ``primary`` and ``secondary`` are the short and long windows, and
+    ``tertiary`` a longer one still where the plan has three (OpenCode Go
+    meters 5-hour, weekly and monthly). ``credits`` is whatever
+    pay-as-you-go balance the plan carries, as the provider reports it.
+    ``exhausted_until`` is Mira's own note: the account answered a 429, and
+    this is when it is worth trying again — the windows alone cannot say
+    that, because a refusal can arrive before a window reads 100%.
     """
 
     primary: UsageWindow | None = None
     secondary: UsageWindow | None = None
+    tertiary: UsageWindow | None = None
     credits: dict[str, Any] | None = None
     plan: str = ""
     limit_reached: bool = False
@@ -110,15 +113,19 @@ class UsageSnapshot:
     exhausted_until: float = 0.0
     last_used_at: float = 0.0
 
+    def windows(self) -> list[UsageWindow]:
+        """The metered windows that were reported, shortest first."""
+        return [w for w in (self.primary, self.secondary, self.tertiary) if w is not None]
+
     def has_data(self) -> bool:
-        return self.primary is not None or self.secondary is not None or self.credits is not None
+        return bool(self.windows()) or self.credits is not None
 
     def available(self, now: float | None = None) -> bool:
         """Can this account take a call right now, as far as we know?"""
         now = now if now is not None else time.time()
         if self.exhausted_until > now:
             return False
-        windows = [w for w in (self.primary, self.secondary) if w is not None]
+        windows = self.windows()
         if any(w.exhausted(now) for w in windows):
             return False
         if self.limit_reached:
@@ -132,7 +139,7 @@ class UsageSnapshot:
 
     def headroom(self) -> float:
         """Percent of allowance left in the tightest window (100 = untouched)."""
-        used = [w.used_percent for w in (self.primary, self.secondary) if w is not None]
+        used = [w.used_percent for w in self.windows()]
         if not used:
             return 100.0
         return max(0.0, 100.0 - max(used))
@@ -154,6 +161,7 @@ class UsageSnapshot:
         return {
             "primary": self.primary.to_dict() if self.primary else None,
             "secondary": self.secondary.to_dict() if self.secondary else None,
+            "tertiary": self.tertiary.to_dict() if self.tertiary else None,
             "credits": self.credits,
             "plan": self.plan,
             "limit_reached": self.limit_reached,
@@ -171,6 +179,7 @@ class UsageSnapshot:
         return cls(
             primary=UsageWindow.from_dict(data.get("primary")),
             secondary=UsageWindow.from_dict(data.get("secondary")),
+            tertiary=UsageWindow.from_dict(data.get("tertiary")),
             credits=credits if isinstance(credits, dict) else None,
             plan=str(data.get("plan", "") or ""),
             limit_reached=bool(data.get("limit_reached", False)),

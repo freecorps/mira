@@ -40,6 +40,13 @@ that is already connected replaces its session (a reconnect); any other
 account is added alongside. Each account has its own **Refresh usage**,
 **Refresh session** and **Disconnect**.
 
+Below the sign-in cards, **API-key endpoints** lists the key-based providers
+Mira has a profile for (OpenRouter, OpenCode Go): whether each one's key is
+set in the server's environment, which of them `llm.base_url` points at, and
+— for a provider that meters a subscription — its windows, read from the
+provider's own usage endpoint. Those are not connections; there is nothing to
+sign in to. See [docs/opencode-go.md](opencode-go.md).
+
 ### What "default" means, and how to choose
 
 A model can be picked in two ways under **Settings → Models**:

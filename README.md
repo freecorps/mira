@@ -130,6 +130,25 @@ is generic; ChatGPT is the first provider on it.
 
 → [docs/oauth.md](docs/oauth.md)
 
+## Review on an OpenCode Go subscription
+
+[OpenCode Go](https://opencode.ai/docs/go/) is a $10/month plan for open coding
+models (Kimi, GLM, DeepSeek, Qwen, MiniMax, …) behind one OpenAI-compatible
+endpoint, metered in 5-hour, weekly and monthly windows instead of per token:
+
+```yaml
+llm:
+  provider: "opencode-go"      # fills in the endpoint and OPENCODE_API_KEY
+  model: "kimi-k2.7-code"
+  indexing_model: "glm-5.3-flash"
+```
+
+The model picker lists what the endpoint serves, and **Settings → Connections**
+shows the three meters, read from Go's own usage endpoint, so you can see a
+window running dry before a review does.
+
+→ [docs/opencode-go.md](docs/opencode-go.md)
+
 ## Review before you push
 
 The same review, against a change that is not a pull request yet:

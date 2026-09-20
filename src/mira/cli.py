@@ -1135,7 +1135,7 @@ def _usage_line(usage: dict | None) -> str:
     from datetime import UTC, datetime
 
     parts: list[str] = []
-    for window in (usage.get("primary"), usage.get("secondary")):
+    for window in (usage.get("primary"), usage.get("secondary"), usage.get("tertiary")):
         if not window:
             continue
         used = window.get("used_percent", 0)
@@ -1220,6 +1220,7 @@ def auth_status(refresh: bool) -> None:
             usage = _usage_line(account.get("usage"))
             if usage:
                 click.echo(f"      {' ' * 20} {usage}")
+    _echo_key_providers(refresh)
     if active_provider:
         target = f"{active_provider}:{active_account}" if active_account else active_provider
         click.echo(f"\nBare model ids run through: {target}")
@@ -1229,6 +1230,47 @@ def auth_status(refresh: bool) -> None:
         "A model may also name its backend directly: oauth:<provider>:<key>:<model>, "
         "oauth:<provider>:*:<model> (rotate), or api:<model> (the API key)."
     )
+
+
+def _echo_key_providers(refresh: bool) -> None:
+    """The API-key endpoints Mira knows: which is configured, and its allowance.
+
+    A key is not a session, so there is nothing to renew and nothing to log
+    out of; what an endpoint like OpenCode Go still has is a metered
+    subscription, shown here the way an account's windows are.
+    """
+    import asyncio
+
+    from mira.llm import key_providers
+    from mira.llm import provider_profiles as profiles
+
+    try:
+        llm = load_config().llm
+    except Exception:  # noqa: BLE001 - a broken config is not this command's problem
+        llm = None
+    if refresh:
+        for name, profile in profiles.labelled().items():
+            if profile.get("usage_url") and key_providers.api_key_for(profile, llm):
+                try:
+                    asyncio.run(key_providers.refresh(name, llm))
+                except key_providers.UsageError as exc:
+                    click.echo(f"  ({name}: {exc})", err=True)
+    entries = asyncio.run(key_providers.list_status(llm))
+    if not entries:
+        return
+    click.echo("\nAPI-key endpoints:")
+    for entry in entries:
+        mark = "*" if entry["is_endpoint"] else " "
+        key = (
+            f"key in {entry['api_key_env']}"
+            if entry["key_configured"]
+            else f"no key ({entry['api_key_env'] or 'unset'})"
+        )
+        where = " — the configured API-key endpoint" if entry["is_endpoint"] else ""
+        click.echo(f"  {mark} {entry['id']:<12} {entry['label']} — {key}{where}")
+        usage = _usage_line(entry.get("usage"))
+        if usage:
+            click.echo(f"    {' ' * 12} {usage}")
 
 
 @auth_group.command("use")

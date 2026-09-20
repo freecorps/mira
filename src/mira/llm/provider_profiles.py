@@ -25,13 +25,24 @@ _BUNDLED_PATH = Path(__file__).parent / "providers.json"
 _OVERRIDE_ENV = "MIRA_PROVIDERS_JSON_PATH"
 
 # The portable fallback for any endpoint without a profile: bare model name,
-# no attribution headers, no reasoning remap.
+# no attribution headers, no reasoning remap, nothing to show on a card.
 DEFAULT_PROFILE: dict = {
     "name": "",
+    "label": "",
+    "description": "",
+    "docs_url": "",
     "model_prefix": "strip",
     "extra_headers": {},
     "reasoning_effort_map": {},
     "api_key_env": None,
+    # A header carrying a stable per-conversation id, for an endpoint that
+    # routes and caches by one (OpenCode Go refuses a request without it).
+    "session_header": "",
+    # A GET endpoint reporting the key's allowance, and the parser that reads
+    # its document (see ``mira.llm.key_providers``). Empty for pay-per-token
+    # endpoints, which have nothing to meter.
+    "usage_url": "",
+    "usage_format": "",
 }
 
 
@@ -69,9 +80,23 @@ def all_profiles() -> dict[str, dict]:
 
 
 def get(name: str) -> dict | None:
-    """Return the profile named ``name``, or None."""
+    """Return the profile named ``name`` (every field filled in), or None."""
     profile = _load().get(name)
-    return {**profile, "name": name} if profile else None
+    return {**DEFAULT_PROFILE, **profile, "name": name} if profile else None
+
+
+def labelled() -> dict[str, dict]:
+    """The profiles the dashboard shows as endpoints of their own.
+
+    A label is what makes a profile presentable: without one there is
+    nothing to head a card with, and an operator's override entry that only
+    renames a model prefix has no business on the Connections page.
+    """
+    return {
+        name: {**DEFAULT_PROFILE, **profile, "name": name}
+        for name, profile in _load().items()
+        if profile.get("label")
+    }
 
 
 def _norm(url: str) -> str:

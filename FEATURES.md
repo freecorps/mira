@@ -190,6 +190,8 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Any provider available through OpenRouter — Anthropic, OpenAI, Google Gemini, DeepSeek, and more — so you pay your provider directly with no Mira markup
 - Any OpenAI-compatible endpoint via `llm.base_url` — vLLM, Ollama, LiteLLM proxy, LocalAI, llama.cpp, Together, Fireworks, Groq
 - AWS Bedrock as a direct backend (Converse API, standard AWS credential chain)
+- OpenCode Go as a named provider (`llm.provider: opencode-go`): the subscription's open coding models in the picker with labels and recommendations, the per-conversation session header the endpoint requires, and its 5-hour / weekly / monthly meters on the Connections page and in `mira auth status`, read from Go's own usage endpoint
+- `llm.provider` may name any profile in `providers.json`; the profile supplies the endpoint, the key variable, and — where the provider meters a subscription — the usage endpoint the dashboard reads
 - Sign in with a ChatGPT account instead of an API key and review with the models that plan includes, through the same backend the Codex CLI uses — the session is stored server-side and renewed automatically, and switching back to a key is one setting
 - Generic OAuth layer under it: a provider is a spec class, so the dashboard page, API routes, CLI and model dropdown pick up a new one with no other change
 - OAuth logins from either side — `mira auth login` on the machine with the browser, or the dashboard's Connections page anywhere else — reading and writing the same store

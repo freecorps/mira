@@ -1,7 +1,23 @@
 {
   "_comment": "Per-provider quirks for the OpenAI-compatible client, matched by base_url (fields documented in providers.py). Any endpoint with no entry here gets the portable default: bare model name, no extra headers, no reasoning remap. Override or extend via MIRA_PROVIDERS_JSON_PATH.",
+  "_fields": {
+    "label": "Display name for the dashboard (the Connections page and the line under each model picker).",
+    "description": "One sentence for the Connections page card.",
+    "docs_url": "Where the provider documents its API and plans.",
+    "base_url": "The endpoint this profile applies to; `llm.base_url` is matched against it. `llm.provider: <name>` fills it in.",
+    "api_key_env": "Environment variable holding the key, used when `llm.api_key_env` is unset or its variable is empty.",
+    "model_prefix": "'keep' sends the full vendor/model id (OpenRouter routes on it); 'strip' sends the bare model name.",
+    "extra_headers": "Headers added to every request (attribution, client identification).",
+    "reasoning_effort_map": "Renames for the unified reasoning.effort levels this endpoint spells differently.",
+    "session_header": "Optional header carrying a stable per-conversation id (one per client instance, so one per review pass), for endpoints that route and cache by it.",
+    "usage_url": "Optional GET endpoint reporting the key's allowance. Its document is read by the parser named in usage_format.",
+    "usage_format": "Which parser reads usage_url's document (see mira.llm.key_providers). Currently: 'opencode-go'."
+  },
 
   "openrouter": {
+    "label": "OpenRouter",
+    "description": "Pay-per-token access to Anthropic, OpenAI, Google, DeepSeek and more behind one key.",
+    "docs_url": "https://openrouter.ai/docs",
     "base_url": "https://openrouter.ai/api/v1",
     "api_key_env": "OPENROUTER_API_KEY",
     "model_prefix": "keep",
@@ -10,5 +26,21 @@
       "X-Title": "Mira Code Reviewer"
     },
     "reasoning_effort_map": { "max": "xhigh" }
+  },
+
+  "opencode-go": {
+    "label": "OpenCode Go",
+    "description": "OpenCode's $10/month subscription to open coding models (Kimi, GLM, DeepSeek, Qwen, MiniMax and more), metered in 5-hour, weekly and monthly windows.",
+    "docs_url": "https://opencode.ai/docs/go/",
+    "base_url": "https://opencode.ai/zen/go/v1",
+    "api_key_env": "OPENCODE_API_KEY",
+    "model_prefix": "strip",
+    "extra_headers": {
+      "x-opencode-client": "mira"
+    },
+    "reasoning_effort_map": {},
+    "session_header": "x-opencode-session",
+    "usage_url": "https://opencode.ai/zen/go/v1/usage",
+    "usage_format": "opencode-go"
   }
 }

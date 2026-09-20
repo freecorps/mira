@@ -39,15 +39,20 @@ class TestCurrentGenerationModels:
     def test_recommended_defaults_unchanged(self):
         # Recommended stays on the eval-validated pair until benchmarks say
         # otherwise (v10 baseline was measured on Sonnet 4.6 / Haiku 4.5).
+        # An entry pinned to an endpoint (OpenCode Go) recommends within that
+        # endpoint only — the dashboard never offers it on OpenRouter or
+        # Bedrock — so its pair sits alongside rather than replacing these.
         indexing = registry.models_for_purpose("indexing")
         review = registry.models_for_purpose("review")
         assert [m["value"] for m in indexing if m["recommended"]] == [
             "anthropic/claude-haiku-4-5",
             "us.anthropic.claude-haiku-4-5-v1:0",
+            "glm-5.3-flash",
         ]
         assert [m["value"] for m in review if m["recommended"]] == [
             "anthropic/claude-sonnet-4-6",
             "us.anthropic.claude-sonnet-4-6-v1:0",
+            "kimi-k2.7-code",
         ]
 
     def test_superseded_models_removed(self):

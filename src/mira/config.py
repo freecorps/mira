@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # The check framework's configuration is large and obeys one rule that is
 # easier to audit with a file boundary around it — nothing in a pull request
@@ -78,6 +78,9 @@ class LLMConfig(BaseModel):
     max_context_tokens: int = 120_000
     # Provider selection. "openai" uses any OpenAI-compatible endpoint (default).
     # "bedrock" uses AWS Bedrock Converse API directly (requires boto3).
+    # Any other value names a profile in `llm/providers.json` ("opencode-go",
+    # "openrouter"): its base_url and api_key_env are filled in from there,
+    # and the config then reads as the OpenAI-compatible backend it is.
     provider: str = "openai"
     # Protocol dialect for the OpenAI-compatible endpoint: "chat"
     # (Chat Completions, default) or "responses" (OpenAI Responses API).
@@ -160,6 +163,40 @@ class LLMConfig(BaseModel):
         """Empty and ``*`` both mean "any account"; anything else is a key."""
         text = (v or "").strip()
         return text if text and text != "*" else None
+
+    @model_validator(mode="after")
+    def _apply_provider_profile(self) -> LLMConfig:
+        """``provider: opencode-go`` — a profile name stands for its endpoint and key.
+
+        "openai" and "bedrock" are the two backends the client knows. Any other
+        value has to name a profile in ``providers.json``; it supplies
+        ``base_url`` and ``api_key_env`` where this config did not name them
+        itself, and the config then reads as the plain OpenAI-compatible
+        backend it is, so nothing downstream has to know the shortcut existed.
+        An unknown name is rejected here: left alone it would be sent to
+        OpenRouter with whatever key that path finds, which is the opposite of
+        what a provider name asks for.
+        """
+        name = (self.provider or "").strip().lower()
+        if name in ("", "openai", "bedrock"):
+            return self
+        from mira.llm import provider_profiles as profiles
+
+        profile = profiles.get(name)
+        if profile is None or not profile.get("base_url"):
+            known = ", ".join(
+                sorted(n for n, p in profiles.all_profiles().items() if p.get("base_url"))
+            )
+            raise ValueError(
+                f"llm.provider {self.provider!r} is not 'openai', 'bedrock' or a provider "
+                f"profile (have: {known})"
+            )
+        if "base_url" not in self.model_fields_set:
+            self.base_url = profile["base_url"]
+        if "api_key_env" not in self.model_fields_set and profile.get("api_key_env"):
+            self.api_key_env = profile["api_key_env"]
+        self.provider = "openai"
+        return self
 
 
 class FilterConfig(BaseModel):

@@ -19,6 +19,16 @@ llm:
   # region: "us-east-1"
   # aws_profile: "my-profile"  # optional, uses default AWS credential chain if omitted
 
+  # ── OpenCode Go (uncomment to use) ──
+  # The $10/month subscription to open coding models, metered in 5-hour,
+  # weekly and monthly windows. Naming the provider fills in the endpoint
+  # (https://opencode.ai/zen/go/v1) and the key variable (OPENCODE_API_KEY);
+  # model ids are the bare ones the endpoint lists. The Connections page
+  # shows the meters. See docs/opencode-go.md.
+  # provider: "opencode-go"
+  # model: "kimi-k2.7-code"
+  # indexing_model: "glm-5.3-flash"
+
   # Retry and timeout configuration (defaults: 3 attempts, 120s timeout, 2-30s backoff)
   # Increase for flex-tier models or proxied endpoints under load
   # max_retries: 3
