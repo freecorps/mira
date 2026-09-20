@@ -16,6 +16,12 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY ui/mira/ ./
 RUN npm run build
 
+# ── The uv binary ─────────────────────────────────────────────────
+# Declared as a stage only so that it is a `FROM` line. Dependabot's docker
+# updater parses those and nothing else, so a digest sitting inside
+# `--mount=from=<image>` is one it can never propose an update for.
+FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
+
 # ── Stage 2: backend + bundled UI ─────────────────────────────────
 # Digest-pinned for the same reason as the UI builder above.
 FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
@@ -40,7 +46,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 # of wheels (per architecture).
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=from=ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6,source=/uv,target=/bin/uv \
+    --mount=from=uv,source=/uv,target=/bin/uv \
     uv sync --locked --no-dev --no-install-project --extra serve --extra bedrock
 
 # Layer 2 — the package itself. Small, and the one layer that changes every
@@ -48,7 +54,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY README.md ./
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=from=ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6,source=/uv,target=/bin/uv \
+    --mount=from=uv,source=/uv,target=/bin/uv \
     uv sync --locked --no-dev --no-editable --extra serve --extra bedrock
 
 # Pull the built UI in from stage 1. webhooks.create_app() picks this up
