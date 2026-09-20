@@ -15,7 +15,7 @@ repos:
     # If contributors run a newer local ruff than pre-commit pins, the same
     # source can lint/format differently in two places — exactly the kind
     # of drift CI parity is meant to prevent.
-    rev: v0.16.7
+    rev: v0.16.8
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
