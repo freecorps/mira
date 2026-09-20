@@ -138,6 +138,31 @@ class TestProviderShortcut:
         assert cfg.base_url == "https://openrouter.ai/api/v1"
         assert cfg.api_key_env == "OPENROUTER_API_KEY"
 
+    def test_a_profiles_url_is_checked_like_a_written_one(self, tmp_path, monkeypatch):
+        custom = tmp_path / "providers.json"
+        custom.write_text(
+            json.dumps(
+                {
+                    "insecure": {"base_url": "http://public.example/v1", "api_key_env": "K"},
+                    "broken": {"base_url": "not a url"},
+                    "local": {"base_url": "http://localhost:11434/v1", "api_key_env": ""},
+                }
+            )
+        )
+        monkeypatch.setenv("MIRA_PROVIDERS_JSON_PATH", str(custom))
+        profiles._load.cache_clear()
+        try:
+            with pytest.raises(ValueError, match="plain http to a public host"):
+                LLMConfig(provider="insecure")
+            with pytest.raises(ValueError, match="must be an http\\(s\\) URL"):
+                LLMConfig(provider="broken")
+            # A local endpoint may say "" for "no key" — and get it.
+            local = LLMConfig(provider="local")
+            assert local.base_url == "http://localhost:11434/v1"
+            assert local.api_key_env == ""
+        finally:
+            profiles._load.cache_clear()
+
 
 # ── Catalog ──────────────────────────────────────────────────────────
 
@@ -232,6 +257,9 @@ class TestCatalog:
         assert found == [{"value": "kimi-k2.7-code", "label": "kimi-k2.7-code"}]
         assert seen["url"] == f"{GO_URL}/models"
         assert seen["headers"]["Authorization"] == f"Bearer {go_key}"
+        assert seen["headers"]["x-opencode-client"] == "mira"
+        # A catalog lookup is not a conversation; no session header.
+        assert "x-opencode-session" not in seen["headers"]
 
 
 # ── Client headers ───────────────────────────────────────────────────
@@ -275,15 +303,17 @@ class TestGoUsageDocument:
         assert names == ["5-hour", "weekly", "monthly"]
         assert snapshot.primary.used_percent == 12.5
         assert snapshot.secondary.used_percent == 40
-        assert snapshot.tertiary.used_percent == 99.7
+        # A window the provider calls rate-limited is recorded as spent, at
+        # whatever percent it read, so the refusal stays attached to *its*
+        # reset (October 1st) and not to the 5-hour window's (09:00Z).
+        assert snapshot.tertiary.used_percent == 100.0
         # ISO reset times become epoch seconds.
         assert snapshot.tertiary.resets_at == 1790812800.0
         assert snapshot.source == "endpoint"
-        # "rate-limited" on any window is believed even at 99.7% — until the
-        # next window reset, which is the 5-hour one (09:00Z).
         assert snapshot.limit_reached is True
-        assert snapshot.available(now=1789894000.0) is False
-        assert snapshot.available(now=1789894801.0) is True
+        assert snapshot.available(now=1789894801.0) is False  # 5-hour reset passed
+        assert snapshot.available(now=1790812799.0) is False
+        assert snapshot.available(now=1790812801.0) is True
 
     def test_a_missing_window_is_left_out(self):
         doc = {"usage": {"rolling": {"status": "ok", "percent": 5, "resetsAt": "x"}}}
@@ -304,7 +334,7 @@ class TestGoUsageDocument:
         assert again is not None
         assert again.tertiary is not None
         assert again.tertiary.to_dict() == snapshot.tertiary.to_dict()
-        assert again.headroom() == pytest.approx(0.3)
+        assert again.headroom() == 0.0
         # A snapshot written before there was a third window still reads.
         old = UsageSnapshot.from_dict({"primary": {"used_percent": 1}})
         assert old is not None and old.tertiary is None and old.has_data()
@@ -409,6 +439,24 @@ class TestUsageCache:
         with pytest.raises(key_providers.UsageError):
             await key_providers.usage_for(profile, "oc_sk_1", db, force=True)
         assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_one_keys_failure_does_not_silence_another(self, db, monkeypatch):
+        asked: list[str] = []
+
+        async def fetch(profile, api_key):
+            asked.append(api_key)
+            if api_key == "oc_sk_bad":
+                raise key_providers.UsageError("Usage lookup answered HTTP 401: Invalid API key.")
+            return key_providers.parse_opencode_go(GO_USAGE)
+
+        monkeypatch.setattr(key_providers, "fetch_usage", fetch)
+        profile = profiles.get("opencode-go")
+        assert await key_providers.usage_for(profile, "oc_sk_bad", db) is None
+        # The refusal is remembered for that key alone; a rotated key is tried.
+        found = await key_providers.usage_for(profile, "oc_sk_new", db)
+        assert found is not None
+        assert asked == ["oc_sk_bad", "oc_sk_new"]
 
     @pytest.mark.asyncio
     async def test_no_key_means_no_lookup(self, db, monkeypatch):

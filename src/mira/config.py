@@ -191,10 +191,15 @@ class LLMConfig(BaseModel):
                 f"llm.provider {self.provider!r} is not 'openai', 'bedrock' or a provider "
                 f"profile (have: {known})"
             )
+        # Assignment here is not validated by pydantic, and the profile may
+        # come from an operator's override file: the URL goes through the
+        # same check a `base_url` written in this config would.
         if "base_url" not in self.model_fields_set:
-            self.base_url = profile["base_url"]
-        if "api_key_env" not in self.model_fields_set and profile.get("api_key_env"):
-            self.api_key_env = profile["api_key_env"]
+            self.base_url = self._validate_base_url(profile["base_url"])
+        # A profile may say "" to mean "no key" (a local endpoint), so only
+        # an absent value leaves the default in place.
+        if "api_key_env" not in self.model_fields_set and profile.get("api_key_env") is not None:
+            self.api_key_env = str(profile["api_key_env"])
         self.provider = "openai"
         return self
 
