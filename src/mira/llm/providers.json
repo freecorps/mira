@@ -1,11 +1,12 @@
 {
-  "_comment": "Per-provider quirks for the OpenAI-compatible client, matched by base_url (fields documented in providers.py). Any endpoint with no entry here gets the portable default: bare model name, no extra headers, no reasoning remap. Override or extend via MIRA_PROVIDERS_JSON_PATH.",
+  "_comment": "Endpoint presets. Each entry is both a per-endpoint quirk table for the OpenAI-compatible client (matched by base_url) and a starting point the dashboard offers when adding an endpoint: picking one fills in the URL, the protocol and the key variable, and carries the quirks the endpoint needs. An endpoint with no entry here gets the portable default: bare model name, no extra headers, no reasoning remap. Add or override entries with MIRA_PROVIDERS_JSON_PATH.",
   "_fields": {
-    "label": "Display name for the dashboard (the Connections page and the line under each model picker).",
-    "description": "One sentence for the Connections page card.",
+    "label": "Display name, shown on the Connections page and under each model picker.",
+    "description": "One sentence for the card and the preset list.",
     "docs_url": "Where the provider documents its API and plans.",
-    "base_url": "The endpoint this profile applies to; `llm.base_url` is matched against it. `llm.provider: <name>` fills it in.",
-    "api_key_env": "Environment variable holding the key, used when `llm.api_key_env` is unset or its variable is empty.",
+    "base_url": "The endpoint this profile applies to; `llm.base_url` is matched against it, and the dashboard prefills it. `llm.provider: <name>` fills it in too.",
+    "api_key_env": "Environment variable holding the key when one is not stored in Mira's database. \"\" means the endpoint needs no key.",
+    "api_style": "Protocol dialect the endpoint is reached with: 'chat' (Chat Completions) or 'responses'.",
     "model_prefix": "'keep' sends the full vendor/model id (OpenRouter routes on it); 'strip' sends the bare model name.",
     "extra_headers": "Headers added to every request (attribution, client identification).",
     "reasoning_effort_map": "Renames for the unified reasoning.effort levels this endpoint spells differently.",
@@ -20,6 +21,7 @@
     "docs_url": "https://openrouter.ai/docs",
     "base_url": "https://openrouter.ai/api/v1",
     "api_key_env": "OPENROUTER_API_KEY",
+    "api_style": "chat",
     "model_prefix": "keep",
     "extra_headers": {
       "HTTP-Referer": "https://github.com/miracodeai/mira",
@@ -34,6 +36,7 @@
     "docs_url": "https://opencode.ai/docs/go/",
     "base_url": "https://opencode.ai/zen/go/v1",
     "api_key_env": "OPENCODE_API_KEY",
+    "api_style": "chat",
     "model_prefix": "strip",
     "extra_headers": {
       "x-opencode-client": "mira"
@@ -42,5 +45,79 @@
     "session_header": "x-opencode-session",
     "usage_url": "https://opencode.ai/zen/go/v1/usage",
     "usage_format": "opencode-go"
+  },
+
+  "opencode-zen": {
+    "label": "OpenCode Zen",
+    "description": "OpenCode's pay-per-token catalogue — Claude, GPT, Gemini and the open models — on the same key as Go.",
+    "docs_url": "https://opencode.ai/docs/zen/",
+    "base_url": "https://opencode.ai/zen/v1",
+    "api_key_env": "OPENCODE_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "strip",
+    "extra_headers": {
+      "x-opencode-client": "mira"
+    },
+    "session_header": "x-opencode-session"
+  },
+
+  "openai": {
+    "label": "OpenAI",
+    "description": "OpenAI's own API, billed to your OpenAI account.",
+    "docs_url": "https://platform.openai.com/docs/api-reference",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "strip"
+  },
+
+  "deepseek": {
+    "label": "DeepSeek",
+    "description": "DeepSeek's own API, direct and cheap for its own models.",
+    "docs_url": "https://api-docs.deepseek.com",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "strip"
+  },
+
+  "groq": {
+    "label": "Groq",
+    "description": "Open models served fast on Groq's own hardware.",
+    "docs_url": "https://console.groq.com/docs/openai",
+    "base_url": "https://api.groq.com/openai/v1",
+    "api_key_env": "GROQ_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "strip"
+  },
+
+  "together": {
+    "label": "Together AI",
+    "description": "Hosted open models, pay per token.",
+    "docs_url": "https://docs.together.ai/docs/openai-api-compatibility",
+    "base_url": "https://api.together.xyz/v1",
+    "api_key_env": "TOGETHER_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "keep"
+  },
+
+  "fireworks": {
+    "label": "Fireworks AI",
+    "description": "Hosted open models with function calling, pay per token.",
+    "docs_url": "https://docs.fireworks.ai/tools-sdks/openai-compatibility",
+    "base_url": "https://api.fireworks.ai/inference/v1",
+    "api_key_env": "FIREWORKS_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "keep"
+  },
+
+  "ollama": {
+    "label": "Ollama",
+    "description": "Models running on your own machine or network. No key needed; point the URL at the host running Ollama.",
+    "docs_url": "https://docs.ollama.com/api/openai-compatibility",
+    "base_url": "http://localhost:11434/v1",
+    "api_key_env": "",
+    "api_style": "chat",
+    "model_prefix": "strip"
   }
 }

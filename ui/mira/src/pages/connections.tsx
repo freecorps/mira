@@ -4,7 +4,9 @@ import {
   Gauge,
   KeyRound,
   Loader2,
+  Pencil,
   Plug,
+  Plus,
   RefreshCw,
   Repeat,
   TriangleAlert,
@@ -39,7 +41,12 @@ import type {
   UsageSnapshot,
   UsageWindow,
 } from "@/lib/api/oauth"
-import type { KeyProvider, KeyProviders } from "@/lib/api/providers"
+import type {
+  EndpointPreset,
+  ProviderEndpoint,
+  ProvidersResponse,
+} from "@/lib/api/providers"
+import { EndpointDialog } from "@/components/endpoint-dialog"
 import { useAuth } from "@/lib/auth"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 
@@ -292,44 +299,64 @@ function AccountRow({
   )
 }
 
-// An endpoint reached with a key from the server's environment. Nothing to
-// sign in to or renew; the card says whether the key is set, whether this is
-// the endpoint reviews are configured for, and — where the provider meters a
-// subscription (OpenCode Go) — how much of it is spent.
-function KeyProviderCard({
-  provider,
+// Where the key comes from, in the words the card uses.
+function keyLabel(endpoint: ProviderEndpoint): React.ReactNode {
+  if (endpoint.key_source === "stored") {
+    return (
+      <Badge variant="secondary">
+        <KeyRound /> key stored{" "}
+        {endpoint.key_hint && (
+          <code className="font-mono">{endpoint.key_hint}</code>
+        )}
+      </Badge>
+    )
+  }
+  if (endpoint.key_source.startsWith("env:")) {
+    return (
+      <Badge variant="secondary">
+        <KeyRound /> key from{" "}
+        <code className="font-mono">{endpoint.key_source.slice(4)}</code>
+      </Badge>
+    )
+  }
+  return <Badge variant="outline">no key</Badge>
+}
+
+// An endpoint reached with an API key. Nothing to sign in to or renew; the
+// card says where it points, what opens it, whether bare model ids go here,
+// and — where the provider meters a subscription (OpenCode Go) — how much
+// of it is spent.
+function EndpointCard({
+  endpoint,
   working,
   onRefresh,
+  onEdit,
+  onUseDefault,
+  onDelete,
 }: {
-  provider: KeyProvider
+  endpoint: ProviderEndpoint
   working: boolean
   onRefresh: () => void
+  onEdit: () => void
+  onUseDefault: () => void
+  onDelete: () => void
 }) {
-  const usage = provider.usage
+  const usage = endpoint.usage
   const windows = usageWindows(usage)
-  const limited = !!usage && !provider.available
+  const limited = !!usage && !endpoint.available
   return (
     <Card>
       <CardHeader>
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
             <CardTitle className="flex flex-wrap items-center gap-2">
-              {provider.label}
-              {provider.is_endpoint && (
-                <Badge variant="default">Configured API-key endpoint</Badge>
+              {endpoint.label}
+              {endpoint.is_default && (
+                <Badge variant="default">Default for bare model ids</Badge>
               )}
-              {provider.key_configured ? (
-                <Badge variant="secondary">
-                  <KeyRound /> key in{" "}
-                  <code className="font-mono">{provider.api_key_env}</code>
-                </Badge>
-              ) : (
-                <Badge variant="outline">
-                  no key · set{" "}
-                  <code className="font-mono">
-                    {provider.api_key_env || "an API key"}
-                  </code>
-                </Badge>
+              {keyLabel(endpoint)}
+              {!endpoint.editable && (
+                <Badge variant="outline">from mira.yaml</Badge>
               )}
               {limited && (
                 <Badge variant="destructive">
@@ -340,12 +367,12 @@ function KeyProviderCard({
                 </Badge>
               )}
             </CardTitle>
-            <CardDescription>{provider.description}</CardDescription>
+            <CardDescription>{endpoint.description}</CardDescription>
           </div>
-          {provider.docs_url && (
+          {endpoint.docs_url && (
             <a
               className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-              href={provider.docs_url}
+              href={endpoint.docs_url}
               target="_blank"
               rel="noreferrer"
             >
@@ -355,15 +382,15 @@ function KeyProviderCard({
         </div>
         <div className="flex flex-wrap items-center gap-1.5 pt-1 text-xs text-muted-foreground">
           <span>Calls use</span>
-          <Badge variant="outline">{provider.protocol.protocol}</Badge>
-          <Badge variant="outline">{provider.protocol.transport}</Badge>
+          <Badge variant="outline">{endpoint.protocol.protocol}</Badge>
+          <Badge variant="outline">{endpoint.protocol.transport}</Badge>
           <Badge variant="outline" className="font-mono">
-            {endpointHost(provider.protocol.endpoint)}
+            {endpointHost(endpoint.endpoint)}
           </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        {provider.reports_usage ? (
+        {endpoint.reports_usage && (
           <div className="space-y-2">
             {windows.length > 0 ? (
               <div
@@ -379,9 +406,9 @@ function KeyProviderCard({
               </div>
             ) : (
               <p className="text-xs text-muted-foreground">
-                {provider.key_configured
+                {endpoint.key_configured
                   ? "No usage recorded yet — press Refresh usage to ask the provider now."
-                  : "Set the key in the server's environment to see this subscription's allowance."}
+                  : "Add a key to see this subscription's allowance."}
               </p>
             )}
             {usage && usage.fetched_at > 0 && (
@@ -389,27 +416,68 @@ function KeyProviderCard({
                 As of {agoLabel(usage.fetched_at)} · from the usage endpoint
               </p>
             )}
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          {!endpoint.is_default && (
+            <Button
+              size="sm"
+              disabled={working}
+              title="Send model ids that do not name a backend to this endpoint"
+              onClick={onUseDefault}
+            >
+              Use for reviews
+            </Button>
+          )}
+          {endpoint.editable && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={working}
+              onClick={onEdit}
+            >
+              <Pencil className="mr-1 h-3 w-3" /> Edit
+            </Button>
+          )}
+          {endpoint.reports_usage && (
             <Button
               size="sm"
               variant="ghost"
-              disabled={working || !provider.key_configured}
+              disabled={working || !endpoint.key_configured}
               title="Ask the provider where this key's allowance stands"
               onClick={onRefresh}
             >
               <Gauge className="mr-1 h-3 w-3" /> Refresh usage
             </Button>
-          </div>
-        ) : (
+          )}
+          {endpoint.editable && (
+            <ConfirmButton
+              size="sm"
+              variant="ghost"
+              destructive
+              disabled={working}
+              dialogTitle={`Remove ${endpoint.label}?`}
+              dialogDescription={
+                endpoint.is_default
+                  ? "Bare model ids go here. Removing it sends them back to the endpoint mira.yaml names, and forgets the key stored with it."
+                  : "Mira will forget this endpoint and the key stored with it. Any model pinned to it will fail until you pick another."
+              }
+              confirmLabel="Remove"
+              onConfirm={onDelete}
+            >
+              Remove
+            </ConfirmButton>
+          )}
+        </div>
+
+        {!endpoint.editable && (
           <p className="text-xs text-muted-foreground">
-            Pay per token: there is no allowance to meter here.
+            This one comes from the config file and its key from the
+            environment, so it is shown here but edited there. Add an endpoint
+            to point reviews somewhere else without touching either.
           </p>
         )}
-        <p className="text-xs text-muted-foreground">
-          {provider.is_endpoint
-            ? "A model picked without a backend goes here, unless a signed-in account above is the default. "
-            : `Point reviews here with llm.provider: "${provider.id}" in mira.yaml. `}
-          The key lives in the server&apos;s environment; Mira never stores it.
-        </p>
       </CardContent>
     </Card>
   )
@@ -442,41 +510,73 @@ export function ConnectionsPage() {
   const activeProvider = data?.active_provider ?? ""
   const reload = () => setRefreshKey((k) => k + 1)
   // The key-based endpoints, loaded on their own so a slow usage endpoint
-  // does not hold up the sign-in cards above — and not on `refreshKey`,
-  // since an account action changes nothing on these cards. A refreshed
-  // card is updated from the refresh response rather than by asking for
-  // every provider again, which would repeat the remote usage lookups.
+  // does not hold up the sign-in cards above. `endpointKey` is their own
+  // reload signal: an account action above changes nothing here, and a
+  // usage refresh updates one card from its response rather than asking
+  // the server for every endpoint again.
+  const [endpointKey, setEndpointKey] = useState(0)
   const {
-    data: keyData,
-    loading: keyLoading,
-    error: keyError,
+    data: endpointData,
+    loading: endpointsLoading,
+    error: endpointsError,
   } = useAsync(
     () =>
       user?.is_admin
-        ? api.getKeyProviders()
-        : Promise.resolve({ providers: [] as KeyProvider[] }),
-    [user]
+        ? api.getProviders()
+        : Promise.resolve({
+            endpoints: [] as ProviderEndpoint[],
+            presets: [] as EndpointPreset[],
+            active: "",
+            env_candidates: [] as string[],
+            configured: true,
+          }),
+    [user, endpointKey]
   )
-  // Refreshed cards, remembered together with the response they belong to,
-  // so a later reload of the list starts from a clean slate without an
+  // Cards updated in place, remembered together with the response they
+  // belong to, so a later reload starts from a clean slate without an
   // effect to clear them.
-  const [keyUpdates, setKeyUpdates] = useState<{
-    of: KeyProviders | null
-    cards: Record<string, KeyProvider>
+  const [cardUpdates, setCardUpdates] = useState<{
+    of: ProvidersResponse | null
+    cards: Record<string, ProviderEndpoint>
   }>({ of: null, cards: {} })
-  const refreshed = keyUpdates.of === keyData ? keyUpdates.cards : {}
-  const keyProviders: KeyProvider[] = (keyData?.providers ?? []).map(
-    (p) => refreshed[p.id] ?? p
+  const patched = cardUpdates.of === endpointData ? cardUpdates.cards : {}
+  const endpointList: ProviderEndpoint[] = (endpointData?.endpoints ?? []).map(
+    (e) => patched[e.id] ?? e
   )
+  const reloadEndpoints = () => setEndpointKey((k) => k + 1)
+  const patchCard = (card: ProviderEndpoint) =>
+    setCardUpdates((prev) => ({
+      of: endpointData,
+      cards: {
+        ...(prev.of === endpointData ? prev.cards : {}),
+        [card.id]: card,
+      },
+    }))
 
-  const refreshKeyUsage = async (id: string) => {
-    setBusy(`key:${id}`)
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [editing, setEditing] = useState<ProviderEndpoint | null>(null)
+
+  const onEndpoint = async (
+    id: string,
+    fn: () => Promise<unknown>,
+    done?: string
+  ) => {
+    setBusy(`endpoint:${id}`)
     try {
-      const updated = await api.refreshKeyProviderUsage(id)
-      setKeyUpdates((prev) => ({
-        of: keyData,
-        cards: { ...(prev.of === keyData ? prev.cards : {}), [id]: updated },
-      }))
+      await fn()
+      reloadEndpoints()
+      if (done) toast.success(done)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  const refreshEndpointUsage = async (id: string) => {
+    setBusy(`endpoint:${id}`)
+    try {
+      patchCard(await api.refreshProviderUsage(id))
       toast.success("Usage updated")
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
@@ -720,37 +820,83 @@ export function ConnectionsPage() {
       )}
 
       <div className="space-y-4">
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight">
-            API-key endpoints
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Endpoints reached with a key from the server&apos;s environment.
-            There is nothing to sign in to; each card says whether its key is
-            set, which endpoint reviews are configured for, and — where the
-            provider meters a subscription — how much of it is spent.
-          </p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight">
+              API-key endpoints
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Any OpenAI-compatible endpoint, configured here rather than in{" "}
+              <code className="text-xs">mira.yaml</code>: a URL, a key, and
+              which one reviews use. Start from a preset for a provider Mira
+              knows, and see a metered subscription&apos;s allowance on its
+              card.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            onClick={() => {
+              setEditing(null)
+              setDialogOpen(true)
+            }}
+          >
+            <Plus className="mr-1 h-3 w-3" /> Add endpoint
+          </Button>
         </div>
-        {keyLoading ? (
+        {endpointsLoading ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" /> Loading…
           </div>
-        ) : keyError ? (
+        ) : endpointsError ? (
           <p className="flex items-center gap-2 text-sm text-destructive">
             <TriangleAlert className="size-4" /> Could not load the API-key
-            endpoints: {keyError}
+            endpoints: {endpointsError}
+          </p>
+        ) : endpointList.length === 0 ? (
+          <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+            No endpoint configured yet. Add one to review with an API key, or
+            sign in to an account above.
           </p>
         ) : (
-          keyProviders.map((p) => (
-            <KeyProviderCard
-              key={p.id}
-              provider={p}
-              working={busy === `key:${p.id}`}
-              onRefresh={() => refreshKeyUsage(p.id)}
+          endpointList.map((e) => (
+            <EndpointCard
+              key={e.id}
+              endpoint={e}
+              working={busy === `endpoint:${e.id}`}
+              onRefresh={() => refreshEndpointUsage(e.id)}
+              onEdit={() => {
+                setEditing(e)
+                setDialogOpen(true)
+              }}
+              onUseDefault={() =>
+                onEndpoint(
+                  e.id,
+                  () => api.setActiveProvider(e.editable ? e.id : ""),
+                  `Bare model ids now go to ${e.label}`
+                )
+              }
+              onDelete={() =>
+                onEndpoint(e.id, () => api.deleteProvider(e.id), "Removed")
+              }
             />
           ))
         )}
       </div>
+
+      <EndpointDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        presets={endpointData?.presets ?? []}
+        envCandidates={endpointData?.env_candidates ?? []}
+        editing={editing}
+        // The first endpoint added is what reviews should use; after that,
+        // "Use for reviews" is an explicit choice on the card.
+        makeDefault={!editing && endpointList.every((e) => !e.editable)}
+        onSaved={(saved) => {
+          reloadEndpoints()
+          toast.success(editing ? `Saved ${saved.label}` : `Added ${saved.label}`)
+        }}
+      />
 
       <Dialog open={flow !== null} onOpenChange={(o) => !o && setFlow(null)}>
         <DialogContent>

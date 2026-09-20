@@ -17,6 +17,7 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 from mira import __version__
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
+from mira.llm import endpoints
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 from mira.llm.utils import loads_lenient, strip_code_fences, strip_think_blocks
@@ -82,12 +83,26 @@ class LLMProviderProtocol(Protocol):
 def _get_api_key(config: LLMConfig, profile: dict | None = None) -> str:
     """Resolve the API key for the configured endpoint.
 
-    Reads `config.api_key_env` first, then the matched provider profile's
-    `api_key_env`, then the legacy `OPENROUTER_API_KEY` / `OPENAI_API_KEY`
-    lookup for backward compatibility. If `api_key_env` is explicitly "" the
-    empty string is returned without error — useful for local endpoints
-    (Ollama, llama.cpp server) that don't require auth.
+    An endpoint configured from the dashboard answers for itself: the key
+    stored alongside it, or the environment variable it names. It is
+    returned even when empty, because "this endpoint needs no key" is
+    something the operator said there rather than something to guess at.
+
+    Otherwise, as before: `config.api_key_env` first, then the matched
+    provider profile's `api_key_env`, then the legacy `OPENROUTER_API_KEY` /
+    `OPENAI_API_KEY` lookup for backward compatibility. If `api_key_env` is
+    explicitly "" the empty string is returned without error — useful for
+    local endpoints (Ollama, llama.cpp server) that don't require auth.
     """
+    named = endpoints.name_of(config.endpoint)
+    if named:
+        stored = endpoints.get(named)
+        if stored is not None:
+            return endpoints.key_for(stored)
+        logger.warning(
+            "Endpoint %r is configured but not stored; falling back to the environment",
+            named,
+        )
     if config.api_key_env == "":
         return ""
     key = os.environ.get(config.api_key_env, "")
@@ -101,18 +116,25 @@ def _get_api_key(config: LLMConfig, profile: dict | None = None) -> str:
     return key
 
 
-def _strip_model_prefix(model: str, base_url: str) -> str:
+def _strip_model_prefix(model: str, profile: dict | str) -> str:
     """Apply the endpoint's model-prefix policy from its provider profile.
 
     'keep' (OpenRouter) routes on the full `vendor/model` string and only sheds
     a redundant self-prefix (`openrouter/…`). 'strip' (the default for other
     endpoints) sends the bare model name (e.g. 'minimax/MiniMax-M2.7' →
     'MiniMax-M2.7').
+
+    Takes the resolved profile — the client already holds one, and a stored
+    endpoint's policy comes from its preset rather than from its URL. A bare
+    URL is still accepted, for callers that have only that.
     """
-    profile = profiles.resolve(base_url)
+    if isinstance(profile, str):
+        profile = profiles.resolve(profile)
     if profile.get("model_prefix") == "keep":
-        self_prefix = f"{profile['name']}/"
-        return model[len(self_prefix) :] if model.startswith(self_prefix) else model
+        self_prefix = f"{profile.get('name') or ''}/"
+        if len(self_prefix) > 1 and model.startswith(self_prefix):
+            return model[len(self_prefix) :]
+        return model
     return model.split("/", 1)[1] if "/" in model else model
 
 
@@ -341,11 +363,14 @@ class OpenAICompatibleProvider:
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
-        self.profile = profiles.resolve(config.base_url)
+        # The endpoint's quirks: from the stored endpoint's preset when the
+        # dashboard configured one, otherwise matched to the URL as before.
+        self.profile = endpoints.profile_for_config(config)
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self._no_forced_tool_choice: set[str] = set()
         self._no_reasoning: set[str] = set()
+        self._no_temperature: set[str] = set()
         # One id per client instance — which is one per review pass, since a
         # client is created per purpose per review. Sent where the profile
         # names a session header, so an endpoint that routes and caches by
@@ -405,6 +430,36 @@ class OpenAICompatibleProvider:
         effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
         body["reasoning"] = {"effort": effort}
         body.pop("temperature", None)
+
+    def _temperature(self, body: dict, temperature: float | None = None) -> None:
+        """Set the sampling temperature, unless this model has refused one.
+
+        Some models are fixed at their own default and 400 on any other value
+        (Kimi K2.7 Code, the GPT-5 family on the Responses API). Once one has
+        said so, the field is left out of its later requests rather than
+        spending a round trip on the same refusal every call.
+        """
+        if body.get("model") in self._no_temperature:
+            body.pop("temperature", None)
+            return
+        body["temperature"] = temperature if temperature is not None else self.config.temperature
+
+    def _refused_temperature(self, resp: httpx.Response, body: dict) -> bool:
+        """Was this a 400 about the temperature? If so, drop it for a retry.
+
+        The caller re-posts the same body without the field: a fixed
+        temperature is the model's, and reviewing at its default beats
+        failing the review over a sampling knob.
+        """
+        if resp.status_code != 400 or "temperature" not in body:
+            return False
+        if "temperature" not in resp.text.lower():
+            return False
+        model = body.get("model")
+        logger.info("Model %s rejected a custom temperature; retrying without it", model)
+        self._no_temperature.add(str(model))
+        body.pop("temperature", None)
+        return True
 
     def _account_usage(self, data: dict) -> None:
         """Accumulate token counts. Default: chat/completions key names.

@@ -97,8 +97,11 @@ class Destination:
 
     Deliberately excludes the model id: two models from one vendor over one
     endpoint are one recipient. It includes ``api_key_env`` because a different
-    credential is a different account, and ``api_style`` because the protocol
-    determines what is transmitted and where.
+    credential is a different account, ``api_style`` because the protocol
+    determines what is transmitted and where, and ``configured`` — the id of a
+    dashboard-configured endpoint — because two of those can share a URL and
+    open it with different keys, which is two recipients however alike the
+    addresses look.
     """
 
     purpose: str
@@ -107,17 +110,30 @@ class Destination:
     vendor: str
     api_key_env: str
     api_style: str
+    #: The stored endpoint this goes through, or "" for the configured one.
+    configured: str = ""
     #: Reported, never compared.
     model: str = ""
 
     @property
-    def key(self) -> tuple[str, str, str, str, str]:
-        return (self.provider, self.endpoint, self.vendor, self.api_key_env, self.api_style)
+    def key(self) -> tuple[str, str, str, str, str, str]:
+        return (
+            self.provider,
+            self.endpoint,
+            self.vendor,
+            self.api_key_env,
+            self.api_style,
+            self.configured,
+        )
 
     def describe(self) -> str:
         if self.provider == "bedrock":
             return f"bedrock {self.endpoint} (model {self.model or 'unset'})"
-        credential = self.api_key_env or "no credential"
+        credential = (
+            f"the key stored for {self.configured}"
+            if self.configured
+            else (self.api_key_env or "no credential")
+        )
         return f"{self.endpoint} via {credential} (model {self.model or 'unset'})"
 
     def as_dict(self) -> dict[str, str]:
@@ -128,6 +144,7 @@ class Destination:
             "vendor": self.vendor,
             "api_key_env": self.api_key_env,
             "api_style": self.api_style,
+            "configured": self.configured,
             "model": self.model,
         }
 
@@ -164,15 +181,20 @@ def destination_for(config: MiraConfig, purpose: str) -> Destination:
     will be at call time.
     """
     from mira.dashboard.models_config import llm_config_for
+    from mira.llm import endpoints
 
     resolved = llm_config_for(purpose, config.llm)
+    configured = endpoints.name_of(resolved.endpoint)
     return Destination(
         purpose=purpose,
         provider=(resolved.provider or "").lower(),
         endpoint=_endpoint_of(resolved),
         vendor=_vendor_of(resolved.model),
-        api_key_env=resolved.api_key_env or "",
+        # A stored endpoint carries its own key, so the variable is not what
+        # identifies the credential there — the endpoint is.
+        api_key_env="" if configured else (resolved.api_key_env or ""),
         api_style=(resolved.api_style or "").lower(),
+        configured=configured,
         model=resolved.model or "",
     )
 

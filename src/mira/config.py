@@ -44,6 +44,27 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CONFIG_FILENAMES = (".mira.yaml", ".mira.yml")
 
 
+def validate_base_url(value: str, field: str = "llm.base_url") -> str:
+    """Return ``value`` if it is an endpoint we will send a key to, else raise.
+
+    Shared by the config field, the provider-profile shortcut and the
+    dashboard's endpoint form, so an endpoint typed into the browser is held
+    to exactly the rule an endpoint written in ``mira.yaml`` is: http(s) with
+    a host, and plain http only where it cannot leave the machine or the
+    private network.
+    """
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"{field} must be an http(s) URL, got {value!r}")
+    if parsed.scheme == "http" and not _is_local_host(parsed.hostname):
+        raise ValueError(
+            f"{field} {value!r} uses plain http to a public host — use https "
+            "(http is allowed only for localhost, private IPs, and dotless "
+            "hostnames like docker-compose services)"
+        )
+    return value
+
+
 def _is_local_host(host: str) -> bool:
     """Loopback, private/link-local IP literals, and dotless hostnames
     (docker-compose services) — where a plain-http endpoint is legitimate."""
@@ -98,6 +119,13 @@ class LLMConfig(BaseModel):
     # any of them — each call goes to the account with the most allowance
     # left, and one the backend refuses is set aside until its window resets.
     oauth_account: str | None = None
+    # An endpoint configured from the dashboard (Settings → Connections),
+    # named by its id. When set it supplies the URL, the protocol and the key
+    # — the key from Mira's own database rather than from the environment —
+    # so a deployment that cannot easily edit this file or its env (a
+    # container, a hosted image) can still point reviews somewhere new. The
+    # dashboard writes the same field; nothing here needs to be set by hand.
+    endpoint: str | None = None
     # Endpoint configuration. Defaults to OpenRouter but any OpenAI-compatible
     # chat-completions endpoint works — vLLM, Ollama, LiteLLM proxy, LocalAI,
     # llama.cpp server, Together, Fireworks, Groq, etc. Set api_key_env to ""
@@ -127,16 +155,7 @@ class LLMConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def _validate_base_url(cls, v: str) -> str:
-        parsed = urlparse(v)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError(f"llm.base_url must be an http(s) URL, got {v!r}")
-        if parsed.scheme == "http" and not _is_local_host(parsed.hostname):
-            raise ValueError(
-                f"llm.base_url {v!r} uses plain http to a public host — use https "
-                "(http is allowed only for localhost, private IPs, and dotless "
-                "hostnames like docker-compose services)"
-            )
-        return v
+        return validate_base_url(v)
 
     @field_validator("oauth_provider")
     @classmethod

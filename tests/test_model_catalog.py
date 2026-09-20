@@ -26,9 +26,14 @@ class TestActiveBackend:
         assert active_backend(LLMConfig(provider="bedrock")) == "bedrock"
 
     def test_generic_endpoint(self):
-        assert (
-            active_backend(LLMConfig(base_url="http://localhost:11434/v1")) == "openai-compatible"
+        assert active_backend(LLMConfig(base_url="https://llm.acme.test/v1")) == (
+            "openai-compatible"
         )
+
+    def test_a_url_a_preset_claims_is_named_by_it(self):
+        # Ollama's default URL is a preset, so its quirks and its model list
+        # are the preset's rather than the portable default's.
+        assert active_backend(LLMConfig(base_url="http://localhost:11434/v1")) == "ollama"
 
 
 class TestBuildOptions:

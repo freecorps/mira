@@ -110,6 +110,10 @@ changing who receives the source is not. All three tiers that see repository
 content are checked (`review`, `indexing`, `security`), so redirecting
 `indexing_model` alone is refused too.
 
+An endpoint configured from the dashboard is identified by its id as well as
+its URL (`configured` above): two of those can share a URL and open it with
+different keys, which is two recipients however alike the addresses look.
+
 There is no flag to turn this off.
 
 ### The destination comes from the base, not from the change
@@ -268,7 +272,7 @@ the stream is safe to pipe.
   "head":  { "label": "working tree", "sha": "" },
   "destinations": [
     { "purpose": "review", "provider": "openai", "endpoint": "https://openrouter.ai/api/v1",
-      "vendor": "anthropic", "api_key_env": "OPENROUTER_API_KEY",
+      "vendor": "anthropic", "api_key_env": "OPENROUTER_API_KEY", "configured": "",
       "api_style": "chat", "model": "anthropic/claude-sonnet-4-6" }
   ],
   "review": {

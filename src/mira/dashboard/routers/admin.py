@@ -156,7 +156,9 @@ async def get_models() -> ModelsResponse:
         account_models,
         active_backend,
         build_options,
+        endpoint_entries,
         endpoint_host,
+        endpoint_options,
         fetch_catalog,
         oauth_option_groups,
         provider_models,
@@ -164,6 +166,7 @@ async def get_models() -> ModelsResponse:
     from mira.dashboard.models_config import (
         API_STYLES,
         THINKING_MODES,
+        apply_endpoint_binding,
         describe_call,
         effective_route,
         get_indexing_model,
@@ -171,8 +174,10 @@ async def get_models() -> ModelsResponse:
         get_review_thinking_mode,
         get_security_model,
         resolve_api_style,
+        resolve_endpoint_default,
         resolve_oauth_default,
     )
+    from mira.llm import endpoints as endpoint_store
     from mira.oauth import registry, store
     from mira.oauth.routes import api_route
 
@@ -191,12 +196,17 @@ async def get_models() -> ModelsResponse:
     # resolution next to a ChatGPT catalog names a model no call will make.
     default = resolve_oauth_default(llm, db.get_setting("llm_oauth_provider"))
     default_provider, default_account = default
+    db_endpoint = db.get_setting(endpoint_store.ACTIVE_KEY)
+    selected_endpoint = resolve_endpoint_default(llm, db_endpoint)
 
     # The API-key endpoint's own catalog, with any mira.yaml OAuth choice set
-    # aside: this is the list for the key path whether or not it is the default.
+    # aside: this is the list for the key path whether or not it is the
+    # default — the endpoint the dashboard selected, or the configured one.
     api_config = llm.model_copy(
         update={"oauth_provider": None, "oauth_account": None, "api_style": api_style}
     )
+    if selected_endpoint:
+        api_config = apply_endpoint_binding(api_config, selected_endpoint, model_is_explicit=True)
     api_backend = active_backend(api_config)
     api_catalog = await fetch_catalog(api_config)
     api_desc = describe_call(api_config)
@@ -252,21 +262,41 @@ async def get_models() -> ModelsResponse:
         api_style = spec.llm.api_style
     else:
         backend = api_backend
+        if selected_endpoint:
+            # Bare ids go to the endpoint the Connections page selected. The
+            # page says so in the same words the picker's group header uses.
+            default_backend = {
+                "provider": api_desc["provider"],
+                "provider_label": api_desc["provider_label"],
+                "account": "",
+                "account_label": api_desc["account_label"],
+                "mode": "endpoint",
+                "accounts": 0,
+            }
+            api_style = api_desc["api_style"]
 
     explicit_oauth = await oauth_option_groups(default, db)
+    # Every other configured endpoint, as routes that name it — so indexing
+    # can run on one endpoint while reviews run on another.
+    entries = await endpoint_entries(
+        llm.model_copy(update={"oauth_provider": None, "oauth_account": None}), db
+    )
 
     def options(purpose: str) -> list[ModelOption]:
         if default_provider:
             merged = bare_options + api_options(purpose, explicit=True)
         else:
             merged = api_options(purpose, explicit=False)
+        merged += endpoint_options(entries, purpose, bare=selected_endpoint)
         return [ModelOption(**m) for m in merged + explicit_oauth]
 
-    def route(resolved: str, chosen: str | None) -> dict:
+    def route(resolved: str, chosen: str | None, purpose: str = "review") -> dict:
         """What a call for ``resolved`` does. ``chosen`` = who picked it."""
-        return effective_route(llm, resolved, chosen, default)
+        return effective_route(llm, resolved, chosen, default, db_endpoint, purpose)
 
-    indexing = route(get_indexing_model(llm, db_indexing), db_indexing or llm.indexing_model)
+    indexing = route(
+        get_indexing_model(llm, db_indexing), db_indexing or llm.indexing_model, "indexing"
+    )
     review = route(get_review_model(llm, db_review), db_review or llm.review_model)
     security = route(
         get_security_model(llm, db_security, db_review),
@@ -287,7 +317,9 @@ async def get_models() -> ModelsResponse:
         security_source="dashboard" if db_security else "config",
         # The "inherit from deployment config" targets: what each purpose would
         # resolve to with its dashboard override cleared.
-        config_indexing_model=route(get_indexing_model(llm), llm.indexing_model)["value"],
+        config_indexing_model=route(get_indexing_model(llm), llm.indexing_model, "indexing")[
+            "value"
+        ],
         config_review_model=route(get_review_model(llm), llm.review_model)["value"],
         config_security_model=route(
             get_security_model(llm), llm.security_model or llm.review_model

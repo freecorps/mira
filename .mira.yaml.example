@@ -19,6 +19,15 @@ llm:
   # region: "us-east-1"
   # aws_profile: "my-profile"  # optional, uses default AWS credential chain if omitted
 
+  # ── Or configure the endpoint from the dashboard ──
+  # Settings -> Connections -> Add endpoint stores a URL, a key and a
+  # protocol in Mira's database, so a container or hosted image needs no
+  # file edit. Nothing has to be set here for that; the dashboard writes
+  # its own choice and it takes precedence over this file. A purpose can
+  # also name one directly, which works here too:
+  # review_model: "endpoint:<id>:<model>"
+  # See docs/endpoints.md.
+
   # ── OpenCode Go (uncomment to use) ──
   # The $10/month subscription to open coding models, metered in 5-hour,
   # weekly and monthly windows. Naming the provider fills in the endpoint

@@ -130,11 +130,26 @@ is generic; ChatGPT is the first provider on it.
 
 → [docs/oauth.md](docs/oauth.md)
 
+## Point it at a provider from the dashboard
+
+The endpoint and the key can live in Mira's database instead of in
+`mira.yaml` and the environment — useful when the file and the process
+belong to a container image rather than to you:
+
+**Settings → Connections → Add endpoint.** Pick a preset (OpenRouter,
+OpenCode Go, OpenAI, Groq, Ollama, …) or type any OpenAI-compatible URL,
+paste the key, test it, and choose which endpoint reviews use. Several can
+be configured at once, and each purpose can name one of its own.
+
+→ [docs/endpoints.md](docs/endpoints.md)
+
 ## Review on an OpenCode Go subscription
 
 [OpenCode Go](https://opencode.ai/docs/go/) is a $10/month plan for open coding
 models (Kimi, GLM, DeepSeek, Qwen, MiniMax, …) behind one OpenAI-compatible
 endpoint, metered in 5-hour, weekly and monthly windows instead of per token:
+
+Add it from the dashboard as above, or name it in the config file:
 
 ```yaml
 llm:

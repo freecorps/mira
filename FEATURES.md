@@ -190,8 +190,12 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Any provider available through OpenRouter — Anthropic, OpenAI, Google Gemini, DeepSeek, and more — so you pay your provider directly with no Mira markup
 - Any OpenAI-compatible endpoint via `llm.base_url` — vLLM, Ollama, LiteLLM proxy, LocalAI, llama.cpp, Together, Fireworks, Groq
 - AWS Bedrock as a direct backend (Converse API, standard AWS credential chain)
-- OpenCode Go as a named provider (`llm.provider: opencode-go`): the subscription's open coding models in the picker with labels and recommendations, the per-conversation session header the endpoint requires, and its 5-hour / weekly / monthly meters on the Connections page and in `mira auth status`, read from Go's own usage endpoint
-- `llm.provider` may name any profile in `providers.json`; the profile supplies the endpoint, the key variable, and — where the provider meters a subscription — the usage endpoint the dashboard reads
+- Endpoints configured from the dashboard — name, URL, key and protocol stored in Mira's database, with a connection test that says whether the key was actually checked, so a container or hosted image needs no file edit and no restart to change provider
+- Presets for the endpoints Mira knows (OpenRouter, OpenCode Go, OpenCode Zen, OpenAI, DeepSeek, Groq, Together, Fireworks, Ollama), carrying each one's URL, key variable and quirks; anything else is a custom OpenAI-compatible URL, and operators can add presets via `MIRA_PROVIDERS_JSON_PATH`
+- Several endpoints at once, one of them the default, and `endpoint:<id>:<model>` routes so each purpose can name its own — indexing on a subscription, reviews somewhere stronger
+- A stored key lives in its own row and is never returned by any route; an endpoint can point at an environment variable instead, and a preset falls back to its conventional one
+- OpenCode Go as a preset (or `llm.provider: opencode-go`): the subscription's open coding models in the picker with labels and recommendations, the per-conversation session header the endpoint requires, and its 5-hour / weekly / monthly meters on the Connections page and in `mira auth status`, read from Go's own usage endpoint
+- Per-model recovery from a fixed sampling temperature: a 400 naming `temperature` drops the field, retries, and remembers the model
 - Sign in with a ChatGPT account instead of an API key and review with the models that plan includes, through the same backend the Codex CLI uses — the session is stored server-side and renewed automatically, and switching back to a key is one setting
 - Generic OAuth layer under it: a provider is a spec class, so the dashboard page, API routes, CLI and model dropdown pick up a new one with no other change
 - OAuth logins from either side — `mira auth login` on the machine with the browser, or the dashboard's Connections page anywhere else — reading and writing the same store

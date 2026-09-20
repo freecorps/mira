@@ -240,17 +240,19 @@ class ResponsesProvider(OpenAICompatibleProvider):
     ) -> str:
         """Make a single LLM call with retries against the /responses endpoint."""
         body: dict = {
-            "model": _strip_model_prefix(model, self.config.base_url),
+            "model": _strip_model_prefix(model, self.profile),
             "input": _responses_input(messages),
-            "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
+        self._temperature(body, temperature)
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
+            if self._refused_temperature(resp, body):
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -269,7 +271,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
         The LLM returns structured data by 'calling' a tool. We extract the
         tool arguments as the JSON response.
         """
-        api_model = _strip_model_prefix(model, self.config.base_url)
+        api_model = _strip_model_prefix(model, self.profile)
         if not tools:
             raise LLMError("no_tools")
         forced_choice: dict | str = {
@@ -281,9 +283,9 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "input": _responses_input(messages),
             "tools": [_responses_tool(t) for t in tools],
             "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
-            "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
+        self._temperature(body, temperature)
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
@@ -301,9 +303,9 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
                 body.pop("reasoning", None)
-                body["temperature"] = (
-                    temperature if temperature is not None else self.config.temperature
-                )
+                self._temperature(body, temperature)
+                resp = await self._post(client, body)
+            if self._refused_temperature(resp, body):
                 resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
@@ -353,25 +355,25 @@ class ResponsesProvider(OpenAICompatibleProvider):
         if not tools:
             raise LLMError("no_tools")
         body: dict = {
-            "model": _strip_model_prefix(model, self.config.base_url),
+            "model": _strip_model_prefix(model, self.profile),
             "input": _responses_input(messages),
             "tools": [_responses_tool(t) for t in tools],
             "tool_choice": "auto",
-            "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }
+        self._temperature(body, temperature)
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
             if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
-                api_model = _strip_model_prefix(model, self.config.base_url)
+                api_model = _strip_model_prefix(model, self.profile)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
                 body.pop("reasoning", None)
-                body["temperature"] = (
-                    temperature if temperature is not None else self.config.temperature
-                )
+                self._temperature(body, temperature)
+                resp = await self._post(client, body)
+            if self._refused_temperature(resp, body):
                 resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
