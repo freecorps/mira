@@ -1233,44 +1233,48 @@ def auth_status(refresh: bool) -> None:
 
 
 def _echo_key_providers(refresh: bool) -> None:
-    """The API-key endpoints Mira knows: which is configured, and its allowance.
+    """The endpoints reached with a key: where each points, and its allowance.
 
     A key is not a session, so there is nothing to renew and nothing to log
     out of; what an endpoint like OpenCode Go still has is a metered
-    subscription, shown here the way an account's windows are.
+    subscription, shown here the way an account's windows are. Endpoints are
+    added and edited from the dashboard — this command reads them.
     """
     import asyncio
 
     from mira.llm import key_providers
-    from mira.llm import provider_profiles as profiles
 
     try:
         llm = load_config().llm
     except Exception:  # noqa: BLE001 - a broken config is not this command's problem
         llm = None
-    if refresh:
-        for name, profile in profiles.labelled().items():
-            if profile.get("usage_url") and key_providers.api_key_for(profile, llm):
-                try:
-                    asyncio.run(key_providers.refresh(name, llm))
-                except key_providers.UsageError as exc:
-                    click.echo(f"  ({name}: {exc})", err=True)
     entries = asyncio.run(key_providers.list_status(llm))
+    if refresh:
+        for entry in entries:
+            if entry["reports_usage"] and entry["key_configured"]:
+                try:
+                    asyncio.run(key_providers.refresh(entry["id"], llm))
+                except key_providers.UsageError as exc:
+                    click.echo(f"  ({entry['id']}: {exc})", err=True)
+        entries = asyncio.run(key_providers.list_status(llm))
     if not entries:
         return
     click.echo("\nAPI-key endpoints:")
     for entry in entries:
-        mark = "*" if entry["is_endpoint"] else " "
-        key = (
-            f"key in {entry['api_key_env']}"
-            if entry["key_configured"]
-            else f"no key ({entry['api_key_env'] or 'unset'})"
-        )
-        where = " — the configured API-key endpoint" if entry["is_endpoint"] else ""
-        click.echo(f"  {mark} {entry['id']:<12} {entry['label']} — {key}{where}")
+        mark = "*" if entry["is_default"] else " "
+        source = entry["key_source"]
+        if source == "stored":
+            key = f"key stored here {entry['key_hint']}".rstrip()
+        elif source.startswith("env:"):
+            key = f"key in {source[4:]}"
+        else:
+            key = "no key"
+        where = " — from mira.yaml" if not entry["editable"] else ""
+        click.echo(f"  {mark} {entry['id']:<14} {entry['label']} — {key}{where}")
+        click.echo(f"    {' ' * 14} {entry['endpoint']}")
         usage = _usage_line(entry.get("usage"))
         if usage:
-            click.echo(f"    {' ' * 12} {usage}")
+            click.echo(f"    {' ' * 14} {usage}")
 
 
 @auth_group.command("use")

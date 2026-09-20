@@ -144,6 +144,90 @@ def apply_oauth_binding(
     return config.model_copy(update=update)
 
 
+def resolve_endpoint_default(config: LLMConfig, db_value: str | None = None) -> str:
+    """Which stored endpoint the API-key path uses, or "" for the config's own.
+
+    DB → ``llm.endpoint`` → none, the same order the models and the OAuth
+    default follow: the dashboard is where an install is steered, and the
+    file is what it falls back to. An id that is not stored resolves to "",
+    so a deleted endpoint degrades to the configured one instead of failing
+    every review.
+    """
+    from mira.llm import endpoints
+
+    chosen = db_value.strip() if isinstance(db_value, str) else ""
+    if chosen:
+        if endpoints.get(chosen) is not None:
+            return chosen
+        logger.warning("Endpoint %r is selected but not stored; using the configured one", chosen)
+        return ""
+    named = endpoints.name_of(config.endpoint)
+    if named and endpoints.get(named) is None:
+        logger.warning("llm.endpoint %r is not stored; using the configured endpoint", named)
+        return ""
+    return named
+
+
+def apply_endpoint_binding(
+    config: LLMConfig, endpoint_id: str, *, model_is_explicit: bool = True, purpose: str = ""
+) -> LLMConfig:
+    """Point an LLMConfig at an endpoint configured from the dashboard.
+
+    The URL and the protocol come from the stored row, and the key from
+    beside it, so this overrides ``base_url``/``api_key_env`` for the same
+    reason the OAuth binding does: those describe a different destination,
+    and leaving them in place would send this endpoint's calls — or this
+    endpoint's key — to the one in the file.
+
+    Any OAuth binding is cleared: a route or a default that names an
+    endpoint is a statement that this call goes to a key, not to a session.
+
+    The model is replaced only when it plainly belongs elsewhere — a
+    vendor-prefixed id on an endpoint whose preset the registry knows models
+    for — and only when that endpoint has a model to offer. An unfamiliar
+    bare id is somebody's deliberate choice and is sent as written.
+
+    ``purpose`` picks *which* model to fall back to: indexing runs over every
+    file and belongs on the cheap one the registry recommends for it, not on
+    the review model just because that is the endpoint's headline.
+    """
+    from mira.llm import endpoints
+
+    stored = endpoints.get(endpoint_id)
+    if stored is None:
+        return config
+    update: dict = {
+        "endpoint": stored.id,
+        "base_url": stored.base_url,
+        "api_style": stored.api_style,
+        "oauth_provider": None,
+        "oauth_account": None,
+    }
+    fallback = (
+        endpoints.recommended_model(stored.preset, purpose) if purpose else ""
+    ) or stored.default_model
+    if fallback and (not model_is_explicit or _is_foreign_id(config.model, fallback)):
+        if config.model != fallback:
+            logger.info(
+                "Model %r is not one %s serves; using %s instead",
+                config.model,
+                stored.label,
+                fallback,
+            )
+        update["model"] = fallback
+    return config.model_copy(update=update)
+
+
+def _is_foreign_id(model: str, default_model: str) -> bool:
+    """True when ``model`` carries a vendor prefix this endpoint's does not.
+
+    The same tell the OAuth binding uses: OpenRouter and Bedrock ids are
+    ``vendor/model``, the ids these endpoints serve are bare. An endpoint
+    whose own default is prefixed (an OpenRouter-style one) is left alone.
+    """
+    return "/" in (model or "") and "/" not in default_model
+
+
 def _is_foreign_model(model: str, binding: LLMBinding) -> bool:
     """True when ``model`` plainly belongs to another backend, not this one.
 
@@ -173,6 +257,8 @@ def bind_model(
     default: tuple[str, str],
     thinking_mode: str | None = None,
     api_style: str | None = None,
+    api_endpoint: str | None = None,
+    purpose: str = "",
 ) -> LLMConfig:
     """The LLMConfig a call for ``value`` is made with.
 
@@ -180,14 +266,18 @@ def bind_model(
     bare model id, or a route naming its backend (see
     :mod:`mira.oauth.routes`). Three cases, in order:
 
-    * ``api:<model>`` — the configured API-key endpoint, whatever the
-      default backend is. This is how one purpose stays on a key while the
+    * ``api:<model>`` — the API-key path, whatever the default backend is:
+      the endpoint the dashboard selected, or the configured one when it
+      selected none. This is how one purpose stays on a key while the
       others use a signed-in account.
+    * ``endpoint:<id>:<model>`` — one endpoint configured in the dashboard,
+      whether or not it is the default. This is how indexing runs on a
+      subscription while reviews run somewhere else.
     * ``oauth:<provider>:<account>:<model>`` — that account (or any of the
       provider's, for ``*``). The model is sent as written: the route was
       chosen from that account's own list, so there is nothing to second-guess.
     * a bare id — the default backend: the OAuth provider ``default`` names,
-      or the API-key endpoint when it names none. The same rules as before
+      the selected endpoint, or the configured one. The same rules as before
       apply to the model (see :func:`apply_oauth_binding`).
     """
     from mira.oauth.routes import parse_route
@@ -197,9 +287,29 @@ def bind_model(
         "reasoning_effort": thinking_mode,
         "api_style": api_style if api_style is not None else base.api_style,
     }
+    if route is not None and route.backend == "endpoint":
+        update.update({"model": route.model, "oauth_provider": None, "oauth_account": None})
+        config = base.model_copy(update=update)
+        bound = apply_endpoint_binding(
+            config, route.provider, model_is_explicit=True, purpose=purpose
+        )
+        if bound is config:
+            # The route named an endpoint that is not configured here. It
+            # stays named — the factory refuses it with an error saying so —
+            # rather than quietly spending the default endpoint's key on a
+            # call the operator pointed somewhere else on purpose.
+            logger.warning("Model route %r names an endpoint that is not configured", value)
+            return config.model_copy(update={"endpoint": route.provider})
+        return bound
     if route is not None and route.backend == "api":
         update.update({"model": route.model, "oauth_provider": None, "oauth_account": None})
-        return base.model_copy(update=update)
+        config = base.model_copy(update=update)
+        selected = resolve_endpoint_default(base, api_endpoint)
+        return (
+            apply_endpoint_binding(config, selected, model_is_explicit=True, purpose=purpose)
+            if selected
+            else config
+        )
     if route is not None:
         update["model"] = route.model
         config = base.model_copy(update=update)
@@ -226,8 +336,13 @@ def bind_model(
     config = base.model_copy(update=update)
     provider_id, account = default
     if provider_id:
-        config = apply_oauth_binding(
+        return apply_oauth_binding(
             config, provider_id, model_is_explicit=model_is_explicit, account=account
+        )
+    selected = resolve_endpoint_default(base, api_endpoint)
+    if selected:
+        config = apply_endpoint_binding(
+            config, selected, model_is_explicit=model_is_explicit, purpose=purpose
         )
     return config
 
@@ -296,11 +411,52 @@ def describe_call(config: LLMConfig) -> dict:
             "endpoint": f"bedrock:{config.region}",
             "connected": True,
         }
+    from mira.llm import endpoints
     from mira.llm import provider_profiles as profiles
+
+    style = config.api_style if config.api_style in API_STYLE_VALUES else "chat"
+    named = endpoints.name_of(config.endpoint)
+    stored = endpoints.get(named) if named else None
+    if named and stored is None:
+        # A route to an endpoint this install does not have. Shown as what it
+        # is — a dead endpoint route — not as the key it will never use.
+        return {
+            "backend": "endpoint",
+            "provider": named,
+            "provider_label": f"{named} (not a configured endpoint)",
+            "account": "",
+            "account_label": "",
+            "model": config.model,
+            "api_style": "",
+            "protocol": "",
+            "transport": "",
+            "endpoint": "",
+            "connected": False,
+        }
+    if stored is not None:
+        source = endpoints.key_source(stored)
+        return {
+            "backend": "endpoint",
+            "provider": stored.id,
+            "provider_label": stored.label,
+            "account": stored.id,
+            # What opens it, in the words the Connections card uses: a key
+            # stored here, one read from the environment, or none at all.
+            "account_label": (
+                "stored key"
+                if source == "stored"
+                else (f"key from {source[4:]}" if source.startswith("env:") else "no key")
+            ),
+            "model": config.model,
+            "api_style": stored.api_style,
+            "protocol": next(s["label"] for s in API_STYLES if s["value"] == stored.api_style),
+            "transport": "HTTPS",
+            "endpoint": stored.base_url,
+            "connected": True,
+        }
 
     profile = profiles.resolve(config.base_url)
     label = profile.get("label") or "API-key endpoint"
-    style = config.api_style if config.api_style in API_STYLE_VALUES else "chat"
     return {
         "backend": "api",
         "provider": profile.get("name") or "openai-compatible",
@@ -413,13 +569,17 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
 
     The value may be a route as well as a model id — ``oauth:chatgpt:*:gpt-
     5-codex`` sends this purpose through a signed-in account whatever the
-    others do, ``api:…`` keeps it on the key — see :func:`bind_model`.
+    others do, ``endpoint:<id>:…`` sends it to one configured endpoint, and
+    ``api:…`` keeps it on the key — see :func:`bind_model`.
     """
+    from mira.llm import endpoints
+
     db_model: str | None = None
     db_thinking: str | None = None
     db_review: str | None = None
     db_style: str | None = None
     db_oauth: str | None = None
+    db_endpoint: str | None = None
     try:
         from mira.dashboard.api import _app_db
 
@@ -435,6 +595,7 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
                 db_review = _app_db.get_setting("review_model")
             db_style = _app_db.get_setting("api_style")
             db_oauth = _app_db.get_setting("llm_oauth_provider")
+            db_endpoint = _app_db.get_setting(endpoints.ACTIVE_KEY)
     except Exception:
         pass  # DB not available — resolve from config fields alone
 
@@ -461,6 +622,8 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
             model_is_explicit=_model_is_explicit(base, None),
             default=default,
             api_style=resolved_style,
+            api_endpoint=db_endpoint,
+            purpose=purpose,
         )
 
     source = "dashboard setting" if db_model else ("mira.yaml" if config_model else "default")
@@ -472,6 +635,8 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
         default=default,
         thinking_mode=thinking_mode,
         api_style=resolved_style,
+        api_endpoint=db_endpoint,
+        purpose=purpose,
     )
     if config.oauth_provider:
         logger.info(
@@ -479,6 +644,13 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
             purpose.capitalize(),
             config.oauth_provider,
             config.oauth_account or "any account",
+        )
+    elif config.endpoint:
+        logger.info(
+            "%s calls go to the %s endpoint (%s)",
+            purpose.capitalize(),
+            config.endpoint,
+            config.base_url,
         )
     return config
 
@@ -496,7 +668,12 @@ def _model_is_explicit(base: LLMConfig, per_purpose: str | None) -> bool:
 
 
 def effective_route(
-    base: LLMConfig, resolved: str, per_purpose: str | None, default: tuple[str, str]
+    base: LLMConfig,
+    resolved: str,
+    per_purpose: str | None,
+    default: tuple[str, str],
+    api_endpoint: str | None = None,
+    purpose: str = "",
 ) -> dict:
     """What a call for this purpose will actually do, for the Models page.
 
@@ -510,7 +687,12 @@ def effective_route(
     from mira.oauth.routes import parse_route
 
     bound = bind_model(
-        base, resolved, model_is_explicit=_model_is_explicit(base, per_purpose), default=default
+        base,
+        resolved,
+        model_is_explicit=_model_is_explicit(base, per_purpose),
+        default=default,
+        api_endpoint=api_endpoint,
+        purpose=purpose,
     )
     described = describe_call(bound)
     # A route is shown as written; a bare id shows whatever the binding

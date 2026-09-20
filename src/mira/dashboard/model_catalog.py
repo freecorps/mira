@@ -42,14 +42,25 @@ OAUTH_BACKEND_PREFIX = "oauth:"
 def active_backend(config: LLMConfig) -> str:
     """Which backend the config's calls go to, by name.
 
-    ``"oauth:<id>"`` for a signed-in account, ``"bedrock"``, the profile's
-    name for an endpoint ``providers.json`` knows (``"openrouter"``,
-    ``"opencode-go"``), or ``"openai-compatible"`` for any other endpoint.
+    ``"oauth:<id>"`` for a signed-in account, ``"bedrock"``, the preset name
+    for an endpoint built from one (``"opencode-go"``), the profile's name
+    for a URL ``providers.json`` knows (``"openrouter"``), or
+    ``"openai-compatible"`` for anything else.
+
+    The name is what the registry's endpoint-pinned entries are matched
+    against, so an endpoint configured from the OpenCode Go preset is
+    offered Go's models wherever it is pointed.
     """
     if config.oauth_provider:
         return f"{OAUTH_BACKEND_PREFIX}{config.oauth_provider}"
     if config.provider == "bedrock":
         return "bedrock"
+    from mira.llm import endpoints
+
+    if endpoints.name_of(config.endpoint):
+        stored = endpoints.get(config.endpoint)
+        if stored is not None:
+            return stored.preset or "openai-compatible"
     return profiles.resolve(config.base_url).get("name") or "openai-compatible"
 
 
@@ -74,7 +85,9 @@ def _norm(model_id: str) -> str:
 async def _fetch_openai_style(config: LLMConfig, tools_only: bool) -> list[dict]:
     """GET {base_url}/models. With tools_only (OpenRouter), keep only
     tool-calling models — Mira's review pass needs tool calling."""
-    profile = profiles.resolve(config.base_url)
+    from mira.llm import endpoints
+
+    profile = endpoints.profile_for_config(config)
     # The profile's own headers (attribution, client id) go with the list
     # request too; the per-conversation session header does not, since a
     # catalog lookup is not a conversation and the endpoint does not ask for
@@ -129,6 +142,8 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     page must not re-block on a dead endpoint on every load. A per-key lock
     coalesces concurrent cold-cache fetches (two tabs, the setup modal poll).
     """
+    from mira.llm import endpoints
+
     backend = active_backend(config)
     # An OAuth backend serves a fixed, curated list — there is no catalog
     # endpoint to call, and no key to call it with.
@@ -138,7 +153,10 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     if backend == "bedrock":
         cache_key = f"bedrock:{config.region}:{config.aws_profile or ''}"
     else:
-        cache_key = config.base_url
+        # Per endpoint, not per URL: two endpoints may share a URL and open
+        # it with different keys, which can be entitled to different models.
+        named = endpoints.name_of(config.endpoint)
+        cache_key = f"endpoint:{named}" if named else config.base_url
 
     def cached() -> tuple[float, list[dict] | None] | None:
         hit = _cache.get(cache_key)
@@ -253,6 +271,63 @@ async def provider_models(spec: Any, accounts: dict[str, Any], db: Any = None) -
         return []
     common = set.intersection(*(({o["value"] for o in options}) for options in lists))
     return [o for o in lists[0] if o["value"] in common]
+
+
+async def endpoint_entries(base: LLMConfig, db: Any = None) -> list[dict]:
+    """Every configured endpoint, bound and with its catalog fetched.
+
+    One entry per endpoint: the config a call to it would be made with, the
+    backend name its models are matched against, its live catalog, and the
+    header the picker groups it under. Fetched once for the page rather than
+    once per purpose — three pickers ask the same question.
+    """
+    from mira.dashboard.models_config import apply_endpoint_binding
+    from mira.llm import endpoints as store
+
+    entries = []
+    for endpoint in store.all_endpoints(db).values():
+        config = apply_endpoint_binding(base, endpoint.id, model_is_explicit=True)
+        if config.endpoint != endpoint.id:  # it vanished between the two reads
+            continue
+        entries.append(
+            {
+                "endpoint": endpoint,
+                "backend": active_backend(config),
+                "catalog": await fetch_catalog(config),
+                "group": f"{endpoint.label} · {endpoint_host(endpoint.base_url)}",
+                "detail": (
+                    f"{'Responses API' if endpoint.api_style == 'responses' else 'Chat Completions'}"
+                    f" · {'stored key' if store.key_source(endpoint, db) == 'stored' else 'API key'}"
+                ),
+            }
+        )
+    return entries
+
+
+def endpoint_options(entries: list[dict], purpose: str, *, bare: str = "") -> list[dict]:
+    """Picker options for configured endpoints, as routes naming each one.
+
+    The endpoint named by ``bare`` is the one bare ids already reach, so its
+    models are offered bare there and not twice.
+    """
+    from mira.oauth.routes import endpoint_route
+
+    out: list[dict] = []
+    for entry in entries:
+        endpoint = entry["endpoint"]
+        if endpoint.id == bare:
+            continue
+        for option in build_options(entry["backend"], entry["catalog"], purpose):
+            out.append(
+                {
+                    **option,
+                    "recommended": False,
+                    "value": endpoint_route(endpoint.id, option["value"]),
+                    "group": entry["group"],
+                    "detail": entry["detail"],
+                }
+            )
+    return out
 
 
 async def oauth_option_groups(default: tuple[str, str], db: Any = None) -> list[dict]:

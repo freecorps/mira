@@ -27,7 +27,8 @@ class ErrorMessage:
 LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
     "no_api_key": ErrorMessage(
         full=(
-            "No API key found. Set {api_key_env} (or OPENROUTER_API_KEY / "
+            "No API key found. Add one under Settings → Connections in the "
+            "dashboard, or set {api_key_env} (or OPENROUTER_API_KEY / "
             'OPENAI_API_KEY) in the environment, or set llm.api_key_env: "" in '
             "your config for a local endpoint that needs no auth."
         ),
@@ -76,6 +77,13 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
             "Settings → Connections, or run: mira auth login {provider_id}"
         ),
         safe="LLM provider is not connected",
+    ),
+    "unknown_endpoint": ErrorMessage(
+        full=(
+            "Endpoint '{endpoint}' is not configured on this instance — add it, "
+            "or pick another backend, under Settings → Connections"
+        ),
+        safe="LLM endpoint is not configured",
     ),
     "oauth_unknown_provider": ErrorMessage(
         full=(

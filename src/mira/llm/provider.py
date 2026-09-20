@@ -50,11 +50,11 @@ class LLMProvider(OpenAICompatibleProvider):
     ) -> str:
         """Make a single LLM call with retries against the /chat/completions endpoint."""
         body: dict = {
-            "model": _strip_model_prefix(model, self.config.base_url),
+            "model": _strip_model_prefix(model, self.profile),
             "messages": messages,
-            "temperature": temperature if temperature is not None else self.config.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
+        self._temperature(body, temperature)
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         self._apply_reasoning(body)
@@ -65,6 +65,8 @@ class LLMProvider(OpenAICompatibleProvider):
                 headers=self._build_headers(),
                 json=body,
             )
+            if self._refused_temperature(resp, body):
+                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -83,7 +85,7 @@ class LLMProvider(OpenAICompatibleProvider):
         The LLM returns structured data by 'calling' a tool. We extract the
         tool arguments as the JSON response.
         """
-        api_model = _strip_model_prefix(model, self.config.base_url)
+        api_model = _strip_model_prefix(model, self.profile)
         if not tools:
             raise LLMError("no_tools")
         forced_choice: dict | str = {
@@ -97,9 +99,9 @@ class LLMProvider(OpenAICompatibleProvider):
             # Force the one tool for structured args; models that reject a
             # forced choice fall back to "auto" (handled on the 400 below).
             "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
-            "temperature": temperature if temperature is not None else self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
+        self._temperature(body, temperature)
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
@@ -124,9 +126,9 @@ class LLMProvider(OpenAICompatibleProvider):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
                 body.pop("reasoning", None)
-                body["temperature"] = (
-                    temperature if temperature is not None else self.config.temperature
-                )
+                self._temperature(body, temperature)
+                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+            if self._refused_temperature(resp, body):
                 resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
             self._handle_error(resp)
             data = resp.json()
@@ -169,13 +171,13 @@ class LLMProvider(OpenAICompatibleProvider):
         if not tools:
             raise LLMError("no_tools")
         body: dict = {
-            "model": _strip_model_prefix(model, self.config.base_url),
+            "model": _strip_model_prefix(model, self.profile),
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
-            "temperature": temperature if temperature is not None else self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
+        self._temperature(body, temperature)
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
@@ -184,6 +186,8 @@ class LLMProvider(OpenAICompatibleProvider):
                 headers=self._build_headers(),
                 json=body,
             )
+            if self._refused_temperature(resp, body):
+                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
             self._handle_error(resp)
             data = resp.json()
 

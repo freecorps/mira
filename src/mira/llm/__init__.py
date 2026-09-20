@@ -27,6 +27,18 @@ def create_llm(config: LLMConfig) -> LLMProviderProtocol:
             return OAuthResponsesProvider(config)
         raise LLMError("oauth_unknown_provider", provider_id=config.oauth_provider)
 
+    # Same rule for an endpoint configured in the dashboard: a route or a
+    # setting naming one that is not stored is refused rather than served by
+    # whichever endpoint the config file happens to name, which would spend
+    # the wrong key and report the wrong destination.
+    from mira.llm import endpoints
+
+    named = endpoints.name_of(config.endpoint)
+    if named and endpoints.get(named) is None:
+        from mira.exceptions import LLMError
+
+        raise LLMError("unknown_endpoint", endpoint=named)
+
     if config.provider == "bedrock":
         from mira.llm.bedrock import BedrockProvider
 

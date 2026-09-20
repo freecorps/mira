@@ -64,10 +64,16 @@ EXPECTED_ROUTES = {
     ("/api/oauth/{provider_id}/accounts/{account_key}", "DELETE"),
     ("/api/oauth/{provider_id}/accounts/{account_key}/refresh", "POST"),
     ("/api/oauth/{provider_id}/accounts/{account_key}/usage", "POST"),
-    # API-key providers (admin-only): which endpoint is configured, whether
-    # its key is set, and a metered subscription's allowance. Never the key.
-    ("/api/providers/keys", "GET"),
-    ("/api/providers/keys/{provider_id}/usage", "POST"),
+    # Endpoints reached with a key (admin-only): where each one points, what
+    # opens it, and a metered subscription's allowance. A key is written
+    # here and never read back, so no route returns one.
+    ("/api/providers", "GET"),
+    ("/api/providers", "POST"),
+    ("/api/providers/active", "PUT"),
+    ("/api/providers/test", "POST"),
+    ("/api/providers/{endpoint_id}", "PUT"),
+    ("/api/providers/{endpoint_id}", "DELETE"),
+    ("/api/providers/{endpoint_id}/usage", "POST"),
     # Phase 5 — assisted correction (all admin-only; the cancel route
     # additionally requires the cancel permission). There is deliberately no
     # route that *starts* a fix: that is a repository write permission, not a

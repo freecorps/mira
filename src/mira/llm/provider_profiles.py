@@ -31,6 +31,8 @@ DEFAULT_PROFILE: dict = {
     "label": "",
     "description": "",
     "docs_url": "",
+    "base_url": "",
+    "api_style": "chat",
     "model_prefix": "strip",
     "extra_headers": {},
     "reasoning_effort_map": {},
@@ -86,11 +88,11 @@ def get(name: str) -> dict | None:
 
 
 def labelled() -> dict[str, dict]:
-    """The profiles the dashboard shows as endpoints of their own.
+    """The profiles the dashboard offers as presets when adding an endpoint.
 
     A label is what makes a profile presentable: without one there is
     nothing to head a card with, and an operator's override entry that only
-    renames a model prefix has no business on the Connections page.
+    renames a model prefix has no business in the preset list.
     """
     return {
         name: {**DEFAULT_PROFILE, **profile, "name": name}

@@ -10,12 +10,14 @@ A route is a model id with the backend written in front of it::
 
     oauth:chatgpt:<account>:gpt-5-codex   a specific signed-in account
     oauth:chatgpt:*:gpt-5-codex           any account of that provider (rotates)
-    api:openai/gpt-5.1                    the configured API-key endpoint
+    endpoint:opencode-go:kimi-k2.7-code   one endpoint configured in the dashboard
+    api:openai/gpt-5.1                    whichever endpoint the API key path uses
     anthropic/claude-sonnet-4-6           bare: the default backend, as before
 
 The prefixes cannot collide with a real model id — no vendor ships an id
-starting with ``oauth:`` or ``api:`` — and the model part may itself contain
-colons (Bedrock ids do), which is why it is always the last, unsplit field.
+starting with ``oauth:``, ``endpoint:`` or ``api:`` — and the model part may
+itself contain colons (Bedrock ids do), which is why it is always the last,
+unsplit field.
 Routes are accepted anywhere a model id is: the dashboard, ``mira.yaml``,
 and a repository's own ``.mira.yaml``.
 """
@@ -25,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 OAUTH_PREFIX = "oauth:"
+ENDPOINT_PREFIX = "endpoint:"
 API_PREFIX = "api:"
 # The account field meaning "any account this provider has".
 ANY_ACCOUNT = "*"
@@ -32,7 +35,11 @@ ANY_ACCOUNT = "*"
 
 @dataclass(frozen=True)
 class ModelRoute:
-    """A parsed route. ``backend`` is ``"oauth"`` or ``"api"``."""
+    """A parsed route. ``backend`` is ``"oauth"``, ``"endpoint"`` or ``"api"``.
+
+    ``provider`` names the backend within its kind: the OAuth provider, or
+    the id of an endpoint configured in the dashboard.
+    """
 
     backend: str
     model: str
@@ -47,6 +54,8 @@ class ModelRoute:
     def value(self) -> str:
         if self.backend == "oauth":
             return oauth_route(self.provider, self.account, self.model)
+        if self.backend == "endpoint":
+            return endpoint_route(self.provider, self.model)
         return api_route(self.model)
 
 
@@ -61,6 +70,14 @@ def parse_route(value: str | None) -> ModelRoute | None:
     if text.startswith(API_PREFIX):
         model = text[len(API_PREFIX) :].strip()
         return ModelRoute(backend="api", model=model) if model else None
+    if text.startswith(ENDPOINT_PREFIX):
+        parts = text[len(ENDPOINT_PREFIX) :].split(":", 1)
+        if len(parts) != 2:
+            return None
+        endpoint_id, model = (p.strip() for p in parts)
+        if not endpoint_id or not model:
+            return None
+        return ModelRoute(backend="endpoint", model=model, provider=endpoint_id)
     if text.startswith(OAUTH_PREFIX):
         parts = text[len(OAUTH_PREFIX) :].split(":", 2)
         if len(parts) != 3:
@@ -79,6 +96,10 @@ def parse_route(value: str | None) -> ModelRoute | None:
 
 def oauth_route(provider: str, account: str, model: str) -> str:
     return f"{OAUTH_PREFIX}{provider}:{account or ANY_ACCOUNT}:{model}"
+
+
+def endpoint_route(endpoint_id: str, model: str) -> str:
+    return f"{ENDPOINT_PREFIX}{endpoint_id}:{model}"
 
 
 def api_route(model: str) -> str:
