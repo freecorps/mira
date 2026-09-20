@@ -1,0 +1,62 @@
+# Scans the locked dependency sets against the OSV database.
+#
+# Until now the only channel for a new advisory was an external email digest,
+# which reports against a periodically refreshed SBOM — it told us about two
+# anyio CVEs eight days after the lockfile had already moved past them. This
+# runs against the lockfiles in the repository, so it answers for the code as
+# it actually stands.
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'uv.lock'
+      - 'pyproject.toml'
+      - 'ui/mira/package-lock.json'
+      - 'ui/mira/package.json'
+      - '.github/workflows/dependency-audit.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'uv.lock'
+      - 'pyproject.toml'
+      - 'ui/mira/package-lock.json'
+      - 'ui/mira/package.json'
+      - '.github/workflows/dependency-audit.yml'
+  # A dependency set that was clean when it merged stops being clean the day
+  # an advisory is published against it, and no commit marks that day.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  osv-scan:
+    name: OSV scan
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Scans every lockfile in the checkout — `uv.lock` and
+      # `ui/mira/package-lock.json`, which is all of them. osv-scanner exits
+      # non-zero when it finds a known vulnerability, which fails the job.
+      #
+      # The upstream reusable workflow would do the same thing, but it declares
+      # `security-events: write` to upload SARIF even when that upload is turned
+      # off, and a called workflow cannot ask for more than the caller grants.
+      # Calling the action directly keeps the token at `contents: read`.
+      - name: Run osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        with:
+          scan-args: |-
+            --recursive
+            ./
