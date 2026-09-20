@@ -54,3 +54,20 @@ updates:
     groups:
       ui-minor-and-patch:
         update-types: ["minor", "patch"]
+
+  # `docker` keeps the digest-pinned base images in the Dockerfile current.
+  # Without this the pins would freeze node/python at whatever they pointed
+  # at the day they were written, which trades one supply-chain problem
+  # (a moving tag) for a worse one (a base image that never gets patched).
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - docker
+    groups:
+      docker:
+        patterns: ["*"]
