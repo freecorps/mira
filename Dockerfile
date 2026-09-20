@@ -5,7 +5,10 @@
 # a cross-platform build (e.g. `--platform linux/arm64` from an amd64 host)
 # runs node natively instead of emulating it — that emulation used to be the
 # single slowest part of the arm64 image build.
-FROM --platform=$BUILDPLATFORM node:24-slim AS ui-builder
+# Digest-pinned: `node:24-slim` is a moving tag, so an unpinned build is not
+# reproducible and silently picks up whatever the tag points at that day.
+# Dependabot's docker ecosystem proposes the new digest weekly.
+FROM --platform=$BUILDPLATFORM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS ui-builder
 WORKDIR /ui
 COPY ui/mira/package.json ui/mira/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -14,7 +17,8 @@ COPY ui/mira/ ./
 RUN npm run build
 
 # ── Stage 2: backend + bundled UI ─────────────────────────────────
-FROM python:3.12-slim
+# Digest-pinned for the same reason as the UI builder above.
+FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
 LABEL org.opencontainers.image.source="https://github.com/miracodeai/mira"
 LABEL org.opencontainers.image.description="Self-hostable AI code reviewer"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
