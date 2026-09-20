@@ -32,12 +32,16 @@ from mira.llm.endpoints import EndpointError
 class EndpointBody(BaseModel):
     """The endpoint form. ``api_key`` is write-only and never returned.
 
-    Every field is a tri-state on an edit: absent leaves what is stored
-    alone, "" clears it, and a value replaces it. That matters most for
-    ``api_key``, which the form does not have to send back — but it matters
-    for the rest too, or a request that means "rename this" would also wipe
-    the preset that says which endpoint it is and the variable its key is
-    read from.
+    An absent field leaves what is stored alone, so a request that means
+    "rename this" does not also wipe the preset that says which endpoint it
+    is and the variable its key is read from.
+
+    For the fields that have a meaningful empty state — ``api_key``,
+    ``api_key_env``, ``model_prefix``, ``default_model``, and ``preset``,
+    whose empty value is "a plain OpenAI-compatible URL" — "" clears them.
+    ``label``, ``base_url`` and ``api_style`` have none: an endpoint without
+    a name, a URL or a protocol is not an endpoint, so "" there reads as
+    "leave it" rather than storing something no call could use.
     """
 
     label: str | None = None
@@ -204,15 +208,20 @@ async def test_provider(body: TestBody, request: Request) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     profile["base_url"] = base_url
 
+    # What the *form* says opens it, in the order a call would resolve it:
+    # a key typed here, then the variable typed here — which has to beat the
+    # stored key, or typing a new variable would silently test the old key
+    # and report on something the operator is replacing. The stored key is
+    # the fallback for a form nobody retyped either field into.
     api_key = body.api_key or ""
-    if not api_key:
-        stored = endpoints.get(body.endpoint, _db()) if body.endpoint else None
+    if not api_key and body.api_key_env:
+        api_key = os.environ.get(body.api_key_env, "")
+    if not api_key and body.endpoint:
+        stored = endpoints.get(body.endpoint, _db())
         if stored is not None:
             api_key = endpoints.key_for(stored, _db())
-        elif body.api_key_env:
-            api_key = os.environ.get(body.api_key_env, "")
-        elif profile.get("api_key_env"):
-            api_key = os.environ.get(str(profile["api_key_env"]), "")
+    if not api_key and profile.get("api_key_env"):
+        api_key = os.environ.get(str(profile["api_key_env"]), "")
     return await key_providers.test_connection(profile, api_key)
 
 

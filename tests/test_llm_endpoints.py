@@ -117,6 +117,37 @@ class TestPresets:
         assert go["reports_usage"] is True
         assert next(o for o in options if o["id"] == "openrouter")["reports_usage"] is False
 
+    def test_a_preset_may_not_take_a_backend_name(self, tmp_path, monkeypatch, caplog):
+        """``llm.provider: openai`` has always meant "any OpenAI-compatible
+        endpoint", so a preset called that could never be selected — and
+        would read as a silent redirect. OpenAI's own API is ``openai-api``."""
+        assert "openai" not in endpoints.presets()
+        assert endpoints.presets()["openai-api"]["base_url"] == "https://api.openai.com/v1"
+        assert LLMConfig(provider="openai").base_url == "https://openrouter.ai/api/v1"
+        assert LLMConfig(provider="openai-api").base_url == "https://api.openai.com/v1"
+
+        custom = tmp_path / "providers.json"
+        custom.write_text(
+            json.dumps(
+                {
+                    "openai": {"label": "Mine", "base_url": "https://mine.test/v1"},
+                    "bedrock": {"label": "Mine", "base_url": "https://mine.test/v2"},
+                }
+            )
+        )
+        monkeypatch.setenv("MIRA_PROVIDERS_JSON_PATH", str(custom))
+        profiles._load.cache_clear()
+        try:
+            with caplog.at_level("WARNING", logger="mira.llm.provider_profiles"):
+                loaded = profiles.all_profiles()
+            assert "openai" not in loaded and "bedrock" not in loaded
+            assert "that name means the backend itself" in caplog.text
+            # …and the reserved names still mean what they always did.
+            assert LLMConfig(provider="openai").base_url == "https://openrouter.ai/api/v1"
+            assert LLMConfig(provider="bedrock").provider == "bedrock"
+        finally:
+            profiles._load.cache_clear()
+
     def test_an_unlabelled_override_is_not_a_preset(self, tmp_path, monkeypatch):
         custom = tmp_path / "providers.json"
         custom.write_text(json.dumps({"quiet": {"base_url": "https://quiet.test/v1"}}))
@@ -235,6 +266,17 @@ class TestStore:
         endpoints.set_secret(endpoint.id, "stored-key", db)
         assert endpoints.key_for(endpoint, db) == "stored-key"
 
+    def test_the_variable_an_endpoint_names_is_reported_even_when_unset(self, db):
+        """What the form has to show. Reporting only where the key comes
+        from would blank the field for a variable the server does not export
+        yet, and saving would then take the pointer away."""
+        endpoint = endpoints.create(
+            label="Proxy", base_url="https://p.test/v1", api_key_env="NOT_SET_HERE", db=db
+        )
+        assert endpoints.key_variable(endpoint) == "NOT_SET_HERE"
+        assert endpoints.key_source(endpoint, db) == ""
+        assert endpoints.key_for(endpoint, db) == ""
+
     def test_a_preset_variable_is_read_when_nothing_else_is_set(self, db, monkeypatch):
         monkeypatch.setenv("OPENCODE_API_KEY", "from-the-environment")
         endpoint = _go(db, key="")
@@ -341,6 +383,21 @@ class TestBinding:
     def test_binding_to_a_gone_endpoint_changes_nothing(self, db: AppDatabase):
         config = LLMConfig()
         assert apply_endpoint_binding(config, "ghost") is config
+
+    def test_binding_reads_the_database_it_was_given(self, db: AppDatabase, tmp_path, monkeypatch):
+        """A caller that passes a store must be answered from it, not from
+        whichever one happens to be the process-wide default."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        with monkeypatch.context() as patch:
+            patch.setenv("MIRA_INDEX_DIR", str(elsewhere))
+            other = AppDatabase(url="", admin_password="admin")
+        endpoint = endpoints.create(label="Proxy", base_url="https://p.test/v1", db=other)
+        # Not in the default store, so the default lookup finds nothing…
+        assert apply_endpoint_binding(LLMConfig(), endpoint.id).endpoint is None
+        # …and the one it was handed does.
+        bound = apply_endpoint_binding(LLMConfig(), endpoint.id, db=other)
+        assert bound.endpoint == endpoint.id and bound.base_url == "https://p.test/v1"
 
     def test_the_default_is_the_dashboards_then_the_files(self, db: AppDatabase):
         endpoint = _go(db, default=False)
@@ -509,6 +566,18 @@ class TestClient:
         with pytest.raises(LLMError, match="not configured"):
             create_llm(LLMConfig(endpoint="ghost"))
 
+    def test_an_endpoint_deleted_mid_flight_takes_no_other_key(self, db, monkeypatch):
+        """The client outlives the row: a call bound to an endpoint that is
+        removed before its first request must not fall back to the config
+        file's key, which would hand one provider's credential to another's
+        URL — the URL is already bound."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-someone-elses-key")
+        endpoint = _go(db)
+        llm = create_llm(apply_endpoint_binding(LLMConfig(), endpoint.id))
+        endpoints.delete(endpoint.id, db)
+        with pytest.raises(LLMError, match="not configured"):
+            llm._build_headers()
+
     @pytest.mark.asyncio
     async def test_a_model_fixed_at_its_own_temperature_is_retried_without_one(self, db):
         """What the live endpoint taught us: Kimi K2.7 Code — the model
@@ -600,6 +669,39 @@ class TestCatalog:
             assert "kimi-k2.7-code" not in {
                 o["value"] for o in build_options(backend, None, "review")
             }
+
+    @pytest.mark.asyncio
+    async def test_editing_an_endpoint_shows_its_new_list_at_once(self, db, monkeypatch):
+        """The catalogue is cached for an hour against the endpoint. Keyed by
+        id alone, changing the URL or the key would leave the old provider's
+        models on screen for the rest of it."""
+        from mira.dashboard import model_catalog
+
+        fetched: list[str] = []
+
+        async def fetch(config, tools_only):
+            fetched.append(config.base_url)
+            return [{"value": "m", "label": "m"}]
+
+        monkeypatch.setattr(model_catalog, "_fetch_openai_style", fetch)
+        endpoint = _go(db)
+        config = apply_endpoint_binding(LLMConfig(), endpoint.id, db=db)
+        await model_catalog.fetch_catalog(config)
+        await model_catalog.fetch_catalog(config)
+        assert fetched == [GO_URL]  # the second read is the cache
+
+        endpoint.base_url = "https://proxy.test/v1"
+        endpoints.save(endpoint, db)
+        moved = apply_endpoint_binding(LLMConfig(), endpoint.id, db=db)
+        await model_catalog.fetch_catalog(moved)
+        assert fetched == [GO_URL, "https://proxy.test/v1"]
+
+        # A new key can mean a different catalogue, so it counts as a change
+        # too — even though it is stored in a row of its own.
+        endpoints.set_secret(endpoint.id, "oc_sk_a_different_key", db)
+        rekeyed = apply_endpoint_binding(LLMConfig(), endpoint.id, db=db)
+        await model_catalog.fetch_catalog(rekeyed)
+        assert len(fetched) == 3
 
     def test_options_name_the_endpoint_they_go_to(self, db: AppDatabase):
         go = _go(db)
@@ -970,6 +1072,35 @@ class TestDashboardRoutes:
         assert endpoints.require(endpoint.id, db).preset == "opencode-go"
 
     @pytest.mark.asyncio
+    async def test_an_edit_keeps_a_variable_whose_value_is_not_set(self, db: AppDatabase):
+        """The card reports the variable an endpoint names, not only the one
+        it is currently reading — or an edit made against a server that does
+        not export it yet would save the pointer away."""
+        from mira.dashboard.routers.providers import EndpointBody, update_provider
+
+        endpoint = endpoints.create(
+            label="Proxy", base_url="https://p.test/v1", api_key_env="NOT_SET_HERE", db=db
+        )
+        card = await key_providers.endpoint_card(endpoint, is_default=False, db=db)
+        assert card["key_variable"] == "NOT_SET_HERE"
+        assert card["key_source"] == ""  # nothing is exporting it right now
+        # The form sends back what the card showed, and it survives.
+        saved = await update_provider(
+            endpoint.id, EndpointBody(label="Proxy", api_key_env=card["key_variable"]), _admin()
+        )
+        assert saved["key_variable"] == "NOT_SET_HERE"
+        assert endpoints.require(endpoint.id, db).api_key_env == "NOT_SET_HERE"
+
+    @pytest.mark.asyncio
+    async def test_a_stored_key_can_be_taken_back_out(self, db: AppDatabase):
+        from mira.dashboard.routers.providers import EndpointBody, update_provider
+
+        endpoint = _go(db)
+        card = await update_provider(endpoint.id, EndpointBody(api_key=""), _admin())
+        assert card["key_source"] == "" and card["key_hint"] == ""
+        assert endpoints.secret(endpoint.id, db) == ""
+
+    @pytest.mark.asyncio
     async def test_changing_the_preset_takes_its_model_with_it(self, db: AppDatabase):
         from mira.dashboard.routers.providers import EndpointBody, update_provider
 
@@ -1043,6 +1174,29 @@ class TestDashboardRoutes:
         )
         answer = await test_provider(TestBody(preset="opencode-go", api_key="bad"), _admin())
         assert answer == {"ok": False, "detail": "Invalid API key."}
+
+    @pytest.mark.asyncio
+    async def test_the_test_route_tries_the_form_before_the_stored_key(self, db, monkeypatch):
+        """Typing a new variable into the form has to be what gets tested —
+        otherwise the answer describes the key being replaced."""
+        from mira.dashboard.routers.providers import TestBody, test_provider
+
+        monkeypatch.setenv("NEW_KEY_VAR", "the-new-key")
+        _go(db)  # stored key: oc_sk_test_1234
+        tried: list[str] = []
+        monkeypatch.setattr(
+            key_providers,
+            "test_connection",
+            lambda profile, api_key: _async({"ok": True, "detail": api_key})(),
+        )
+        for body in [
+            TestBody(endpoint="opencode-go", preset="opencode-go", api_key_env="NEW_KEY_VAR"),
+            TestBody(endpoint="opencode-go", preset="opencode-go", api_key="typed-key"),
+            # Neither field touched: the stored key is what a call would use.
+            TestBody(endpoint="opencode-go", preset="opencode-go"),
+        ]:
+            tried.append((await test_provider(body, _admin()))["detail"])
+        assert tried == ["the-new-key", "typed-key", "oc_sk_test_1234"]
 
     @pytest.mark.asyncio
     async def test_the_test_route_refuses_a_url_it_would_not_store(self, db):

@@ -8,6 +8,7 @@ model there; this file picks it up automatically.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from mira.config import LLMConfig
 from mira.llm import registry
@@ -169,7 +170,12 @@ def resolve_endpoint_default(config: LLMConfig, db_value: str | None = None) -> 
 
 
 def apply_endpoint_binding(
-    config: LLMConfig, endpoint_id: str, *, model_is_explicit: bool = True, purpose: str = ""
+    config: LLMConfig,
+    endpoint_id: str,
+    *,
+    model_is_explicit: bool = True,
+    purpose: str = "",
+    db: Any = None,
 ) -> LLMConfig:
     """Point an LLMConfig at an endpoint configured from the dashboard.
 
@@ -193,7 +199,7 @@ def apply_endpoint_binding(
     """
     from mira.llm import endpoints
 
-    stored = endpoints.get(endpoint_id)
+    stored = endpoints.get(endpoint_id, db)
     if stored is None:
         return config
     update: dict = {

@@ -4,6 +4,7 @@
     "label": "Display name, shown on the Connections page and under each model picker.",
     "description": "One sentence for the card and the preset list.",
     "docs_url": "Where the provider documents its API and plans.",
+    "_naming": "An entry's key is what `llm.provider` names it by, so it may not be 'openai' or 'bedrock': those two have always meant the generic OpenAI-compatible backend and AWS Bedrock, and an entry taking either name would be unreachable from the config file. OpenAI's own API is therefore 'openai-api'.",
     "base_url": "The endpoint this profile applies to; `llm.base_url` is matched against it, and the dashboard prefills it. `llm.provider: <name>` fills it in too.",
     "api_key_env": "Environment variable holding the key when one is not stored in Mira's database. \"\" means the endpoint needs no key.",
     "api_style": "Protocol dialect the endpoint is reached with: 'chat' (Chat Completions) or 'responses'.",
@@ -61,7 +62,7 @@
     "session_header": "x-opencode-session"
   },
 
-  "openai": {
+  "openai-api": {
     "label": "OpenAI",
     "description": "OpenAI's own API, billed to your OpenAI account.",
     "docs_url": "https://platform.openai.com/docs/api-reference",

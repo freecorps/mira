@@ -15,6 +15,10 @@ export type ProviderEndpoint = {
   // "stored" (in Mira's database), "env:VAR", or "" for no key at all.
   key_source: string
   key_hint: string
+  // The variable this endpoint reads a key from, whether or not the server
+  // currently exports it. The form edits this; `key_source` only says where
+  // the key is coming from right now.
+  key_variable: string
   key_configured: boolean
   // Bare model ids go here, unless a signed-in account outranks it.
   is_default: boolean

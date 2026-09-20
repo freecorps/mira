@@ -84,8 +84,11 @@ and its last four characters, which is what tells two keys apart.
   sensitive as the environment variable it replaces. It is not separately
   encrypted at rest.
 * Every route under `/api/providers` is admin-only, reads included.
-* A key is written and never read back. Editing an endpoint and leaving the
-  key field blank keeps the key that is set; clearing it removes it.
+* **No route hands a key back.** Mira reads it to sign a request and to
+  derive the four characters on the card, and nothing else returns it —
+  there is no endpoint that answers with a key, so the browser never holds
+  one it did not just type. Editing an endpoint and leaving the key field
+  blank keeps the key that is set; **Remove stored key** clears it.
 
 **Keeping the key in the environment.** The form's *environment variable*
 field points an endpoint at a variable instead of storing a secret: Mira
@@ -117,6 +120,13 @@ llm:
 
 An unknown name is rejected at config load rather than at review time, where
 it would quietly resolve to OpenRouter and whatever key that path found.
+
+Two names are not presets and never will be: **`openai`** means any
+OpenAI-compatible endpoint — whatever `base_url` says, which is what it has
+always meant — and **`bedrock`** means the AWS Converse API. OpenAI's own
+API is therefore the **`openai-api`** preset. A profile that tries to take
+either name is ignored with a warning, so neither meaning can shift under a
+config that already works.
 
 ## First run
 

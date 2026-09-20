@@ -120,9 +120,13 @@ function EndpointForm({
   // Always empty: the server never sends a key back, so an untouched field
   // means "keep whatever is stored".
   const [apiKey, setApiKey] = useState("")
-  const [apiKeyEnv, setApiKeyEnv] = useState(
-    editing?.key_source.startsWith("env:") ? editing.key_source.slice(4) : ""
-  )
+  // The variable the endpoint names, not the one it is currently reading: a
+  // server that does not export it yet still has it configured, and seeding
+  // this from "where the key comes from" would blank the field and save the
+  // pointer away.
+  const [apiKeyEnv, setApiKeyEnv] = useState(editing?.key_variable ?? "")
+  // Sends api_key: "" — the only way to take a stored key back out.
+  const [clearKey, setClearKey] = useState(false)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [tested, setTested] = useState<EndpointTest | null>(null)
@@ -179,9 +183,10 @@ function EndpointForm({
         preset,
         api_style: apiStyle,
         api_key_env: apiKeyEnv,
-        // Absent leaves a stored key alone. On a new endpoint there is
-        // nothing to leave, so "" is as good as absent.
-        ...(apiKey ? { api_key: apiKey } : {}),
+        // A typed key replaces the stored one and "" removes it. Absent —
+        // neither typed nor cleared — leaves it alone, which is what an
+        // edit that only touches the name has to do.
+        ...(apiKey ? { api_key: apiKey } : clearKey ? { api_key: "" } : {}),
         ...(makeDefault ? { make_default: true } : {}),
       }
       const saved = editing
@@ -196,11 +201,13 @@ function EndpointForm({
     }
   }
 
-  const keyPlaceholder = editing?.key_configured
-    ? "Leave blank to keep the key that is set"
-    : chosen?.api_key_env
-      ? `sk-…  (or leave blank and read ${chosen.api_key_env} from the environment)`
-      : "sk-…"
+  const keyPlaceholder = clearKey
+    ? "The stored key will be removed on save"
+    : editing?.key_source === "stored"
+      ? "Leave blank to keep the key that is stored"
+      : chosen?.api_key_env
+        ? `sk-…  (or leave blank and read ${chosen.api_key_env} from the environment)`
+        : "sk-…"
 
   return (
     <>
@@ -277,11 +284,27 @@ function EndpointForm({
             autoComplete="off"
             value={apiKey}
             placeholder={keyPlaceholder}
+            disabled={clearKey}
             onChange={(e) => {
               setApiKey(e.target.value)
               setTested(null)
             }}
           />
+          {editing?.key_source === "stored" && (
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                className="size-3.5 accent-current"
+                checked={clearKey}
+                onChange={(e) => {
+                  setClearKey(e.target.checked)
+                  if (e.target.checked) setApiKey("")
+                  setTested(null)
+                }}
+              />
+              Remove the stored key {editing.key_hint} on save
+            </label>
+          )}
         </Field>
 
         <Field

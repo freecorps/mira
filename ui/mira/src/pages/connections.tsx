@@ -487,7 +487,22 @@ export function ConnectionsPage() {
   useDocumentTitle("Connections")
   const { user } = useAuth()
   const [refreshKey, setRefreshKey] = useState(0)
-  const [busy, setBusy] = useState("")
+  // Which actions are in flight, by key. A single "the page is busy" string
+  // would be cleared by whichever of two concurrent actions finished first,
+  // re-enabling the buttons of one that is still running.
+  const [busy, setBusy] = useState<readonly string[]>([])
+  const isBusy = (key: string) => busy.includes(key)
+  const withBusy = async (key: string, fn: () => Promise<unknown>) => {
+    setBusy((keys) => [...keys, key])
+    try {
+      return await fn()
+    } finally {
+      setBusy((keys) => {
+        const at = keys.indexOf(key)
+        return at < 0 ? keys : [...keys.slice(0, at), ...keys.slice(at + 1)]
+      })
+    }
+  }
   // The in-flight sign-in, if any. Held here rather than in the dialog so the
   // `state` from `start` survives until the user comes back with the redirect.
   const [flow, setFlow] = useState<OAuthStart | null>(null)
@@ -561,27 +576,25 @@ export function ConnectionsPage() {
     fn: () => Promise<unknown>,
     done?: string
   ) => {
-    setBusy(`endpoint:${id}`)
     try {
-      await fn()
+      await withBusy(`endpoint:${id}`, fn)
       reloadEndpoints()
       if (done) toast.success(done)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy("")
     }
   }
 
   const refreshEndpointUsage = async (id: string) => {
-    setBusy(`endpoint:${id}`)
     try {
-      patchCard(await api.refreshProviderUsage(id))
+      patchCard(
+        (await withBusy(`endpoint:${id}`, () =>
+          api.refreshProviderUsage(id)
+        )) as ProviderEndpoint
+      )
       toast.success("Usage updated")
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy("")
     }
   }
 
@@ -594,16 +607,15 @@ export function ConnectionsPage() {
   }
 
   const connect = async (provider: string) => {
-    setBusy(provider)
     try {
-      const started = await api.startOAuth(provider)
+      const started = (await withBusy(provider, () =>
+        api.startOAuth(provider)
+      )) as OAuthStart
       setRedirectUrl("")
       setFlow(started)
       window.open(started.authorization_url, "_blank", "noopener")
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy("")
     }
   }
 
@@ -633,15 +645,12 @@ export function ConnectionsPage() {
     fn: () => Promise<unknown>,
     done?: string
   ) => {
-    setBusy(provider)
     try {
-      await fn()
+      await withBusy(provider, fn)
       reload()
       if (done) toast.success(done)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy("")
     }
   }
 
@@ -666,7 +675,7 @@ export function ConnectionsPage() {
         <div className="space-y-4">
           {providers.map((p) => {
             const isDefault = activeProvider === p.id
-            const working = busy === p.id
+            const working = isBusy(p.id)
             const many = p.accounts.length > 1
             return (
               <Card key={p.id}>
@@ -862,7 +871,7 @@ export function ConnectionsPage() {
             <EndpointCard
               key={e.id}
               endpoint={e}
-              working={busy === `endpoint:${e.id}`}
+              working={isBusy(`endpoint:${e.id}`)}
               onRefresh={() => refreshEndpointUsage(e.id)}
               onEdit={() => {
                 setEditing(e)
@@ -894,7 +903,9 @@ export function ConnectionsPage() {
         makeDefault={!editing && endpointList.every((e) => !e.editable)}
         onSaved={(saved) => {
           reloadEndpoints()
-          toast.success(editing ? `Saved ${saved.label}` : `Added ${saved.label}`)
+          toast.success(
+            editing ? `Saved ${saved.label}` : `Added ${saved.label}`
+          )
         }}
       />
 

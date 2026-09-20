@@ -48,10 +48,33 @@ DEFAULT_PROFILE: dict = {
 }
 
 
+# Names a profile may not take: they are the backends themselves in
+# ``llm.provider``, so an entry called either would be unreachable from the
+# config file and would read as a silent redirect to the other one.
+RESERVED_NAMES = frozenset({"openai", "bedrock"})
+
+
 def _read(path: Path) -> dict[str, dict]:
-    """Parse a providers.json file, dropping the leading ``_*`` doc keys."""
+    """Parse a providers.json file, dropping the leading ``_*`` doc keys.
+
+    An entry under a reserved name is dropped with a warning rather than
+    loaded: it could never be selected by name, and matching it by URL alone
+    would give it quirks nobody could ask for or turn off.
+    """
     raw = json.loads(path.read_text())
-    return {k: v for k, v in raw.items() if not k.startswith("_")}
+    profiles = {}
+    for name, profile in raw.items():
+        if name.startswith("_"):
+            continue
+        if name in RESERVED_NAMES:
+            logger.warning(
+                "Ignoring provider profile %r: that name means the backend itself in "
+                "llm.provider. Give it another name (OpenAI's own API is 'openai-api').",
+                name,
+            )
+            continue
+        profiles[name] = profile
+    return profiles
 
 
 @lru_cache(maxsize=1)
