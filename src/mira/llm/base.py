@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import secrets
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, ClassVar, Protocol, runtime_checkable
@@ -13,6 +14,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
+from mira import __version__
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
 from mira.llm import provider_profiles as profiles
@@ -344,6 +346,11 @@ class OpenAICompatibleProvider:
         self.total_completion_tokens = 0
         self._no_forced_tool_choice: set[str] = set()
         self._no_reasoning: set[str] = set()
+        # One id per client instance — which is one per review pass, since a
+        # client is created per purpose per review. Sent where the profile
+        # names a session header, so an endpoint that routes and caches by
+        # conversation sees the calls of one review as one conversation.
+        self._session_id = secrets.token_hex(15)
 
         # Apply retry decorator imperatively so it reads config values
         # (max_retries, retry_min_wait, retry_max_wait) at instance time.
@@ -361,16 +368,24 @@ class OpenAICompatibleProvider:
     # ── Shared helpers ─────────────────────────────────────────────
 
     def _build_headers(self) -> dict[str, str]:
-        """Build request headers: Content-Type, optional Bearer auth, and any
-        provider-specific extras from the profile. Authorization is omitted
-        entirely if the endpoint needs no key (Ollama, llama.cpp, etc.)."""
+        """Build request headers: Content-Type, a User-Agent naming Mira,
+        optional Bearer auth, and any provider-specific extras from the
+        profile. Authorization is omitted entirely if the endpoint needs no
+        key (Ollama, llama.cpp, etc.)."""
         if hasattr(self, "_cached_headers"):
             return dict(self._cached_headers)
-        headers: dict[str, str] = {"Content-Type": "application/json"}
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            # Say who is calling rather than hiding behind the HTTP library's
+            # name: some gateways (OpenCode Go) ask coding agents to.
+            "User-Agent": f"mira/{__version__} (+https://github.com/miracodeai/mira)",
+        }
         key = _get_api_key(self.config, self.profile)
         if key:
             headers["Authorization"] = f"Bearer {key}"
         headers.update(self.profile.get("extra_headers", {}))
+        if self.profile.get("session_header"):
+            headers[self.profile["session_header"]] = self._session_id
         self._cached_headers = headers
         return dict(headers)
 

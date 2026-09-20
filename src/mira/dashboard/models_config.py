@@ -299,7 +299,7 @@ def describe_call(config: LLMConfig) -> dict:
     from mira.llm import provider_profiles as profiles
 
     profile = profiles.resolve(config.base_url)
-    label = "OpenRouter" if profile.get("name") == "openrouter" else "API-key endpoint"
+    label = profile.get("label") or "API-key endpoint"
     style = config.api_style if config.api_style in API_STYLE_VALUES else "chat"
     return {
         "backend": "api",

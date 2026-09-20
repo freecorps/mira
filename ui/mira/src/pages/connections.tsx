@@ -2,6 +2,7 @@ import {
   CheckCircle2,
   ExternalLink,
   Gauge,
+  KeyRound,
   Loader2,
   Plug,
   RefreshCw,
@@ -35,8 +36,10 @@ import type {
   OAuthAccount,
   OAuthProvider,
   OAuthStart,
+  UsageSnapshot,
   UsageWindow,
 } from "@/lib/api/oauth"
+import type { KeyProvider } from "@/lib/api/providers"
 import { useAuth } from "@/lib/auth"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 
@@ -79,6 +82,14 @@ function endpointHost(url: string): string {
   } catch {
     return url
   }
+}
+
+// The windows a snapshot reports, shortest first (two for ChatGPT, three
+// for OpenCode Go).
+function usageWindows(usage: UsageSnapshot | null | undefined): UsageWindow[] {
+  return [usage?.primary, usage?.secondary, usage?.tertiary].filter(
+    (w): w is UsageWindow => !!w
+  )
 }
 
 // One metered window as a labelled bar: "5-hour · 42% used · resets in 2 h".
@@ -124,9 +135,7 @@ function AccountRow({
   const usage = account.usage
   // `available` is the server's judgement, so this render stays pure.
   const limited = !!usage && !account.available && usage.exhausted_until > 0
-  const windows = [usage?.primary, usage?.secondary].filter(
-    (w): w is UsageWindow => !!w
-  )
+  const windows = usageWindows(usage)
   return (
     <div className="space-y-3 rounded-md border p-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -183,7 +192,13 @@ function AccountRow({
       {provider.reports_usage && (
         <div className="space-y-2">
           {windows.length > 0 ? (
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div
+              className={
+                windows.length > 2
+                  ? "grid gap-3 sm:grid-cols-3"
+                  : "grid gap-3 sm:grid-cols-2"
+              }
+            >
               {windows.map((w) => (
                 <UsageMeter key={w.name} window={w} />
               ))}
@@ -277,6 +292,129 @@ function AccountRow({
   )
 }
 
+// An endpoint reached with a key from the server's environment. Nothing to
+// sign in to or renew; the card says whether the key is set, whether this is
+// the endpoint reviews are configured for, and — where the provider meters a
+// subscription (OpenCode Go) — how much of it is spent.
+function KeyProviderCard({
+  provider,
+  working,
+  onRefresh,
+}: {
+  provider: KeyProvider
+  working: boolean
+  onRefresh: () => void
+}) {
+  const usage = provider.usage
+  const windows = usageWindows(usage)
+  const limited = !!usage && !provider.available
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              {provider.label}
+              {provider.is_endpoint && (
+                <Badge variant="default">Configured API-key endpoint</Badge>
+              )}
+              {provider.key_configured ? (
+                <Badge variant="secondary">
+                  <KeyRound /> key in{" "}
+                  <code className="font-mono">{provider.api_key_env}</code>
+                </Badge>
+              ) : (
+                <Badge variant="outline">
+                  no key · set{" "}
+                  <code className="font-mono">
+                    {provider.api_key_env || "an API key"}
+                  </code>
+                </Badge>
+              )}
+              {limited && (
+                <Badge variant="destructive">
+                  <TriangleAlert /> rate-limited
+                  {usage!.exhausted_until > 0 && (
+                    <> · {untilLabel(usage!.exhausted_until)}</>
+                  )}
+                </Badge>
+              )}
+            </CardTitle>
+            <CardDescription>{provider.description}</CardDescription>
+          </div>
+          {provider.docs_url && (
+            <a
+              className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+              href={provider.docs_url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Docs <ExternalLink className="size-3" />
+            </a>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5 pt-1 text-xs text-muted-foreground">
+          <span>Calls use</span>
+          <Badge variant="outline">{provider.protocol.protocol}</Badge>
+          <Badge variant="outline">{provider.protocol.transport}</Badge>
+          <Badge variant="outline" className="font-mono">
+            {endpointHost(provider.protocol.endpoint)}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {provider.reports_usage ? (
+          <div className="space-y-2">
+            {windows.length > 0 ? (
+              <div
+                className={
+                  windows.length > 2
+                    ? "grid gap-3 sm:grid-cols-3"
+                    : "grid gap-3 sm:grid-cols-2"
+                }
+              >
+                {windows.map((w) => (
+                  <UsageMeter key={w.name} window={w} />
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                {provider.key_configured
+                  ? "No usage recorded yet — press Refresh usage to ask the provider now."
+                  : "Set the key in the server's environment to see this subscription's allowance."}
+              </p>
+            )}
+            {usage && usage.fetched_at > 0 && (
+              <p className="text-[0.7rem] text-muted-foreground">
+                As of {agoLabel(usage.fetched_at)} · from the usage endpoint
+              </p>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={working || !provider.key_configured}
+              title="Ask the provider where this key's allowance stands"
+              onClick={onRefresh}
+            >
+              <Gauge className="mr-1 h-3 w-3" /> Refresh usage
+            </Button>
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Pay per token: there is no allowance to meter here.
+          </p>
+        )}
+        <p className="text-xs text-muted-foreground">
+          {provider.is_endpoint
+            ? "A model picked without a backend goes here, unless a signed-in account above is the default. "
+            : `Point reviews here with llm.provider: "${provider.id}" in mira.yaml. `}
+          The key lives in the server&apos;s environment; Mira never stores it.
+        </p>
+      </CardContent>
+    </Card>
+  )
+}
+
 export function ConnectionsPage() {
   useDocumentTitle("Connections")
   const { user } = useAuth()
@@ -303,6 +441,16 @@ export function ConnectionsPage() {
   const providers: OAuthProvider[] = data?.providers ?? []
   const activeProvider = data?.active_provider ?? ""
   const reload = () => setRefreshKey((k) => k + 1)
+  // The key-based endpoints, loaded on their own so a slow usage endpoint
+  // does not hold up the sign-in cards above.
+  const { data: keyData, loading: keyLoading } = useAsync(
+    () =>
+      user?.is_admin
+        ? api.getKeyProviders()
+        : Promise.resolve({ providers: [] as KeyProvider[] }),
+    [user, refreshKey]
+  )
+  const keyProviders: KeyProvider[] = keyData?.providers ?? []
 
   if (!user?.is_admin) {
     return (
@@ -537,6 +685,40 @@ export function ConnectionsPage() {
           })}
         </div>
       )}
+
+      <div className="space-y-4">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">
+            API-key endpoints
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Endpoints reached with a key from the server&apos;s environment.
+            There is nothing to sign in to; each card says whether its key is
+            set, which endpoint reviews are configured for, and — where the
+            provider meters a subscription — how much of it is spent.
+          </p>
+        </div>
+        {keyLoading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+          </div>
+        ) : (
+          keyProviders.map((p) => (
+            <KeyProviderCard
+              key={p.id}
+              provider={p}
+              working={busy === `key:${p.id}`}
+              onRefresh={() =>
+                act(
+                  `key:${p.id}`,
+                  () => api.refreshKeyProviderUsage(p.id),
+                  "Usage updated"
+                )
+              }
+            />
+          ))
+        )}
+      </div>
 
       <Dialog open={flow !== null} onOpenChange={(o) => !o && setFlow(null)}>
         <DialogContent>

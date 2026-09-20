@@ -12,6 +12,7 @@ import { gateApi } from "./api/gate"
 import { logsApi } from "./api/logs"
 import { oauthApi } from "./api/oauth"
 import { packagesApi } from "./api/packages"
+import { providersApi } from "./api/providers"
 import { relationshipsApi } from "./api/relationships"
 import { reposApi } from "./api/repos"
 import { reviewInsightsApi } from "./api/review-insights"
@@ -46,5 +47,6 @@ export const api = {
   ...checksApi,
   ...logsApi,
   ...oauthApi,
+  ...providersApi,
   ...triageApi,
 }
