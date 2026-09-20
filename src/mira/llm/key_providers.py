@@ -75,8 +75,10 @@ def parse_opencode_go(payload: Any) -> UsageSnapshot | None:
                    "weekly":  {...}, "monthly": {...}}}
 
     ``status`` is ``"rate-limited"`` once a window is spent; the percent can
-    read just under 100 at that point, so the flag is kept as well as the
-    number. A document with no window at all is not a snapshot.
+    read just under 100 at that point, so that window is recorded as fully
+    spent — which keeps the refusal attached to *its* reset rather than to
+    the earliest reset of any window, as a snapshot-wide flag alone would.
+    A document with no window at all is not a snapshot.
     """
     if not isinstance(payload, dict):
         return None
@@ -91,10 +93,11 @@ def parse_opencode_go(payload: Any) -> UsageSnapshot | None:
         if not isinstance(raw, dict) or percent is None:
             windows.append(None)
             continue
-        limited = limited or raw.get("status") == "rate-limited"
+        window_limited = raw.get("status") == "rate-limited"
+        limited = limited or window_limited
         windows.append(
             UsageWindow(
-                used_percent=float(percent),
+                used_percent=100.0 if window_limited else float(percent),
                 window_minutes=minutes,
                 resets_at=_iso_epoch(raw.get("resetsAt")),
             )
@@ -270,17 +273,21 @@ async def usage_for(
     name = profile["name"]
     if not api_key or not profile.get("usage_url"):
         return None
+    # The failure memory and the lock share the snapshot's identity — this
+    # provider under this key — so one refused key does not silence lookups
+    # for another key of the same provider.
+    slot = _slot(name, api_key)
     stored = load_usage(name, api_key, db)
 
     def fresh_enough() -> bool:
         now = time.time()
         if stored is not None and now - stored.fetched_at < FRESH_SECONDS:
             return True
-        return now - _failed_at.get(name, 0.0) < FAILURE_SECONDS
+        return now - _failed_at.get(slot, 0.0) < FAILURE_SECONDS
 
     if not force and fresh_enough():
         return stored
-    async with _locks[name]:
+    async with _locks[slot]:
         if not force:
             stored = load_usage(name, api_key, db)
             if fresh_enough():
@@ -288,12 +295,12 @@ async def usage_for(
         try:
             snapshot = await fetch_usage(profile, api_key)
         except UsageError as exc:
-            _failed_at[name] = time.time()
+            _failed_at[slot] = time.time()
             if force:
                 raise
             logger.warning("%s: %s", profile.get("label") or name, exc)
             return stored
-        _failed_at.pop(name, None)
+        _failed_at.pop(slot, None)
         save_usage(name, api_key, snapshot, db)
         return snapshot
 

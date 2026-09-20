@@ -74,9 +74,14 @@ def _norm(model_id: str) -> str:
 async def _fetch_openai_style(config: LLMConfig, tools_only: bool) -> list[dict]:
     """GET {base_url}/models. With tools_only (OpenRouter), keep only
     tool-calling models — Mira's review pass needs tool calling."""
-    headers = {}
+    profile = profiles.resolve(config.base_url)
+    # The profile's own headers (attribution, client id) go with the list
+    # request too; the per-conversation session header does not, since a
+    # catalog lookup is not a conversation and the endpoint does not ask for
+    # one there.
+    headers = dict(profile.get("extra_headers", {}))
     try:
-        key = _get_api_key(config, profiles.resolve(config.base_url))
+        key = _get_api_key(config, profile)
     except Exception as exc:
         logger.warning("Could not retrieve API key for model catalog fetch: %s", exc)
         key = ""

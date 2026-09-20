@@ -39,7 +39,7 @@ import type {
   UsageSnapshot,
   UsageWindow,
 } from "@/lib/api/oauth"
-import type { KeyProvider } from "@/lib/api/providers"
+import type { KeyProvider, KeyProviders } from "@/lib/api/providers"
 import { useAuth } from "@/lib/auth"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 
@@ -442,15 +442,48 @@ export function ConnectionsPage() {
   const activeProvider = data?.active_provider ?? ""
   const reload = () => setRefreshKey((k) => k + 1)
   // The key-based endpoints, loaded on their own so a slow usage endpoint
-  // does not hold up the sign-in cards above.
-  const { data: keyData, loading: keyLoading } = useAsync(
+  // does not hold up the sign-in cards above — and not on `refreshKey`,
+  // since an account action changes nothing on these cards. A refreshed
+  // card is updated from the refresh response rather than by asking for
+  // every provider again, which would repeat the remote usage lookups.
+  const {
+    data: keyData,
+    loading: keyLoading,
+    error: keyError,
+  } = useAsync(
     () =>
       user?.is_admin
         ? api.getKeyProviders()
         : Promise.resolve({ providers: [] as KeyProvider[] }),
-    [user, refreshKey]
+    [user]
   )
-  const keyProviders: KeyProvider[] = keyData?.providers ?? []
+  // Refreshed cards, remembered together with the response they belong to,
+  // so a later reload of the list starts from a clean slate without an
+  // effect to clear them.
+  const [keyUpdates, setKeyUpdates] = useState<{
+    of: KeyProviders | null
+    cards: Record<string, KeyProvider>
+  }>({ of: null, cards: {} })
+  const refreshed = keyUpdates.of === keyData ? keyUpdates.cards : {}
+  const keyProviders: KeyProvider[] = (keyData?.providers ?? []).map(
+    (p) => refreshed[p.id] ?? p
+  )
+
+  const refreshKeyUsage = async (id: string) => {
+    setBusy(`key:${id}`)
+    try {
+      const updated = await api.refreshKeyProviderUsage(id)
+      setKeyUpdates((prev) => ({
+        of: keyData,
+        cards: { ...(prev.of === keyData ? prev.cards : {}), [id]: updated },
+      }))
+      toast.success("Usage updated")
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy("")
+    }
+  }
 
   if (!user?.is_admin) {
     return (
@@ -702,19 +735,18 @@ export function ConnectionsPage() {
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" /> Loading…
           </div>
+        ) : keyError ? (
+          <p className="flex items-center gap-2 text-sm text-destructive">
+            <TriangleAlert className="size-4" /> Could not load the API-key
+            endpoints: {keyError}
+          </p>
         ) : (
           keyProviders.map((p) => (
             <KeyProviderCard
               key={p.id}
               provider={p}
               working={busy === `key:${p.id}`}
-              onRefresh={() =>
-                act(
-                  `key:${p.id}`,
-                  () => api.refreshKeyProviderUsage(p.id),
-                  "Usage updated"
-                )
-              }
+              onRefresh={() => refreshKeyUsage(p.id)}
             />
           ))
         )}
