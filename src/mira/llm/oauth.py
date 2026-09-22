@@ -213,6 +213,10 @@ class OAuthResponsesProvider(ResponsesProvider):
         await self._ensure_token()
         return await super()._call_llm_agentic(*args, **kwargs)
 
+    async def _call_llm_json_schema(self, *args: Any, **kwargs: Any) -> str:
+        await self._ensure_token()
+        return await super()._call_llm_json_schema(*args, **kwargs)
+
     # ── Transport ──────────────────────────────────────────────────
 
     async def _post(self, client: httpx.AsyncClient, body: dict) -> httpx.Response:

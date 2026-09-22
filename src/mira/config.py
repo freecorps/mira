@@ -172,6 +172,13 @@ class LLMConfig(BaseModel):
     # tool's arguments as plain JSON (response_format=json_object) instead of
     # as a tool call. Set false to fail the call instead.
     json_mode_fallback: bool = True
+    # First choice for structured output: ask the endpoint to hold the reply
+    # to the schema (`response_format: json_schema` with `strict: true`, or
+    # `text.format` on the Responses API), which leaves the model no way out
+    # of the shape. An endpoint that refuses or ignores it is remembered and
+    # served through tool calling instead. Set false to go straight to tool
+    # calling, as before.
+    json_schema_mode: bool = True
 
     @field_validator("base_url")
     @classmethod

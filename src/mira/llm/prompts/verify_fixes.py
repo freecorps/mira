@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from mira.llm.utils import strip_code_fences, strip_think_blocks
+from pydantic import BaseModel, Field
+
 from mira.models import UnresolvedThread
 
 # Markers that signal the start of noise sections in formatted review comments.
@@ -118,23 +119,17 @@ def build_verify_fixes_prompt(
     ]
 
 
-def parse_verify_fixes_response(raw: str) -> list[str]:
-    """Parse the LLM response and return thread IDs confirmed as fixed."""
-    import json
+class _FixVerdict(BaseModel):
+    id: str = Field(description="The thread id, exactly as given.")
+    fixed: bool
 
-    try:
-        data = json.loads(strip_think_blocks(strip_code_fences(raw)))
-    except (json.JSONDecodeError, TypeError):
-        return []
 
-    results = data.get("results")
-    if not isinstance(results, list):
-        return []
+class VerifyFixesResult(BaseModel):
+    """Submit, for every issue listed, whether it has been fixed."""
 
-    fixed_ids: list[str] = []
-    for entry in results:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("fixed") is True and isinstance(entry.get("id"), str):
-            fixed_ids.append(entry["id"])
-    return fixed_ids
+    results: list[_FixVerdict] = Field(default_factory=list)
+
+
+def fixed_thread_ids(result: VerifyFixesResult) -> list[str]:
+    """The thread ids the model confirmed as fixed, in its order."""
+    return [entry.id for entry in result.results if entry.fixed]

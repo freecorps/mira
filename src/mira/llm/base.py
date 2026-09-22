@@ -9,20 +9,23 @@ import random
 import secrets
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, TypeVar, runtime_checkable
 
 import httpx
+from pydantic import BaseModel
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from mira import __version__
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
-from mira.llm import endpoints
+from mira.llm import endpoints, structured
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 from mira.llm.utils import loads_lenient, strip_code_fences, strip_think_blocks
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound=BaseModel)
 
 
 @runtime_checkable
@@ -64,6 +67,17 @@ class LLMProviderProtocol(Protocol):
         tools: list[dict],
         temperature: float | None = None,
     ) -> dict: ...
+
+    async def generate_object(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[T],
+        *,
+        name: str,
+        description: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> T: ...
 
     async def review(
         self, messages: list[dict[str, str]], temperature: float | None = None
@@ -253,6 +267,13 @@ _TOOL_CORRECTION = (
     "report fewer items rather than cutting the JSON short."
 )
 
+_SCHEMA_CORRECTION = (
+    "Your previous `{tool}` reply was valid JSON but did not match the "
+    "schema ({reason}). Reply again with the complete object, those fields "
+    "corrected: every field of the right type, enums spelled exactly as "
+    "listed, nothing extra."
+)
+
 _TRUNCATION_CORRECTION = (
     "Your previous reply hit the output limit before it produced a usable "
     "`{tool}` tool call ({reason}). Keep any thinking brief, then reply with "
@@ -266,6 +287,25 @@ _JSON_FALLBACK_PROMPT = (
     "nothing else — no prose, no markdown fences. It must match the argument "
     "schema of the `{tool}` tool:\n\n{schema}"
 )
+
+_JSON_SCHEMA_PROMPT = (
+    "Reply with the arguments of `{tool}` as a single JSON object. The "
+    "response format holds the reply to that tool's schema, so write the "
+    "object itself: no tool call, no prose around it, no markdown fences."
+)
+
+# Words a 400 about ``response_format: json_schema`` carries when the endpoint
+# (or the model behind it) does not take the parameter. Anything else — a
+# context overflow, a bad key — is not about the strategy and says nothing
+# about the next call.
+_JSON_SCHEMA_REFUSAL_HINTS = ("response_format", "json_schema", "schema", "structured", "strict")
+
+# (endpoint, model) pairs seen not to honour ``response_format: json_schema``:
+# refused with a 400 naming it, or answered as though it were not there. Kept
+# for the life of the process rather than of one client — a client lasts one
+# review pass, and rediscovering the same refusal on every pass would spend a
+# request per review on it.
+_NO_JSON_SCHEMA: set[tuple[str, str]] = set()
 
 # Upper bound for the output budget a truncated re-roll may grow to when the
 # registry does not know the model. Every current model serves at least this
@@ -400,6 +440,29 @@ def _as_json_object(raw: object) -> str | None:
     return text  # already clean — hand it on verbatim
 
 
+def _tool_parameters(tools: list[dict]) -> dict | None:
+    """The argument schema of the tool we asked for, or None if malformed."""
+    try:
+        parameters = tools[0]["function"]["parameters"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return parameters if isinstance(parameters, dict) else None
+
+
+def _settle(payload: str, tools: list[dict]) -> str:
+    """``payload`` brought back to the tool's schema (see :func:`structured.normalize`).
+
+    Handed on verbatim when there was nothing to fix, so a clean answer
+    reaches the parser byte for byte as the model wrote it.
+    """
+    parameters = _tool_parameters(tools)
+    if parameters is None:
+        return payload
+    data = json.loads(payload)
+    fixed = structured.normalize(data, parameters)
+    return payload if fixed == data else json.dumps(fixed)
+
+
 def _answers_the_tool(payload: str, tools: list[dict]) -> bool:
     """True when the object plausibly answers the tool we asked for.
 
@@ -473,6 +536,10 @@ class OpenAICompatibleProvider:
 
     supports_json_mode: ClassVar[bool] = True
     supports_tool_calling: ClassVar[bool] = True
+    # Whether this protocol can ask for a reply constrained to a JSON Schema
+    # (``response_format: json_schema`` / ``text.format``). Whether a given
+    # endpoint honours it is learned per call; see ``_takes_json_schema``.
+    supports_json_schema: ClassVar[bool] = True
     # Whether this protocol names a reasoning level as a nested
     # ``reasoning: {effort}`` object whatever the profile says. True for the
     # Responses API, where that is the only spelling.
@@ -511,6 +578,7 @@ class OpenAICompatibleProvider:
         self._call_llm = self._retry(self._call_llm)
         self._call_llm_with_tools = self._retry(self._call_llm_with_tools)
         self._call_llm_agentic = self._retry(self._call_llm_agentic)
+        self._call_llm_json_schema = self._retry(self._call_llm_json_schema)
 
     # ── Shared helpers ─────────────────────────────────────────────
 
@@ -619,6 +687,19 @@ class OpenAICompatibleProvider:
             return None
         return self._output_budget.get(model, self.config.max_tokens)
 
+    def _structured_budget(self, model: str, floor: int | None) -> int | None:
+        """The output cap for a structured call: the model's budget, at least ``floor``.
+
+        ``floor`` is what the caller knows its answer needs (a batch of file
+        summaries needs more than a verdict). It raises the cap without
+        pinning it, so a truncated re-roll can still grow the budget past it.
+        None means no cap, as for ``_max_tokens_for``.
+        """
+        budget = self._max_tokens_for(model)
+        if budget is None:
+            return None
+        return max(budget, floor) if floor else budget
+
     def _raise_output_budget(self, model: str) -> bool:
         """Double ``model``'s output budget after a truncated reply, up to its cap.
 
@@ -709,6 +790,81 @@ class OpenAICompatibleProvider:
             raise LLMError("malformed_response", detail="choice carried no message")
         return message
 
+    # ── Schema-constrained output ──────────────────────────────────
+
+    def _endpoint_key(self) -> str:
+        """Where this client's calls land, as a key for what it has refused."""
+        if self.config.oauth_provider:
+            return f"oauth:{self.config.oauth_provider}"
+        if self.config.endpoint:
+            return f"endpoint:{self.config.endpoint}"
+        return self.config.base_url.rstrip("/")
+
+    def _json_schema_for(self, tools: list[dict]) -> dict | None:
+        """The strict schema for this call's tool, or None to skip the strategy.
+
+        None when the strategy is switched off, when the protocol cannot ask
+        for it, or when the tool's schema uses something strict mode cannot
+        express — an open map, a ``oneOf`` — in which case tool calling
+        carries the call, as it always did.
+        """
+        if not self.config.json_schema_mode or not self.supports_json_schema:
+            return None
+        parameters = _tool_parameters(tools)
+        if parameters is None:
+            return None
+        try:
+            return structured.strict_schema(parameters)
+        except structured.UnstrictableSchema as exc:
+            logger.debug("Not asking for json_schema output for %s: %s", _tool_name(tools), exc)
+            return None
+
+    def _takes_json_schema(self, model: str) -> bool:
+        """False once this endpoint has shown ``model`` does not honour json_schema."""
+        return (self._endpoint_key(), model) not in _NO_JSON_SCHEMA
+
+    def _refuse_json_schema(self, model: str, why: str, *, remember: bool = True) -> None:
+        """Stop asking ``model`` for json_schema output — for good, or for this call."""
+        if remember:
+            _NO_JSON_SCHEMA.add((self._endpoint_key(), model))
+        logger.info(
+            "Model %s %s; structured output goes through tool calling %s",
+            model,
+            why,
+            "from now on" if remember else "for this call",
+        )
+
+    def _schema_reply(
+        self,
+        model: str,
+        content: str,
+        tools: list[dict],
+        *,
+        truncated: bool,
+        empty_detail: str,
+    ) -> str:
+        """Read a json_schema-mode reply as the tool's arguments, or raise.
+
+        A reply that is not the object we asked for, when it was not cut off,
+        is evidence the endpoint ignored the format — under real enforcement
+        the model cannot write anything else — so the model is moved to tool
+        calling before the error goes up for the re-roll.
+        """
+        if content.strip():
+            try:
+                return _tool_arguments(content, tools)
+            except ToolCallFormatError as exc:
+                exc.truncated = truncated
+                if not truncated:
+                    self._refuse_json_schema(model, "answered outside the json_schema format")
+                raise
+        raise ToolCallFormatError(
+            "bad_tool_arguments",
+            tool=_tool_name(tools),
+            preview=empty_detail,
+            truncated=truncated,
+        )
+
     # ── Subclass hooks (abstract) ──────────────────────────────────
 
     async def _call_llm(
@@ -727,6 +883,7 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         raise NotImplementedError
 
@@ -737,6 +894,23 @@ class OpenAICompatibleProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> dict:
+        raise NotImplementedError
+
+    async def _call_llm_json_schema(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        schema: dict,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Ask for the tool's arguments as the reply itself, held to ``schema``.
+
+        Returns the arguments as a JSON-object string, like
+        ``_call_llm_with_tools``, and raises ``ToolCallFormatError`` for a
+        reply that is not one (see :meth:`_schema_reply`).
+        """
         raise NotImplementedError
 
     # ── Public API (shared across chat and responses providers) ─────
@@ -793,34 +967,84 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        validate: structured.Validator | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Call the tool on ``model``, re-rolling a badly-formatted answer.
 
         Transport failures are already retried a level down; this loop is for
         the model's own mistakes — truncated JSON arguments, prose instead of a
-        call. Resending the identical request would resample the same mistake,
-        so each re-roll tells the model what was wrong and nudges the
-        temperature up to break out of the bad sample.
+        call, an object that does not fit the schema. Resending the identical
+        request would resample the same mistake, so each re-roll tells the
+        model what was wrong and nudges the temperature up to break out of the
+        bad sample. ``validate``, when given, is the schema check: its error
+        names the fields at fault, and the correction reads them back.
 
         A reply cut off at the output limit is a different mistake: the model
         did not misunderstand the format, it ran out of room — usually a
         reasoning model that spent the whole budget thinking. That re-roll
         keeps the temperature and doubles the budget instead.
+
+        Each attempt asks, when it can, for a reply constrained to the tool's
+        schema (``response_format: json_schema`` with ``strict``), which leaves
+        the model no way out of the shape; tool calling is the second choice.
+        An endpoint that refuses the format costs no attempt — the same turn
+        goes out as a tool call — and one that ignores it is moved to tool
+        calling for the attempts after.
         """
         attempts = 1 + self.config.tool_call_retries
         convo = messages
         temp = temperature
         last_err: ToolCallFormatError | None = None
+        schema = self._json_schema_for(tools)
+        attempt = 0
 
-        for attempt in range(attempts):
+        while attempt < attempts:
+            use_schema = schema is not None and self._takes_json_schema(model)
             try:
-                return await self._call_llm_with_tools(model, convo, tools, temperature=temp)
+                if use_schema:
+                    assert schema is not None
+                    hint = {
+                        "role": "user",
+                        "content": _JSON_SCHEMA_PROMPT.format(tool=_tool_name(tools)),
+                    }
+                    payload = await self._call_llm_json_schema(
+                        model,
+                        [*convo, hint],
+                        tools,
+                        schema,
+                        temperature=temp,
+                        max_tokens=max_tokens,
+                    )
+                else:
+                    payload = await self._call_llm_with_tools(
+                        model, convo, tools, temperature=temp, max_tokens=max_tokens
+                    )
+                payload = _settle(payload, tools)
+                if validate is not None:
+                    validate(payload)
+                return payload
+            except NonRetriableLLMError as exc:
+                if not use_schema or exc.status not in (400, 404, 422):
+                    raise
+                # Refused: the endpoint or the model does not take the format.
+                # Remembered only when the error says so — a context overflow
+                # would fail the tool call too, and is no reason to stop asking.
+                detail = str(exc).lower()
+                self._refuse_json_schema(
+                    model,
+                    f"rejected json_schema output with HTTP {exc.status}",
+                    remember=any(word in detail for word in _JSON_SCHEMA_REFUSAL_HINTS),
+                )
+                schema = None
+                continue
             except ToolCallFormatError as exc:
+                attempt += 1
                 last_err = exc
                 logger.warning(
                     "Model %s returned an unusable tool call (attempt %d/%d): %s",
                     model,
-                    attempt + 1,
+                    attempt,
                     attempts,
                     exc,
                 )
@@ -828,9 +1052,13 @@ class OpenAICompatibleProvider:
                     self._raise_output_budget(model)
                     correction = _TRUNCATION_CORRECTION
                 else:
-                    correction = _TOOL_CORRECTION
+                    correction = (
+                        _SCHEMA_CORRECTION
+                        if exc.code == "invalid_structured_output"
+                        else _TOOL_CORRECTION
+                    )
                     base_temp = self.config.temperature if temperature is None else temperature
-                    temp = min(1.0, base_temp + 0.2 * (attempt + 1))
+                    temp = min(1.0, base_temp + 0.2 * attempt)
                 convo = [
                     *messages,
                     {
@@ -850,6 +1078,8 @@ class OpenAICompatibleProvider:
         tools: list[dict],
         temperature: float | None = None,
         model: str | None = None,
+        validate: structured.Validator | None = None,
+        max_tokens: int | None = None,
     ) -> str | None:
         """Ask for the tool's arguments as plain JSON when tool calling won't work.
 
@@ -859,8 +1089,9 @@ class OpenAICompatibleProvider:
         Some models — and some gateways in front of them — advertise tool
         calling but answer with prose, truncated arguments, or a 400. Rather
         than failing the whole review, describe the tool's schema in the prompt
-        and use JSON mode instead. Returns None if this path fails too, leaving
-        the caller to raise.
+        and use JSON mode instead. Returns None if this path fails too — the
+        answer is not JSON, or ``validate`` finds it does not fit the schema —
+        leaving the caller to raise.
         """
         if not self.config.json_mode_fallback or not tools:
             # Said out loud: from the outside, "the last recovery path was
@@ -886,7 +1117,13 @@ class OpenAICompatibleProvider:
         ]
         target = model or self.config.model
         try:
-            raw = await self._call_llm(target, prompt, True, temperature=temperature)
+            raw = await self._call_llm(
+                target,
+                prompt,
+                True,
+                temperature=temperature,
+                max_tokens=self._structured_budget(target, max_tokens),
+            )
         except Exception as exc:
             logger.warning(
                 "JSON-mode fallback failed on %s (%s: %s)",
@@ -900,6 +1137,13 @@ class OpenAICompatibleProvider:
         if normalized is None:
             logger.warning("JSON-mode fallback returned unusable output: %s", _preview(raw))
             return None
+        normalized = _settle(normalized, tools)
+        if validate is not None:
+            try:
+                validate(normalized)
+            except ToolCallFormatError as exc:
+                logger.warning("JSON-mode fallback returned an object off the schema: %s", exc)
+                return None
         logger.info("Recovered structured output via JSON-mode fallback")
         return normalized
 
@@ -915,10 +1159,61 @@ class OpenAICompatibleProvider:
         primary model, then the fallback model, then plain JSON mode. Only when
         all of them come back empty does the call fail.
         """
+        return await self._structured(messages, tools, temperature=temperature)
+
+    async def generate_object(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[T],
+        *,
+        name: str,
+        description: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> T:
+        """Ask for an object of type ``schema`` and return it validated.
+
+        The structured-output entry point for new code: the tool, the strict
+        schema and the validation all come from the one Pydantic model, so
+        what the model is told, what the endpoint enforces and what the caller
+        receives cannot drift apart. ``name`` names the tool the object is
+        submitted through (``submit_…``); ``description`` defaults to the
+        model's docstring. Goes through the same recovery ladder as
+        :meth:`complete_with_tools`, with every answer checked against
+        ``schema`` and a misfit re-rolled with the fields named.
+        """
+        tool = structured.tool_for(schema, name, description)
+        payload = await self._structured(
+            messages,
+            [tool],
+            temperature=temperature,
+            validate=structured.validator_for(schema, name),
+            max_tokens=max_tokens,
+        )
+        return schema.model_validate_json(payload)
+
+    async def _structured(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        temperature: float | None = None,
+        validate: structured.Validator | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """The recovery ladder behind ``complete_with_tools`` and ``generate_object``.
+
+        ``max_tokens`` is a floor for the output budget (see
+        :meth:`_structured_budget`), not a cap.
+        """
         await self._prepare_reasoning()
         try:
             return await self._tool_call_with_rerolls(
-                self.config.model, messages, tools, temperature=temperature
+                self.config.model,
+                messages,
+                tools,
+                temperature=temperature,
+                validate=validate,
+                max_tokens=max_tokens,
             )
         except NonRetriableLLMError as exc:
             # A 400/404/422 on a tool-calling request often means this model or
@@ -932,7 +1227,11 @@ class OpenAICompatibleProvider:
                     exc,
                 )
                 recovered = await self._json_mode_tool_fallback(
-                    messages, tools, temperature=temperature
+                    messages,
+                    tools,
+                    temperature=temperature,
+                    validate=validate,
+                    max_tokens=max_tokens,
                 )
                 if recovered is not None:
                     return recovered
@@ -959,6 +1258,8 @@ class OpenAICompatibleProvider:
                         messages,
                         tools,
                         temperature=temperature,
+                        validate=validate,
+                        max_tokens=max_tokens,
                     )
                 except Exception as fallback_err:
                     # Rescue the model whose answer was malformed: the fallback
@@ -973,7 +1274,12 @@ class OpenAICompatibleProvider:
                     )
                     recovered = (
                         await self._json_mode_tool_fallback(
-                            messages, tools, temperature=temperature, model=rescue_model
+                            messages,
+                            tools,
+                            temperature=temperature,
+                            model=rescue_model,
+                            validate=validate,
+                            max_tokens=max_tokens,
                         )
                         if rescue_model
                         else None
@@ -1003,7 +1309,11 @@ class OpenAICompatibleProvider:
                     ) from fallback_err
             if _json_mode_can_help(primary_err):
                 recovered = await self._json_mode_tool_fallback(
-                    messages, tools, temperature=temperature
+                    messages,
+                    tools,
+                    temperature=temperature,
+                    validate=validate,
+                    max_tokens=max_tokens,
                 )
                 if recovered is not None:
                     return recovered

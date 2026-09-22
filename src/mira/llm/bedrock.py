@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import ClassVar
+from typing import ClassVar, TypeVar
 
+from pydantic import BaseModel
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -14,8 +15,16 @@ from tenacity import (
 )
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
-from mira.llm.base import _TOOL_CORRECTION, _as_json_object, _preview, _tool_name
+from mira.exceptions import LLMError, ToolCallFormatError
+from mira.llm import structured
+from mira.llm.base import (
+    _SCHEMA_CORRECTION,
+    _TOOL_CORRECTION,
+    _as_json_object,
+    _preview,
+    _settle,
+    _tool_name,
+)
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 from mira.llm.utils import loads_lenient
 
@@ -38,6 +47,8 @@ _JSON_RESPONSE_TOOL = {
 # Bedrock's "let the model decide" toolChoice, used when a model rejects the
 # forced form.
 _AUTO_TOOL: dict = {"auto": {}}
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class _BedrockThrottlingError(Exception):
@@ -405,6 +416,50 @@ class BedrockProvider:
         re-rolled with a corrective prompt at a slightly higher temperature —
         resending the identical request would just resample the same mistake.
         """
+        return await self._structured(messages, tools, temperature=temperature)
+
+    async def generate_object(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[T],
+        *,
+        name: str,
+        description: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> T:
+        """Ask for an object of type ``schema`` and return it validated.
+
+        Converse has no schema-constrained reply format, so the object comes
+        through a forced tool call; an answer that does not fit ``schema`` is
+        re-rolled with the fields named, as on the OpenAI-compatible path.
+        """
+        tool = structured.tool_for(schema, name, description)
+        payload = await self._structured(
+            messages,
+            [tool],
+            temperature=temperature,
+            validate=structured.validator_for(schema, name),
+            max_tokens=max_tokens,
+        )
+        return schema.model_validate_json(payload)
+
+    async def _structured(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        temperature: float | None = None,
+        validate: structured.Validator | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """The re-roll loop behind ``complete_with_tools`` and ``generate_object``.
+
+        ``max_tokens`` is a floor for the output budget, as on the
+        OpenAI-compatible path; ``max_tokens: 0`` in the config still means
+        no cap at all.
+        """
+        if max_tokens is not None:
+            max_tokens = max(max_tokens, self.config.max_tokens) if self.config.max_tokens else None
         bedrock_tools = [_openai_tool_to_bedrock(t) for t in tools]
         tool_name = _tool_name(tools)
         tool_config = {
@@ -423,6 +478,7 @@ class BedrockProvider:
                     convo,
                     tool_config=tool_config,
                     temperature=temp,
+                    max_tokens=max_tokens,
                 )
             except LLMError as exc:
                 # Several Bedrock models reject a forced tool selection with a
@@ -440,34 +496,40 @@ class BedrockProvider:
                     convo,
                     tool_config=tool_config,
                     temperature=temp,
+                    max_tokens=max_tokens,
                 )
 
-            tool_json = self._extract_tool_use(response, tool_name)
-            if tool_json:
-                return tool_json
+            payload = self._extract_tool_use(response, tool_name)
+            if not payload:
+                # Some models answer with text instead of a tool call. Keep it
+                # when it is the JSON object we asked for; otherwise re-roll.
+                last_text = self._extract_text(response)
+                payload = _as_json_object(last_text) if last_text else None
+                if payload is not None:
+                    logger.warning(
+                        "Bedrock model returned text instead of a tool call; parsed as JSON"
+                    )
 
-            # Some models answer with text instead of a tool call. Keep it when
-            # it is the JSON object we asked for; otherwise re-roll.
-            last_text = self._extract_text(response)
-            as_json = _as_json_object(last_text) if last_text else None
-            if as_json is not None:
-                logger.warning("Bedrock model returned text instead of a tool call; parsed as JSON")
-                return as_json
+            correction, reason = _TOOL_CORRECTION, "the arguments were not valid JSON"
+            if payload:
+                payload = _settle(payload, tools)
+                try:
+                    if validate is not None:
+                        validate(payload)
+                    return payload
+                except ToolCallFormatError as exc:
+                    correction, reason = _SCHEMA_CORRECTION, exc.safe_message
+                    last_text = payload
 
             logger.warning(
                 "Bedrock model returned an unusable tool call (attempt %d/%d): %s",
                 attempt + 1,
                 attempts,
-                _preview(last_text) if last_text else "empty response",
+                reason if payload else _preview(last_text) if last_text else "empty response",
             )
             convo = [
                 *messages,
-                {
-                    "role": "user",
-                    "content": _TOOL_CORRECTION.format(
-                        tool=tool_name, reason="the arguments were not valid JSON"
-                    ),
-                },
+                {"role": "user", "content": correction.format(tool=tool_name, reason=reason)},
             ]
             base_temp = self.config.temperature if temperature is None else temperature
             temp = min(1.0, base_temp + 0.2 * (attempt + 1))

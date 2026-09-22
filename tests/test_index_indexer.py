@@ -11,13 +11,14 @@ from mira.config import MiraConfig
 from mira.index.indexer import (
     _build_file_summary,
     _content_hash,
-    _parse_summarize_response,
+    _FileSummaries,
     _should_index,
-    _strip_code_fences,
     index_diff,
     index_repo,
 )
 from mira.index.store import IndexStore
+from mira.llm.utils import loads_lenient
+from tests.llm_support import object_from
 
 
 class TestShouldIndex:
@@ -72,64 +73,25 @@ class TestContentHash:
         assert _content_hash("hello") != _content_hash("world")
 
 
-class TestParseSummarizeResponse:
-    def test_files_key(self):
-        raw = json.dumps({"files": [{"path": "a.py", "summary": "Test"}]})
-        result = _parse_summarize_response(raw)
-        assert len(result) == 1
-        assert result[0]["path"] == "a.py"
-
-    def test_list_format(self):
-        raw = json.dumps([{"path": "a.py", "summary": "Test"}])
-        result = _parse_summarize_response(raw)
-        assert len(result) == 1
-
-    def test_invalid_json(self):
-        result = _parse_summarize_response("not json")
-        assert result == []
-
-    def test_empty_response(self):
-        result = _parse_summarize_response("{}")
-        assert result == []
-
-    def test_markdown_fenced_json(self):
-        inner = json.dumps({"files": [{"path": "a.py", "summary": "Test"}]})
-        raw = f"```json\n{inner}\n```"
-        result = _parse_summarize_response(raw)
-        assert len(result) == 1
-        assert result[0]["path"] == "a.py"
-
-    def test_markdown_fenced_no_lang(self):
-        inner = json.dumps({"files": [{"path": "b.py", "summary": "B"}]})
-        raw = f"```\n{inner}\n```"
-        result = _parse_summarize_response(raw)
-        assert len(result) == 1
+class TestSummaryReplyRecovery:
+    """Replies the provider still has to repair before they validate."""
 
     def test_unescaped_backslash_in_string(self):
         # DeepSeek-style: PHP namespace backslashes left unescaped (issue #96).
         raw = '{"files": [{"path": "a.php", "summary": "Model in \\App\\Models namespace"}]}'
-        result = _parse_summarize_response(raw)
-        assert len(result) == 1
-        assert result[0]["summary"] == "Model in \\App\\Models namespace"
+        data = loads_lenient(raw)
+        assert data == {"files": [{"path": "a.php", "summary": "Model in \\App\\Models namespace"}]}
 
     def test_valid_escapes_preserved(self):
         raw = json.dumps({"files": [{"path": "a.py", "summary": 'tab\there "quote"'}]})
-        result = _parse_summarize_response(raw)
-        assert result[0]["summary"] == 'tab\there "quote"'
+        data = loads_lenient(raw)
+        assert data["files"][0]["summary"] == 'tab\there "quote"'
 
-
-class TestStripCodeFences:
-    def test_json_fence(self):
-        assert _strip_code_fences('```json\n{"a": 1}\n```') == '{"a": 1}'
-
-    def test_plain_fence(self):
-        assert _strip_code_fences("```\nhello\n```") == "hello"
-
-    def test_no_fence(self):
-        assert _strip_code_fences('{"a": 1}') == '{"a": 1}'
-
-    def test_whitespace(self):
-        assert _strip_code_fences('  ```json\n{"a": 1}\n```  ') == '{"a": 1}'
+    def test_summaries_validate_into_the_schema(self):
+        result = _FileSummaries.model_validate(
+            {"files": [{"path": "a.py", "summary": "Test", "symbols": [{"name": "f"}]}]}
+        )
+        assert result.files[0].symbols[0].kind == "function"
 
 
 class TestBuildFileSummary:
@@ -212,8 +174,8 @@ class TestIndexRepo:
         store = IndexStore(str(tmp_path / "test.db"))
 
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(
-            return_value=json.dumps(
+        mock_llm.generate_object = AsyncMock(
+            side_effect=object_from(
                 {
                     "files": [
                         {
@@ -264,7 +226,7 @@ class TestIndexRepo:
         """Files above index.max_file_size are dropped before summarization."""
         store = IndexStore(str(tmp_path / "test.db"))
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock()
+        mock_llm.generate_object = AsyncMock()
 
         config = MiraConfig()
         config.index.max_file_size = 1_000
@@ -282,7 +244,7 @@ class TestIndexRepo:
         )
 
         assert count == 0
-        mock_llm.complete.assert_not_called()
+        mock_llm.generate_object.assert_not_called()
         store.close()
 
 
@@ -293,8 +255,8 @@ class TestIndexDiff:
         store = IndexStore(str(tmp_path / "test.db"))
 
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(
-            return_value=json.dumps(
+        mock_llm.generate_object = AsyncMock(
+            side_effect=object_from(
                 {
                     "files": [
                         {
@@ -351,7 +313,7 @@ class TestIndexDiff:
             }
         )
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(return_value='{"files": []}')
+        mock_llm.generate_object = AsyncMock(side_effect=object_from({"files": []}))
 
         with patch("mira.security.poller.poll_repo", new=AsyncMock()) as poll:
             count = await index_diff(
@@ -370,7 +332,7 @@ class TestIndexDiff:
         versions = {(p.name, p.version) for p in store.list_manifest_packages()}
         assert ("lodash", "4.17.21") in versions
         assert ("lodash", "4.17.20") not in versions
-        mock_llm.complete.assert_not_called()
+        mock_llm.generate_object.assert_not_called()
         poll.assert_called_once_with("test", "repo")
         store.close()
 
@@ -391,7 +353,7 @@ class TestIndexDiff:
         )
 
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(return_value='{"files": []}')
+        mock_llm.generate_object = AsyncMock(side_effect=object_from({"files": []}))
 
         with patch("mira.security.poller.poll_repo", new=AsyncMock()):
             await index_diff(
@@ -421,7 +383,7 @@ class TestIndexDiff:
         )
 
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(return_value='{"files": []}')
+        mock_llm.generate_object = AsyncMock(side_effect=object_from({"files": []}))
 
         await index_diff(
             owner="test",

@@ -96,6 +96,7 @@ class LLMProvider(OpenAICompatibleProvider):
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Make an LLM call with tool/function calling and retries.
 
@@ -117,7 +118,7 @@ class LLMProvider(OpenAICompatibleProvider):
             # forced choice fall back to "auto" (handled on the 400 below).
             "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
         }
-        _set_budget(body, "max_tokens", None, self._max_tokens_for(model))
+        _set_budget(body, "max_tokens", None, self._structured_budget(model, max_tokens))
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
@@ -185,6 +186,63 @@ class LLMProvider(OpenAICompatibleProvider):
             if content.strip()
             else _empty_reply_detail(finish_reason, reasoning=_carries_reasoning(message)),
             truncated=finish_reason == "length",
+        )
+
+    async def _call_llm_json_schema(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        schema: dict,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Ask for the tool's arguments as the reply, constrained to ``schema``.
+
+        ``response_format: json_schema`` with ``strict: true`` — where the
+        endpoint enforces it, decoding is held to the schema and the reply
+        cannot be anything but the object. A 400 the endpoint answers with is
+        raised as-is; the caller decides whether it was about the format.
+        """
+        api_model = _strip_model_prefix(model, self.profile)
+        body: dict = {
+            "model": api_model,
+            "messages": messages,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": _tool_name(tools), "strict": True, "schema": schema},
+            },
+        }
+        _set_budget(body, "max_tokens", None, self._structured_budget(model, max_tokens))
+        self._temperature(body, temperature)
+        self._apply_reasoning(body)
+
+        async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
+            resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+            if (
+                resp.status_code == 400
+                and _asked_for_reasoning(body)
+                and "reasoning" in resp.text.lower()
+            ):
+                logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
+                self._no_reasoning.add(api_model)
+                _drop_reasoning(body)
+                self._temperature(body, temperature)
+                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+            if self._refused_temperature(resp, body):
+                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+            self._handle_error(resp)
+            data = resp.json()
+
+        self._account_usage(data)
+        message = self._chat_message(data)
+        finish_reason = _finish_reason(data)
+        return self._schema_reply(
+            model,
+            message.get("content") or "",
+            tools,
+            truncated=finish_reason == "length",
+            empty_detail=_empty_reply_detail(finish_reason, reasoning=_carries_reasoning(message)),
         )
 
     async def _call_llm_agentic(

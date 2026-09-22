@@ -20,13 +20,17 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError
 from mira.llm.base import LLMProviderProtocol
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound=BaseModel)
 
 
 def describe_provider(provider: object) -> str:
@@ -194,6 +198,29 @@ class FallbackChain:
             "Tool call",
             lambda _i, p: p.complete_with_tools(messages, tools, temperature=temperature),
         )
+
+    async def generate_object(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[T],
+        *,
+        name: str,
+        description: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> T:
+        result: T = await self._walk(
+            "Structured output",
+            lambda _i, p: p.generate_object(
+                messages,
+                schema,
+                name=name,
+                description=description,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
+        )
+        return result
 
     async def complete_agentic(
         self,

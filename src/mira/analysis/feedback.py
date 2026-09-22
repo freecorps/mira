@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections import defaultdict
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
+from pydantic import BaseModel, Field
 
 from mira.index.store import IndexStore
-from mira.llm.utils import strip_code_fences, strip_think_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +27,20 @@ _MAX_HUMAN_COMMENTS = int(os.environ.get("MIRA_HUMAN_SYNTH_MAX", "50"))
 _MAX_LLM_RULES = int(os.environ.get("MIRA_HUMAN_SYNTH_MAX_RULES", "5"))
 
 _TEMPLATE_DIR = Path(__file__).parent.parent / "llm" / "prompts" / "templates"
+
+
+class _SynthesizedRule(BaseModel):
+    rule: str = Field(description="What reviewers should look for, in imperative voice.")
+    rationale: str = Field(default="", description="Why this matters to this team.")
+    evidence_count: int = Field(
+        default=0, description="Number of distinct comments that support the rule."
+    )
+
+
+class _SynthesizedRules(BaseModel):
+    """Submit the recurring review patterns found in the team's comments."""
+
+    rules: list[_SynthesizedRule] = Field(default_factory=list)
 
 
 def _dir_of(path: str) -> str:
@@ -167,34 +180,23 @@ async def synthesize_from_human_reviews(store: IndexStore, llm) -> int:  # type:
     prompt = template.render(comments=comments, max_rules=_MAX_LLM_RULES)
 
     try:
-        raw = await llm.complete(
-            messages=[{"role": "user", "content": prompt}],
-            json_mode=True,
+        result = await llm.generate_object(
+            [{"role": "user", "content": prompt}],
+            _SynthesizedRules,
+            name="submit_rules",
             temperature=0.0,
         )
     except Exception as exc:
         logger.warning("LLM synthesis failed: %s", exc)
         return 0
 
-    try:
-        data = json.loads(strip_think_blocks(strip_code_fences(raw)))
-    except json.JSONDecodeError:
-        logger.warning("LLM returned non-JSON response for feedback synthesis")
-        return 0
-
-    rules = data.get("rules") or []
-    if not isinstance(rules, list):
-        return 0
-
     upserted = 0
-    for idx, item in enumerate(rules[:_MAX_LLM_RULES]):
-        if not isinstance(item, dict):
-            continue
-        rule_text = str(item.get("rule") or "").strip()
+    for idx, item in enumerate(result.rules[:_MAX_LLM_RULES]):
+        rule_text = item.rule.strip()
         if not rule_text:
             continue
-        rationale = str(item.get("rationale") or "").strip()
-        evidence = int(item.get("evidence_count") or 0)
+        rationale = item.rationale.strip()
+        evidence = item.evidence_count
         if rationale:
             rule_text = f"{rule_text} ({rationale})"
         # Use a synthetic unique path_pattern per rule so upsert keys don't collide.

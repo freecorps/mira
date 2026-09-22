@@ -89,6 +89,44 @@ def _balance_json(text: str) -> str:
     return out + "".join(closers[c] for c in reversed(stack))
 
 
+_VALID_JSON_ESCAPES = set('"\\/bfnrtu')
+
+
+def escape_lone_backslashes(text: str) -> str:
+    """Escape backslashes that aren't part of a valid JSON escape sequence.
+
+    Models like DeepSeek mention PHP namespaces (``\\App\\Models``) or Windows
+    paths in summaries and emit the backslashes unescaped, so json.loads bails
+    with "Invalid \\escape". We walk string literals and double any backslash
+    that doesn't start a real escape, consuming valid escapes as pairs so an
+    escaped quote is never mistaken for a string boundary.
+    """
+    out: list[str] = []
+    in_string = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+        elif ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt in _VALID_JSON_ESCAPES:
+                out.append(ch + nxt)
+                i += 2
+            else:
+                out.append("\\\\")
+                i += 1
+        else:
+            if ch == '"':
+                in_string = False
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _repair_json(text: str) -> str:
     """Best-effort repair: drop leaked tool-call XML, then re-balance brackets."""
     cut = min((i for i in (text.find(t) for t in _TOOL_XML_TAGS) if i != -1), default=-1)
@@ -98,8 +136,10 @@ def _repair_json(text: str) -> str:
 
 
 def loads_lenient(text: str) -> object | None:
-    """Parse JSON, repairing leaked tool-call XML / missing braces. None on failure."""
-    for candidate in (text, _repair_json(text)):
+    """Parse JSON, repairing leaked tool-call XML, missing braces and lone
+    backslashes. None on failure."""
+    escaped = escape_lone_backslashes(text)
+    for candidate in (text, escaped, _repair_json(text), _repair_json(escaped)):
         try:
             return json.loads(candidate, strict=False)
         except (json.JSONDecodeError, TypeError):

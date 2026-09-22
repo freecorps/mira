@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from mira.llm.prompts.verify_fixes import parse_verify_fixes_response
+from mira.llm.base import _as_json_object
+from mira.llm.prompts.verify_fixes import VerifyFixesResult, fixed_thread_ids
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 
 
@@ -64,8 +65,16 @@ class TestStripThinkBlocks:
         assert "useful output" in result
 
 
+def parse_verify_fixes_response(raw: str) -> list[str]:
+    """What the provider hands verify-fixes for a JSON-mode reply."""
+    payload = _as_json_object(raw)
+    if payload is None:
+        return []
+    return fixed_thread_ids(VerifyFixesResult.model_validate_json(payload))
+
+
 class TestVerifyFixesWithThinkBlocks:
-    """parse_verify_fixes_response must strip think blocks before JSON parsing."""
+    """The provider must strip think blocks before JSON parsing."""
 
     def test_verify_fixes_with_think_block_and_fences(self):
         """MiniMax-style output: think block wrapping a JSON code fence."""

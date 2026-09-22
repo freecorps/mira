@@ -50,6 +50,12 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Model called {tool} with arguments that are not valid JSON: {preview}",
         safe="Model returned malformed tool-call arguments",
     ),
+    "invalid_structured_output": ErrorMessage(
+        full="Model answered {tool} with an object that does not match its schema: {errors}",
+        # Read back to the model in the re-roll's correction, so it names the
+        # fields. It holds field paths and validator messages, never values.
+        safe="the object did not match the schema: {errors}",
+    ),
     "no_tools": ErrorMessage(
         full="tools list must not be empty",
         safe="tools list must not be empty",

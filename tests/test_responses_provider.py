@@ -424,7 +424,8 @@ class TestCreateLlmDispatch:
 class TestReviewAndWalkthrough:
     @pytest.mark.asyncio
     async def test_review_calls_complete_with_tools(self, config: LLMConfig):
-        provider = ResponsesProvider(config)
+        # The tool path itself; the json_schema strategy has tests of its own.
+        provider = ResponsesProvider(config.model_copy(update={"json_schema_mode": False}))
         mock_data = _make_resp_tool("submit_review", '{"comments":[]}')
         mock_resp = _mock_httpx_response(mock_data, 200)
         mock_client = _mock_client(mock_resp)
@@ -436,7 +437,7 @@ class TestReviewAndWalkthrough:
 
     @pytest.mark.asyncio
     async def test_walkthrough_calls_complete_with_tools(self, config: LLMConfig):
-        provider = ResponsesProvider(config)
+        provider = ResponsesProvider(config.model_copy(update={"json_schema_mode": False}))
         mock_data = _make_resp_tool("submit_walkthrough", '{"summary":"x","file_changes":[]}')
         mock_resp = _mock_httpx_response(mock_data, 200)
         mock_client = _mock_client(mock_resp)

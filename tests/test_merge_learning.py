@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mira.analysis.feedback import synthesize_from_human_reviews, synthesize_rules
+from mira.exceptions import LLMError
 from mira.index.store import IndexStore
 from mira.models import BotThreadRecord, HumanReviewComment
 from mira.providers.github import parse_bot_comment_metadata
+from tests.llm_support import object_from
 
 
 @pytest.fixture
@@ -197,7 +199,7 @@ class TestSynthesizeFromHumanReviews:
         _fb(store, signal="human_review", category="human_review")
         n = await synthesize_from_human_reviews(store, llm)
         assert n == 0
-        llm.complete.assert_not_called()
+        llm.generate_object.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_calls_llm_and_stores_rules(self, store):
@@ -216,7 +218,7 @@ class TestSynthesizeFromHumanReviews:
             )
 
         llm = AsyncMock()
-        llm.complete.return_value = json.dumps(
+        llm.generate_object.side_effect = object_from(
             {
                 "rules": [
                     {
@@ -235,7 +237,7 @@ class TestSynthesizeFromHumanReviews:
 
         n = await synthesize_from_human_reviews(store, llm)
         assert n == 2
-        llm.complete.assert_called_once()
+        llm.generate_object.assert_called_once()
         # Verify stored as human_pattern source
         rules = store.list_learned_rules()
         human_rules = [r for r in rules if r.source_signal == "human_pattern"]
@@ -256,7 +258,8 @@ class TestSynthesizeFromHumanReviews:
                 actor="u",
             )
         llm = AsyncMock()
-        llm.complete.return_value = "this is not json"
+        # What the provider raises once every recovery path has failed.
+        llm.generate_object.side_effect = LLMError("tool_call_failed", model="m", error="not json")
         assert await synthesize_from_human_reviews(store, llm) == 0
 
     @pytest.mark.asyncio

@@ -60,6 +60,11 @@ def isolate_index_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     from mira.llm import models_dev
 
     models_dev.reset()
+    # Which endpoints refused json_schema output is remembered per process;
+    # one test's refusal must not route the next test's calls.
+    from mira.llm import base as llm_base
+
+    llm_base._NO_JSON_SCHEMA.clear()
 
 
 @pytest.fixture

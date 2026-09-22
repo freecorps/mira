@@ -14,22 +14,37 @@ than blocking the review.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 from mira.config import MiraConfig
 from mira.core.noise_filter import _jaccard_similarity
 from mira.llm.base import LLMProviderProtocol
 from mira.llm.prompts.overlap import build_overlap_prompt
-from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.models import OpenPRRef, OverlapFinding, PRFingerprint, PRInfo
 
 logger = logging.getLogger(__name__)
 
 # Severity ordering for sorting findings (higher = surfaced first).
 _KIND_RANK = {"both": 3, "merge_conflict": 2, "duplicate_effort": 1, "none": 0}
-_VALID_KINDS = {"merge_conflict", "duplicate_effort", "both", "none"}
+
+
+class _OverlapVerdict(BaseModel):
+    pr_number: int = Field(description="Number of the candidate pull request.")
+    kind: Literal["merge_conflict", "duplicate_effort", "both", "none"]
+    reason: str = Field(default="", description="One concise sentence.")
+    # Not bounded in the schema: a model that answers 1.2 meant "certain",
+    # and clamping it is cheaper than a re-roll.
+    confidence: float = Field(default=0.0, description="From 0.0 to 1.0.")
+
+
+class _OverlapVerdicts(BaseModel):
+    """Submit one overlap verdict for every candidate pull request."""
+
+    overlaps: list[_OverlapVerdict] = Field(default_factory=list)
 
 
 def _prefilter(
@@ -67,38 +82,12 @@ def _is_stacked(pr_info: PRInfo, ref: OpenPRRef) -> bool:
     return bool(ref.base_ref and ref.base_ref == pr_info.head_branch)
 
 
-def _parse_overlap_response(raw: str) -> dict[int, tuple[str, str, float]]:
-    """Parse the LLM verdict JSON into ``pr_number → (kind, reason, confidence)``.
-
-    Tolerant by design: malformed or partial output yields whatever entries
-    could be read, never an exception.
-    """
-    cleaned = strip_code_fences(strip_think_blocks(raw))
-    try:
-        data = json.loads(cleaned, strict=False)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("Overlap verdict was not valid JSON; dropping")
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    out: dict[int, tuple[str, str, float]] = {}
-    for entry in data.get("overlaps", []) or []:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            number = int(entry["pr_number"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        kind = str(entry.get("kind", "none")).strip().lower()
-        if kind not in _VALID_KINDS:
-            kind = "none"
-        reason = str(entry.get("reason", "")).strip()
-        try:
-            confidence = float(entry.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        out[number] = (kind, reason, max(0.0, min(1.0, confidence)))
-    return out
+def _verdicts(result: _OverlapVerdicts) -> dict[int, tuple[str, str, float]]:
+    """``pr_number → (kind, reason, confidence)``, confidence clamped to [0, 1]."""
+    return {
+        v.pr_number: (v.kind, v.reason.strip(), max(0.0, min(1.0, v.confidence)))
+        for v in result.overlaps
+    }
 
 
 async def detect_overlaps(
@@ -170,12 +159,12 @@ async def detect_overlaps(
     # Stage 2 — one batched LLM judgment over the shortlist.
     messages = build_overlap_prompt(pr_info, current, survivors)
     try:
-        raw = await llm.complete(messages, json_mode=True)
+        result = await llm.generate_object(messages, _OverlapVerdicts, name="submit_overlaps")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Overlap LLM judgment failed, skipping: %s", exc)
         return []
 
-    verdicts = _parse_overlap_response(raw)
+    verdicts = _verdicts(result)
 
     findings: list[OverlapFinding] = []
     for ref, _fp, shared in survivors:
