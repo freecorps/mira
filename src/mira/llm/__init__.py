@@ -2,15 +2,49 @@
 
 from __future__ import annotations
 
+import logging
+
 from mira.config import LLMConfig
 from mira.llm.base import LLMProviderProtocol
+
+logger = logging.getLogger(__name__)
 
 
 def create_llm(config: LLMConfig) -> LLMProviderProtocol:
     """Create the appropriate LLM provider based on config.provider.
 
-    Returns an instance satisfying LLMProviderProtocol.
+    Returns an instance satisfying LLMProviderProtocol. A config carrying
+    ``fallbacks`` (the chain ``llm_config_for`` resolved for its purpose)
+    yields a :class:`~mira.llm.chain.FallbackChain` over one provider per
+    entry, so the caller sees one provider that tries them in order.
     """
+    if config.fallbacks:
+        from mira.llm.chain import FallbackChain, describe_provider
+
+        primary = _create_one(config.model_copy(update={"fallbacks": []}))
+        providers = [primary]
+        for entry in config.fallbacks:
+            try:
+                providers.append(_create_one(entry.model_copy(update={"fallbacks": []})))
+            except Exception as exc:  # noqa: BLE001 — a bad fallback must not fail the primary
+                # A route to an endpoint or account this install does not
+                # have. The primary still reviews; the chain is one short and
+                # the log says which entry and why.
+                logger.warning(
+                    "Skipping fallback model %s (%s: %s)",
+                    entry.model,
+                    type(exc).__name__,
+                    exc,
+                )
+        if len(providers) == 1:
+            return primary
+        logger.info("Model chain: %s", " → ".join(describe_provider(p) for p in providers))
+        return FallbackChain(providers)
+    return _create_one(config)
+
+
+def _create_one(config: LLMConfig) -> LLMProviderProtocol:
+    """One provider for one config — the factory as it was before chains."""
     # An OAuth session outranks the API-key path: the operator signed in on
     # purpose, and the endpoint/auth then both come from the provider spec.
     # Config validation rejects ids that aren't registered and the default

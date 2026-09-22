@@ -19,7 +19,11 @@ from mira.exceptions import LLMError, ToolCallFormatError
 from mira.llm.base import (
     OpenAICompatibleProvider,
     _as_json_object,
+    _asked_for_reasoning,
+    _drop_reasoning,
+    _empty_reply_detail,
     _preview,
+    _set_budget,
     _strip_model_prefix,
     _tool_arguments,
     _tool_name,
@@ -117,6 +121,22 @@ def _responses_tool(chat_tool: dict) -> dict:
     return out
 
 
+def _responses_truncated(data: dict) -> bool:
+    """True when the response stopped at ``max_output_tokens``."""
+    if data.get("status") != "incomplete":
+        return False
+    details = data.get("incomplete_details")
+    return isinstance(details, dict) and details.get("reason") == "max_output_tokens"
+
+
+def _responses_reasoning(data: dict) -> bool:
+    """True when the output carries a reasoning item (thinking happened)."""
+    output = data.get("output")
+    return isinstance(output, list) and any(
+        isinstance(item, dict) and item.get("type") == "reasoning" for item in output
+    )
+
+
 def _output_text(data: dict) -> str:
     """Concatenated assistant text: scan data["output"] for message items whose
     content parts are type "output_text" or "text" (accept both for compat),
@@ -198,6 +218,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
     supports_json_mode: ClassVar[bool] = True
     supports_tool_calling: ClassVar[bool] = True
+    _nested_reasoning: ClassVar[bool] = True
 
     def __init__(self, config: LLMConfig) -> None:
         super().__init__(config)
@@ -242,8 +263,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
         body: dict = {
             "model": _strip_model_prefix(model, self.profile),
             "input": _responses_input(messages),
-            "max_output_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
+        _set_budget(body, "max_output_tokens", max_tokens, self._max_tokens_for(model))
         if json_mode:
             body["text"] = {"format": {"type": "json_object"}}
         self._temperature(body, temperature)
@@ -283,8 +304,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "input": _responses_input(messages),
             "tools": [_responses_tool(t) for t in tools],
             "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
-            "max_output_tokens": self.config.max_tokens,
         }
+        _set_budget(body, "max_output_tokens", None, self._max_tokens_for(model))
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
@@ -299,10 +320,14 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
                 resp = await self._post(client, body)
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                resp.status_code == 400
+                and _asked_for_reasoning(body)
+                and "reasoning" in resp.text.lower()
+            ):
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                body.pop("reasoning", None)
+                _drop_reasoning(body)
                 self._temperature(body, temperature)
                 resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
@@ -321,9 +346,16 @@ class ResponsesProvider(OpenAICompatibleProvider):
             if isinstance(item, dict) and item.get("type") == "function_call"
         ]
         wanted = _tool_name(tools)
+        truncated = _responses_truncated(data)
         call = next((c for c in calls if c.get("name") == wanted), calls[0] if calls else None)
         if call is not None:
-            return _tool_arguments(call.get("arguments"), tools)
+            try:
+                return _tool_arguments(call.get("arguments"), tools)
+            except ToolCallFormatError as exc:
+                # Arguments the repair pass could not salvage. When the reply
+                # was cut off, more room — not a hotter sample — is the fix.
+                exc.truncated = truncated
+                raise
 
         # Fallback: text content, but only when it is the JSON object we asked
         # for. Prose means the model missed the format, which the caller
@@ -334,10 +366,19 @@ class ResponsesProvider(OpenAICompatibleProvider):
             logger.warning("Model returned content instead of a tool call; parsed it as JSON")
             return as_json
 
+        status = data.get("status")
         raise ToolCallFormatError(
             "bad_tool_arguments",
             tool=wanted,
-            preview=_preview(text) if text else "empty response",
+            preview=_preview(text)
+            if text.strip()
+            else _empty_reply_detail(
+                "length"
+                if truncated
+                else (str(status) if status and status != "completed" else None),
+                reasoning=_responses_reasoning(data),
+            ),
+            truncated=truncated,
         )
 
     async def _call_llm_agentic(
@@ -359,18 +400,22 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "input": _responses_input(messages),
             "tools": [_responses_tool(t) for t in tools],
             "tool_choice": "auto",
-            "max_output_tokens": self.config.max_tokens,
         }
+        _set_budget(body, "max_output_tokens", None, self._max_tokens_for(model))
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                resp.status_code == 400
+                and _asked_for_reasoning(body)
+                and "reasoning" in resp.text.lower()
+            ):
                 api_model = _strip_model_prefix(model, self.profile)
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                body.pop("reasoning", None)
+                _drop_reasoning(body)
                 self._temperature(body, temperature)
                 resp = await self._post(client, body)
             if self._refused_temperature(resp, body):

@@ -81,14 +81,26 @@ class TestLLMConfigFor:
 
 class TestSetModelsThinkingValidation:
     def test_rejects_invalid_thinking_mode(self, in_memory_db: AppDatabase):
+        # A provider may report a level our list lacks ("ultra", "xhigh"),
+        # so the check is on the shape: a short lowercase token. Anything
+        # else is refused.
+        body = ModelsUpdate(
+            indexing_model="anthropic/claude-haiku-4-5",
+            review_model="anthropic/claude-sonnet-4-6",
+            review_thinking_mode="not a level!",
+        )
+        with pytest.raises(HTTPException) as exc:
+            set_models(body, _admin_req())
+        assert exc.value.status_code == 400
+
+    def test_accepts_a_level_a_provider_reports(self, in_memory_db: AppDatabase):
         body = ModelsUpdate(
             indexing_model="anthropic/claude-haiku-4-5",
             review_model="anthropic/claude-sonnet-4-6",
             review_thinking_mode="ultra",
         )
-        with pytest.raises(HTTPException) as exc:
-            set_models(body, _admin_req())
-        assert exc.value.status_code == 400
+        assert set_models(body, _admin_req()) == {"ok": True}
+        assert in_memory_db.get_setting("review_thinking_mode") == "ultra"
 
     def test_persists_valid_thinking_mode(self, in_memory_db: AppDatabase):
         body = ModelsUpdate(

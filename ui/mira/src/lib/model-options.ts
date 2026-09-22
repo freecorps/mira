@@ -9,6 +9,9 @@ export type ModelOption = {
   // Protocol and endpoint, one line under the group header.
   detail?: string
   description?: string
+  // The reasoning levels this model takes, as its provider reports them.
+  // Empty when the provider has not said; the built-in list stands in.
+  reasoning_levels?: string[]
 }
 
 // What the closed picker shows for a value: the option's label, with its

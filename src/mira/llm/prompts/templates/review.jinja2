@@ -90,6 +90,13 @@ You only know what's in the diff and the project context provided to you. You do
 
 Use the `submit_review` tool to submit your findings. The tool schema defines the required structure. Every comment must include an accurate `existing_code` field — verbatim copy from the diff. Inaccurate quotes cause automatic discard.
 
+How to work, so the call actually lands:
+
+1. Read every hunk once and decide what is worth filing. Keep any deliberation short and to the point — the tool call is the deliverable, and a reply that never reaches it is a failed review.
+2. Call `submit_review` exactly once, with a single complete JSON object as its arguments. Do not write the review as prose, do not wrap anything in markdown fences, and do not add commentary before or after the call.
+3. Call it even when you found nothing: `comments: []`, `key_issues: []`, and a one-line `summary` saying the change looks correct. An empty reply is not "no findings" — it is a failure.
+4. Keep each `body` focused and each `suggestion` minimal. If the full answer would be long, file the highest-severity findings and stop rather than cutting the JSON short.
+
 ## Valid File Paths
 
 Only use these file paths in your comments:

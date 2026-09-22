@@ -73,6 +73,71 @@ llm:
   indexing_model: "endpoint:opencode-go:glm-5.3-flash"
 ```
 
+## Fallback models
+
+A model can stop answering without the endpoint going down: a rate limit
+that outlasts the backoff, a gateway that starts returning empty replies, a
+reasoning model that spends its whole output budget thinking and has
+nothing left for the tool call. One provider already does what it can for
+its own model — transport retries, re-rolls of a malformed tool call with a
+corrective prompt, a bigger output budget after a truncated reply, and a
+plain-JSON rescue when tool calling will not work. When all of that is
+spent, the review used to fail.
+
+Each purpose can now name an ordered list of models to try next. Under
+**Settings → Models**, every picker has a *Fallback models* list beneath it:
+add entries, put them in order with the arrows, and save. When the purpose's
+model fails a call, the same call is made with the first fallback, then the
+second, and so on; the review fails only when the whole chain has. A
+fallback answers one call, not the rest of the review — the next chunk
+starts from the primary again, so a model that has recovered is back in
+use without anyone touching the page.
+
+Entries are the same values the pickers take — a bare id, or a route naming
+its backend — so a chain can cross endpoints and accounts:
+
+```yaml
+llm:
+  review_model: "kimi-k2.7-code"
+  review_fallback_models:
+    - "glm-5.3"                              # same endpoint, another model
+    - "api:anthropic/claude-sonnet-4-6"      # the API-key endpoint
+    - "oauth:chatgpt:*:gpt-5.6-sol"          # a signed-in account
+  indexing_fallback_models: ["endpoint:openrouter:anthropic/claude-haiku-4-5"]
+```
+
+The dashboard's list outranks the file's, the way the model settings do;
+*Use deployment config* hands the choice back to the file. The security
+pass falls back to the review chain when it has none of its own, the way
+`security_model` falls back to `review_model`. At most five per purpose:
+each entry is a full round of retries before the next is tried, so a long
+chain is a slow failure rather than a resilient one. An entry naming an
+endpoint or account this install does not have is skipped with a warning
+at start-up rather than failing the primary.
+
+**Reasoning levels.** *Review Thinking Mode* offers the levels the review
+model's provider reports for it — read from [models.dev](https://models.dev),
+the catalogue the OpenCode client reads, for API-key endpoints, and from
+the backend itself for ChatGPT — and falls back to the built-in list when
+the provider has said nothing. A line under the picker says which. On the
+wire, a level a model lacks is snapped to the nearest it has, so one
+setting serves a chain of models with different scales; each preset in
+`providers.json` names the field the level travels in (`reasoning_param`)
+and its models.dev id (`models_dev`). Set `MIRA_MODELS_DEV_URL=""` to keep
+an install off that catalogue.
+
+**Output budget.** The same page sets *Max output tokens*, the cap on every
+call — thinking included, which is why a reasoning model on the 4096
+default can answer with nothing. Pick a count, or *Unlimited* to send no
+cap at all and let the model's own maximum apply; `max_tokens: 0` in
+`mira.yaml` means the same. It applies to every purpose and to every model
+in a chain.
+
+The log tells the story: `Model chain: kimi-k2.7-code @ … → glm-5.3 @ …`
+when the client is built, a warning naming the failure and the next model
+at each step, and the trace id on every line so the Logs page shows the
+whole walk (see [logs.md](logs.md)).
+
 ## Where the key lives
 
 A stored key is a row in the dashboard's `settings` table, in its own row

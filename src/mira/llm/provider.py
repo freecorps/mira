@@ -17,8 +17,14 @@ from mira.exceptions import LLMError, ToolCallFormatError
 from mira.llm.base import (
     OpenAICompatibleProvider,
     _as_json_object,
+    _asked_for_reasoning,
+    _carries_reasoning,
+    _drop_reasoning,
+    _empty_reply_detail,
+    _finish_reason,
     _pick_tool_call,
     _preview,
+    _set_budget,
     _strip_model_prefix,
     _tool_arguments,
     _tool_name,
@@ -52,8 +58,8 @@ class LLMProvider(OpenAICompatibleProvider):
         body: dict = {
             "model": _strip_model_prefix(model, self.profile),
             "messages": messages,
-            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
+        _set_budget(body, "max_tokens", max_tokens, self._max_tokens_for(model))
         self._temperature(body, temperature)
         if json_mode:
             body["response_format"] = {"type": "json_object"}
@@ -71,7 +77,18 @@ class LLMProvider(OpenAICompatibleProvider):
             data = resp.json()
 
         self._account_usage(data)
-        return self._chat_message(data).get("content") or ""
+        message = self._chat_message(data)
+        content = message.get("content") or ""
+        if not content.strip():
+            # Said here, where the payload still is: the caller only sees an
+            # empty string and cannot tell a spent thinking budget from a
+            # gateway that dropped the answer.
+            logger.warning(
+                "Model %s returned an %s",
+                model,
+                _empty_reply_detail(_finish_reason(data), reasoning=_carries_reasoning(message)),
+            )
+        return content
 
     async def _call_llm_with_tools(
         self,
@@ -99,8 +116,8 @@ class LLMProvider(OpenAICompatibleProvider):
             # Force the one tool for structured args; models that reject a
             # forced choice fall back to "auto" (handled on the 400 below).
             "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
-            "max_tokens": self.config.max_tokens,
         }
+        _set_budget(body, "max_tokens", None, self._max_tokens_for(model))
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
@@ -120,12 +137,16 @@ class LLMProvider(OpenAICompatibleProvider):
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
                 resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
-            if resp.status_code == 400 and "reasoning" in body and "reasoning" in resp.text.lower():
+            if (
+                resp.status_code == 400
+                and _asked_for_reasoning(body)
+                and "reasoning" in resp.text.lower()
+            ):
                 # Reasoning effort unsupported on this model/endpoint — drop it
                 # and review without thinking instead of failing the review.
                 logger.info("Model %s rejected reasoning effort; retrying without it", api_model)
                 self._no_reasoning.add(api_model)
-                body.pop("reasoning", None)
+                _drop_reasoning(body)
                 self._temperature(body, temperature)
                 resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
             if self._refused_temperature(resp, body):
@@ -136,9 +157,16 @@ class LLMProvider(OpenAICompatibleProvider):
         self._account_usage(data)
 
         message = self._chat_message(data)
+        finish_reason = _finish_reason(data)
         call = _pick_tool_call(message.get("tool_calls"), tools)
         if call is not None:
-            return _tool_arguments(call["function"].get("arguments"), tools)
+            try:
+                return _tool_arguments(call["function"].get("arguments"), tools)
+            except ToolCallFormatError as exc:
+                # Arguments the repair pass could not salvage. When the reply
+                # was cut off, more room — not a hotter sample — is the fix.
+                exc.truncated = finish_reason == "length"
+                raise
 
         # Some models answer with content instead of calling the tool. That is
         # fine when the content is the JSON object we asked for; when it is
@@ -153,7 +181,10 @@ class LLMProvider(OpenAICompatibleProvider):
         raise ToolCallFormatError(
             "bad_tool_arguments",
             tool=_tool_name(tools),
-            preview=_preview(content) if content else "empty response",
+            preview=_preview(content)
+            if content.strip()
+            else _empty_reply_detail(finish_reason, reasoning=_carries_reasoning(message)),
+            truncated=finish_reason == "length",
         )
 
     async def _call_llm_agentic(
@@ -175,8 +206,8 @@ class LLMProvider(OpenAICompatibleProvider):
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
-            "max_tokens": self.config.max_tokens,
         }
+        _set_budget(body, "max_tokens", None, self._max_tokens_for(model))
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 

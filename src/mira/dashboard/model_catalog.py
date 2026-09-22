@@ -297,6 +297,7 @@ async def endpoint_entries(base: LLMConfig, db: Any = None) -> list[dict]:
         entries.append(
             {
                 "endpoint": endpoint,
+                "config": config,
                 "backend": active_backend(config),
                 "catalog": await fetch_catalog(config),
                 "group": f"{endpoint.label} · {endpoint_host(endpoint.base_url)}",
@@ -322,7 +323,10 @@ def endpoint_options(entries: list[dict], purpose: str, *, bare: str = "") -> li
         endpoint = entry["endpoint"]
         if endpoint.id == bare:
             continue
-        for option in build_options(entry["backend"], entry["catalog"], purpose):
+        options = build_options(entry["backend"], entry["catalog"], purpose)
+        if entry.get("config") is not None:
+            options = with_reasoning_levels(options, entry["config"])
+        for option in options:
             out.append(
                 {
                     **option,
@@ -379,6 +383,22 @@ async def oauth_option_groups(default: tuple[str, str], db: Any = None) -> list[
                         "detail": detail,
                     }
                 )
+    return out
+
+
+def with_reasoning_levels(options: list[dict], config: LLMConfig) -> list[dict]:
+    """Each option with the reasoning levels its model takes, per models.dev.
+
+    ``config`` says which endpoint the options belong to; an option whose
+    model the catalogue has not described keeps an empty list, which the
+    page reads as "use the built-in levels".
+    """
+    from mira.llm import models_dev
+
+    out = []
+    for option in options:
+        levels = models_dev.reasoning_levels(config, str(option.get("value", "")))
+        out.append({**option, "reasoning_levels": list(levels or ())})
     return out
 
 
