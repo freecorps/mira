@@ -58,6 +58,9 @@ class FallbackChain:
         if not providers:
             raise ValueError("a fallback chain needs at least one provider")
         self.providers = list(providers)
+        # Which provider issued each assistant turn's raw ``items`` (keyed by
+        # the list's id, holding the list so the id cannot be reused).
+        self._items_owner: dict[int, tuple[list, int]] = {}
         self.supports_json_mode = bool(getattr(providers[0], "supports_json_mode", True))
         self.supports_tool_calling = bool(getattr(providers[0], "supports_tool_calling", True))
 
@@ -98,34 +101,58 @@ class FallbackChain:
 
     # ── The walk ───────────────────────────────────────────────────
 
-    async def _walk(self, what: str, call: Callable[[LLMProviderProtocol], Awaitable[Any]]) -> Any:
+    async def _walk(
+        self,
+        what: str,
+        call: Callable[[int, LLMProviderProtocol], Awaitable[Any]],
+        usable: Callable[[Any], bool] = lambda _result: True,
+    ) -> Any:
         """Make ``call`` on each provider in turn until one answers.
 
         Anything a provider raises sends the call to the next one: a
         non-retriable 4xx here means "this model or key cannot take this
-        call", which is exactly when another model should. When the last
-        one fails too the error names the whole chain and carries the last
+        call", which is exactly when another model should. So does an answer
+        ``usable`` rejects — an empty completion is the failure this chain
+        exists for, even when the provider returned it rather than raising.
+
+        When no provider gives a usable answer, the first unusable one is
+        returned if there was one: that is what a lone provider would have
+        handed back, and its caller already knows what to do with it.
+        Otherwise the error names the whole chain and carries the last
         failure, so the log shows every step and the pull request sees one
         safe line.
         """
         last_err: Exception | None = None
+        unusable: list[Any] = []
         total = len(self.providers)
         for index, provider in enumerate(self.providers):
             try:
-                return await call(provider)
+                result = await call(index, provider)
             except Exception as exc:  # noqa: BLE001 — every failure is a reason to move on
                 last_err = exc
-                if index + 1 < total:
-                    logger.warning(
-                        "%s failed on %s (%s: %s); falling back to %s (%d of %d)",
-                        what,
-                        describe_provider(provider),
-                        type(exc).__name__,
-                        exc,
-                        describe_provider(self.providers[index + 1]),
-                        index + 2,
-                        total,
-                    )
+                reason = f"{type(exc).__name__}: {exc}"
+            else:
+                if usable(result):
+                    return result
+                unusable.append(result)
+                reason = "empty answer"
+            if index + 1 < total:
+                logger.warning(
+                    "%s failed on %s (%s); falling back to %s (%d of %d)",
+                    what,
+                    describe_provider(provider),
+                    reason,
+                    describe_provider(self.providers[index + 1]),
+                    index + 2,
+                    total,
+                )
+        if unusable:
+            logger.warning(
+                "%s came back empty from every model in the chain that answered (%s)",
+                what,
+                " → ".join(self.labels()),
+            )
+            return unusable[0]
         assert last_err is not None  # the loop only ends here after a failure
         logger.error(
             "%s failed on every model in the chain (%s)",
@@ -151,9 +178,10 @@ class FallbackChain:
     ) -> str:
         return await self._walk(
             "Completion",
-            lambda p: p.complete(
+            lambda _i, p: p.complete(
                 messages, json_mode=json_mode, temperature=temperature, max_tokens=max_tokens
             ),
+            usable=lambda text: isinstance(text, str) and bool(text.strip()),
         )
 
     async def complete_with_tools(
@@ -164,7 +192,7 @@ class FallbackChain:
     ) -> str:
         return await self._walk(
             "Tool call",
-            lambda p: p.complete_with_tools(messages, tools, temperature=temperature),
+            lambda _i, p: p.complete_with_tools(messages, tools, temperature=temperature),
         )
 
     async def complete_agentic(
@@ -173,13 +201,50 @@ class FallbackChain:
         tools: list[dict],
         temperature: float | None = None,
     ) -> dict:
-        return await self._walk(
-            "Agentic call",
-            lambda p: p.complete_agentic(messages, tools, temperature=temperature),
-        )
+        async def call(index: int, provider: LLMProviderProtocol) -> dict:
+            message = await provider.complete_agentic(
+                self._items_for(index, messages), tools, temperature=temperature
+            )
+            items = message.get("items") if isinstance(message, dict) else None
+            if isinstance(items, list) and items:
+                self._items_owner[id(items)] = (items, index)
+            return message
+
+        return await self._walk("Agentic call", call, usable=_agentic_usable)
+
+    def _items_for(self, index: int, messages: list) -> list:
+        """``messages`` as provider ``index`` may see them.
+
+        A Responses-protocol provider hands back its raw output items with
+        each assistant turn, and the agentic loop replays them so the model
+        keeps its encrypted reasoning and call ids. Those belong to the
+        endpoint — and the account — that issued them: a Chat Completions
+        fallback would reject the unknown field, and another Responses
+        endpoint would refuse reasoning it cannot decrypt. So a turn's items
+        go back only to the provider that produced them; any other gets the
+        turn rebuilt from its content and tool calls, which every protocol
+        reads.
+        """
+        out = []
+        for message in messages:
+            items = message.get("items") if isinstance(message, dict) else None
+            if isinstance(items, list) and items:
+                owner = self._items_owner.get(id(items))
+                if owner is None or owner[0] is not items or owner[1] != index:
+                    message = {k: v for k, v in message.items() if k != "items"}
+            out.append(message)
+        return out
 
     async def review(self, messages: list[dict[str, str]], temperature: float | None = None) -> str:
-        return await self._walk("Review", lambda p: p.review(messages, temperature=temperature))
+        return await self._walk("Review", lambda _i, p: p.review(messages, temperature=temperature))
 
     async def walkthrough(self, messages: list[dict[str, str]]) -> str:
-        return await self._walk("Walkthrough", lambda p: p.walkthrough(messages))
+        return await self._walk("Walkthrough", lambda _i, p: p.walkthrough(messages))
+
+
+def _agentic_usable(message: Any) -> bool:
+    """An agentic hop answered when it said something or asked for a tool."""
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return bool(message.get("tool_calls")) or (isinstance(content, str) and bool(content.strip()))

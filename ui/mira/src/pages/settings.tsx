@@ -252,12 +252,16 @@ export function SettingsPage() {
   const saveModels = async () => {
     setSavingModels(true)
     const extras: ModelsSaveExtras = {}
+    // A row added but never given a model is not a fallback: it is left out
+    // here, in the open, rather than dropped by the server behind the page.
+    const filled = (chain: string[] | null | undefined) =>
+      chain == null ? chain : chain.filter((v) => v.trim() !== "")
     if (fallbackEdits.indexing !== undefined)
-      extras.indexing_fallbacks = fallbackEdits.indexing
+      extras.indexing_fallbacks = filled(fallbackEdits.indexing)
     if (fallbackEdits.review !== undefined)
-      extras.review_fallbacks = fallbackEdits.review
+      extras.review_fallbacks = filled(fallbackEdits.review)
     if (fallbackEdits.security !== undefined)
-      extras.security_fallbacks = fallbackEdits.security
+      extras.security_fallbacks = filled(fallbackEdits.security)
     if (maxTokensDirty) {
       if (maxTokensMode === "inherit") extras.max_tokens = null
       else if (maxTokensMode === "unlimited") extras.max_tokens = 0
@@ -463,9 +467,13 @@ export function SettingsPage() {
                 <X />
               </Button>
             </div>
-            {value && (
+            {value ? (
               <p className="pl-6 font-mono text-[0.7rem] text-muted-foreground">
                 → {routeLine(value, "", "", options)}
+              </p>
+            ) : (
+              <p className="pl-6 text-[0.7rem] text-amber-600 dark:text-amber-500">
+                Pick a model — a row left empty is not saved.
               </p>
             )}
           </div>

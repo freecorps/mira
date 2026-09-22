@@ -180,6 +180,7 @@ async def get_models() -> ModelsResponse:
         get_review_model,
         get_review_thinking_mode,
         get_security_model,
+        parse_max_tokens_setting,
         resolve_api_style,
         resolve_endpoint_default,
         resolve_oauth_default,
@@ -372,7 +373,11 @@ async def get_models() -> ModelsResponse:
         config_security_fallbacks=config_fallbacks["security"],
         fallback_chain_limit=FALLBACK_CHAIN_LIMIT,
         max_tokens=max_tokens,
-        max_tokens_source="dashboard" if max_tokens != llm.max_tokens else "config",
+        # Whether the dashboard holds a value, not whether it differs from the
+        # file's: an override equal to the file's value is still an override.
+        max_tokens_source=(
+            "dashboard" if parse_max_tokens_setting(db_max_tokens) is not None else "config"
+        ),
         config_max_tokens=llm.max_tokens,
     )
 
@@ -496,6 +501,31 @@ def set_models(body: ModelsUpdate, request: Request) -> dict:
             status_code=400,
             detail=f"{body.api_style!r} is not a valid API style.",
         )
+    # Every check runs before any write, so a refused request leaves the
+    # stored settings exactly as they were rather than half-applied.
+    chains: dict[str, list[str] | None] = {}
+    for purpose in FALLBACK_SETTING_KEYS:
+        field = f"{purpose}_fallbacks"
+        if field not in body.model_fields_set:
+            continue
+        chain = getattr(body, field)
+        if chain is not None:
+            chain = normalize_fallbacks(chain, limit=None)
+            if len(chain) > FALLBACK_CHAIN_LIMIT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"At most {FALLBACK_CHAIN_LIMIT} fallback models per purpose.",
+                )
+        chains[purpose] = chain
+    if (
+        "max_tokens" in body.model_fields_set
+        and body.max_tokens is not None
+        and body.max_tokens < 0
+    ):
+        raise HTTPException(
+            status_code=400, detail="max_tokens must be 0 (unlimited) or a positive count."
+        )
+
     # "" clears the override so mira.yaml is authoritative again. Any other id
     # is stored as-is — the dashboard accepts the same free-form model ids as
     # mira.yaml (the dropdown still guides toward registry models), and the
@@ -507,30 +537,13 @@ def set_models(body: ModelsUpdate, request: Request) -> dict:
     # and must not clear what the Models page stored. null clears the
     # override ("" reads back as unset, as for the models); a list is stored
     # as sent, an empty one included, since "no fallbacks" is a choice too.
-    for purpose, key in FALLBACK_SETTING_KEYS.items():
-        field = f"{purpose}_fallbacks"
-        if field not in body.model_fields_set:
-            continue
-        chain = getattr(body, field)
-        if chain is None:
-            _api._app_db.set_setting(key, "")
-            continue
-        cleaned = normalize_fallbacks(chain, limit=None)
-        if len(cleaned) > FALLBACK_CHAIN_LIMIT:
-            raise HTTPException(
-                status_code=400,
-                detail=f"At most {FALLBACK_CHAIN_LIMIT} fallback models per purpose.",
-            )
-        _api._app_db.set_setting(key, json.dumps(cleaned))
+    for purpose, chain in chains.items():
+        key = FALLBACK_SETTING_KEYS[purpose]
+        _api._app_db.set_setting(key, "" if chain is None else json.dumps(chain))
     if "max_tokens" in body.model_fields_set:
-        if body.max_tokens is None:
-            _api._app_db.set_setting(MAX_TOKENS_KEY, "")
-        elif body.max_tokens < 0:
-            raise HTTPException(
-                status_code=400, detail="max_tokens must be 0 (unlimited) or a positive count."
-            )
-        else:
-            _api._app_db.set_setting(MAX_TOKENS_KEY, str(body.max_tokens))
+        _api._app_db.set_setting(
+            MAX_TOKENS_KEY, "" if body.max_tokens is None else str(body.max_tokens)
+        )
     # Clear "off" to "" rather than persisting the literal — "off" is the
     # default, and a stored value would shadow a mira.yaml
     # `review_reasoning_effort` override. "" (not None — the column is NOT NULL)

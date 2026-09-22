@@ -376,3 +376,34 @@ class TestProviderReasoningLevels:
                 ModelsUpdate(indexing_model="", review_model="", review_thinking_mode="not ok!"),
                 _admin_req(),
             )
+
+
+class TestModelsReviewFindings:
+    def test_a_refused_request_writes_nothing(self, in_memory_db: AppDatabase):
+        from fastapi import HTTPException
+
+        in_memory_db.set_setting("review_model", "kept/model")
+        body = ModelsUpdate(
+            indexing_model="",
+            review_model="new/model",
+            review_fallbacks=[f"m/{i}" for i in range(6)],
+        )
+        with pytest.raises(HTTPException):
+            set_models(body, _admin_req())
+        assert in_memory_db.get_setting("review_model") == "kept/model"
+
+        with pytest.raises(HTTPException):
+            set_models(
+                ModelsUpdate(indexing_model="", review_model="new/model", max_tokens=-1),
+                _admin_req(),
+            )
+        assert in_memory_db.get_setting("review_model") == "kept/model"
+
+    @pytest.mark.asyncio
+    async def test_an_override_equal_to_the_file_is_still_an_override(
+        self, in_memory_db: AppDatabase, no_catalog_fetch
+    ):
+        in_memory_db.set_setting("llm_max_tokens", "4096")
+        resp = await get_models()
+        assert resp.max_tokens == resp.config_max_tokens == 4096
+        assert resp.max_tokens_source == "dashboard"

@@ -54,6 +54,9 @@ _levels: dict[str, dict[str, tuple[str, ...]]] = {}
 _apis: dict[str, str] = {}
 _fetched_at: float | None = None
 _loaded = False
+# Whether the last attempt failed. A failed refresh keeps the previous answer
+# but is retried after _RETRY, not after the hour a success stands for.
+_last_failed = False
 _lock = asyncio.Lock()
 
 
@@ -102,7 +105,8 @@ def _norm_url(value: str) -> str:
 
 def load(document: Any) -> None:
     """Install ``document`` as the current answer (tests, or a bundled copy)."""
-    global _fetched_at, _loaded
+    global _fetched_at, _loaded, _last_failed
+    _last_failed = False
     _levels.clear()
     _apis.clear()
     levels, apis = reduce_document(document)
@@ -114,7 +118,8 @@ def load(document: Any) -> None:
 
 def reset() -> None:
     """Forget everything (tests)."""
-    global _fetched_at, _loaded
+    global _fetched_at, _loaded, _last_failed
+    _last_failed = False
     _levels.clear()
     _apis.clear()
     _fetched_at = None
@@ -131,16 +136,14 @@ async def warm() -> bool:
     A failure is remembered for a minute so a dead network costs one attempt
     per minute, not one per call; a success stands for an hour.
     """
-    global _fetched_at
+    global _fetched_at, _last_failed
     target = url()
     if not target:
         return _loaded
-    if _fetched_at is not None:
-        age = time.time() - _fetched_at
-        if age < (_TTL if _loaded else _RETRY):
-            return _loaded
+    if _fresh():
+        return _loaded
     async with _lock:
-        if _fetched_at is not None and time.time() - _fetched_at < (_TTL if _loaded else _RETRY):
+        if _fresh():
             return _loaded
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -150,8 +153,17 @@ async def warm() -> bool:
             logger.info("Loaded reasoning levels for %d providers from models.dev", len(_levels))
         except Exception as exc:
             _fetched_at = time.time()
+            _last_failed = True
             logger.warning("Could not load models.dev (%s: %s)", type(exc).__name__, exc)
         return _loaded
+
+
+def _fresh() -> bool:
+    """Is the last attempt recent enough not to try again yet?"""
+    if _fetched_at is None:
+        return False
+    ttl = _RETRY if _last_failed or not _loaded else _TTL
+    return time.time() - _fetched_at < ttl
 
 
 def provider_id_for(preset: str = "", base_url: str = "") -> str:
@@ -192,6 +204,13 @@ def levels_for(provider_id: str, model: str) -> tuple[str, ...] | None:
     for candidate in candidates:
         if candidate in known:
             return known[candidate]
+    if "/" not in model:
+        # A bare id against a catalogue keyed by ``vendor/model``: taken only
+        # when every prefixed entry of that name agrees, since two vendors
+        # serving one name may take different levels.
+        found = {levels for key, levels in known.items() if key.rsplit("/", 1)[-1] == model}
+        if len(found) == 1:
+            return found.pop()
     return None
 
 
