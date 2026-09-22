@@ -688,3 +688,41 @@ class TestReplayingABrokenToolCall:
         assert tool_use["toolUseId"] == "call_1"
         assert tool_use["input"] == {}
         assert conversation[2]["content"][0]["toolResult"]["toolUseId"] == "call_1"
+
+
+class TestUnlimitedOutput:
+    """`max_tokens: 0` leaves maxTokens off the Converse request entirely."""
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_no_max_tokens_on_the_request(self, mock_session_cls):
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = _mock_converse_response("ok")
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config(max_tokens=0))
+        await provider.complete([{"role": "user", "content": "hi"}], json_mode=False)
+
+        assert "maxTokens" not in mock_client.converse.call_args[1]["inferenceConfig"]
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_thinking_budget_is_not_clamped_by_a_missing_cap(self, mock_session_cls):
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = _mock_converse_response("ok")
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config(reasoning_effort="high", max_tokens=0))
+        await provider.complete([{"role": "user", "content": "hi"}], json_mode=False)
+
+        call_kwargs = mock_client.converse.call_args[1]
+        assert call_kwargs["additionalModelRequestFields"]["thinking"]["budget_tokens"] == 16384
+        assert "maxTokens" not in call_kwargs["inferenceConfig"]

@@ -154,16 +154,20 @@ async def agentic_review_loop(
 
 def _indexing_llm(fallback: LLMProvider) -> LLMProvider:
     """Build an indexing-tier provider, falling back to ``fallback`` on error."""
+    from mira.llm import create_llm
+
     try:
-        return LLMProvider(llm_config_for("indexing", load_config().llm))
+        return create_llm(llm_config_for("indexing", load_config().llm))  # type: ignore[return-value]
     except Exception:
         return fallback
 
 
 def _security_llm(fallback: LLMProvider) -> LLMProvider:
     """Build a security-tier provider, falling back to ``fallback`` on error."""
+    from mira.llm import create_llm
+
     try:
-        return LLMProvider(llm_config_for("security", load_config().llm))
+        return create_llm(llm_config_for("security", load_config().llm))  # type: ignore[return-value]
     except Exception:
         return fallback
 

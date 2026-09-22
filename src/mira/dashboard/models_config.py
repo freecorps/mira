@@ -7,6 +7,7 @@ model there; this file picks it up automatically.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -552,6 +553,139 @@ def get_security_model(
     return get_review_model(config, db_review_model)
 
 
+# ── Fallback chains ─────────────────────────────────────────────────
+
+# Longest chain the dashboard accepts. Every entry is a full round of
+# retries and re-rolls before the next is tried, so a long chain is a slow
+# failure rather than a resilient one.
+FALLBACK_CHAIN_LIMIT = 5
+
+# The settings-table key holding each purpose's chain, as a JSON array of
+# routes. "" (or no row) means "not set here": the config file decides.
+FALLBACK_SETTING_KEYS: dict[str, str] = {
+    "indexing": "indexing_fallback_models",
+    "review": "review_fallback_models",
+    "security": "security_fallback_models",
+}
+
+
+def parse_fallback_setting(raw: str | None) -> list[str] | None:
+    """The chain a stored setting holds, or None when it is unset.
+
+    An unreadable value reads as unset rather than as an empty chain: the
+    config file's list is the better answer to "what did the operator
+    want" than a list nobody wrote.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        logger.warning("Ignoring an unreadable fallback-model setting: %s", raw[:80])
+        return None
+    if not isinstance(parsed, list):
+        logger.warning("Ignoring a fallback-model setting that is not a list: %s", raw[:80])
+        return None
+    return normalize_fallbacks(parsed)
+
+
+def normalize_fallbacks(
+    values: list[object], *, primary: str = "", limit: int | None = FALLBACK_CHAIN_LIMIT
+) -> list[str]:
+    """Trim, drop blanks and repeats, drop the primary, cap the length.
+
+    The order is the operator's and is kept; only what could never be
+    tried — an empty entry, a second copy of one already in the chain, the
+    model the chain is a fallback *for* — is removed. ``limit=None`` keeps
+    every entry, for a caller that wants to refuse a long list rather than
+    quietly shorten it.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text or text == primary or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def get_fallback_routes(
+    purpose: str,
+    config: LLMConfig,
+    db_values: dict[str, str | None] | None = None,
+) -> tuple[list[str], str]:
+    """The chain a purpose falls back through, and where it came from.
+
+    DB → config, per purpose; the security chain then falls back to the
+    review chain when neither names one, the way ``security_model`` falls
+    back to ``review_model``: the security pass is a review-tier call and
+    should survive the same outages. Indexing has only its own chain. The
+    source is ``"dashboard"`` when the DB row for *this* purpose is set,
+    ``"config"`` otherwise — including when the chain was inherited from
+    review, which the Models page reports as the config-level answer.
+    """
+    db_values = db_values or {}
+    key = FALLBACK_SETTING_KEYS.get(purpose)
+    stored = parse_fallback_setting(db_values.get(key)) if key else None
+    if stored is not None:
+        return stored, "dashboard"
+    own = normalize_fallbacks(getattr(config, key, None) or []) if key else []
+    if own:
+        return own, "config"
+    if purpose == "security":
+        return get_fallback_routes("review", config, db_values)[0], "config"
+    return [], "config"
+
+
+# ── Output budget ───────────────────────────────────────────────────
+
+# The settings-table key holding the dashboard's output budget. "" (or no
+# row) means "not set here"; "0" means unlimited; anything else is a count.
+MAX_TOKENS_KEY = "llm_max_tokens"
+
+
+def parse_max_tokens_setting(raw: str | None) -> int | None:
+    """The stored output budget, or None when unset or unreadable.
+
+    0 is a value, not "unset": it says to send no cap at all. A value that
+    is not a whole number reads as unset, so a corrupt row degrades to the
+    config file rather than to a request the endpoint refuses.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning("Ignoring an unreadable output-budget setting: %s", raw[:40])
+        return None
+    return value if value >= 0 else None
+
+
+def get_max_tokens(config: LLMConfig, db_value: str | None = None) -> int:
+    """Resolve the output budget: DB → config.max_tokens. 0 means unlimited."""
+    stored = parse_max_tokens_setting(db_value)
+    return stored if stored is not None else config.max_tokens
+
+
+def _binding_key(config: LLMConfig) -> tuple:
+    """What makes two bound configs the same call: the model and where it goes."""
+    return (
+        config.model,
+        config.provider,
+        config.oauth_provider,
+        config.oauth_account,
+        config.endpoint,
+        config.base_url,
+        config.api_style,
+    )
+
+
 def get_review_thinking_mode(config: LLMConfig, db_value: str | None = None) -> str | None:
     """Resolve the review thinking mode: DB → config.review_reasoning_effort → None.
 
@@ -586,6 +720,8 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
     db_style: str | None = None
     db_oauth: str | None = None
     db_endpoint: str | None = None
+    db_fallbacks: dict[str, str | None] = {}
+    db_max_tokens: str | None = None
     try:
         from mira.dashboard.api import _app_db
 
@@ -602,8 +738,20 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
             db_style = _app_db.get_setting("api_style")
             db_oauth = _app_db.get_setting("llm_oauth_provider")
             db_endpoint = _app_db.get_setting(endpoints.ACTIVE_KEY)
+            db_fallbacks = {key: _app_db.get_setting(key) for key in FALLBACK_SETTING_KEYS.values()}
+            db_max_tokens = _app_db.get_setting(MAX_TOKENS_KEY)
     except Exception:
         pass  # DB not available — resolve from config fields alone
+
+    # The output budget applies to every purpose alike, so it is folded into
+    # ``base`` before any binding: the chain's members inherit it too.
+    max_tokens = get_max_tokens(base, db_max_tokens)
+    if max_tokens != base.max_tokens:
+        logger.info(
+            "Output budget: %s (source: dashboard setting)",
+            "unlimited" if max_tokens == 0 else max_tokens,
+        )
+        base = base.model_copy(update={"max_tokens": max_tokens})
 
     default = resolve_oauth_default(base, db_oauth)
     resolved_style = resolve_api_style(base, db_style)
@@ -658,7 +806,67 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
             config.endpoint,
             config.base_url,
         )
-    return config
+    return _with_fallbacks(
+        config,
+        purpose,
+        base,
+        db_fallbacks,
+        default=default,
+        thinking_mode=thinking_mode,
+        api_style=resolved_style,
+        api_endpoint=db_endpoint,
+    )
+
+
+def _with_fallbacks(
+    config: LLMConfig,
+    purpose: str,
+    base: LLMConfig,
+    db_fallbacks: dict[str, str | None],
+    *,
+    default: tuple[str, str],
+    thinking_mode: str | None,
+    api_style: str,
+    api_endpoint: str | None,
+) -> LLMConfig:
+    """Attach the purpose's fallback chain to its bound config.
+
+    Each route is bound the way the primary was — same default backend,
+    same thinking mode, same protocol — so a fallback goes exactly where
+    the same value would have gone as the primary. An entry that binds to
+    the same call as the primary, or as an earlier entry, is dropped: it
+    would only repeat a failure.
+    """
+    routes, source = get_fallback_routes(purpose, base, db_fallbacks)
+    if not routes:
+        return config
+    seen = {_binding_key(config)}
+    chain: list[LLMConfig] = []
+    for route in routes:
+        bound = bind_model(
+            base,
+            route,
+            model_is_explicit=True,
+            default=default,
+            thinking_mode=thinking_mode,
+            api_style=api_style,
+            api_endpoint=api_endpoint,
+            purpose=purpose,
+        )
+        key = _binding_key(bound)
+        if key in seen:
+            continue
+        seen.add(key)
+        chain.append(bound.model_copy(update={"fallbacks": []}))
+    if not chain:
+        return config
+    logger.info(
+        "%s fallbacks: %s (source: %s)",
+        purpose.capitalize(),
+        " → ".join(c.model for c in chain),
+        "dashboard setting" if source == "dashboard" else "mira.yaml",
+    )
+    return config.model_copy(update={"fallbacks": chain})
 
 
 def _model_is_explicit(base: LLMConfig, per_purpose: str | None) -> bool:

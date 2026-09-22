@@ -383,6 +383,11 @@ class ModelOption(BaseModel):
     # Protocol and endpoint, one line, shown under the group header.
     detail: str = ""
     description: str = ""
+    # The reasoning levels this model takes, as its provider reports them
+    # (models.dev for API-key endpoints, the backend itself for ChatGPT).
+    # Empty when the provider has not said, in which case the built-in
+    # list stands in.
+    reasoning_levels: list[str] = []
 
 
 class ModelsResponse(BaseModel):
@@ -418,6 +423,31 @@ class ModelsResponse(BaseModel):
     # the model options come from that provider and `api_style` is fixed by it.
     oauth_provider: str = ""
     oauth_label: str = ""
+    # Ordered fallback chains per purpose: the routes tried, in order, when
+    # the purpose's model fails a call. Resolved DB → config (security then
+    # inherits review's), with the source and the config-level chain beside
+    # each so the page can offer "inherit" the way it does for the model.
+    indexing_fallbacks: list[str] = []
+    review_fallbacks: list[str] = []
+    security_fallbacks: list[str] = []
+    indexing_fallbacks_source: str = "config"
+    review_fallbacks_source: str = "config"
+    security_fallbacks_source: str = "config"
+    config_indexing_fallbacks: list[str] = []
+    config_review_fallbacks: list[str] = []
+    config_security_fallbacks: list[str] = []
+    fallback_chain_limit: int = 5
+    # Output budget per call, resolved DB → config. 0 means unlimited: no
+    # cap on the request, the model stops where it stops.
+    max_tokens: int = 4096
+    max_tokens_source: str = "config"
+    config_max_tokens: int = 4096
+    # The reasoning levels the *saved* review model takes, and who says so:
+    # "provider" when its backend reported them, "builtin" otherwise (the
+    # thinking_options list). The page recomputes this for a draft from the
+    # option's own reasoning_levels.
+    review_thinking_levels: list[str] = []
+    review_thinking_source: str = "builtin"
 
 
 class ModelsUpdate(BaseModel):
@@ -426,6 +456,16 @@ class ModelsUpdate(BaseModel):
     security_model: str = ""
     review_thinking_mode: str = "off"
     api_style: str = "chat"
+    # Three states per chain, told apart by whether the field was sent:
+    # absent leaves the stored chain alone (the setup page never sends
+    # them), null clears the dashboard's chain so mira.yaml decides again,
+    # and a list — an empty one included — is stored as the chain.
+    indexing_fallbacks: list[str] | None = None
+    review_fallbacks: list[str] | None = None
+    security_fallbacks: list[str] | None = None
+    # Same three states: absent leaves the stored budget alone, null clears
+    # the override, 0 is unlimited, anything else is the cap.
+    max_tokens: int | None = None
 
 
 class GlobalSettingsResponse(BaseModel):

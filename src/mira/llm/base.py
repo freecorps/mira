@@ -228,11 +228,87 @@ _TOOL_CORRECTION = (
     "report fewer items rather than cutting the JSON short."
 )
 
+_TRUNCATION_CORRECTION = (
+    "Your previous reply hit the output limit before it produced a usable "
+    "`{tool}` tool call ({reason}). Keep any thinking brief, then reply with "
+    "exactly one call to `{tool}` whose arguments are a single complete JSON "
+    "object. Report fewer items and keep each `body` short rather than "
+    "running out of room again."
+)
+
 _JSON_FALLBACK_PROMPT = (
     "Do not use tools for this reply. Respond with a single JSON object and "
     "nothing else — no prose, no markdown fences. It must match the argument "
     "schema of the `{tool}` tool:\n\n{schema}"
 )
+
+# Upper bound for the output budget a truncated re-roll may grow to when the
+# registry does not know the model. Every current model serves at least this
+# much, and it keeps a bad finish_reason from asking for a million tokens.
+_OUTPUT_BUDGET_CEILING = 16_384
+
+
+def _set_budget(body: dict, key: str, explicit: int | None, default: int | None) -> None:
+    """Put the output cap on a request body, or leave it off for "unlimited".
+
+    ``explicit`` is a cap the caller asked for on this one call; ``default``
+    is the client's budget for the model, None when ``max_tokens: 0`` said
+    to send none. A body with no cap lets the endpoint apply its own, which
+    for most is the model's maximum.
+    """
+    cap = explicit if explicit is not None else default
+    if cap:
+        body[key] = cap
+
+
+def _asked_for_reasoning(body: dict) -> bool:
+    """True when the request carries a reasoning level, in either spelling."""
+    return "reasoning" in body or "reasoning_effort" in body
+
+
+def _drop_reasoning(body: dict) -> None:
+    body.pop("reasoning", None)
+    body.pop("reasoning_effort", None)
+
+
+def _finish_reason(data: object) -> str | None:
+    """``finish_reason`` of the first choice in a chat/completions payload."""
+    if not isinstance(data, dict):
+        return None
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    reason = choices[0].get("finish_reason")
+    return str(reason) if reason else None
+
+
+def _empty_reply_detail(finish_reason: str | None, *, reasoning: bool) -> str:
+    """Why an empty reply was empty, in the words the log line needs.
+
+    "empty response" alone was the whole diagnosis for a review that died,
+    and it fits three very different causes: a model that spent its output
+    budget thinking and had nothing left for the call, a gateway that
+    dropped the content, and a model that simply stopped. The finish reason
+    and whether reasoning came back tell them apart.
+    """
+    parts = ["empty response"]
+    if finish_reason:
+        parts.append(f"finish_reason={finish_reason}")
+    if reasoning:
+        parts.append("the reply carried reasoning but no content")
+    if finish_reason == "length" and reasoning:
+        parts.append("the output budget was spent on thinking")
+    return parts[0] + (f" ({'; '.join(parts[1:])})" if len(parts) > 1 else "")
+
+
+def _carries_reasoning(message: object) -> bool:
+    """True when a chat message holds reasoning text (any of the field names in use)."""
+    if not isinstance(message, dict):
+        return False
+    return any(
+        isinstance(message.get(key), str) and message[key].strip()
+        for key in ("reasoning_content", "reasoning", "thinking")
+    )
 
 
 def _tool_name(tools: list[dict]) -> str:
@@ -362,6 +438,10 @@ class OpenAICompatibleProvider:
 
     supports_json_mode: ClassVar[bool] = True
     supports_tool_calling: ClassVar[bool] = True
+    # Whether this protocol names a reasoning level as a nested
+    # ``reasoning: {effort}`` object whatever the profile says. True for the
+    # Responses API, where that is the only spelling.
+    _nested_reasoning: ClassVar[bool] = False
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
@@ -373,6 +453,11 @@ class OpenAICompatibleProvider:
         self._no_forced_tool_choice: set[str] = set()
         self._no_reasoning: set[str] = set()
         self._no_temperature: set[str] = set()
+        # Output budget per model, once a truncated reply has shown that
+        # ``config.max_tokens`` is not enough for it. Kept for the life of
+        # the client (one review pass) so every later call to that model
+        # starts with the budget it was seen to need.
+        self._output_budget: dict[str, int] = {}
         # One id per client instance — which is one per review pass, since a
         # client is created per purpose per review. Sent where the profile
         # names a session header, so an endpoint that routes and caches by
@@ -419,19 +504,60 @@ class OpenAICompatibleProvider:
     def _apply_reasoning(self, body: dict) -> None:
         """Enable extended thinking when a reasoning effort is configured.
 
-        The effort is passed via the unified ``reasoning.effort`` knob, after
-        any per-provider remap from the profile. Anthropic models reject a
-        custom ``temperature`` while thinking is on, so we drop it.
-        No-op when reasoning is off, keeping the request unchanged.
+        The level goes through the profile's rename map, then — when
+        models.dev has described this model — is snapped to the nearest
+        level the model actually takes, so "max" on a model that stops at
+        "high" is "high" rather than a 400 (see :mod:`mira.llm.models_dev`).
+        How it is named on the wire is the profile's call: the OpenAI
+        ``reasoning_effort`` field for OpenAI-compatible endpoints, the
+        nested ``reasoning.effort`` object for OpenRouter and for the
+        Responses API. Anthropic models reject a custom ``temperature``
+        while thinking is on, so it is dropped. No-op when reasoning is off.
+        """
+        from mira.llm import models_dev
+
+        effort = self.config.reasoning_effort
+        if not effort or effort == "off":
+            return
+        model = str(body.get("model") or "")
+        if model in self._no_reasoning:
+            return
+        effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
+        levels = models_dev.reasoning_levels(self.config, model)
+        if levels:
+            snapped = models_dev.snap_effort(levels, effort)
+            if snapped != effort:
+                logger.info(
+                    "Model %s takes reasoning levels %s; sending %s for %s",
+                    model,
+                    "/".join(levels),
+                    snapped,
+                    effort,
+                )
+                effort = snapped
+        nested = (
+            self._nested_reasoning
+            or self.profile.get("reasoning_param", "reasoning_effort") == "reasoning"
+        )
+        if nested:
+            body["reasoning"] = {"effort": effort}
+        else:
+            body["reasoning_effort"] = effort
+        body.pop("temperature", None)
+
+    async def _prepare_reasoning(self) -> None:
+        """Have models.dev's levels in hand before a call that asks for thinking.
+
+        Lookups are synchronous and never fetch, so the fetch happens here,
+        where a call can afford to wait — and only when a level will be
+        sent, so a review with thinking off never touches the catalogue.
         """
         effort = self.config.reasoning_effort
         if not effort or effort == "off":
             return
-        if body.get("model") in self._no_reasoning:
-            return
-        effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
-        body["reasoning"] = {"effort": effort}
-        body.pop("temperature", None)
+        from mira.llm import models_dev
+
+        await models_dev.warm()
 
     def _temperature(self, body: dict, temperature: float | None = None) -> None:
         """Set the sampling temperature, unless this model has refused one.
@@ -445,6 +571,47 @@ class OpenAICompatibleProvider:
             body.pop("temperature", None)
             return
         body["temperature"] = temperature if temperature is not None else self.config.temperature
+
+    def _max_tokens_for(self, model: str) -> int | None:
+        """The output budget a call to ``model`` is made with, or None for no cap.
+
+        ``config.max_tokens`` unless a truncated reply has raised it for this
+        model (see :meth:`_raise_output_budget`). ``max_tokens: 0`` is
+        "unlimited": the request carries no cap and the model stops where
+        it stops.
+        """
+        if not self.config.max_tokens:
+            return None
+        return self._output_budget.get(model, self.config.max_tokens)
+
+    def _raise_output_budget(self, model: str) -> bool:
+        """Double ``model``'s output budget after a truncated reply, up to its cap.
+
+        The cap is the registry's ``max_output_tokens`` for the model, or a
+        fixed ceiling when the registry does not know it. Returns False when
+        the budget is already at the cap — or when there is no budget to
+        raise — so the caller knows a re-roll with the same budget is all
+        that is left.
+        """
+        from mira.llm import registry
+
+        current = self._max_tokens_for(model)
+        if current is None:
+            return False
+        cap = max(
+            self.config.max_tokens,
+            registry.max_output_tokens(model, default=_OUTPUT_BUDGET_CEILING),
+        )
+        if current >= cap:
+            return False
+        self._output_budget[model] = min(current * 2, cap)
+        logger.info(
+            "Model %s ran out of output budget at %d tokens; raising it to %d for its next calls",
+            model,
+            current,
+            self._output_budget[model],
+        )
+        return True
 
     def _refused_temperature(self, resp: httpx.Response, body: dict) -> bool:
         """Was this a 400 about the temperature? If so, drop it for a retry.
@@ -547,6 +714,7 @@ class OpenAICompatibleProvider:
         max_tokens: int | None = None,
     ) -> str:
         """Complete a prompt using JSON mode, with fallback model support."""
+        await self._prepare_reasoning()
         try:
             return await self._call_llm(
                 self.config.model,
@@ -598,6 +766,11 @@ class OpenAICompatibleProvider:
         call. Resending the identical request would resample the same mistake,
         so each re-roll tells the model what was wrong and nudges the
         temperature up to break out of the bad sample.
+
+        A reply cut off at the output limit is a different mistake: the model
+        did not misunderstand the format, it ran out of room — usually a
+        reasoning model that spent the whole budget thinking. That re-roll
+        keeps the temperature and doubles the budget instead.
         """
         attempts = 1 + self.config.tool_call_retries
         convo = messages
@@ -616,17 +789,22 @@ class OpenAICompatibleProvider:
                     attempts,
                     exc,
                 )
+                if exc.truncated:
+                    self._raise_output_budget(model)
+                    correction = _TRUNCATION_CORRECTION
+                else:
+                    correction = _TOOL_CORRECTION
+                    base_temp = self.config.temperature if temperature is None else temperature
+                    temp = min(1.0, base_temp + 0.2 * (attempt + 1))
                 convo = [
                     *messages,
                     {
                         "role": "user",
-                        "content": _TOOL_CORRECTION.format(
+                        "content": correction.format(
                             tool=_tool_name(tools), reason=exc.safe_message
                         ),
                     },
                 ]
-                base_temp = self.config.temperature if temperature is None else temperature
-                temp = min(1.0, base_temp + 0.2 * (attempt + 1))
 
         assert last_err is not None  # the loop only exits here after a failure
         raise last_err
@@ -697,6 +875,7 @@ class OpenAICompatibleProvider:
         primary model, then the fallback model, then plain JSON mode. Only when
         all of them come back empty does the call fail.
         """
+        await self._prepare_reasoning()
         try:
             return await self._tool_call_with_rerolls(
                 self.config.model, messages, tools, temperature=temperature
@@ -793,6 +972,7 @@ class OpenAICompatibleProvider:
         temperature: float | None = None,
     ) -> dict:
         """Single hop of an agentic loop. Returns the assistant message dict."""
+        await self._prepare_reasoning()
         try:
             return await self._call_llm_agentic(
                 self.config.model, messages, tools, temperature=temperature

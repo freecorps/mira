@@ -70,6 +70,13 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Both primary ({primary_model}) and fallback ({fallback_model}) models failed: {error}",
         safe="Both primary and fallback models failed",
     ),
+    "all_models_failed": ErrorMessage(
+        full=(
+            "Every model in the fallback chain failed ({models}); "
+            "last error, from {last_model}: {error}"
+        ),
+        safe="Every configured model failed",
+    ),
     # OAuth-backed providers (ChatGPT/Codex and friends)
     "oauth_not_connected": ErrorMessage(
         full=(

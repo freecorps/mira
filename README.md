@@ -92,6 +92,12 @@ Run Mira self-hosted to auto-review every PR and merge request and answer `@mira
 llm:
   model: "anthropic/claude-sonnet-4-6"
   indexing_model: "anthropic/claude-haiku-4-5"
+  # Tried in order when the review model fails a call — after its own
+  # retries. Routes work here too (`api:…`, `endpoint:<id>:…`, `oauth:…`).
+  review_fallback_models: ["openai/gpt-5.1", "endpoint:opencode-go:kimi-k2.7-code"]
+  # Output cap per call; 0 sends none and lets the model decide (best for
+  # reasoning models, whose thinking counts against it).
+  max_tokens: 0
 ```
 
 ```bash

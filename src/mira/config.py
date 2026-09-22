@@ -88,6 +88,22 @@ class LLMConfig(BaseModel):
     # the security sweep is the highest-stakes pass and must not silently
     # downgrade to the indexing tier.
     security_model: str | None = None
+    # Ordered fallback chains, one per purpose: when the purpose's model fails
+    # a call — every retry, re-roll and JSON-mode rescue spent — the same call
+    # is made with the next entry, and so on down the list. Entries take the
+    # same form as the model fields: a bare id or a route (`api:…`,
+    # `endpoint:<id>:…`, `oauth:<provider>:<account>:…`), so a chain can cross
+    # endpoints and accounts. The security chain falls back to the review
+    # chain when it is not set, the way `security_model` does. The dashboard
+    # stores its own lists over these (Settings → Models).
+    indexing_fallback_models: list[str] = Field(default_factory=list)
+    review_fallback_models: list[str] = Field(default_factory=list)
+    security_fallback_models: list[str] = Field(default_factory=list)
+    # The resolved chain for one purpose: the bound configs the client falls
+    # back through, in order. Set by `llm_config_for` from the lists above
+    # (or the dashboard's), the way `model` is resolved from `review_model`;
+    # nothing in a config file needs to set it.
+    fallbacks: list[LLMConfig] = Field(default_factory=list)
     # Extended-thinking effort for reviews ("low"/"medium"/"high"; None/"off" =
     # no reasoning). `review_reasoning_effort` is the mira.yaml-level override;
     # `reasoning_effort` is the resolved value the provider reads (set by
@@ -95,7 +111,12 @@ class LLMConfig(BaseModel):
     review_reasoning_effort: str | None = None
     reasoning_effort: str | None = None
     temperature: float = 0.2
-    max_tokens: int = 4096
+    # Output budget per call. 0 means unlimited: the request carries no
+    # `max_tokens` at all and the model stops where it stops, which is the
+    # safe choice for a reasoning model whose thinking would otherwise eat
+    # the budget meant for the answer. The dashboard (Settings → Models) can
+    # override this.
+    max_tokens: int = Field(default=4096, ge=0)
     max_context_tokens: int = 120_000
     # Provider selection. "openai" uses any OpenAI-compatible endpoint (default).
     # "bedrock" uses AWS Bedrock Converse API directly (requires boto3).

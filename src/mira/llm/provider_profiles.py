@@ -36,6 +36,12 @@ DEFAULT_PROFILE: dict = {
     "model_prefix": "strip",
     "extra_headers": {},
     "reasoning_effort_map": {},
+    # How a Chat Completions request names its reasoning level: the OpenAI
+    # field for the portable default; OpenRouter nests it (see providers.json).
+    "reasoning_param": "reasoning_effort",
+    # This endpoint's provider id on models.dev, source of per-model
+    # reasoning levels. Empty when the catalogue does not list it.
+    "models_dev": "",
     "api_key_env": None,
     # A header carrying a stable per-conversation id, for an endpoint that
     # routes and caches by one (OpenCode Go refuses a request without it).

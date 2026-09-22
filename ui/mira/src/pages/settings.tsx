@@ -1,4 +1,4 @@
-import { Loader2 } from "lucide-react"
+import { ArrowDown, ArrowUp, Loader2, Plus, X } from "lucide-react"
 import { useEffect, useState } from "react"
 
 import { ModelCombobox, type ModelOption } from "@/components/model-combobox"
@@ -21,7 +21,11 @@ import {
 import { useParams } from "react-router"
 
 import { api } from "@/lib/api"
-import type { DefaultBackend, ModelRoute } from "@/lib/api/settings"
+import type {
+  DefaultBackend,
+  ModelRoute,
+  ModelsSaveExtras,
+} from "@/lib/api/settings"
 import { useAuth } from "@/lib/auth"
 import { useDocumentTitle } from "@/lib/hooks"
 
@@ -74,6 +78,13 @@ function writePath(
   return next
 }
 
+type Purpose = "indexing" | "review" | "security"
+const NO_CHAINS: Record<Purpose, string[]> = {
+  indexing: [],
+  review: [],
+  security: [],
+}
+
 export function SettingsPage() {
   useDocumentTitle("Settings")
   const { user: currentUser } = useAuth()
@@ -106,6 +117,32 @@ export function SettingsPage() {
   }>({})
   // The values as loaded, to know when a draft still matches the saved one.
   const [saved, setSaved] = useState({ indexing: "", review: "", security: "" })
+  // Fallback chains as the server resolves them (dashboard → mira.yaml),
+  // where each came from, and what "inherit" would give.
+  const [fallbacks, setFallbacks] =
+    useState<Record<Purpose, string[]>>(NO_CHAINS)
+  const [fallbackSources, setFallbackSources] = useState<
+    Record<Purpose, "dashboard" | "config">
+  >({ indexing: "config", review: "config", security: "config" })
+  const [configFallbacks, setConfigFallbacks] =
+    useState<Record<Purpose, string[]>>(NO_CHAINS)
+  // Chains edited since load: a list to store, or null to hand the chain
+  // back to mira.yaml. Only these are sent on save, so an untouched chain
+  // that came from the file is not silently converted into an override.
+  const [fallbackEdits, setFallbackEdits] = useState<
+    Partial<Record<Purpose, string[] | null>>
+  >({})
+  const [fallbackLimit, setFallbackLimit] = useState(5)
+  // Output budget per call. "inherit" = mira.yaml's `max_tokens`;
+  // "unlimited" sends no cap at all; "custom" is a count. `maxTokensDirty`
+  // says whether to send it on save, so an untouched inherited value stays
+  // inherited rather than becoming an override.
+  const [maxTokensMode, setMaxTokensMode] = useState<
+    "inherit" | "unlimited" | "custom"
+  >("inherit")
+  const [maxTokensValue, setMaxTokensValue] = useState("")
+  const [maxTokensDirty, setMaxTokensDirty] = useState(false)
+  const [configMaxTokens, setConfigMaxTokens] = useState(4096)
   const [savingModels, setSavingModels] = useState(false)
   const [modelsSaved, setModelsSaved] = useState(false)
 
@@ -130,6 +167,19 @@ export function SettingsPage() {
   // render inline under the offending input. `_global` is the catch-all
   // bucket for non-field errors.
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+
+  const loadMaxTokens = (
+    value: number | undefined,
+    source: string | undefined,
+    configValue: number | undefined
+  ) => {
+    setConfigMaxTokens(configValue ?? 4096)
+    if (source !== "dashboard") setMaxTokensMode("inherit")
+    else if (value === 0) setMaxTokensMode("unlimited")
+    else setMaxTokensMode("custom")
+    setMaxTokensValue(value && value > 0 ? String(value) : "")
+    setMaxTokensDirty(false)
+  }
 
   useEffect(() => {
     if (!currentUser?.is_admin) return
@@ -158,6 +208,24 @@ export function SettingsPage() {
       setThinkingOptions(m.thinking_options)
       setApiStyle(m.api_style ?? "chat")
       setApiStyleOptions(m.api_style_options ?? [])
+      setFallbacks({
+        indexing: m.indexing_fallbacks ?? [],
+        review: m.review_fallbacks ?? [],
+        security: m.security_fallbacks ?? [],
+      })
+      setFallbackSources({
+        indexing: m.indexing_fallbacks_source ?? "config",
+        review: m.review_fallbacks_source ?? "config",
+        security: m.security_fallbacks_source ?? "config",
+      })
+      setConfigFallbacks({
+        indexing: m.config_indexing_fallbacks ?? [],
+        review: m.config_review_fallbacks ?? [],
+        security: m.config_security_fallbacks ?? [],
+      })
+      setFallbackLimit(m.fallback_chain_limit ?? 5)
+      setFallbackEdits({})
+      loadMaxTokens(m.max_tokens, m.max_tokens_source, m.config_max_tokens)
     })
     api.getGlobalSettings().then((s) => {
       setEffective(
@@ -183,12 +251,30 @@ export function SettingsPage() {
 
   const saveModels = async () => {
     setSavingModels(true)
+    const extras: ModelsSaveExtras = {}
+    if (fallbackEdits.indexing !== undefined)
+      extras.indexing_fallbacks = fallbackEdits.indexing
+    if (fallbackEdits.review !== undefined)
+      extras.review_fallbacks = fallbackEdits.review
+    if (fallbackEdits.security !== undefined)
+      extras.security_fallbacks = fallbackEdits.security
+    if (maxTokensDirty) {
+      if (maxTokensMode === "inherit") extras.max_tokens = null
+      else if (maxTokensMode === "unlimited") extras.max_tokens = 0
+      else {
+        const n = Number.parseInt(maxTokensValue, 10)
+        // A custom mode with nothing typed is the inherited value, not a
+        // request for zero output.
+        extras.max_tokens = Number.isFinite(n) && n > 0 ? n : null
+      }
+    }
     await api.saveModels(
       indexingModel,
       reviewModel,
       securityModel,
       thinkingMode,
-      apiStyle
+      apiStyle,
+      extras
     )
     setSavingModels(false)
     setModelsSaved(true)
@@ -206,8 +292,35 @@ export function SettingsPage() {
         review: m.review_route,
         security: m.security_route,
       })
+      setFallbacks({
+        indexing: m.indexing_fallbacks ?? [],
+        review: m.review_fallbacks ?? [],
+        security: m.security_fallbacks ?? [],
+      })
+      setFallbackSources({
+        indexing: m.indexing_fallbacks_source ?? "config",
+        review: m.review_fallbacks_source ?? "config",
+        security: m.security_fallbacks_source ?? "config",
+      })
+      setFallbackEdits({})
+      loadMaxTokens(m.max_tokens, m.max_tokens_source, m.config_max_tokens)
     })
   }
+
+  // The chain a purpose shows: the edit in progress, else the saved one. A
+  // pending reset (null) shows what mira.yaml would give.
+  const chainFor = (purpose: Purpose): string[] => {
+    const edit = fallbackEdits[purpose]
+    if (edit === undefined) return fallbacks[purpose]
+    return edit ?? configFallbacks[purpose]
+  }
+  const chainIsOverride = (purpose: Purpose): boolean => {
+    const edit = fallbackEdits[purpose]
+    if (edit !== undefined) return edit !== null
+    return fallbackSources[purpose] === "dashboard"
+  }
+  const editChain = (purpose: Purpose, next: string[] | null) =>
+    setFallbackEdits((prev) => ({ ...prev, [purpose]: next }))
 
   const defaultLabel = defaultBackend.provider_label
     ? `${defaultBackend.provider_label} · ${defaultBackend.account_label ?? ""}`
@@ -240,6 +353,152 @@ export function SettingsPage() {
       return `${effective.slice(4)} via the API-key endpoint`
     }
     return `${effective} via ${defaultLabel} (bare id: goes to the default backend)`
+  }
+
+  // The thinking levels to offer: the review model's own, when its provider
+  // reported them (models.dev for API-key endpoints, the backend itself for
+  // ChatGPT), else the built-in list. A saved level the list lacks is kept
+  // as a row of its own rather than silently shown as something else.
+  const reviewOption = reviewOptions.find(
+    (o) => o.value === (reviewModel === "" ? configReviewModel : reviewModel)
+  )
+  const providerLevels = reviewOption?.reasoning_levels ?? []
+  const thinkingChoices: ModelOption[] =
+    providerLevels.length > 0
+      ? [
+          { value: "off", label: "Off" },
+          ...providerLevels.map((level) => ({
+            value: level,
+            label: level.charAt(0).toUpperCase() + level.slice(1),
+          })),
+        ]
+      : thinkingOptions
+  const thinkingRows = thinkingChoices.some((o) => o.value === thinkingMode)
+    ? thinkingChoices
+    : [
+        ...thinkingChoices,
+        { value: thinkingMode, label: `${thinkingMode} (saved)` },
+      ]
+
+  // An ordered list of fallback models under a purpose's picker. Each row
+  // is the same picker, without the inherit row: a fallback is always a
+  // model somebody chose. Rows move up and down, since the order is the
+  // order they are tried in.
+  const fallbackList = (purpose: Purpose, options: ModelOption[]) => {
+    const chain = chainFor(purpose)
+    const override = chainIsOverride(purpose)
+    const setAt = (i: number, value: string) => {
+      const next = [...chain]
+      next[i] = value
+      editChain(purpose, next)
+    }
+    const move = (i: number, by: -1 | 1) => {
+      const j = i + by
+      if (j < 0 || j >= chain.length) return
+      const next = [...chain]
+      const swapped = next[i]
+      next[i] = next[j]
+      next[j] = swapped
+      editChain(purpose, next)
+    }
+    return (
+      <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium">
+            Fallback models
+            {chain.length > 0 ? ` · ${chain.length} of ${fallbackLimit}` : ""}
+          </span>
+          <span className="text-[0.7rem] text-muted-foreground">
+            {override ? "set here" : "from deployment config"}
+          </span>
+        </div>
+        {chain.length === 0 && (
+          <p className="text-xs text-muted-foreground">
+            None. When this model fails a call after its own retries, the review
+            fails.
+          </p>
+        )}
+        {chain.map((value, i) => (
+          <div key={`${purpose}-${i}`} className="space-y-1">
+            <div className="flex items-center gap-1">
+              <span className="w-5 text-right font-mono text-xs text-muted-foreground">
+                {i + 1}.
+              </span>
+              <div className="min-w-0 flex-1">
+                <ModelCombobox
+                  value={value}
+                  onChange={(v) => setAt(i, v)}
+                  options={options}
+                />
+              </div>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Move up"
+                disabled={i === 0}
+                onClick={() => move(i, -1)}
+              >
+                <ArrowUp />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Move down"
+                disabled={i === chain.length - 1}
+                onClick={() => move(i, 1)}
+              >
+                <ArrowDown />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Remove"
+                onClick={() =>
+                  editChain(
+                    purpose,
+                    chain.filter((_, j) => j !== i)
+                  )
+                }
+              >
+                <X />
+              </Button>
+            </div>
+            {value && (
+              <p className="pl-6 font-mono text-[0.7rem] text-muted-foreground">
+                → {routeLine(value, "", "", options)}
+              </p>
+            )}
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={chain.length >= fallbackLimit}
+            onClick={() => editChain(purpose, [...chain, ""])}
+          >
+            <Plus /> Add fallback
+          </Button>
+          {override && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => editChain(purpose, null)}
+            >
+              Use deployment config
+              {configFallbacks[purpose].length > 0
+                ? ` (${configFallbacks[purpose].length})`
+                : " (none)"}
+            </Button>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Tried in this order when the model above fails a call — after its own
+          retries, re-rolls and JSON-mode rescue. Each entry can be on another
+          endpoint or account.
+        </p>
+      </div>
+    )
   }
 
   const setOverride = (
@@ -572,6 +831,7 @@ export function SettingsPage() {
                 Used to summarize files when building the code index. A cheaper
                 model is recommended since it runs over every file.
               </p>
+              {fallbackList("indexing", indexingOptions)}
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Review Model</label>
@@ -595,6 +855,7 @@ export function SettingsPage() {
                 Used to analyze PRs and post review comments. A more powerful
                 model gives better review quality.
               </p>
+              {fallbackList("review", reviewOptions)}
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Security Model</label>
@@ -617,8 +878,9 @@ export function SettingsPage() {
               <p className="text-xs text-muted-foreground">
                 Used for the dedicated security pass. Defaults to the review
                 model — set a cheaper one only if you accept lower security
-                recall.
+                recall. Its fallbacks default to the review model&apos;s.
               </p>
+              {fallbackList("security", securityOptions)}
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">
@@ -629,18 +891,73 @@ export function SettingsPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {thinkingOptions.map((opt) => (
+                  {thinkingRows.map((opt) => (
                     <SelectItem key={opt.value} value={opt.value}>
                       {opt.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+              <p className="font-mono text-[0.7rem] text-muted-foreground">
+                →{" "}
+                {providerLevels.length > 0
+                  ? `levels reported for ${reviewOption?.label ?? "this model"} by ${reviewOption?.group || "its provider"}: ${providerLevels.join(", ")}`
+                  : "built-in levels (the provider has not reported this model's own)"}
+              </p>
               <p className="text-xs text-muted-foreground">
                 Extended reasoning budget for reviews — improves depth on
-                capable models at the cost of latency and tokens. Works on
-                OpenRouter and Bedrock (Claude); on other endpoints it's skipped
-                automatically when unsupported.
+                capable models at the cost of latency and tokens. The levels are
+                the model&apos;s own where its provider reports them; a level a
+                fallback model lacks is snapped to the nearest it has, and an
+                endpoint that rejects reasoning is retried without it.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Max output tokens</label>
+              <div className="flex items-center gap-2">
+                <Select
+                  value={maxTokensMode}
+                  onValueChange={(v) => {
+                    setMaxTokensMode(v as "inherit" | "unlimited" | "custom")
+                    setMaxTokensDirty(true)
+                  }}
+                >
+                  <SelectTrigger className="w-72">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="inherit">
+                      Inherit from deployment config (
+                      {configMaxTokens === 0 ? "unlimited" : configMaxTokens})
+                    </SelectItem>
+                    <SelectItem value="unlimited">
+                      Unlimited — let the model decide
+                    </SelectItem>
+                    <SelectItem value="custom">Custom limit</SelectItem>
+                  </SelectContent>
+                </Select>
+                {maxTokensMode === "custom" && (
+                  <Input
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    step={1024}
+                    className="w-32"
+                    placeholder={String(configMaxTokens || 4096)}
+                    value={maxTokensValue}
+                    onChange={(e) => {
+                      setMaxTokensValue(e.target.value)
+                      setMaxTokensDirty(true)
+                    }}
+                  />
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                The output budget on every call, thinking included. A reasoning
+                model can spend a small budget entirely on thinking and answer
+                with nothing; <em>Unlimited</em> sends no cap, so the model
+                stops where it stops — its own maximum applies. Applies to every
+                purpose and to the fallback models.
               </p>
             </div>
             {backend !== "bedrock" && (

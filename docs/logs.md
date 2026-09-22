@@ -31,7 +31,9 @@ The trace ID is the handle. Every log line that review emitted carries it —
 including the lines from the LLM client and the platform providers, which know
 nothing about pull requests. Paste it into the **Trace ID** box on
 **Dashboard → Logs** and you get the whole story: which model was tried, what
-each re-roll came back with, whether the fallback model ran, whether JSON mode
+each re-roll came back with — and why an empty one was empty, with the
+finish reason and whether the model spent its budget thinking — which model
+in the fallback chain answered in the end, whether JSON mode
 recovered it, and the stack that finally ended the review.
 
 Without it, "a review failed at some point this afternoon" is a timestamp hunt

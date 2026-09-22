@@ -191,7 +191,7 @@ class TestComplete:
 
     @pytest.mark.asyncio
     async def test_max_effort_passes_through_on_non_openrouter(self):
-        # DeepSeek's native API accepts "max" verbatim.
+        # DeepSeek's native API accepts "max" verbatim, in the OpenAI field.
         config = LLMConfig(
             model="deepseek-reasoner",
             reasoning_effort="max",
@@ -209,7 +209,8 @@ class TestComplete:
 
             await provider.complete([{"role": "user", "content": "hi"}])
             body = mock_client.post.call_args.kwargs["json"]
-            assert body["reasoning"] == {"effort": "max"}
+            assert body["reasoning_effort"] == "max"
+            assert "reasoning" not in body
 
     @pytest.mark.asyncio
     async def test_reasoning_off_leaves_body_unchanged(self):
@@ -946,3 +947,206 @@ class TestRetryAfterForms:
         from mira.llm.base import _retry_after_seconds
 
         assert _retry_after_seconds(self._response("soon")) is None
+
+
+class TestTruncatedReplies:
+    """A reasoning model that spends its budget thinking answers with nothing.
+    "empty response" alone was the whole diagnosis; the re-roll needs room."""
+
+    _TOOL = {
+        "type": "function",
+        "function": {"name": "submit_review", "parameters": {"type": "object"}},
+    }
+
+    def _config(self, **kw) -> LLMConfig:
+        base = {
+            "model": "test-model",
+            "max_tokens": 4096,
+            "max_retries": 1,
+            "retry_min_wait": 0,
+            "retry_max_wait": 0,
+            "json_mode_fallback": False,
+        }
+        base.update(kw)
+        return LLMConfig(**base)
+
+    @staticmethod
+    def _spent_thinking() -> dict:
+        return {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": "", "reasoning_content": "Let me think about..."},
+                }
+            ]
+        }
+
+    async def _call(self, provider, responses):
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            client = AsyncMock()
+            client.post = AsyncMock(side_effect=responses)
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            cls.return_value = client
+            try:
+                return await provider.complete_with_tools(
+                    [{"role": "user", "content": "review this"}], tools=[self._TOOL]
+                )
+            finally:
+                self.posts = client.post.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_the_error_says_why_the_reply_was_empty(self):
+        provider = LLMProvider(self._config(tool_call_retries=0))
+
+        with pytest.raises(LLMError) as info:
+            await self._call(provider, [_mock_httpx_response(self._spent_thinking())])
+
+        message = str(info.value)
+        assert "finish_reason=length" in message
+        assert "reasoning but no content" in message
+        assert "spent on thinking" in message
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_reply_is_rerolled_with_a_bigger_budget(self):
+        provider = LLMProvider(self._config(tool_call_retries=2))
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        result = await self._call(
+            provider,
+            [
+                _mock_httpx_response(self._spent_thinking()),
+                _mock_httpx_response(self._spent_thinking()),
+                good,
+            ],
+        )
+
+        assert result == '{"comments": []}'
+        budgets = [p.kwargs["json"]["max_tokens"] for p in self.posts]
+        assert budgets == [4096, 8192, 16384]
+        # The correction names the cause, and the temperature is left alone:
+        # the model did not misunderstand, it ran out of room.
+        correction = self.posts[1].kwargs["json"]["messages"][-1]["content"]
+        assert "output limit" in correction
+        assert (
+            self.posts[1].kwargs["json"]["temperature"]
+            == self.posts[0].kwargs["json"]["temperature"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_raised_budget_sticks_for_later_calls(self):
+        provider = LLMProvider(self._config(tool_call_retries=1))
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        await self._call(provider, [_mock_httpx_response(self._spent_thinking()), good])
+        await self._call(provider, [good])
+
+        assert self.posts[-1].kwargs["json"]["max_tokens"] == 8192
+
+    @pytest.mark.asyncio
+    async def test_the_budget_stops_at_the_registry_cap(self):
+        """A model the registry knows is capped at its max_output_tokens."""
+        with patch("mira.llm.registry.max_output_tokens", return_value=6000):
+            provider = LLMProvider(self._config(tool_call_retries=2))
+            good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+            await self._call(
+                provider,
+                [
+                    _mock_httpx_response(self._spent_thinking()),
+                    _mock_httpx_response(self._spent_thinking()),
+                    good,
+                ],
+            )
+        budgets = [p.kwargs["json"]["max_tokens"] for p in self.posts]
+        assert budgets == [4096, 6000, 6000]
+
+    @pytest.mark.asyncio
+    async def test_a_prose_reply_is_still_rerolled_hotter_not_bigger(self):
+        provider = LLMProvider(self._config(tool_call_retries=1))
+        prose = _mock_httpx_response(_make_response_json("Looks fine to me."))
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        await self._call(provider, [prose, good])
+
+        assert self.posts[1].kwargs["json"]["max_tokens"] == 4096
+        assert (
+            self.posts[1].kwargs["json"]["temperature"]
+            > self.posts[0].kwargs["json"]["temperature"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_unsalvageable_truncated_arguments_get_room_too(self):
+        provider = LLMProvider(self._config(tool_call_retries=1))
+        cut = _make_tool_response_json("")  # arguments lost entirely
+        cut["choices"][0]["finish_reason"] = "length"
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+
+        await self._call(provider, [_mock_httpx_response(cut), good])
+
+        assert self.posts[1].kwargs["json"]["max_tokens"] == 8192
+
+
+class TestUnlimitedOutput:
+    """`max_tokens: 0` sends no cap: the model's own maximum applies."""
+
+    _TOOL = {
+        "type": "function",
+        "function": {"name": "submit_review", "parameters": {"type": "object"}},
+    }
+
+    def _client(self, responses):
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=responses)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_no_cap_on_any_request_kind(self):
+        provider = LLMProvider(LLMConfig(model="test-model", max_tokens=0))
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+        text = _mock_httpx_response(_make_response_json("ok"))
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([good, text, good])
+            await provider.complete_with_tools([{"role": "user", "content": "x"}], [self._TOOL])
+            await provider.complete([{"role": "user", "content": "x"}])
+            await provider.complete_agentic([{"role": "user", "content": "x"}], [self._TOOL])
+            bodies = [c.kwargs["json"] for c in cls.return_value.post.call_args_list]
+        assert all("max_tokens" not in body for body in bodies)
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_per_call_cap_still_applies(self):
+        provider = LLMProvider(LLMConfig(model="test-model", max_tokens=0))
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([_mock_httpx_response(_make_response_json("ok"))])
+            await provider.complete([{"role": "user", "content": "x"}], max_tokens=512)
+            body = cls.return_value.post.call_args.kwargs["json"]
+        assert body["max_tokens"] == 512
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_reply_has_no_budget_to_raise(self):
+        """With no cap the re-roll still happens, just without a bigger number."""
+        provider = LLMProvider(
+            LLMConfig(
+                model="test-model",
+                max_tokens=0,
+                tool_call_retries=1,
+                json_mode_fallback=False,
+                max_retries=1,
+                retry_min_wait=0,
+                retry_max_wait=0,
+            )
+        )
+        spent = {
+            "choices": [{"finish_reason": "length", "message": {"content": "", "reasoning": "hmm"}}]
+        }
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            cls.return_value = self._client([_mock_httpx_response(spent), good])
+            result = await provider.complete_with_tools(
+                [{"role": "user", "content": "x"}], [self._TOOL]
+            )
+            bodies = [c.kwargs["json"] for c in cls.return_value.post.call_args_list]
+        assert result == '{"comments": []}'
+        assert all("max_tokens" not in body for body in bodies)
+        assert "output limit" in bodies[1]["messages"][-1]["content"]

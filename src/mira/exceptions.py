@@ -75,7 +75,17 @@ class ToolCallFormatError(LLMError):
     resample the same mistake, so this is excluded from the transport-level
     retry and handled by ``complete_with_tools``, which re-rolls with a
     corrective prompt and finally falls back to JSON mode.
+
+    ``truncated`` is set when the reply was cut off at the output limit
+    (``finish_reason: length`` and its equivalents). A reasoning model that
+    spends the whole budget thinking produces exactly this — an empty reply
+    with a full ``reasoning_content`` — and a corrective prompt alone does not
+    help it; the re-roll has to come with a bigger budget.
     """
+
+    def __init__(self, code: str, *, truncated: bool = False, **kwargs: object) -> None:
+        super().__init__(code, **kwargs)
+        self.truncated = truncated
 
 
 class ResponseParseError(MiraError):

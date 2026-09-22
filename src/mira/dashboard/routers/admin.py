@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel
@@ -162,14 +163,20 @@ async def get_models() -> ModelsResponse:
         fetch_catalog,
         oauth_option_groups,
         provider_models,
+        with_reasoning_levels,
     )
     from mira.dashboard.models_config import (
         API_STYLES,
+        FALLBACK_CHAIN_LIMIT,
+        FALLBACK_SETTING_KEYS,
+        MAX_TOKENS_KEY,
         THINKING_MODES,
         apply_endpoint_binding,
         describe_call,
         effective_route,
+        get_fallback_routes,
         get_indexing_model,
+        get_max_tokens,
         get_review_model,
         get_review_thinking_mode,
         get_security_model,
@@ -178,17 +185,28 @@ async def get_models() -> ModelsResponse:
         resolve_oauth_default,
     )
     from mira.llm import endpoints as endpoint_store
+    from mira.llm import models_dev
     from mira.oauth import registry, store
     from mira.oauth.routes import api_route
 
     config = load_config()
     llm = config.llm
     db = _api._app_db
+    # The provider's reasoning levels per model, so the thinking picker can
+    # offer what the review model actually takes.
+    await models_dev.warm()
     db_indexing = db.get_setting("indexing_model")
     db_review = db.get_setting("review_model")
     db_security = db.get_setting("security_model")
     thinking = get_review_thinking_mode(llm, db.get_setting("review_thinking_mode"))
     api_style = resolve_api_style(llm, db.get_setting("api_style"))
+    # The fallback chains, resolved the way a review resolves them, and the
+    # config-level chain beside each — the "inherit" target.
+    db_fallbacks = {key: db.get_setting(key) for key in FALLBACK_SETTING_KEYS.values()}
+    fallbacks = {p: get_fallback_routes(p, llm, db_fallbacks) for p in FALLBACK_SETTING_KEYS}
+    config_fallbacks = {p: get_fallback_routes(p, llm)[0] for p in FALLBACK_SETTING_KEYS}
+    db_max_tokens = db.get_setting(MAX_TOKENS_KEY)
+    max_tokens = get_max_tokens(llm, db_max_tokens)
 
     # Where a bare model id goes. Every value this endpoint reports is read
     # through the same binding a review uses, so the *selected* values are
@@ -222,7 +240,9 @@ async def get_models() -> ModelsResponse:
                 "group": ("API key — " if explicit else "") + api_group,
                 "detail": api_detail,
             }
-            for m in build_options(api_backend, api_catalog, purpose)
+            for m in with_reasoning_levels(
+                build_options(api_backend, api_catalog, purpose), api_config
+            )
         ]
 
     default_backend: dict = {}
@@ -303,6 +323,12 @@ async def get_models() -> ModelsResponse:
         db_security or llm.security_model or db_review or llm.review_model,
     )
 
+    review_options = options("review")
+    # What the saved review model takes: its option's levels, if any.
+    review_levels = next(
+        (o.reasoning_levels for o in review_options if o.value == review["value"]), []
+    )
+
     return ModelsResponse(
         indexing_model=indexing["value"],
         review_model=review["value"],
@@ -325,14 +351,29 @@ async def get_models() -> ModelsResponse:
             get_security_model(llm), llm.security_model or llm.review_model
         )["value"],
         indexing_options=options("indexing"),
-        review_options=options("review"),
+        review_options=review_options,
         security_options=options("review"),
+        review_thinking_levels=review_levels,
+        review_thinking_source="provider" if review_levels else "builtin",
         review_thinking_mode=thinking or "off",
         thinking_options=[ModelOption(**m) for m in THINKING_MODES],
         api_style=api_style,
         api_style_options=[ModelOption(**m) for m in API_STYLES],
         oauth_provider=default_provider,
         oauth_label=default_backend.get("provider_label", ""),
+        indexing_fallbacks=fallbacks["indexing"][0],
+        review_fallbacks=fallbacks["review"][0],
+        security_fallbacks=fallbacks["security"][0],
+        indexing_fallbacks_source=fallbacks["indexing"][1],
+        review_fallbacks_source=fallbacks["review"][1],
+        security_fallbacks_source=fallbacks["security"][1],
+        config_indexing_fallbacks=config_fallbacks["indexing"],
+        config_review_fallbacks=config_fallbacks["review"],
+        config_security_fallbacks=config_fallbacks["security"],
+        fallback_chain_limit=FALLBACK_CHAIN_LIMIT,
+        max_tokens=max_tokens,
+        max_tokens_source="dashboard" if max_tokens != llm.max_tokens else "config",
+        config_max_tokens=llm.max_tokens,
     )
 
 
@@ -429,9 +470,23 @@ def set_global_settings(body: GlobalSettingsUpdate, request: Request) -> dict:
 @router.put("/api/settings/models")
 def set_models(body: ModelsUpdate, request: Request) -> dict:
     _require_admin(request)
-    from mira.dashboard.models_config import API_STYLE_VALUES, THINKING_MODE_VALUES
+    import json
 
-    if body.review_thinking_mode not in THINKING_MODE_VALUES:
+    from mira.dashboard.models_config import (
+        API_STYLE_VALUES,
+        FALLBACK_CHAIN_LIMIT,
+        FALLBACK_SETTING_KEYS,
+        MAX_TOKENS_KEY,
+        THINKING_MODE_VALUES,
+        normalize_fallbacks,
+    )
+
+    # A built-in level, or one a provider reports for its model ("xhigh",
+    # "minimal", "none"): the picker offers whatever the backend said, so
+    # the check is on the shape, not on our list.
+    if body.review_thinking_mode not in THINKING_MODE_VALUES and not re.fullmatch(
+        r"[a-z][a-z0-9_-]{0,15}", body.review_thinking_mode or ""
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"{body.review_thinking_mode!r} is not a valid thinking mode.",
@@ -448,6 +503,34 @@ def set_models(body: ModelsUpdate, request: Request) -> dict:
     _api._app_db.set_setting("indexing_model", body.indexing_model.strip())
     _api._app_db.set_setting("review_model", body.review_model.strip())
     _api._app_db.set_setting("security_model", body.security_model.strip())
+    # A chain is written only when it was sent: the setup page sends none
+    # and must not clear what the Models page stored. null clears the
+    # override ("" reads back as unset, as for the models); a list is stored
+    # as sent, an empty one included, since "no fallbacks" is a choice too.
+    for purpose, key in FALLBACK_SETTING_KEYS.items():
+        field = f"{purpose}_fallbacks"
+        if field not in body.model_fields_set:
+            continue
+        chain = getattr(body, field)
+        if chain is None:
+            _api._app_db.set_setting(key, "")
+            continue
+        cleaned = normalize_fallbacks(chain, limit=None)
+        if len(cleaned) > FALLBACK_CHAIN_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"At most {FALLBACK_CHAIN_LIMIT} fallback models per purpose.",
+            )
+        _api._app_db.set_setting(key, json.dumps(cleaned))
+    if "max_tokens" in body.model_fields_set:
+        if body.max_tokens is None:
+            _api._app_db.set_setting(MAX_TOKENS_KEY, "")
+        elif body.max_tokens < 0:
+            raise HTTPException(
+                status_code=400, detail="max_tokens must be 0 (unlimited) or a positive count."
+            )
+        else:
+            _api._app_db.set_setting(MAX_TOKENS_KEY, str(body.max_tokens))
     # Clear "off" to "" rather than persisting the literal — "off" is the
     # default, and a stored value would shadow a mira.yaml
     # `review_reasoning_effort` override. "" (not None — the column is NOT NULL)

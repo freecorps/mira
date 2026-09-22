@@ -54,6 +54,12 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 def isolate_index_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep tests from writing Mira's durable state to the host data directory."""
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "indexes"))
+    # models.dev is a network document; a test that wants its levels loads
+    # a document of its own with ``models_dev.load``.
+    monkeypatch.setenv("MIRA_MODELS_DEV_URL", "")
+    from mira.llm import models_dev
+
+    models_dev.reset()
 
 
 @pytest.fixture

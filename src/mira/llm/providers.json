@@ -11,12 +11,16 @@
     "model_prefix": "'keep' sends the full vendor/model id (OpenRouter routes on it); 'strip' sends the bare model name.",
     "extra_headers": "Headers added to every request (attribution, client identification).",
     "reasoning_effort_map": "Renames for the unified reasoning.effort levels this endpoint spells differently.",
+    "reasoning_param": "How a Chat Completions request asks for a reasoning level: 'reasoning_effort' (the OpenAI field, what OpenAI-compatible endpoints take) or 'reasoning' (OpenRouter's nested {effort} object). The Responses API always uses the nested form.",
+    "models_dev": "This endpoint's provider id on models.dev, whose per-model reasoning_options say which levels each model takes. The picker offers those levels and a requested one is snapped to the nearest the model has. Empty for an endpoint the catalogue does not list.",
     "session_header": "Optional header carrying a stable per-conversation id (one per client instance, so one per review pass), for endpoints that route and cache by it.",
     "usage_url": "Optional GET endpoint reporting the key's allowance. Its document is read by the parser named in usage_format.",
     "usage_format": "Which parser reads usage_url's document (see mira.llm.key_providers). Currently: 'opencode-go'."
   },
 
   "openrouter": {
+    "models_dev": "openrouter",
+    "reasoning_param": "reasoning",
     "label": "OpenRouter",
     "description": "Pay-per-token access to Anthropic, OpenAI, Google, DeepSeek and more behind one key.",
     "docs_url": "https://openrouter.ai/docs",
@@ -32,6 +36,8 @@
   },
 
   "opencode-go": {
+    "models_dev": "opencode-go",
+    "reasoning_param": "reasoning_effort",
     "label": "OpenCode Go",
     "description": "OpenCode's $10/month subscription to open coding models (Kimi, GLM, DeepSeek, Qwen, MiniMax and more), metered in 5-hour, weekly and monthly windows.",
     "docs_url": "https://opencode.ai/docs/go/",
@@ -49,6 +55,8 @@
   },
 
   "opencode-zen": {
+    "models_dev": "opencode",
+    "reasoning_param": "reasoning_effort",
     "label": "OpenCode Zen",
     "description": "OpenCode's pay-per-token catalogue — Claude, GPT, Gemini and the open models — on the same key as Go.",
     "docs_url": "https://opencode.ai/docs/zen/",
@@ -63,6 +71,8 @@
   },
 
   "openai-api": {
+    "models_dev": "openai",
+    "reasoning_param": "reasoning_effort",
     "label": "OpenAI",
     "description": "OpenAI's own API, billed to your OpenAI account.",
     "docs_url": "https://platform.openai.com/docs/api-reference",
@@ -73,6 +83,8 @@
   },
 
   "deepseek": {
+    "models_dev": "deepseek",
+    "reasoning_param": "reasoning_effort",
     "label": "DeepSeek",
     "description": "DeepSeek's own API, direct and cheap for its own models.",
     "docs_url": "https://api-docs.deepseek.com",
@@ -83,6 +95,8 @@
   },
 
   "groq": {
+    "models_dev": "groq",
+    "reasoning_param": "reasoning_effort",
     "label": "Groq",
     "description": "Open models served fast on Groq's own hardware.",
     "docs_url": "https://console.groq.com/docs/openai",
@@ -93,6 +107,8 @@
   },
 
   "together": {
+    "models_dev": "togetherai",
+    "reasoning_param": "reasoning_effort",
     "label": "Together AI",
     "description": "Hosted open models, pay per token.",
     "docs_url": "https://docs.together.ai/docs/openai-api-compatibility",
@@ -103,6 +119,8 @@
   },
 
   "fireworks": {
+    "models_dev": "fireworks-ai",
+    "reasoning_param": "reasoning_effort",
     "label": "Fireworks AI",
     "description": "Hosted open models with function calling, pay per token.",
     "docs_url": "https://docs.fireworks.ai/tools-sdks/openai-compatibility",
@@ -113,6 +131,8 @@
   },
 
   "ollama": {
+    "models_dev": "",
+    "reasoning_param": "reasoning_effort",
     "label": "Ollama",
     "description": "Models running on your own machine or network. No key needed; point the URL at the host running Ollama.",
     "docs_url": "https://docs.ollama.com/api/openai-compatibility",
