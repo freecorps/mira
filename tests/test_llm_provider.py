@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1150,3 +1151,99 @@ class TestUnlimitedOutput:
         assert result == '{"comments": []}'
         assert all("max_tokens" not in body for body in bodies)
         assert "output limit" in bodies[1]["messages"][-1]["content"]
+
+
+class TestEndpointOutages:
+    """Review c0e47cea33e1cac8: a model timing out cost twelve minutes.
+
+    Every timeout was asked again max_retries times, and then the JSON-mode
+    rescue sent the same doomed request to the same endpoint again as many
+    times. Neither helps when the endpoint does not answer at all.
+    """
+
+    _TOOL = {
+        "type": "function",
+        "function": {"name": "submit_review", "parameters": {"type": "object"}},
+    }
+
+    def _provider(self) -> LLMProvider:
+        return LLMProvider(
+            LLMConfig(
+                model="slow-model",
+                max_retries=3,
+                retry_min_wait=0,
+                retry_max_wait=0,
+                tool_call_retries=2,
+            )
+        )
+
+    async def _call(self, provider, side_effect):
+        with patch("mira.llm.provider.httpx.AsyncClient") as cls:
+            client = AsyncMock()
+            client.post = AsyncMock(side_effect=side_effect)
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            cls.return_value = client
+            try:
+                return await provider.complete_with_tools(
+                    [{"role": "user", "content": "review"}], tools=[self._TOOL]
+                )
+            finally:
+                self.posts = client.post.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_is_tried_twice_and_json_mode_is_skipped(self):
+        provider = self._provider()
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await self._call(provider, httpx.ReadTimeout("slow"))
+        # Two attempts, not three plus three more in JSON mode.
+        assert len(self.posts) == 2
+        assert all("tools" in p.kwargs["json"] for p in self.posts)
+
+    @pytest.mark.asyncio
+    async def test_a_5xx_is_retried_but_json_mode_is_skipped(self):
+        provider = self._provider()
+        down = _mock_httpx_response(
+            {"error": {"message": "Upstream request failed: Endpoint is unavailable."}},
+            status_code=503,
+        )
+        with pytest.raises(LLMError, match="tool-call failed"):
+            await self._call(provider, [down, down, down])
+        assert len(self.posts) == 3
+        assert all("response_format" not in p.kwargs["json"] for p in self.posts)
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_connection_still_gets_its_second_try(self):
+        provider = self._provider()
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+        result = await self._call(provider, [httpx.ReadTimeout("stall"), good])
+        assert result == '{"comments": []}'
+
+    @pytest.mark.asyncio
+    async def test_a_format_failure_still_gets_the_json_rescue(self):
+        provider = self._provider()
+        prose = _mock_httpx_response(_make_response_json("I reviewed it, looks fine."))
+        as_json = _mock_httpx_response(_make_response_json('{"comments": [], "summary": "ok"}'))
+        result = await self._call(provider, [prose, prose, prose, as_json])
+        assert json.loads(result)["summary"] == "ok"
+        assert self.posts[-1].kwargs["json"]["response_format"] == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_an_empty_agentic_turn_says_why(self, caplog):
+        provider = self._provider()
+        spent = {
+            "choices": [
+                {"finish_reason": "length", "message": {"content": "", "reasoning_content": "hm"}}
+            ]
+        }
+        with (
+            patch("mira.llm.provider.httpx.AsyncClient") as cls,
+            caplog.at_level(logging.WARNING, logger="mira.llm.provider"),
+        ):
+            client = AsyncMock()
+            client.post = AsyncMock(return_value=_mock_httpx_response(spent))
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            cls.return_value = client
+            await provider.complete_agentic([{"role": "user", "content": "x"}], [self._TOOL])
+        assert "no tool call and an empty response (finish_reason=length" in caplog.text

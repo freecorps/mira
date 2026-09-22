@@ -190,6 +190,31 @@ def _retry_after_seconds(resp: httpx.Response) -> float | None:
     return max(0.0, (deadline - datetime.now(UTC)).total_seconds())
 
 
+# Attempts a request gets when it keeps timing out. A timeout on a
+# non-streaming call means the answer takes longer than ``request_timeout`` —
+# usually a reasoning model thinking at length — and asking again the same
+# way waits the same time again. One more try covers a stalled connection;
+# the full ``max_retries`` used to turn one slow model into six minutes.
+_TIMEOUT_ATTEMPTS = 2
+
+
+def _make_stop(config: LLMConfig) -> Any:
+    """Stop after ``max_retries`` attempts, or after two timeouts in a row."""
+    by_count = stop_after_attempt(config.max_retries)
+
+    def _stop(retry_state: Any) -> bool:
+        if by_count(retry_state):
+            return True
+        outcome = retry_state.outcome
+        exc = outcome.exception() if outcome is not None else None
+        return (
+            isinstance(exc, httpx.TimeoutException)
+            and retry_state.attempt_number >= _TIMEOUT_ATTEMPTS
+        )
+
+    return _stop
+
+
 def _make_wait(config: LLMConfig) -> Any:
     """Backoff curve: honour Retry-After, otherwise exponential plus jitter.
 
@@ -259,6 +284,16 @@ def _set_budget(body: dict, key: str, explicit: int | None, default: int | None)
     cap = explicit if explicit is not None else default
     if cap:
         body[key] = cap
+
+
+def _json_mode_can_help(exc: BaseException) -> bool:
+    """Would asking the same model for plain JSON fix this failure?
+
+    Only when the model answered and the answer was unusable as a tool call.
+    A timeout, a 5xx or a transport error is the endpoint not answering at
+    all, and a JSON-mode request goes to the same endpoint.
+    """
+    return isinstance(exc, ToolCallFormatError)
 
 
 def _asked_for_reasoning(body: dict) -> bool:
@@ -467,7 +502,7 @@ class OpenAICompatibleProvider:
         # Apply retry decorator imperatively so it reads config values
         # (max_retries, retry_min_wait, retry_max_wait) at instance time.
         self._retry = retry(
-            stop=stop_after_attempt(config.max_retries),
+            stop=_make_stop(config),
             wait=_make_wait(config),
             retry=retry_if_exception(_retriable),
             reraise=True,
@@ -921,8 +956,12 @@ class OpenAICompatibleProvider:
                         temperature=temperature,
                     )
                 except Exception as fallback_err:
-                    recovered = await self._json_mode_tool_fallback(
-                        messages, tools, temperature=temperature
+                    recovered = (
+                        await self._json_mode_tool_fallback(
+                            messages, tools, temperature=temperature
+                        )
+                        if _json_mode_can_help(primary_err) or _json_mode_can_help(fallback_err)
+                        else None
                     )
                     if recovered is not None:
                         return recovered
@@ -947,18 +986,25 @@ class OpenAICompatibleProvider:
                         fallback_model=self.config.fallback_model,
                         error=fallback_err,
                     ) from fallback_err
-            recovered = await self._json_mode_tool_fallback(
-                messages, tools, temperature=temperature
-            )
-            if recovered is not None:
-                return recovered
+            if _json_mode_can_help(primary_err):
+                recovered = await self._json_mode_tool_fallback(
+                    messages, tools, temperature=temperature
+                )
+                if recovered is not None:
+                    return recovered
+                rescue = "JSON mode did not recover it"
+            else:
+                # A timeout, a 5xx, a dropped connection: the endpoint did not
+                # answer, and a JSON-mode request to the same model would wait
+                # on the same endpoint. Hand the failure up at once, where a
+                # fallback chain can try another model.
+                rescue = "JSON mode was skipped, since the endpoint did not answer"
             logger.error(
-                "Tool call failed on %s after %d attempt(s) with no fallback "
-                "model configured, and JSON mode did not recover it (%s: %s)",
+                "Tool call failed on %s (%s: %s); %s",
                 self.config.model,
-                1 + self.config.tool_call_retries,
                 type(primary_err).__name__,
                 primary_err,
+                rescue,
                 exc_info=True,
             )
             raise LLMError(

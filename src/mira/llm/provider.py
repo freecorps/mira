@@ -223,4 +223,13 @@ class LLMProvider(OpenAICompatibleProvider):
             data = resp.json()
 
         self._account_usage(data)
-        return self._chat_message(data)
+        message = self._chat_message(data)
+        content = message.get("content")
+        if not message.get("tool_calls") and not (isinstance(content, str) and content.strip()):
+            # Neither a call nor an answer: say why, where the payload still is.
+            logger.warning(
+                "Model %s returned an agentic turn with no tool call and an %s",
+                model,
+                _empty_reply_detail(_finish_reason(data), reasoning=_carries_reasoning(message)),
+            )
+        return message
