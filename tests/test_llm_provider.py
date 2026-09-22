@@ -1247,3 +1247,33 @@ class TestEndpointOutages:
             cls.return_value = client
             await provider.complete_agentic([{"role": "user", "content": "x"}], [self._TOOL])
         assert "no tool call and an empty response (finish_reason=length" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_5xx_then_a_timeout_is_not_two_timeouts(self):
+        provider = self._provider()
+        down = _mock_httpx_response({"error": "busy"}, status_code=503)
+        good = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
+        result = await self._call(provider, [down, httpx.ReadTimeout("slow"), good])
+        assert result == '{"comments": []}'
+        assert len(self.posts) == 3
+
+    @pytest.mark.asyncio
+    async def test_the_json_rescue_goes_to_the_model_that_answered_badly(self):
+        provider = LLMProvider(
+            LLMConfig(
+                model="primary",
+                fallback_model="secondary",
+                max_retries=2,
+                retry_min_wait=0,
+                retry_max_wait=0,
+                tool_call_retries=0,
+            )
+        )
+        down = _mock_httpx_response({"error": "busy"}, status_code=503)
+        prose = _mock_httpx_response(_make_response_json("Looks fine."))
+        as_json = _mock_httpx_response(_make_response_json('{"comments": [], "summary": "ok"}'))
+        # primary: two 503s; secondary: prose; rescue: JSON.
+        result = await self._call(provider, [down, down, prose, as_json])
+        assert json.loads(result)["summary"] == "ok"
+        assert self.posts[-1].kwargs["json"]["model"] == "secondary"
+        assert self.posts[-1].kwargs["json"]["response_format"] == {"type": "json_object"}
