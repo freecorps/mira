@@ -479,6 +479,29 @@ class ReviewEngine:
         self._status = ReviewStatusReporter(provider, config, dry_run=dry_run)
         self._pr_info: PRInfo | None = None
 
+    def _output_reserve(self) -> int:
+        """Context left free for the answer when sizing a review prompt.
+
+        Read from the client, not from the config file: the dashboard can
+        raise the output budget above ``llm.max_tokens``, and a prompt sized
+        against the file's value would then leave the model less room than
+        it was promised. "Unlimited" (0) still needs room to answer in — the
+        model's own output cap from the registry, held to a quarter of the
+        context window so the diff is never squeezed out by it.
+        """
+        from mira.config import LLMConfig
+        from mira.llm import registry
+
+        config = getattr(self.llm, "config", None)
+        if not isinstance(config, LLMConfig):
+            config = self.config.llm
+        if config.max_tokens:
+            return config.max_tokens
+        return min(
+            registry.max_output_tokens(config.model, default=16384),
+            self.config.llm.max_context_tokens // 4,
+        )
+
     async def report_review_failure(self, exc: BaseException) -> None:
         """Turn a review that raised into a status saying so. Never raises.
 
@@ -1819,7 +1842,7 @@ class ReviewEngine:
         overhead = sum(self.llm.count_tokens(m["content"]) for m in overhead_messages)
         # Reserve output, per-group notes, path lists and tool instructions too.
         context_budget = (
-            self.config.llm.max_context_tokens - overhead - self.config.llm.max_tokens - 6000
+            self.config.llm.max_context_tokens - overhead - self._output_reserve() - 6000
         )
         chunks = chunk_files(
             expanded,
@@ -1883,7 +1906,7 @@ class ReviewEngine:
                     )
 
                 messages = _messages(chunk_history)
-                prompt_limit = self.config.llm.max_context_tokens - self.config.llm.max_tokens
+                prompt_limit = self.config.llm.max_context_tokens - self._output_reserve()
                 if sum(self.llm.count_tokens(m["content"]) for m in messages) > prompt_limit:
                     # Optional commit history must not displace owned diff hunks.
                     messages = _messages({})

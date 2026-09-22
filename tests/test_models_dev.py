@@ -219,3 +219,51 @@ class TestOnTheWire:
         cfg = LLMConfig(model="openai/gpt-5.6", reasoning_effort="max")
         # OpenRouter spells "max" as "xhigh", which this model has.
         assert self._body(cfg)["reasoning"] == {"effort": "xhigh"}
+
+
+class TestReviewFindings:
+    def test_a_bare_id_finds_a_unique_prefixed_key(self, catalogue):
+        assert models_dev.levels_for("openrouter", "gpt-5.6") == (
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        )
+
+    def test_a_bare_id_shared_by_disagreeing_vendors_stays_unknown(self):
+        models_dev.load(
+            {
+                "p": {
+                    "models": {
+                        "a/m": {"reasoning_options": [{"type": "effort", "values": ["low"]}]},
+                        "b/m": {"reasoning_options": [{"type": "effort", "values": ["high"]}]},
+                    }
+                }
+            }
+        )
+        try:
+            assert models_dev.levels_for("p", "m") is None
+        finally:
+            models_dev.reset()
+
+    async def test_a_failed_refresh_is_retried_after_a_minute_not_an_hour(self, monkeypatch):
+        monkeypatch.setenv("MIRA_MODELS_DEV_URL", "https://models.example/api.json")
+        models_dev.load(DOCUMENT)
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(side_effect=RuntimeError("down"))
+        clock = [1_000_000.0]
+        monkeypatch.setattr(models_dev.time, "time", lambda: clock[0])
+        models_dev.load(DOCUMENT)  # loaded "now"
+        try:
+            clock[0] += 3601  # the hour is up: refresh, and it fails
+            with patch("mira.llm.models_dev.httpx.AsyncClient", return_value=client):
+                assert await models_dev.warm() is True  # the old answer stands
+                clock[0] += 61  # a minute later it is tried again
+                assert await models_dev.warm() is True
+            assert client.get.await_count == 2
+            assert models_dev.levels_for("opencode-go", "glm-5.3-flash") == ("low", "high", "max")
+        finally:
+            models_dev.reset()

@@ -188,3 +188,72 @@ class TestFactory:
         provider = create_llm(config)
         assert not isinstance(provider, FallbackChain)
         assert provider.config.model == "a"
+
+
+class TestReviewFindings:
+    """Fixes from the PR review of the chain."""
+
+    async def test_an_empty_completion_falls_back(self):
+        first = _provider("a", complete="   ")
+        second = _provider("b", complete='{"ok": true}')
+        chain = FallbackChain([first, second])
+
+        assert await chain.complete([{"role": "user", "content": "x"}]) == '{"ok": true}'
+
+    async def test_all_empty_returns_the_empty_answer_rather_than_raising(self):
+        chain = FallbackChain([_provider("a", complete=""), _provider("b", complete="")])
+        assert await chain.complete([{"role": "user", "content": "x"}]) == ""
+
+    async def test_an_empty_agentic_hop_falls_back(self):
+        first = _provider("a")
+        first.complete_agentic = AsyncMock(return_value={"role": "assistant", "content": ""})
+        second = _provider("b")
+        chain = FallbackChain([first, second])
+
+        assert (await chain.complete_agentic([], tools=[{"type": "function"}]))["content"] == "hi"
+
+    async def test_raw_items_go_back_only_to_the_provider_that_issued_them(self):
+        items = [{"type": "reasoning", "encrypted_content": "opaque"}]
+        issuer = _provider("responses")
+        issuer.complete_agentic = AsyncMock(
+            return_value={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "1"}],
+                "items": items,
+            }
+        )
+        chain = FallbackChain([issuer, _provider("chat")])
+        first = await chain.complete_agentic([], tools=[{"type": "function"}])
+
+        convo = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "1"}],
+                "items": first["items"],
+            }
+        ]
+        # The issuer sees its own items again.
+        issuer.complete_agentic = AsyncMock(return_value={"role": "assistant", "content": "ok"})
+        await chain.complete_agentic(convo, tools=[{"type": "function"}])
+        assert issuer.complete_agentic.call_args.args[0][0]["items"] is items
+
+        # A fallback never does: the turn is rebuilt from content and calls.
+        issuer.complete_agentic = AsyncMock(side_effect=LLMError("api_error", status=500, body=""))
+        fallback = chain.providers[1]
+        await chain.complete_agentic(convo, tools=[{"type": "function"}])
+        sent = fallback.complete_agentic.call_args.args[0][0]
+        assert "items" not in sent
+        assert sent["tool_calls"] == [{"id": "1"}]
+        # The caller's conversation is not modified.
+        assert convo[0]["items"] is items
+
+    async def test_items_the_chain_did_not_issue_are_dropped_for_everyone(self):
+        provider = _provider("a")
+        chain = FallbackChain([provider, _provider("b")])
+        await chain.complete_agentic(
+            [{"role": "assistant", "content": "x", "items": [{"type": "message"}]}],
+            tools=[{"type": "function"}],
+        )
+        assert "items" not in provider.complete_agentic.call_args.args[0][0]

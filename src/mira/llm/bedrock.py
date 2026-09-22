@@ -21,6 +21,9 @@ from mira.llm.utils import loads_lenient
 
 logger = logging.getLogger(__name__)
 
+# The smallest thinking budget Bedrock accepts; it must also be below maxTokens.
+_MIN_THINKING_BUDGET = 1024
+
 # Generic tool used to force structured JSON output from models that lack
 # native json_mode. The model "calls" this tool with arbitrary JSON as input.
 _JSON_RESPONSE_TOOL = {
@@ -201,10 +204,20 @@ class BedrockProvider:
         # an explicit budget, not an effort level). Thinking requires temperature
         # unset, so drop it when enabled. Budget must stay below maxTokens.
         effort = self.config.reasoning_effort
+        if effort and effort != "off" and max_out and max_out <= _MIN_THINKING_BUDGET:
+            # Bedrock wants 1024 <= budget_tokens < maxTokens; a cap this small
+            # leaves no budget that satisfies both, so review without thinking
+            # rather than send a request it will refuse.
+            logger.info(
+                "Output cap %d is too small for extended thinking on %s; sending without it",
+                max_out,
+                model,
+            )
+            effort = None
         if effort and effort != "off":
             budget = {"low": 2048, "medium": 8192, "high": 16384, "max": 32768}.get(effort, 8192)
             if max_out:
-                budget = min(budget, max(1024, max_out - 1024))
+                budget = min(budget, max(_MIN_THINKING_BUDGET, max_out - 1024))
             kwargs["additionalModelRequestFields"] = {
                 "thinking": {"type": "enabled", "budget_tokens": budget}
             }

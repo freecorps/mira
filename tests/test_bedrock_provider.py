@@ -726,3 +726,42 @@ class TestUnlimitedOutput:
         call_kwargs = mock_client.converse.call_args[1]
         assert call_kwargs["additionalModelRequestFields"]["thinking"]["budget_tokens"] == 16384
         assert "maxTokens" not in call_kwargs["inferenceConfig"]
+
+
+class TestThinkingUnderASmallCap:
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_a_cap_too_small_for_thinking_sends_without_it(self, mock_session_cls):
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = _mock_converse_response("ok")
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config(reasoning_effort="high", max_tokens=1024))
+        await provider.complete([{"role": "user", "content": "hi"}], json_mode=False)
+
+        call_kwargs = mock_client.converse.call_args[1]
+        assert "additionalModelRequestFields" not in call_kwargs
+        assert call_kwargs["inferenceConfig"]["maxTokens"] == 1024
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_the_budget_stays_below_the_cap(self, mock_session_cls):
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = _mock_converse_response("ok")
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config(reasoning_effort="high", max_tokens=1500))
+        await provider.complete([{"role": "user", "content": "hi"}], json_mode=False)
+
+        budget = mock_client.converse.call_args[1]["additionalModelRequestFields"]["thinking"][
+            "budget_tokens"
+        ]
+        assert 1024 <= budget < 1500
