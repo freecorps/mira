@@ -964,8 +964,11 @@ export function SettingsPage() {
                 The output budget on every call, thinking included. A reasoning
                 model can spend a small budget entirely on thinking and answer
                 with nothing; <em>Unlimited</em> sends no cap, so the model
-                stops where it stops — its own maximum applies. Applies to every
-                purpose and to the fallback models.
+                stops where it stops — its own maximum applies. Requests are not
+                streamed, so a model that thinks past the request timeout (120s
+                by default) fails instead; a large custom limit such as 32768 is
+                the safer choice for reasoning models. Applies to every purpose
+                and to the fallback models.
               </p>
             </div>
             {backend !== "bedrock" && (
