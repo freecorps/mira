@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import logging
 
-from mira.llm.prompts.verify_fixes import build_verify_fixes_prompt, parse_verify_fixes_response
+from mira.llm.prompts.verify_fixes import (
+    VerifyFixesResult,
+    build_verify_fixes_prompt,
+    fixed_thread_ids,
+)
 from mira.llm.provider import LLMProvider
 from mira.models import PRInfo, ThreadDecision, UnresolvedThread
 from mira.providers.base import BaseProvider
@@ -77,9 +81,11 @@ async def verify_fixes(
     """Ask the LLM which previously-filed review issues are now fixed."""
     prompt = build_verify_fixes_prompt(file_groups)
     logger.debug("Verify-fixes prompt:\n%s", prompt[1]["content"])
-    response = await llm.complete(prompt, json_mode=True, temperature=0.0)
-    logger.debug("Verify-fixes raw response:\n%s", response)
-    return parse_verify_fixes_response(response)
+    result = await llm.generate_object(
+        prompt, VerifyFixesResult, name="submit_fix_verdicts", temperature=0.0
+    )
+    logger.debug("Verify-fixes response: %s", result)
+    return fixed_thread_ids(result)
 
 
 async def resolve_verified_threads(

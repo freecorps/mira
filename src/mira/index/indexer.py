@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 from collections.abc import Callable
@@ -13,12 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
+from pydantic import BaseModel, Field
 
 from mira.config import MiraConfig, load_config
 from mira.index.manifests import is_manifest, parse_manifest
 from mira.index.store import DirectorySummary, ExternalRef, FileSummary, IndexStore, SymbolInfo
 from mira.llm import create_llm
-from mira.llm.utils import strip_think_blocks
 from mira.platforms.fetch import RepoFetcher, make_fetcher
 
 logger = logging.getLogger(__name__)
@@ -221,86 +220,65 @@ def _safe_call(call: Any) -> tuple[str, str]:
     return "", ""
 
 
-def _strip_code_fences(raw: str) -> str:
-    """Strip markdown code fences (```json ... ```) from LLM output."""
-    text = raw.strip()
-    if text.startswith("```"):
-        # Remove opening fence (```json or ```)
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline + 1 :]
-        # Remove closing fence
-        if text.rstrip().endswith("```"):
-            text = text.rstrip()[:-3]
-    return text.strip()
+class _SymbolOut(BaseModel):
+    name: str
+    kind: str = Field(default="function", description="function, class, constant, ...")
+    signature: str = ""
+    description: str = Field(default="", description="One line.")
 
 
-_VALID_JSON_ESCAPES = set('"\\/bfnrtu')
+class _CallOut(BaseModel):
+    path: str = Field(description="Repo-relative path of the file defining the symbol.")
+    symbol: str
 
 
-def _escape_lone_backslashes(text: str) -> str:
-    """Escape backslashes that aren't part of a valid JSON escape sequence.
-
-    Models like DeepSeek mention PHP namespaces (``\\App\\Models``) or Windows
-    paths in summaries and emit the backslashes unescaped, so json.loads bails
-    with "Invalid \\escape". We walk string literals and double any backslash
-    that doesn't start a real escape, consuming valid escapes as pairs so an
-    escaped quote is never mistaken for a string boundary.
-    """
-    out: list[str] = []
-    in_string = False
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if not in_string:
-            if ch == '"':
-                in_string = True
-            out.append(ch)
-            i += 1
-        elif ch == "\\":
-            nxt = text[i + 1] if i + 1 < n else ""
-            if nxt in _VALID_JSON_ESCAPES:
-                out.append(ch + nxt)
-                i += 2
-            else:
-                out.append("\\\\")
-                i += 1
-        else:
-            if ch == '"':
-                in_string = False
-            out.append(ch)
-            i += 1
-    return "".join(out)
+class _SymbolRefOut(BaseModel):
+    source: str = Field(description="The function or method making the calls.")
+    calls: list[_CallOut] = Field(default_factory=list)
 
 
-def _parse_summarize_response(raw: str) -> list[dict[str, Any]]:
-    """Parse the LLM response from the summarization prompt."""
-    text = strip_think_blocks(_strip_code_fences(raw))
-    # strict=False tolerates raw newlines in strings; a repair pass for lone
-    # backslashes salvages otherwise-valid responses from models that don't
-    # escape paths/namespaces, so one bad string doesn't drop the whole batch.
-    data: Any = None
-    for candidate in (text, _escape_lone_backslashes(text)):
-        try:
-            data = json.loads(candidate, strict=False)
-            break
-        except (json.JSONDecodeError, TypeError):
-            continue
-    else:
-        logger.warning("Failed to parse summarization response: %s", raw[:300])
-        return []
-
-    if isinstance(data, dict) and "files" in data:
-        result: list[dict[str, Any]] = data["files"]
-        return result
-    if isinstance(data, list):
-        return list(data)
-    logger.warning(
-        "Summarization response has unexpected structure (keys: %s): %s",
-        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-        text[:200],
+class _ExternalRefOut(BaseModel):
+    kind: str = Field(
+        description=(
+            "terraform_module, docker_image, api_endpoint, go_import, git_url, "
+            "npm_package or pip_package."
+        )
     )
-    return []
+    target: str = Field(description="The URL, module path, image name, or package name.")
+    description: str = ""
+
+
+class _FileSummaryOut(BaseModel):
+    path: str
+    language: str = ""
+    summary: str = Field(default="", description="1-3 sentences on what the file does.")
+    symbols: list[_SymbolOut] = Field(default_factory=list)
+    imports: list[str] = Field(default_factory=list)
+    symbol_references: list[_SymbolRefOut] = Field(default_factory=list)
+    external_refs: list[_ExternalRefOut] = Field(default_factory=list)
+
+
+class _FileSummaries(BaseModel):
+    """Submit a summary for every file provided."""
+
+    files: list[_FileSummaryOut] = Field(default_factory=list)
+
+
+class _DirectorySummaryOut(BaseModel):
+    path: str = Field(description='The directory, or "(root)" for the repository root.')
+    summary: str = Field(description="1-2 sentences on what it contains and its purpose.")
+
+
+class _DirectorySummaries(BaseModel):
+    """Submit a summary for every directory listed."""
+
+    directories: list[_DirectorySummaryOut] = Field(default_factory=list)
+
+
+class _OneDirectorySummary(BaseModel):
+    """Submit the summary of the directory."""
+
+    summary: str = Field(description="1-2 sentences on what it contains and its purpose.")
 
 
 def _build_file_summary(path: str, content: str, file_data: dict[str, Any]) -> FileSummary:
@@ -385,9 +363,10 @@ async def _summarize_batch(
             from mira.llm.registry import max_output_tokens
 
             cap = min(max_output_tokens(llm.config.model, default=16384), 32768)
-            raw = await llm.complete(
+            result = await llm.generate_object(
                 messages,
-                json_mode=True,
+                _FileSummaries,
+                name="submit_file_summaries",
                 temperature=0.0,
                 max_tokens=cap,
             )
@@ -395,10 +374,8 @@ async def _summarize_batch(
             logger.warning("LLM summarization failed for batch of %d files: %s", len(files), exc)
             return []
 
-    parsed = _parse_summarize_response(raw)
-
     results = []
-    parsed_by_path = {d.get("path", ""): d for d in parsed}
+    parsed_by_path = {f.path: f.model_dump() for f in result.files}
     for path, content in files:
         if path in parsed_by_path:
             results.append((path, content, parsed_by_path[path]))
@@ -808,13 +785,13 @@ async def _summarize_directories(store: IndexStore, llm: Any, semaphore: asyncio
         ]
         async with semaphore:
             try:
-                raw = await llm.complete(
+                result = await llm.generate_object(
                     messages,
-                    json_mode=True,
+                    _DirectorySummaries,
+                    name="submit_directory_summaries",
                     temperature=0.0,
                     max_tokens=4096,
                 )
-                data = json.loads(strip_think_blocks(_strip_code_fences(raw)))
             except Exception as exc:
                 logger.warning("Directory batch summary failed: %s", exc)
                 return
@@ -822,13 +799,11 @@ async def _summarize_directories(store: IndexStore, llm: Any, semaphore: asyncio
         # Map returned summaries back to dir paths. Use "(root)" → "" so the
         # store key matches what other queries use.
         by_path: dict[str, str] = {}
-        for entry in data.get("directories") or []:
-            if not isinstance(entry, dict):
-                continue
-            p = str(entry.get("path", "")).strip()
+        for entry in result.directories:
+            p = entry.path.strip()
             if p == "(root)":
                 p = ""
-            s = str(entry.get("summary", "")).strip()
+            s = entry.summary.strip()
             if s:
                 by_path[p] = s
 
@@ -1025,9 +1000,13 @@ async def _summarize_directories_selective(
 
         async with semaphore:
             try:
-                raw = await llm.complete(messages, json_mode=True, temperature=0.0)
-                data = json.loads(strip_think_blocks(_strip_code_fences(raw)))
-                summary_text = data.get("summary", "")
+                result = await llm.generate_object(
+                    messages,
+                    _OneDirectorySummary,
+                    name="submit_directory_summary",
+                    temperature=0.0,
+                )
+                summary_text = result.summary.strip()
                 if summary_text:
                     store.upsert_directory(
                         DirectorySummary(

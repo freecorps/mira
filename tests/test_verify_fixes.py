@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-import json
+import pytest
+from pydantic import ValidationError
 
+from mira.llm.base import _as_json_object
 from mira.llm.prompts.verify_fixes import (
+    VerifyFixesResult,
     _extract_issue_description,
     build_verify_fixes_prompt,
-    parse_verify_fixes_response,
+    fixed_thread_ids,
 )
 from mira.models import UnresolvedThread
 
@@ -160,69 +163,54 @@ class TestBuildVerifyFixesPrompt:
         assert "Prompt for AI Agents" not in user
 
 
-class TestParseVerifyFixesResponse:
+class TestVerifyFixesResult:
+    """The verdicts arrive as a validated object; these pin what it accepts."""
+
+    @staticmethod
+    def _ids(payload: dict) -> list[str]:
+        return fixed_thread_ids(VerifyFixesResult.model_validate(payload))
+
     def test_valid_response_all_fixed(self):
-        raw = json.dumps(
-            {
-                "results": [
-                    {"id": "T1", "fixed": True},
-                    {"id": "T2", "fixed": True},
-                ]
-            }
-        )
-        assert parse_verify_fixes_response(raw) == ["T1", "T2"]
+        payload = {"results": [{"id": "T1", "fixed": True}, {"id": "T2", "fixed": True}]}
+        assert self._ids(payload) == ["T1", "T2"]
 
     def test_valid_response_mixed(self):
-        raw = json.dumps(
-            {
-                "results": [
-                    {"id": "T1", "fixed": True},
-                    {"id": "T2", "fixed": False},
-                    {"id": "T3", "fixed": True},
-                ]
-            }
-        )
-        assert parse_verify_fixes_response(raw) == ["T1", "T3"]
+        payload = {
+            "results": [
+                {"id": "T1", "fixed": True},
+                {"id": "T2", "fixed": False},
+                {"id": "T3", "fixed": True},
+            ]
+        }
+        assert self._ids(payload) == ["T1", "T3"]
 
     def test_valid_response_none_fixed(self):
-        raw = json.dumps(
-            {
-                "results": [
-                    {"id": "T1", "fixed": False},
-                ]
-            }
-        )
-        assert parse_verify_fixes_response(raw) == []
+        assert self._ids({"results": [{"id": "T1", "fixed": False}]}) == []
 
     def test_empty_results(self):
-        raw = json.dumps({"results": []})
-        assert parse_verify_fixes_response(raw) == []
+        assert self._ids({"results": []}) == []
 
-    def test_invalid_json(self):
-        assert parse_verify_fixes_response("NOT JSON {{{") == []
+    def test_missing_results_key_means_nothing_fixed(self):
+        assert self._ids({}) == []
 
-    def test_missing_results_key(self):
-        raw = json.dumps({"something": "else"})
-        assert parse_verify_fixes_response(raw) == []
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"results": "oops"},
+            {"results": [{"fixed": True}]},
+            {"results": [{"id": "T1"}]},
+            {"results": ["T1", "T2"]},
+        ],
+    )
+    def test_malformed_entries_are_refused(self, payload):
+        # Refused rather than read as "nothing fixed": the provider re-asks the
+        # model with the fields named instead of silently keeping every thread.
+        with pytest.raises(ValidationError):
+            VerifyFixesResult.model_validate(payload)
 
-    def test_results_not_a_list(self):
-        raw = json.dumps({"results": "oops"})
-        assert parse_verify_fixes_response(raw) == []
 
-    def test_entry_missing_id(self):
-        raw = json.dumps({"results": [{"fixed": True}]})
-        assert parse_verify_fixes_response(raw) == []
-
-    def test_entry_missing_fixed(self):
-        raw = json.dumps({"results": [{"id": "T1"}]})
-        assert parse_verify_fixes_response(raw) == []
-
-    def test_entry_not_dict(self):
-        raw = json.dumps({"results": ["T1", "T2"]})
-        assert parse_verify_fixes_response(raw) == []
-
-    def test_none_input(self):
-        assert parse_verify_fixes_response(None) == []
+class TestVerifyFixesReplyRecovery:
+    """Replies the provider still has to dig the object out of, in JSON mode."""
 
     def test_json_block_after_analysis_with_other_code_blocks(self):
         """LLM returns markdown analysis with ```python blocks before the ```json result."""
@@ -244,7 +232,9 @@ class TestParseVerifyFixesResponse:
             '{"results": [{"id": "T1", "fixed": true}, {"id": "T2", "fixed": false}]}\n'
             "```\n"
         )
-        assert parse_verify_fixes_response(raw) == ["T1"]
+        payload = _as_json_object(raw)
+        assert payload is not None
+        assert fixed_thread_ids(VerifyFixesResult.model_validate_json(payload)) == ["T1"]
 
     def test_json_block_after_plain_analysis(self):
         """LLM returns plain text analysis followed by a ```json result."""
@@ -254,4 +244,9 @@ class TestParseVerifyFixesResponse:
             '{"results": [{"id": "T1", "fixed": true}]}\n'
             "```\n"
         )
-        assert parse_verify_fixes_response(raw) == ["T1"]
+        payload = _as_json_object(raw)
+        assert payload is not None
+        assert fixed_thread_ids(VerifyFixesResult.model_validate_json(payload)) == ["T1"]
+
+    def test_invalid_json_is_unusable(self):
+        assert _as_json_object("NOT JSON {{{") is None

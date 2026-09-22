@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from mira.config import MiraConfig
 from mira.core.overlap import (
     _is_stacked,
-    _parse_overlap_response,
+    _OverlapVerdicts,
     _prefilter,
+    _verdicts,
     detect_overlaps,
 )
 from mira.index.store import IndexStore
@@ -175,25 +177,34 @@ def test_not_stacked_independent_branches():
 # ── Verdict parsing ───────────────────────────────────────────────────────
 
 
-def test_parse_overlap_response_valid():
-    raw = (
-        '{"overlaps": [{"pr_number": 5, "kind": "duplicate_effort", '
-        '"reason": "same feature", "confidence": 0.8}]}'
+def test_verdicts_valid():
+    result = _OverlapVerdicts.model_validate(
+        {
+            "overlaps": [
+                {
+                    "pr_number": 5,
+                    "kind": "duplicate_effort",
+                    "reason": " same feature ",
+                    "confidence": 0.8,
+                }
+            ]
+        }
     )
-    out = _parse_overlap_response(raw)
-    assert out == {5: ("duplicate_effort", "same feature", 0.8)}
+    assert _verdicts(result) == {5: ("duplicate_effort", "same feature", 0.8)}
 
 
-def test_parse_overlap_response_fenced_and_unknown_kind():
-    raw = '```json\n{"overlaps": [{"pr_number": 5, "kind": "weird", "confidence": 2}]}\n```'
-    out = _parse_overlap_response(raw)
-    # Unknown kind coerced to none, confidence clamped to 1.0.
-    assert out[5][0] == "none"
-    assert out[5][2] == 1.0
+def test_verdicts_clamp_confidence():
+    result = _OverlapVerdicts.model_validate(
+        {"overlaps": [{"pr_number": 5, "kind": "both", "confidence": 2}]}
+    )
+    assert _verdicts(result)[5][2] == 1.0
 
 
-def test_parse_overlap_response_garbage():
-    assert _parse_overlap_response("not json at all") == {}
+def test_unknown_kind_is_refused():
+    # Refused rather than coerced to "none": the provider re-asks the model
+    # with the field named, where coercing hid a verdict it meant to give.
+    with pytest.raises(ValidationError):
+        _OverlapVerdicts.model_validate({"overlaps": [{"pr_number": 5, "kind": "weird"}]})
 
 
 # ── End-to-end detect_overlaps with a fake provider/LLM ───────────────────
@@ -215,8 +226,8 @@ class _FakeLLM:
         self._response = response
         self.supports_json_mode = True
 
-    async def complete(self, messages, json_mode=True, **kw):
-        return self._response
+    async def generate_object(self, messages, schema, **kw):
+        return schema.model_validate_json(self._response)
 
 
 @pytest.mark.asyncio
@@ -309,7 +320,7 @@ async def test_detect_overlaps_no_survivors_skips_llm():
     class _ExplodingLLM:
         supports_json_mode = True
 
-        async def complete(self, *a, **k):
+        async def generate_object(self, *a, **k):
             raise AssertionError("LLM should not be called when no candidate survives")
 
     findings = await detect_overlaps(
