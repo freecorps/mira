@@ -203,14 +203,14 @@ def _make_stop(config: LLMConfig) -> Any:
     by_count = stop_after_attempt(config.max_retries)
 
     def _stop(retry_state: Any) -> bool:
-        if by_count(retry_state):
-            return True
+        # Consecutive timeouts, kept on the call's own retry state: a 503
+        # followed by one timeout is not two timeouts, and still retries.
         outcome = retry_state.outcome
         exc = outcome.exception() if outcome is not None else None
-        return (
-            isinstance(exc, httpx.TimeoutException)
-            and retry_state.attempt_number >= _TIMEOUT_ATTEMPTS
-        )
+        timeouts = getattr(retry_state, "mira_timeouts", 0)
+        timeouts = timeouts + 1 if isinstance(exc, httpx.TimeoutException) else 0
+        retry_state.mira_timeouts = timeouts
+        return by_count(retry_state) or timeouts >= _TIMEOUT_ATTEMPTS
 
     return _stop
 
@@ -849,8 +849,12 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, str]],
         tools: list[dict],
         temperature: float | None = None,
+        model: str | None = None,
     ) -> str | None:
         """Ask for the tool's arguments as plain JSON when tool calling won't work.
+
+        ``model`` is the one whose tool call went wrong — the primary unless
+        said otherwise — since that is the model the rescue is for.
 
         Some models — and some gateways in front of them — advertise tool
         calling but answer with prose, truncated arguments, or a 400. Rather
@@ -880,12 +884,13 @@ class OpenAICompatibleProvider:
                 ),
             },
         ]
+        target = model or self.config.model
         try:
-            raw = await self._call_llm(self.config.model, prompt, True, temperature=temperature)
+            raw = await self._call_llm(target, prompt, True, temperature=temperature)
         except Exception as exc:
             logger.warning(
                 "JSON-mode fallback failed on %s (%s: %s)",
-                self.config.model,
+                target,
                 type(exc).__name__,
                 exc,
                 exc_info=True,
@@ -956,11 +961,21 @@ class OpenAICompatibleProvider:
                         temperature=temperature,
                     )
                 except Exception as fallback_err:
+                    # Rescue the model whose answer was malformed: the fallback
+                    # when it was, else the primary when it was. A model that
+                    # did not answer at all gets no JSON-mode request.
+                    rescue_model = (
+                        self.config.fallback_model
+                        if _json_mode_can_help(fallback_err)
+                        else self.config.model
+                        if _json_mode_can_help(primary_err)
+                        else None
+                    )
                     recovered = (
                         await self._json_mode_tool_fallback(
-                            messages, tools, temperature=temperature
+                            messages, tools, temperature=temperature, model=rescue_model
                         )
-                        if _json_mode_can_help(primary_err) or _json_mode_can_help(fallback_err)
+                        if rescue_model
                         else None
                     )
                     if recovered is not None:
