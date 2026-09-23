@@ -162,6 +162,7 @@ async def get_models() -> ModelsResponse:
         endpoint_options,
         fetch_catalog,
         oauth_option_groups,
+        protocol_detail,
         provider_models,
         with_reasoning_levels,
     )
@@ -230,7 +231,6 @@ async def get_models() -> ModelsResponse:
     api_catalog = await fetch_catalog(api_config)
     api_desc = describe_call(api_config)
     api_group = f"{api_desc['provider_label']} · {endpoint_host(api_desc['endpoint'])}"
-    api_detail = f"{api_desc['protocol']} · API key"
 
     def api_options(purpose: str, *, explicit: bool) -> list[dict]:
         """The key path's models: bare when it is the default, ``api:`` otherwise."""
@@ -239,7 +239,8 @@ async def get_models() -> ModelsResponse:
                 **m,
                 "value": api_route(m["value"]) if explicit else m["value"],
                 "group": ("API key — " if explicit else "") + api_group,
-                "detail": api_detail,
+                # Per model: one endpoint can serve models over two protocols.
+                "detail": protocol_detail(api_config, m["value"], "API key"),
             }
             for m in with_reasoning_levels(
                 build_options(api_backend, api_catalog, purpose), api_config

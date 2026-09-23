@@ -711,7 +711,7 @@ class TestCatalog:
                 "backend": "opencode-go",
                 "catalog": None,
                 "group": "OpenCode Go · opencode.ai/zen/go/v1",
-                "detail": "Chat Completions · stored key",
+                "key_detail": "stored key",
             }
         ]
         options = endpoint_options(entries, "review")

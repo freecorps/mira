@@ -269,6 +269,39 @@ def bind_model(
 ) -> LLMConfig:
     """The LLMConfig a call for ``value`` is made with.
 
+    Whatever the route, the protocol is the model's when it differs from its
+    endpoint's (see :mod:`mira.llm.protocols`), so the Models page describes
+    the call that will actually be made.
+    """
+    from mira.llm.protocols import with_model_protocol
+
+    return with_model_protocol(
+        _bind_model(
+            base,
+            value,
+            model_is_explicit=model_is_explicit,
+            default=default,
+            thinking_mode=thinking_mode,
+            api_style=api_style,
+            api_endpoint=api_endpoint,
+            purpose=purpose,
+        )
+    )
+
+
+def _bind_model(
+    base: LLMConfig,
+    value: str,
+    *,
+    model_is_explicit: bool,
+    default: tuple[str, str],
+    thinking_mode: str | None = None,
+    api_style: str | None = None,
+    api_endpoint: str | None = None,
+    purpose: str = "",
+) -> LLMConfig:
+    """:func:`bind_model` before the model's own protocol is applied.
+
     ``value`` is whatever the DB → config chain produced for a purpose: a
     bare model id, or a route naming its backend (see
     :mod:`mira.oauth.routes`). Three cases, in order:
@@ -455,8 +488,10 @@ def describe_call(config: LLMConfig) -> dict:
                 else (f"key from {source[4:]}" if source.startswith("env:") else "no key")
             ),
             "model": config.model,
-            "api_style": stored.api_style,
-            "protocol": next(s["label"] for s in API_STYLES if s["value"] == stored.api_style),
+            # The bound config's, not the row's: a model served over the
+            # other protocol has already been moved to it (bind_model).
+            "api_style": style,
+            "protocol": next(s["label"] for s in API_STYLES if s["value"] == style),
             "transport": "HTTPS",
             "endpoint": stored.base_url,
             "connected": True,
