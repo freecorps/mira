@@ -137,6 +137,11 @@ _GREP_SKIP_DIRS = ("node_modules/", "vendor/", "dist/", "build/", ".git/")
 _GREP_LATE_MARKERS = ("test", "spec", "docs/", ".md", "fixture", "mock", "__snapshots__")
 
 
+def _in_skipped_dir(path: str) -> bool:
+    """A whole path segment names a skipped directory (`src/myvendor/` is kept)."""
+    return any(path.startswith(d) or f"/{d}" in path for d in _GREP_SKIP_DIRS)
+
+
 def _grep_order(path: str) -> tuple[int, str]:
     lower = path.lower()
     return (1 if any(m in lower for m in _GREP_LATE_MARKERS) else 0, path)
@@ -326,11 +331,7 @@ class AgenticToolExecutor:
             return f"[invalid regex `{pattern}`: {exc}]"
 
         candidates = sorted(
-            (
-                c
-                for c in candidates
-                if not c.endswith(_GREP_SKIP_EXTS) and not any(d in c for d in _GREP_SKIP_DIRS)
-            ),
+            (c for c in candidates if not c.endswith(_GREP_SKIP_EXTS) and not _in_skipped_dir(c)),
             key=_grep_order,
         )
 
@@ -351,7 +352,10 @@ class AgenticToolExecutor:
             # Files the tree lists but the archive left out (`export-ignore`,
             # symlinks) were not searched either.
             archived = getattr(snapshot, "paths", None) or set()
-            missing = sum(1 for c in candidates if c not in archived) if archived else 0
+            oversized = getattr(snapshot, "oversized", None) or set()
+            missing = sum(
+                1 for c in candidates if (archived and c not in archived) or c in oversized
+            )
             if getattr(snapshot, "partial", False) or missing:
                 # Say so rather than let a miss read as proof of absence.
                 scope = f"{scanned} files; the rest of the repository could not be searched"

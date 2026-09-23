@@ -111,6 +111,9 @@ def number_hunk_lines(hunk: HunkInfo) -> str:
 
 
 _GUTTER_PREFIX_RE = re.compile(r"^\s*\d{1,6} (?=[+\- ])")
+# The blank gutter of a removed line, then its marker: exactly the gutter width
+# plus its separating space, so ordinary indented code is left alone.
+_BLANK_GUTTER_RE = re.compile(rf"^ {{{_GUTTER + 1}}}(?=-)")
 
 
 def strip_line_gutter(text: str) -> str:
@@ -133,6 +136,9 @@ def strip_line_gutter(text: str) -> str:
             lines.append(rest[1:])
         elif line[:1] in ("+", "-") and line[1:2] != line[:1]:
             lines.append(line[1:])
+        elif blank := _BLANK_GUTTER_RE.match(line):
+            # A removed line's gutter is blank: `      -    code`.
+            lines.append(line[blank.end() + 1 :])
         else:
             lines.append(line)
     return "\n".join(lines)
