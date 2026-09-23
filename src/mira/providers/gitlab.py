@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
@@ -53,6 +53,9 @@ from mira.triage.capabilities import (
 from mira.triage.capabilities import (
     TriageCapabilities,
 )
+
+if TYPE_CHECKING:
+    from mira.platforms.fetch import RepoSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +245,19 @@ class GitLabProvider(BaseProvider):
             logger.debug("Failed to fetch repo tree: %s", exc)
             return []
         return [it["path"] for it in items if it.get("type") == "blob"]
+
+    async def get_repo_snapshot(
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+    ) -> RepoSnapshot | None:
+        """The repository at ``ref`` from one archive download (see ``BaseProvider``)."""
+        from mira.platforms.fetch import fetch_snapshot
+
+        return await fetch_snapshot(
+            f"{self._project(pr_info)}/repository/archive.tar.gz?sha={quote(ref, safe='')}",
+            {"PRIVATE-TOKEN": self._token},
+            label=f"{pr_info.owner}/{pr_info.repo}@{ref[:12]}",
+            max_bytes=max_bytes,
+        )
 
     async def get_file_history(
         self, pr_info: PRInfo, paths: list[str], max_per_file: int = 5
