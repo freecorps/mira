@@ -374,13 +374,27 @@ async def _summarize_batch(
             logger.warning("LLM summarization failed for batch of %d files: %s", len(files), exc)
             return []
 
+    # Joined on the requested paths: a summary for a path nobody asked about
+    # is dropped, and a path summarized twice keeps its first summary rather
+    # than whichever the model wrote last.
+    parsed_by_path: dict[str, dict[str, Any]] = {}
+    for summary in result.files:
+        parsed_by_path.setdefault(summary.path, summary.model_dump())
     results = []
-    parsed_by_path = {f.path: f.model_dump() for f in result.files}
+    missing = []
     for path, content in files:
         if path in parsed_by_path:
             results.append((path, content, parsed_by_path[path]))
         else:
-            logger.debug("No summary returned for %s", path)
+            missing.append(path)
+    if missing:
+        # Left out of the index until the next run summarizes them.
+        logger.warning(
+            "Summarization returned nothing for %d of %d file(s): %s",
+            len(missing),
+            len(files),
+            ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else ""),
+        )
     return results
 
 

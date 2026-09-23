@@ -200,6 +200,19 @@ def test_verdicts_clamp_confidence():
     assert _verdicts(result)[5][2] == 1.0
 
 
+def test_a_pr_judged_twice_keeps_its_most_confident_verdict():
+    result = _OverlapVerdicts.model_validate(
+        {
+            "overlaps": [
+                {"pr_number": 5, "kind": "none", "confidence": 0.3},
+                {"pr_number": 5, "kind": "merge_conflict", "reason": "x", "confidence": 0.9},
+                {"pr_number": 5, "kind": "none", "confidence": 0.1},
+            ]
+        }
+    )
+    assert _verdicts(result) == {5: ("merge_conflict", "x", 0.9)}
+
+
 def test_unknown_kind_is_refused():
     # Refused rather than coerced to "none": the provider re-asks the model
     # with the field named, where coercing hid a verdict it meant to give.

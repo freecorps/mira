@@ -294,11 +294,19 @@ _JSON_SCHEMA_PROMPT = (
     "object itself: no tool call, no prose around it, no markdown fences."
 )
 
-# Words a 400 about ``response_format: json_schema`` carries when the endpoint
-# (or the model behind it) does not take the parameter. Anything else — a
-# context overflow, a bad key — is not about the strategy and says nothing
-# about the next call.
-_JSON_SCHEMA_REFUSAL_HINTS = ("response_format", "json_schema", "schema", "structured", "strict")
+# Words a 400 carries when the endpoint (or the model behind it) does not take
+# ``response_format: json_schema`` at all. Only these are remembered: a bare
+# "schema" or "strict" is as likely a complaint about this one tool's schema,
+# which says nothing about the next call's, and a context overflow or a bad
+# key is not about the strategy at all. Either way the call itself still
+# falls back to tool calling.
+_JSON_SCHEMA_REFUSAL_HINTS = (
+    "response_format",
+    "json_schema",
+    "text.format",
+    "structured output",
+    "structured_output",
+)
 
 # (endpoint, model) pairs seen not to honour ``response_format: json_schema``:
 # refused with a 400 naming it, or answered as though it were not there. Kept

@@ -76,6 +76,11 @@ class TestContentHash:
 class TestSummaryReplyRecovery:
     """Replies the provider still has to repair before they validate."""
 
+    def test_a_windows_path_is_not_a_unicode_escape(self):
+        # ``\\u`` followed by something other than four hex digits is a path.
+        data = loads_lenient('{"summary": "Reads C:\\users\\dev and \\u00e9"}')
+        assert data == {"summary": "Reads C:\\users\\dev and \u00e9"}
+
     def test_unescaped_backslash_in_string(self):
         # DeepSeek-style: PHP namespace backslashes left unescaped (issue #96).
         raw = '{"files": [{"path": "a.php", "summary": "Model in \\App\\Models namespace"}]}'
@@ -397,3 +402,32 @@ class TestIndexDiff:
 
         assert store.get_summary("old.py") is None
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_summaries_join_on_the_requested_paths(caplog):
+    """A duplicate keeps the first summary; an unrequested path is dropped; a
+    missing one is said out loud."""
+    import asyncio
+
+    from mira.index.indexer import _summarize_batch
+
+    llm = AsyncMock()
+    llm.config.model = "m"
+    llm.generate_object = AsyncMock(
+        side_effect=object_from(
+            {
+                "files": [
+                    {"path": "a.py", "summary": "first"},
+                    {"path": "a.py", "summary": "second"},
+                    {"path": "stranger.py", "summary": "nobody asked"},
+                ]
+            }
+        )
+    )
+    with caplog.at_level("WARNING"):
+        results = await _summarize_batch(
+            [("a.py", "x = 1"), ("b.py", "y = 2")], llm, asyncio.Semaphore(1)
+        )
+    assert [(path, data["summary"]) for path, _content, data in results] == [("a.py", "first")]
+    assert "1 of 2 file(s): b.py" in caplog.text

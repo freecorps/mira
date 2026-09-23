@@ -250,3 +250,20 @@ class TestVerifyFixesReplyRecovery:
 
     def test_invalid_json_is_unusable(self):
         assert _as_json_object("NOT JSON {{{") is None
+
+
+@pytest.mark.asyncio
+async def test_only_threads_that_were_asked_about_come_back_fixed():
+    from unittest.mock import AsyncMock
+
+    from mira.core.threads import verify_fixes
+    from tests.llm_support import object_from
+
+    llm = AsyncMock()
+    llm.generate_object = AsyncMock(
+        side_effect=object_from(
+            {"results": [{"id": "T1", "fixed": True}, {"id": "T-invented", "fixed": True}]}
+        )
+    )
+    groups = [("src/app.py", "x = 1\n", [_make_thread("T1"), _make_thread("T2")])]
+    assert await verify_fixes(llm, groups) == ["T1"]
