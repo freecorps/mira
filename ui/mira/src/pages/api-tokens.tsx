@@ -142,10 +142,11 @@ export function ApiTokensPage() {
   const [created, setCreated] = useState<CreatedApiToken | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const { data: tokens, loading } = useAsync(
-    () => api.listApiTokens(isAdmin),
-    [refreshKey, isAdmin]
-  )
+  const {
+    data: tokens,
+    loading,
+    error: loadError,
+  } = useAsync(() => api.listApiTokens(isAdmin), [refreshKey, isAdmin])
   const { data: users } = useAsync(
     () => (isAdmin ? api.listUsers() : Promise.resolve([])),
     [isAdmin]
@@ -274,6 +275,12 @@ export function ApiTokensPage() {
 
       {loading ? (
         <div className="text-sm text-muted-foreground">Loading…</div>
+      ) : loadError ? (
+        // Not the empty state: a list that failed to load must not read as a
+        // list with nothing in it, or a live token looks like it is gone.
+        <p className="text-sm break-words text-destructive">
+          Could not load tokens: {loadError}
+        </p>
       ) : !tokens || tokens.length === 0 ? (
         <Card>
           <CardContent className="flex flex-col items-center justify-center gap-3 py-12 text-center">

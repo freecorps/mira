@@ -2197,6 +2197,7 @@ class AppDatabase:
         repo: str,
         since: float,
         until: float,
+        after_id: int = 0,
     ) -> tuple[str, list[Any]]:
         """WHERE clause + params for the log filters, in ``?`` placeholder form.
 
@@ -2231,6 +2232,9 @@ class AppDatabase:
         if until > 0:
             clauses.append("created_at <= ?")
             params.append(float(until))
+        if after_id > 0:
+            clauses.append("id > ?")
+            params.append(int(after_id))
         where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         return where, params
 
@@ -2247,12 +2251,17 @@ class AppDatabase:
         limit: int = 200,
         offset: int = 0,
         oldest_first: bool = False,
+        after_id: int = 0,
     ) -> list[dict[str, Any]]:
         """Captured log lines matching the filters, newest first.
 
         ``oldest_first`` is for reading one trace as the story it is: paging
         through a review's lines backwards puts every stack trace before the
-        thing that caused it.
+        thing that caused it. It orders by id, which is the order the lines
+        were emitted in - one writer drains one FIFO queue - so that
+        ``after_id`` can page by key instead of by offset. Retention prunes
+        the oldest rows, which is the head of this order, and an offset into
+        it would skip a line for every row pruned between two pages.
         """
         limit = max(1, min(int(limit), MAX_APP_LOG_ROWS))
         offset = max(0, int(offset))
@@ -2264,14 +2273,11 @@ class AppDatabase:
             repo=repo,
             since=since,
             until=until,
+            after_id=after_id,
         )
         sql = (
             f"SELECT id, {self._APP_LOG_COLUMNS} FROM app_logs {where}"
-            + (
-                "ORDER BY created_at ASC, id ASC "
-                if oldest_first
-                else "ORDER BY created_at DESC, id DESC "
-            )
+            + ("ORDER BY id ASC " if oldest_first else "ORDER BY created_at DESC, id DESC ")
             + "LIMIT ? OFFSET ?"
         )
         rows = self._rows(sql, (*params, limit, offset))

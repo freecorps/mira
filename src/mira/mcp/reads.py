@@ -478,6 +478,7 @@ def list_logs(
     since: float = 0.0,
     until: float = 0.0,
     oldest_first: bool = False,
+    after_id: int = 0,
     limit: int,
     offset: int,
 ) -> list[dict[str, Any]]:
@@ -491,6 +492,7 @@ def list_logs(
         since=since,
         until=until,
         oldest_first=oldest_first,
+        after_id=after_id,
         limit=limit + 1,
         offset=offset,
     )

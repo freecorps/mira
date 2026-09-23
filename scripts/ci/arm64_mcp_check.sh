@@ -94,6 +94,9 @@ assert responses[1]["result"]["serverInfo"]["name"] == "mira"
 assert set(responses[1]["result"]["capabilities"]) == {"tools"}, "declared more than tools"
 
 names = {tool["name"] for tool in responses[2]["result"]["tools"]}
+# The log-trail tools (mira_search_logs, mira_get_trace) are absent on purpose:
+# the trail belongs to the install, no repository grant reaches it, and only
+# the HTTP transport offers them - to an admin's token.
 assert names == {
     "mira_list_repositories",
     "mira_list_findings",
@@ -102,6 +105,7 @@ assert names == {
     "mira_list_evaluations",
     "mira_list_indexed_files",
     "mira_get_indexed_file",
+    "mira_list_reviews",
 }, names
 assert all(t["annotations"]["readOnlyHint"] for t in responses[2]["result"]["tools"])
 
