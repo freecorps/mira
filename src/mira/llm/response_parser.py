@@ -8,7 +8,7 @@ import re
 
 from pydantic import BaseModel, Field, ValidationError
 
-from mira.core.context import extract_hunk_lines
+from mira.core.context import extract_hunk_lines, strip_line_gutter
 from mira.exceptions import ResponseParseError
 from mira.llm.utils import loads_lenient, strip_code_fences, strip_think_blocks
 from mira.models import (
@@ -117,6 +117,133 @@ def _snap_to_diff(line: int, ranges: list[tuple[int, int]]) -> int | None:
     return best
 
 
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_ELLIPSIS_LINES = {"...", "…", "// ...", "# ...", "/* ... */"}
+
+
+def _norm(text: str) -> str:
+    """One line with its whitespace collapsed — what a quote is compared on."""
+    return " ".join(text.split())
+
+
+def _hunk_views(file: FileDiff) -> tuple[list[tuple[int, str]], ...]:
+    """The file's hunks as line sequences, each line with a new-file anchor.
+
+    The *new* view is what the file reads after the change (context and added
+    lines, at their own line numbers); the *old* view is what it read before
+    (context and removed lines). A removed line has no new-file number, so it
+    is anchored at the new-file line that took its place — the one a comment
+    about the removal has to be posted on. The *mixed* view is every line in
+    diff order, for a quote that spans both sides of a change.
+    """
+    new_view: list[tuple[int, str]] = []
+    old_view: list[tuple[int, str]] = []
+    mixed_view: list[tuple[int, str]] = []
+    for hunk in file.hunks:
+        new = hunk.target_start
+        for line in hunk.content.rstrip("\n").split("\n"):
+            line = line.rstrip("\r")
+            header = _HUNK_HEADER_RE.match(line)
+            if header:
+                new = int(header.group(2))
+                continue
+            if line.startswith("\\"):
+                continue
+            if line.startswith("+"):
+                entry = (new, _norm(line[1:]))
+                new_view.append(entry)
+                mixed_view.append(entry)
+                new += 1
+            elif line.startswith("-"):
+                entry = (max(new, 1), _norm(line[1:]))
+                old_view.append(entry)
+                mixed_view.append(entry)
+            else:
+                entry = (new, _norm(line[1:] if line.startswith(" ") else line))
+                new_view.append(entry)
+                old_view.append(entry)
+                mixed_view.append(entry)
+                new += 1
+    return new_view, old_view, mixed_view
+
+
+def _match_at(view: list[tuple[int, str]], start: int, quote: list[str]) -> int | None:
+    """Index of the last view line when ``quote`` matches from ``start``, else None.
+
+    The first quoted line may be the tail of its line and the last one the
+    head of its line — models quote ``foo(bar)`` out of ``x = foo(bar)`` — and
+    the lines between must match whole. Blank lines on either side are skipped.
+    """
+    i = start
+    for n, want in enumerate(quote):
+        while i < len(view) and not view[i][1]:
+            i += 1
+        if i >= len(view):
+            return None
+        have = view[i][1]
+        if len(quote) == 1:
+            ok = want in have
+        elif n == 0:
+            ok = have.endswith(want)
+        elif n == len(quote) - 1:
+            ok = have.startswith(want)
+        else:
+            ok = have == want
+        if not ok:
+            return None
+        i += 1
+    return i - 1
+
+
+def _locate_quote(quote: str, views: tuple) -> list[tuple[int, int]]:
+    """Every ``(first, last)`` new-file line span where ``quote`` appears in the hunks."""
+    lines = [_norm(line) for line in quote.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return []
+    spans: list[tuple[int, int]] = []
+    if any(line in _ELLIPSIS_LINES for line in lines):
+        # An elided quote ("first line / … / last line") can only be placed by
+        # its first line: what the ellipsis stands for cannot be checked.
+        lines = [line for line in lines if line not in _ELLIPSIS_LINES]
+        if not lines:
+            return []
+        lines = lines[:1]
+    for view in views:
+        for start, (_line, text) in enumerate(view):
+            if not text:
+                continue
+            end = _match_at(view, start, lines)
+            if end is not None:
+                spans.append((view[start][0], view[end][0]))
+    # A context line is in every view; one place in the file is one span.
+    return sorted(set(spans))
+
+
+# A quote shorter than this says too little to overrule the model's own line:
+# `x` or `}` is in the diff a dozen times.
+_MIN_ANCHORING_QUOTE = 8
+
+
+def _anchor(
+    line: int, end_line: int | None, spans: list[tuple[int, int]], quote: str, in_diff: bool
+) -> tuple[int, int | None]:
+    """Where to file a comment, given where its quote was found.
+
+    The model's line stands when the quote is there, and when the quote is
+    too ambiguous to argue with a line that is itself in the diff. Otherwise
+    the quote wins: its only occurrence when it has one, else the occurrence
+    nearest the line the model gave.
+    """
+    if any(first <= line <= last for first, last in spans):
+        return line, end_line
+    distinctive = len(_norm(quote)) >= _MIN_ANCHORING_QUOTE
+    if in_diff and (len(spans) > 1 or not distinctive):
+        return line, end_line
+    first, last = min(spans, key=lambda s: min(abs(line - s[0]), abs(line - s[1])))
+    return first, (last if last > first else None)
+
+
 def convert_to_review_comments(
     response: LLMReviewResponse,
     valid_paths: set[str] | None = None,
@@ -127,10 +254,18 @@ def convert_to_review_comments(
     Filters out comments with hallucinated file paths if valid_paths is provided.
     When diff_files is given, validates existing_code against actual hunk content,
     checks for no-op suggestions, and ensures line numbers are within diff ranges.
+
+    The quote is also what places the comment. A model that quoted the code
+    right but counted its line wrong — the commonest slip of smaller models —
+    has its comment moved onto the quoted lines rather than snapped to the
+    nearest hunk edge or dropped. A quote is compared with its whitespace
+    collapsed, and again without a copied line-number gutter or diff marker,
+    before it is judged not to be in the diff.
     """
     hunk_index: dict[str, str] = (
         {f.path: extract_hunk_lines(f) for f in diff_files} if diff_files else {}
     )
+    views: dict[str, tuple] = {f.path: _hunk_views(f) for f in diff_files} if diff_files else {}
     diff_ranges: dict[str, list[tuple[int, int]]] = (
         _build_diff_line_ranges(diff_files) if diff_files else {}
     )
@@ -142,6 +277,23 @@ def convert_to_review_comments(
 
         if c.line < 1:
             continue
+
+        # Drop hallucinated citations (present existing_code that isn't in the diff),
+        # and let a citation that is there fix the line it is filed on.
+        quote = (c.existing_code or "").strip()
+        if hunk_index and quote and c.path in views:
+            spans = _locate_quote(quote, views[c.path]) or _locate_quote(
+                strip_line_gutter(quote), views[c.path]
+            )
+            if not spans:
+                continue
+            in_diff = any(start <= c.line <= end for start, end in diff_ranges.get(c.path, []))
+            line, end_line = _anchor(c.line, c.end_line, spans, quote, in_diff)
+            if line != c.line:
+                logger.debug(
+                    "Re-anchored %s:%d to line %d, where its quoted code is", c.path, c.line, line
+                )
+            c.line, c.end_line = line, end_line
 
         if diff_ranges and c.path in diff_ranges:
             file_ranges = diff_ranges[c.path]
@@ -156,14 +308,8 @@ def convert_to_review_comments(
         if c.suggestion and not c.body.strip():
             continue
 
-        # Drop hallucinated citations (present existing_code that isn't in the diff).
-        if hunk_index and c.existing_code:
-            hunk_text = hunk_index.get(c.path, "")
-            if c.existing_code.strip() not in hunk_text:
-                continue
-
         suggestion = c.suggestion
-        if suggestion and c.existing_code and suggestion.strip() == c.existing_code.strip():
+        if suggestion and c.existing_code and _norm(suggestion) == _norm(c.existing_code):
             suggestion = None
 
         result.append(

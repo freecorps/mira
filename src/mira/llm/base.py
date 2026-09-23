@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 import random
 import secrets
+import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, ClassVar, Protocol, TypeVar, runtime_checkable
@@ -21,7 +23,12 @@ from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
 from mira.llm import endpoints, structured
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
-from mira.llm.utils import loads_lenient, strip_code_fences, strip_think_blocks
+from mira.llm.utils import (
+    loads_lenient,
+    parse_xml_tool_call,
+    strip_code_fences,
+    strip_think_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -439,6 +446,9 @@ def _as_json_object(raw: object) -> str | None:
     try:
         parsed = json.loads(text, strict=False)
     except (json.JSONDecodeError, TypeError):
+        xml_call = parse_xml_tool_call(text)
+        if xml_call is not None and _carries_content(xml_call[1]):
+            return json.dumps(xml_call[1])
         repaired = loads_lenient(strip_code_fences(strip_think_blocks(text)))
         if not isinstance(repaired, dict) or not _carries_content(repaired):
             return None
@@ -527,6 +537,41 @@ def _pick_tool_call(tool_calls: object, tools: list[dict]) -> dict | None:
     if len(candidates) == 1 and not candidates[0]["function"].get("name"):
         return candidates[0]
     return None
+
+
+def _timed(kind: str) -> Any:
+    """Log how long one public call took, on which model, and how it ended.
+
+    A review's time goes almost entirely to these calls, and the HTTP log line
+    names neither the model nor what the call was for. ``kind`` names the call;
+    ``"tool"`` is replaced by the name of the tool the call asked for.
+    """
+
+    def decorate(method: Any) -> Any:
+        @functools.wraps(method)
+        async def timed(self: Any, *args: Any, **kwargs: Any) -> Any:
+            started = time.monotonic()
+            outcome = "failed"
+            try:
+                result = await method(self, *args, **kwargs)
+                outcome = "answered"
+                return result
+            finally:
+                what = kind
+                if kind == "tool":
+                    tools = kwargs.get("tools", args[1] if len(args) > 1 else None)
+                    what = _tool_name(tools) if isinstance(tools, list) else "tool call"
+                logger.info(
+                    "LLM %s on %s %s in %.1fs",
+                    what,
+                    getattr(getattr(self, "config", None), "model", "?"),
+                    outcome,
+                    time.monotonic() - started,
+                )
+
+        return timed
+
+    return decorate
 
 
 # ── Shared base for OpenAI-compatible providers ─────────────────────
@@ -923,6 +968,7 @@ class OpenAICompatibleProvider:
 
     # ── Public API (shared across chat and responses providers) ─────
 
+    @_timed("completion")
     async def complete(
         self,
         messages: list[dict[str, str]],
@@ -1200,6 +1246,7 @@ class OpenAICompatibleProvider:
         )
         return schema.model_validate_json(payload)
 
+    @_timed("tool")
     async def _structured(
         self,
         messages: list[dict[str, str]],
@@ -1344,6 +1391,7 @@ class OpenAICompatibleProvider:
                 "tool_call_failed", model=self.config.model, error=primary_err
             ) from primary_err
 
+    @_timed("agentic hop")
     async def complete_agentic(
         self,
         messages: list,

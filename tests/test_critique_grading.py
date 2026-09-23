@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from mira.core.passes import _critique_keep, _hunk_evidence, self_critique
+from mira.core.passes import (
+    _MAX_HUNK_EVIDENCE_CHARS,
+    _critique_keep,
+    _hunk_evidence,
+    self_critique,
+)
 from mira.models import FileChangeType, FileDiff, HunkInfo, ReviewComment, Severity
 
 
@@ -41,8 +46,15 @@ class TestKeepRule:
     def test_plausible_kept_only_when_severe_and_confident(self):
         assert _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, confidence=0.8))
         assert _critique_keep({"evidence": "plausible"}, _comment(Severity.BLOCKER, 0.95))
-        assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.7))
+        assert _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.7))
+        assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.65))
         assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.SUGGESTION, 0.95))
+
+    def test_plausible_floor_is_a_dial(self):
+        """review.critique_plausible_min_confidence trades recall for precision."""
+        c = _comment(Severity.WARNING, 0.7)
+        assert not _critique_keep({"evidence": "plausible"}, c, plausible_min_confidence=0.8)
+        assert _critique_keep({"evidence": "proven"}, c, plausible_min_confidence=0.99)
 
     def test_legacy_keep_boolean_honored(self):
         c = _comment()
@@ -64,7 +76,11 @@ class TestHunkEvidence:
 
     def test_picks_covering_hunk(self):
         c = _comment(line=10)
-        assert _hunk_evidence(c, [self._file()]) == "hunk-two content"
+        evidence = _hunk_evidence(c, [self._file()])
+        assert "hunk-two content" in evidence
+        assert "hunk-one" not in evidence
+        # Numbered like the reviewer's diff: the hunk starts at new line 8.
+        assert evidence.lstrip().startswith("8 ")
 
     def test_no_match_returns_empty(self):
         c = _comment(line=100)
@@ -79,7 +95,8 @@ class TestHunkEvidence:
             hunks=[HunkInfo(1, 5, 1, 50, "x" * 5000)],
         )
         out = _hunk_evidence(_comment(line=10), [f])
-        assert len(out) < 1300
+        assert len(out) <= _MAX_HUNK_EVIDENCE_CHARS + 1
+        assert out.endswith("…")
 
 
 class TestEvidenceGradedCritique:

@@ -141,6 +141,48 @@ def _repair_json(text: str) -> str:
     return _balance_json(text)
 
 
+_XML_FUNCTION_RE = re.compile(r"<function=([\w.\-]+)>")
+_XML_CLOSING_RE = re.compile(r"(?:\s*</(?:parameter|function|tool_call)>)+\s*$")
+_XML_PARAMETER_RE = re.compile(
+    r"<parameter=([\w.\-]+)>\s*(.*?)\s*(?:</parameter>|(?=<parameter=)|$)", re.S
+)
+
+
+def parse_xml_tool_call(text: str) -> tuple[str | None, dict] | None:
+    """Arguments from a tool call written in the Qwen/Hermes XML form, or None.
+
+    Some models on OpenAI-compatible gateways (seen on MiMo via OpenCode Go)
+    write the call as text — ``<tool_call><function=submit_review>
+    <parameter=comments>[…]</parameter>…`` — in the arguments or the content,
+    and the JSON repair pass, which cuts leaked XML off, is left with nothing.
+    Each parameter's value is read as JSON when it is JSON (the comments
+    array) and kept as text when it is not (a summary). Returns the function
+    name, when the call named one, and the arguments.
+    """
+    if "<parameter=" not in text:
+        return None
+    function = _XML_FUNCTION_RE.search(text)
+    arguments: dict = {}
+    for name, raw in _XML_PARAMETER_RE.findall(text):
+        # An unclosed last parameter runs to the end of the call's own tags.
+        value = _XML_CLOSING_RE.sub("", raw).strip()
+        if value[:1] in ("[", "{"):
+            parsed = loads_lenient(value)
+            if parsed is not None:
+                arguments[name] = parsed
+                continue
+        if value in ("true", "false", "null") or re.fullmatch(r"-?\d+(\.\d+)?", value):
+            try:
+                arguments[name] = json.loads(value)
+                continue
+            except json.JSONDecodeError:  # "007": a string that looks like a number
+                pass
+        arguments[name] = value
+    if not arguments:
+        return None
+    return (function.group(1) if function else None), arguments
+
+
 def loads_lenient(text: str) -> object | None:
     """Parse JSON, repairing leaked tool-call XML, missing braces and lone
     backslashes. None on failure."""
