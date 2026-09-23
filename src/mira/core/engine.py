@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,7 @@ from mira.core.commit_status import ReviewStatusReporter
 from mira.core.context import expand_context
 from mira.core.dependencies import discover_dependencies
 from mira.core.diff_parser import parse_diff
+from mira.core.enclosing import build_enclosing_context
 from mira.core.ensemble import merge_ensemble_runs
 from mira.core.file_filter import filter_files
 from mira.core.noise_filter import drop_already_posted, filter_noise
@@ -42,7 +44,7 @@ from mira.feedback.models import ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, new_finding_id
 from mira.feedback.retrieval import render_rule
 from mira.gate.policy import resolve_policy
-from mira.index.context import build_code_context
+from mira.index.context import SnapshotSourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
 from mira.llm.prompts.review import (
@@ -77,6 +79,10 @@ from mira.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 ReviewPartResult = tuple[list[ReviewComment], list[KeyIssue], str]
+
+# Room an agentic part keeps free for its tool output (the executor caps it at
+# 50 KB per part), so optional context never crowds the loop out of its window.
+_AGENTIC_OUTPUT_TOKENS = 13_000
 
 
 def _build_review_finding(
@@ -466,6 +472,9 @@ class ReviewEngine:
         self._index_was_empty = False
         self._agentic_source_fetcher: object | None = None
         self._agentic_repo_tree: list[str] = []
+        # The review's one reader of the reviewed commit (see
+        # SnapshotSourceFetcher). Built per review, closed when it ends.
+        self._source: SnapshotSourceFetcher | None = None
         # Rules retrieval put in front of this review. Recorded as Phase 3
         # evaluations once the review has been posted and has an id.
         self._exposed_rules: list[ExposedRule] = []
@@ -501,6 +510,29 @@ class ReviewEngine:
             registry.max_output_tokens(config.model, default=16384),
             self.config.llm.max_context_tokens // 4,
         )
+
+    def _usage(self) -> dict[str, int]:
+        """Tokens spent by every model this review called, not only the reviewer.
+
+        The critique, the summary and the dependency pass run on the indexing
+        client and the security pass on its own; counting the review client
+        alone left all of them out of the dashboard's token figure. A client
+        serving two purposes is counted once.
+        """
+        totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        seen: set[int] = set()
+        for client in (self.llm, self.indexing_llm, self.security_llm):
+            if id(client) in seen:
+                continue
+            seen.add(id(client))
+            usage = getattr(client, "usage", None)
+            if not isinstance(usage, dict):
+                continue
+            for key in totals:
+                value = usage.get(key, 0)
+                if isinstance(value, int):
+                    totals[key] += value
+        return totals
 
     async def report_review_failure(self, exc: BaseException) -> None:
         """Turn a review that raised into a status saying so. Never raises.
@@ -696,7 +728,19 @@ class ReviewEngine:
         """
         with log_context() as trace_id:
             logger.info("Review starting for %s (trace %s)", pr_url, trace_id)
-            return await self._review_pr_traced(pr_url)
+            started = time.monotonic()
+            result = await self._review_pr_traced(pr_url)
+            # Inside the trace, so it closes the story `mira_get_trace` tells;
+            # logged by the caller, it carried no trace id at all.
+            logger.info(
+                "Review complete for %s (trace %s): %d comment(s), %d tokens, %.1fs",
+                pr_url,
+                trace_id,
+                len(result.comments),
+                result.token_usage.get("total_tokens", 0),
+                time.monotonic() - started,
+            )
+            return result
 
     async def _review_pr_traced(self, pr_url: str) -> ReviewResult:
         """Fetch PR -> review -> post results.
@@ -747,23 +791,48 @@ class ReviewEngine:
                 logger.warning("Thread resolution failed, continuing: %s", exc)
                 return 0, 0, [], []
 
-        thread_result, diff_text = await _asyncio.gather(
-            _resolve_threads(),
-            self.provider.get_pr_diff(pr_info),
-        )
+        async def _all_bot_threads() -> list | None:
+            # Round detection: any thread of Mira's on the pull request means
+            # this is a follow-up pass. None when the platform would not say.
+            if not self.bot_name or self.provider is None:
+                return []
+            try:
+                return await self.provider.get_all_bot_threads(pr_info, self.bot_name)
+            except Exception as exc:
+                logger.warning("Failed to compute review round: %s", exc)
+                return None
 
-        threads_checked, llm_resolved, unresolved_threads, thread_decisions = thread_result
+        # Thread verification is an LLM call. It used to hold the review until
+        # it answered; now it runs alongside the diff fetch, the snapshot and
+        # the context build, and the review waits for it only where it needs
+        # the answer — right before the review prompt is written.
+        thread_task = _asyncio.create_task(_resolve_threads())
+        try:
+            diff_text, all_bot_threads = await _asyncio.gather(
+                self.provider.get_pr_diff(pr_info),
+                _all_bot_threads(),
+            )
+        except BaseException:
+            thread_task.cancel()
+            raise
 
         _lines_changed = sum(
             1 for line in diff_text.splitlines() if line.startswith("+") or line.startswith("-")
         )
 
-        placeholder_id: int | None = None
-        if not self.dry_run:
+        async def _placeholder() -> int | None:
+            if self.dry_run:
+                return None
             try:
-                placeholder_id = await self._post_placeholder_comment(pr_info)
+                return await self._post_placeholder_comment(pr_info)
             except Exception as exc:
                 logger.warning("Failed to post walkthrough placeholder: %s", exc)
+                return None
+
+        # Posted while the incremental diff and the conventions are read; it
+        # only has to be there before the walkthrough is.
+        placeholder_task = _asyncio.create_task(_placeholder())
+        placeholder_id: int | None = None
 
         _walkthrough_result: list[WalkthroughResult | None] = [None]
 
@@ -787,25 +856,39 @@ class ReviewEngine:
         review_round = 1
         is_review_rest = getattr(self, "_review_only_paths", None) is not None
         resolved_thread_dicts: list[dict] = []
-        try:
-            if self.bot_name and self.provider is not None:
-                all_bot_threads = await self.provider.get_all_bot_threads(
-                    pr_info,
-                    self.bot_name,
-                )
-                if all_bot_threads and not is_review_rest:
-                    review_round = 2
-                resolved_thread_dicts = [
-                    {
-                        "path": t.path,
-                        "line": t.line,
-                        "description": short_thread_description(t.body),
-                    }
-                    for t in all_bot_threads
-                    if t.is_resolved
-                ]
-        except Exception as exc:
-            logger.warning("Failed to compute review round: %s", exc)
+        if all_bot_threads:
+            if not is_review_rest:
+                review_round = 2
+            resolved_thread_dicts = [
+                {
+                    "path": t.path,
+                    "line": t.line,
+                    "description": short_thread_description(t.body),
+                }
+                for t in all_bot_threads
+                if t.is_resolved
+            ]
+
+        async def _threads_for_review() -> tuple[list[UnresolvedThread], list[dict]]:
+            """The open threads, and the settled ones, once verification has answered.
+
+            The thread list above was read while verification was still
+            running, so a thread it has just found fixed reads as open there.
+            It is counted among the settled ones here, where the review sees it.
+            """
+            _checked, _resolved, unresolved, decisions = await _asyncio.shield(thread_task)
+            fixed = {d.thread_id for d in decisions if d.fixed}
+            settled = list(resolved_thread_dicts)
+            settled.extend(
+                {
+                    "path": t.path,
+                    "line": t.line,
+                    "description": short_thread_description(t.body),
+                }
+                for t in all_bot_threads or []
+                if t.thread_id in fixed and not t.is_resolved
+            )
+            return unresolved, settled
 
         # Round 2+ uses incremental diff to avoid re-flagging untouched files.
         # Overlap detection keeps the full diff — its fingerprint must cover the
@@ -885,17 +968,31 @@ class ReviewEngine:
             overlap_task = _asyncio.create_task(self._detect_overlaps_safe(pr_info, full_diff_text))
 
         try:
+            placeholder_id = await placeholder_task
+        except BaseException:
+            thread_task.cancel()
+            raise
+
+        try:
             result = await self._review_diff_internal(
                 diff_text,
                 pr_title=pr_info.title,
                 pr_description=pr_info.description,
-                existing_comments=unresolved_threads or None,
                 on_walkthrough_ready=_on_walkthrough_ready,
                 review_round=review_round,
                 resolved_threads=resolved_thread_dicts or None,
                 team_conventions=team_conventions,
+                threads_source=_threads_for_review,
             )
+            threads_checked, llm_resolved, unresolved_threads, thread_decisions = await thread_task
         except BaseException as exc:
+            if isinstance(exc, Exception):
+                # Verification resolves threads on the platform; let a review
+                # that failed for its own reasons still finish that.
+                with contextlib.suppress(Exception):
+                    await thread_task
+            else:
+                thread_task.cancel()
             # Log the full traceback here, once, at the point the review gives
             # up. Callers re-raise or swallow this at their own level, so
             # without it the captured trail ends on the last warning some inner
@@ -1486,6 +1583,8 @@ class ReviewEngine:
         review_round: int = 1,
         resolved_threads: list[dict] | None = None,
         team_conventions: str = "",
+        threads_source: Callable[[], Awaitable[tuple[list[UnresolvedThread], list[dict]]]]
+        | None = None,
     ) -> ReviewResult:
         """Core review pipeline.
 
@@ -1495,7 +1594,53 @@ class ReviewEngine:
         forget task the moment the walkthrough LLM call resolves — allowing
         callers to post the walkthrough to GitHub well before chunked review
         completes. Exceptions in the callback are logged and swallowed.
+
+        ``threads_source``, when given, supplies the open and settled threads
+        late: it is awaited only when the review prompt is about to be
+        written, so whatever produces them (thread verification, an LLM call)
+        runs alongside everything before that point. Its answer replaces
+        ``existing_comments`` and ``resolved_threads``.
         """
+        try:
+            return await self._review_diff_body(
+                diff_text,
+                pr_title=pr_title,
+                pr_description=pr_description,
+                existing_comments=existing_comments,
+                on_walkthrough_ready=on_walkthrough_ready,
+                review_round=review_round,
+                resolved_threads=resolved_threads,
+                team_conventions=team_conventions,
+                threads_source=threads_source,
+            )
+        finally:
+            source, self._source = self._source, None
+            if source is not None:
+                await source.aclose()
+
+    async def _review_diff_body(
+        self,
+        diff_text: str,
+        pr_title: str = "",
+        pr_description: str = "",
+        existing_comments: list[UnresolvedThread] | None = None,
+        on_walkthrough_ready: Callable[[WalkthroughResult | None], Awaitable[None]] | None = None,
+        review_round: int = 1,
+        resolved_threads: list[dict] | None = None,
+        team_conventions: str = "",
+        threads_source: Callable[[], Awaitable[tuple[list[UnresolvedThread], list[dict]]]]
+        | None = None,
+    ) -> ReviewResult:
+        """The pipeline behind :meth:`_review_diff_internal`, which owns its cleanup."""
+        stage_started = time.monotonic()
+        timings: dict[str, float] = {}
+
+        def _mark(stage: str) -> None:
+            nonlocal stage_started
+            now = time.monotonic()
+            timings[stage] = now - stage_started
+            stage_started = now
+
         # `review_diff` reaches this without going through `review_pr`, and a
         # failure before rule retrieval must not leave the last review's
         # snapshot in place.
@@ -1565,6 +1710,21 @@ class ReviewEngine:
 
         filtered = selected
 
+        # One reader of the reviewed commit for the whole review, started now
+        # so the archive download overlaps the walkthrough and the index reads.
+        review_pr_info = getattr(self, "_pr_info", None)
+        if review_pr_info is not None and self.provider is not None:
+            self._source = SnapshotSourceFetcher(
+                self.provider,
+                review_pr_info,
+                review_pr_info.head_sha or review_pr_info.head_branch,
+                use_snapshot=self.config.review.repo_snapshot,
+                max_bytes=self.config.review.repo_snapshot_max_mb * 1024 * 1024,
+            )
+            self._source.start()
+        source = self._source
+        enclosing_budget = self.config.review.enclosing_context_tokens
+
         async def _generate_walkthrough() -> WalkthroughResult | None:
             if not self.config.review.walkthrough:
                 return None
@@ -1582,30 +1742,34 @@ class ReviewEngine:
                 logger.warning("Walkthrough generation failed, skipping: %s", exc)
                 return None
 
+        # Set by `_build_context` for `_part_context`: whether the index covers
+        # this pull request's files, and the repository tree JIT context needs.
+        part_context_on = False
+        part_context_jit = False
+        part_context_tree: set[str] | None = None
+
         async def _build_context() -> str:
+            """What every part shares: the repository's review docs and cross-repo impact.
+
+            The index and JIT context used to be built here too, once for the
+            whole pull request, and pasted into every part — so a part of UI
+            files carried the imports of the Python files another part had,
+            and a 29-file PR spread one 8k-token budget over all of them. Those
+            are built per part now (see `_part_context`).
+            """
+            nonlocal part_context_on, part_context_jit, part_context_tree
             if not self.config.review.code_context:
                 return ""
             try:
                 pr_info = getattr(self, "_pr_info", None)
                 if pr_info is not None:
                     store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
-                    source_fetcher = None
-                    if self.provider and pr_info:
-                        from mira.index.context import ProviderSourceFetcher
-
-                        source_fetcher = ProviderSourceFetcher(
-                            self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
-                        )
+                    source_fetcher = source
                     changed_paths = [f.path for f in filtered]
-                    ctx = await build_code_context(
-                        changed_paths=changed_paths,
-                        store=store,
-                        token_budget=self.config.review.context_token_budget,
-                        source_fetcher=source_fetcher,
-                    )
+                    ctx = ""
                     doc_context = store.get_all_review_context_text()
                     if doc_context:
-                        ctx = ctx + "\n\n" + doc_context
+                        ctx = doc_context
 
                     # `_jit_needed` and `_index_was_empty` aren't the same signal —
                     # see the field comments in __init__ before changing this.
@@ -1620,34 +1784,12 @@ class ReviewEngine:
                         self.config.review.agentic_tools or not index_has_data_for_changed
                     ):
                         self._agentic_source_fetcher = source_fetcher
-                        if hasattr(self.provider, "get_repo_tree"):
-                            try:
-                                tree_paths = set(
-                                    await self.provider.get_repo_tree(
-                                        pr_info, pr_info.head_sha or pr_info.head_branch
-                                    )
-                                )
-                            except Exception as exc:
-                                logger.debug("Repo tree fetch failed: %s", exc)
+                        tree_paths = set(await source_fetcher.tree()) or None
                         self._agentic_repo_tree = sorted(tree_paths) if tree_paths else []
 
-                    if not index_has_data_for_changed and source_fetcher is not None:
-                        try:
-                            from mira.index.jit_context import (
-                                build_jit_cross_file_context,
-                            )
-
-                            jit = await build_jit_cross_file_context(
-                                changed_files=filtered,
-                                source_fetcher=source_fetcher,
-                                repo_tree=tree_paths,
-                                char_budget=(self.config.review.context_token_budget * 4),
-                                enable_java_go=self.config.review.jit_java_go,
-                            )
-                            if jit:
-                                ctx = ctx + "\n\n" + jit
-                        except Exception as exc:
-                            logger.debug("JIT context build failed: %s", exc)
+                    part_context_on = True
+                    part_context_jit = not index_has_data_for_changed and source_fetcher is not None
+                    part_context_tree = tree_paths
 
                     try:
                         from mira.index.relationships import RelationshipStore
@@ -1680,6 +1822,45 @@ class ReviewEngine:
             except Exception as exc:
                 logger.warning("Code context lookup failed, continuing without: %s", exc)
             return ""
+
+        async def _part_context(files: list) -> str:
+            """Index (or, unindexed, JIT) context for one part's own files."""
+            pr_info = getattr(self, "_pr_info", None)
+            if not part_context_on or pr_info is None:
+                return ""
+            try:
+                store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
+                try:
+                    ctx = await build_code_context(
+                        changed_paths=list(dict.fromkeys(f.path for f in files)),
+                        store=store,
+                        token_budget=self.config.review.context_token_budget,
+                        source_fetcher=source,
+                        # Each part gets its own changed functions in full (see
+                        # core/enclosing.py), so this block spends its source
+                        # budget on the code that depends on them.
+                        include_changed_source=not enclosing_budget,
+                    )
+                finally:
+                    store.close()
+                if ctx.strip() == "## Codebase Context":
+                    ctx = ""
+                if part_context_jit:
+                    from mira.index.jit_context import build_jit_cross_file_context
+
+                    jit = await build_jit_cross_file_context(
+                        changed_files=files,
+                        source_fetcher=source,
+                        repo_tree=part_context_tree,
+                        char_budget=(self.config.review.context_token_budget * 4),
+                        enable_java_go=self.config.review.jit_java_go,
+                    )
+                    if jit:
+                        ctx = (ctx + "\n\n" + jit) if ctx else jit
+                return ctx
+            except Exception as exc:
+                logger.debug("Part context lookup failed: %s", exc)
+                return ""
 
         # Fire walkthrough early so review_pr can post it before chunk review finishes.
         walkthrough_task = _asyncio.create_task(_generate_walkthrough())
@@ -1717,12 +1898,47 @@ class ReviewEngine:
                 logger.debug("File history fetch failed: %s", exc)
                 return {}
 
-        code_context_block, file_history = await _asyncio.gather(
+        expanded = expand_context(filtered, self.config.review.context_lines)
+
+        async def _discover_dependencies() -> dict[str, set[str]]:
+            # Dependency discovery also works when code-context enrichment is
+            # off. Source reads are pinned to the reviewed commit, including
+            # unchanged imports, and come from the review's shared reader.
+            indexed_imports: dict[str, list[str]] = {}
+            pr_info = getattr(self, "_pr_info", None)
+            if pr_info is not None:
+                try:
+                    dependency_store = IndexStore.open(
+                        pr_info.owner, pr_info.repo, platform=pr_info.platform
+                    )
+                    try:
+                        indexed_imports = {
+                            path: summary.imports
+                            for path, summary in dependency_store.get_summaries(
+                                selected_paths
+                            ).items()
+                        }
+                    finally:
+                        dependency_store.close()
+                except Exception as exc:
+                    logger.debug("Dependency index unavailable: %s", exc)
+            dependency_tree = set(await source.tree()) if source is not None else set()
+            return await discover_dependencies(
+                expanded,
+                source,
+                indexed_imports,
+                concurrency=self.config.review.max_concurrent_chunks,
+                repo_tree=dependency_tree,
+            )
+
+        # Context, history and dependency discovery read the same commit and
+        # nothing of each other's, so they run together.
+        code_context_block, file_history, dependencies = await _asyncio.gather(
             _build_context(),
             _fetch_file_history(),
+            _discover_dependencies(),
         )
-
-        expanded = expand_context(filtered, self.config.review.context_lines)
+        _mark("prepare")
 
         learned_rules: list[str] = []
         custom_rules: list[dict[str, str]] = []
@@ -1782,48 +1998,13 @@ class ReviewEngine:
         except Exception:
             pass
 
-        # Dependency discovery also works when code-context enrichment is off.
-        # Pin source reads to the reviewed commit, including unchanged imports.
-        dependency_fetcher = None
-        dependency_tree = set(self._agentic_repo_tree)
-        indexed_imports: dict[str, list[str]] = {}
-        pr_info = getattr(self, "_pr_info", None)
-        if pr_info is not None:
-            if self.provider is not None:
-                from mira.index.context import ProviderSourceFetcher
-
-                dependency_fetcher = ProviderSourceFetcher(
-                    self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
-                )
-                if not dependency_tree and hasattr(self.provider, "get_repo_tree"):
-                    try:
-                        tree = await self.provider.get_repo_tree(
-                            pr_info, pr_info.head_sha or pr_info.head_branch
-                        )
-                        if isinstance(tree, (list, set, tuple)):
-                            dependency_tree = {p for p in tree if isinstance(p, str)}
-                    except Exception as exc:
-                        logger.debug("Dependency tree unavailable: %s", exc)
-            try:
-                dependency_store = IndexStore.open(
-                    pr_info.owner, pr_info.repo, platform=pr_info.platform
-                )
-                try:
-                    indexed_imports = {
-                        path: summary.imports
-                        for path, summary in dependency_store.get_summaries(selected_paths).items()
-                    }
-                finally:
-                    dependency_store.close()
-            except Exception as exc:
-                logger.debug("Dependency index unavailable: %s", exc)
-        dependencies = await discover_dependencies(
-            expanded,
-            dependency_fetcher,
-            indexed_imports,
-            concurrency=self.config.review.max_concurrent_chunks,
-            repo_tree=dependency_tree,
-        )
+        # The thread verification started with the review lands here at the
+        # latest: the prompt below is the first thing that needs its answer.
+        if threads_source is not None:
+            open_threads, settled_threads = await threads_source()
+            existing_comments = open_threads or None
+            resolved_threads = settled_threads or None
+        _mark("threads")
         overhead_messages = build_review_prompt(
             files=[],
             config=self.config,
@@ -1840,6 +2021,13 @@ class ReviewEngine:
             team_conventions=team_conventions,
         )
         overhead = sum(self.llm.count_tokens(m["content"]) for m in overhead_messages)
+        if part_context_on:
+            # Each part adds its own index context (and, unindexed, JIT context),
+            # up to one budget each — held to an eighth of the window, so a small
+            # context window is not reserved away before a diff is placed. A
+            # part whose prompt still overflows drops that context first.
+            reserve = self.config.review.context_token_budget * (2 if part_context_jit else 1)
+            overhead += min(reserve, self.config.llm.max_context_tokens // 8)
         # Reserve output, per-group notes, path lists and tool instructions too.
         context_budget = (
             self.config.llm.max_context_tokens - overhead - self._output_reserve() - 6000
@@ -1889,14 +2077,17 @@ class ReviewEngine:
                     f.path: file_history[f.path] for f in chunk.files if f.path in file_history
                 }
 
-                def _messages(history: dict) -> list[dict[str, str]]:
+                def _messages(
+                    history: dict, part: str = "", enclosing: str = ""
+                ) -> list[dict[str, str]]:
+                    shared = "\n\n".join(p for p in (code_context_block, part) if p)
                     return build_review_prompt(
                         files=chunk.files,
                         config=self.config,
                         pr_title=pr_title,
                         pr_description=pr_description,
                         existing_comments=base_existing or None,
-                        code_context=code_context_block + group_notes,
+                        code_context=shared + enclosing + group_notes,
                         learned_rules=learned_rules or None,
                         custom_rules=custom_rules or None,
                         file_history=history or None,
@@ -1905,13 +2096,31 @@ class ReviewEngine:
                         team_conventions=team_conventions,
                     )
 
-                messages = _messages(chunk_history)
+                def _size(msgs: list[dict[str, str]]) -> int:
+                    return sum(self.llm.count_tokens(m["content"]) for m in msgs)
+
+                part = await _part_context(chunk.files)
+                messages = _messages(chunk_history, part)
                 prompt_limit = self.config.llm.max_context_tokens - self._output_reserve()
-                if sum(self.llm.count_tokens(m["content"]) for m in messages) > prompt_limit:
+                if _size(messages) > prompt_limit:
                     # Optional commit history must not displace owned diff hunks.
-                    messages = _messages({})
-                if sum(self.llm.count_tokens(m["content"]) for m in messages) > prompt_limit:
+                    chunk_history = {}
+                    messages = _messages(chunk_history, part)
+                if _size(messages) > prompt_limit:
+                    # Nor may the part's code context.
+                    part = ""
+                    messages = _messages(chunk_history)
+                if _size(messages) > prompt_limit:
                     raise ValueError("Review prompt exceeds the configured context window")
+                # The changed functions in full, in whatever room the prompt has
+                # left: optional, so it only ever takes space nothing else needs.
+                # Leave the agentic loop room for its tool output, too.
+                tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
+                room = min(enclosing_budget, prompt_limit - _size(messages) - 1000 - tool_room)
+                if room > 500 and source is not None:
+                    enclosing = await build_enclosing_context(chunk.files, source, room * 4)
+                    if enclosing:
+                        messages = _messages(chunk_history, part, enclosing)
 
                 def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
                     parsed = parse_llm_response(raw)
@@ -2002,41 +2211,71 @@ class ReviewEngine:
                     hi = mid - 1
             return value[:lo]
 
+        async def _run_part(idx: int, chunk: ReviewChunk, context: str) -> ReviewPartResult:
+            """One part, with its retries; a part that never lands costs its files."""
+            for attempt in range(self.config.review.chunk_retries + 1):
+                try:
+                    return await _review_chunk(idx, chunk, context)
+                except Exception as exc:
+                    if attempt < self.config.review.chunk_retries:
+                        logger.warning("Retrying review part %d: %s", idx + 1, exc)
+                        audit.append({"stage": "chunk_retry", "chunk": idx, "attempt": attempt + 1})
+                        continue
+                    logger.warning("Review part %d failed: %s", idx + 1, exc)
+                    audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
+                    chunk_failures.append(exc)
+                    unread_paths.update(f.path for f in chunk.files)
+            return [], [], ""
+
+        def _group_context(
+            parts: list[tuple[int, ReviewChunk]], idx: int, notes: str | None
+        ) -> str:
+            if len(parts) <= 1:
+                return ""
+            related = parts[0][1].related_paths
+            others = sorted(
+                {f.path for other_idx, other in parts if other_idx != idx for f in other.files}
+            )
+            if notes is None:
+                # Parts of one group review side by side: none can wait for
+                # another's notes, so each is told who holds the rest.
+                check = (
+                    "the other parts' files are in the repository, so read them with the "
+                    "tools when a claim depends on them"
+                    if self._agentic_source_fetcher is not None
+                    else "you cannot see the other parts, so raise a cross-part concern only "
+                    "when this part's hunks show it"
+                )
+                return (
+                    "\n\n## Your dependency group\n"
+                    "These related changes are split across review parts that run side by "
+                    "side. Review every supplied hunk of this part and check its contracts "
+                    f"against the rest of the group: {check}. "
+                    "File findings only on this part's paths. Long line fragments are "
+                    "incomplete lines.\n"
+                    + _bounded_group_text("\n".join(related))
+                    + "\nChanged in the other parts of this group:\n"
+                    + _bounded_group_text("\n".join(others))
+                )
+            return (
+                "\n\n## Your dependency group\n"
+                "You own these related changes across sequential review parts. "
+                "Check their contracts together; review every supplied hunk. "
+                "Use repository tools to verify cross-file claims. File findings only "
+                "on this part's paths. Long line fragments are incomplete lines.\n"
+                + _bounded_group_text("\n".join(related))
+                + "\nPrevious parts' review notes (context, not verified facts):\n"
+                + _bounded_group_text(notes)
+            )
+
         async def _run_group(
             parts: list[tuple[int, ReviewChunk]],
         ) -> list[tuple[int, ReviewPartResult]]:
+            """A group's parts in order, each reading the notes of the ones before."""
             results: list[tuple[int, ReviewPartResult]] = []
             notes = ""
-            related = parts[0][1].related_paths
             for idx, chunk in parts:
-                context = ""
-                if len(parts) > 1:
-                    context = (
-                        "\n\n## Your dependency group\n"
-                        "You own these related changes across sequential review parts. "
-                        "Check their contracts together; review every supplied hunk. "
-                        "Use repository tools to verify cross-file claims. File findings only "
-                        "on this part's paths. Long line fragments are incomplete lines.\n"
-                        + _bounded_group_text("\n".join(related))
-                        + "\nPrevious parts' review notes (context, not verified facts):\n"
-                        + _bounded_group_text(notes)
-                    )
-                for attempt in range(self.config.review.chunk_retries + 1):
-                    try:
-                        result = await _review_chunk(idx, chunk, context)
-                        break
-                    except Exception as exc:
-                        if attempt < self.config.review.chunk_retries:
-                            logger.warning("Retrying review part %d: %s", idx + 1, exc)
-                            audit.append(
-                                {"stage": "chunk_retry", "chunk": idx, "attempt": attempt + 1}
-                            )
-                            continue
-                        logger.warning("Review part %d failed: %s", idx + 1, exc)
-                        audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
-                        chunk_failures.append(exc)
-                        unread_paths.update(f.path for f in chunk.files)
-                        result = ([], [], "")
+                result = await _run_part(idx, chunk, _group_context(parts, idx, notes))
                 results.append((idx, result))
                 comments, _, summary_text = result
                 new_notes = (
@@ -2054,6 +2293,19 @@ class ReviewEngine:
                 groups.setdefault(key, []).append((idx, chunk))
             pending = list(groups.values())
             results: list[tuple[int, ReviewPartResult]] = []
+            if not self.config.review.sequential_parts:
+                # Every part at once; the semaphore in `_review_chunk` decides
+                # how many are with the model at a time. No waves either — a
+                # wave waited for its slowest member before the next could start.
+                async def _one(
+                    parts: list[tuple[int, ReviewChunk]], idx: int, chunk: ReviewChunk
+                ) -> tuple[int, ReviewPartResult]:
+                    return idx, await _run_part(idx, chunk, _group_context(parts, idx, None))
+
+                done = await _asyncio.gather(
+                    *(_one(parts, idx, chunk) for parts in pending for idx, chunk in parts)
+                )
+                return [result for _, result in sorted(done, key=lambda item: item[0])]
             wave_size = self.config.review.max_chunks_per_review
             for start in range(0, len(pending), wave_size):
                 wave = await _asyncio.gather(
@@ -2097,12 +2349,7 @@ class ReviewEngine:
                         _pkg_store.close()
                 except Exception as exc:
                     logger.debug("Manifest package lookup failed: %s", exc)
-                if self.provider is not None:
-                    from mira.index.context import ProviderSourceFetcher
-
-                    pr_source_fetcher = ProviderSourceFetcher(
-                        self.provider, pr_info, pr_info.head_sha or pr_info.head_branch
-                    )
+                pr_source_fetcher = source
         dependency_task = _asyncio.create_task(
             dependency_review_pass(
                 self.llm,
@@ -2126,6 +2373,7 @@ class ReviewEngine:
         chunk_results, security_comments, dependency_comments, osv_comments = await _asyncio.gather(
             review_task, security_task, dependency_task, osv_task
         )
+        _mark("review")
 
         if chunks and len(chunk_failures) == len(chunks):
             # Nothing was reviewed. Surfacing the first error keeps the PR
@@ -2201,9 +2449,12 @@ class ReviewEngine:
                     indexing_llm=self.indexing_llm,
                     diff_files=critique_files,
                     audit=audit,
+                    source_fetcher=source,
+                    plausible_min_confidence=self.config.review.critique_plausible_min_confidence,
                 )
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
+        _mark("critique")
 
         all_key_issues = _drop_orphan_key_issues(all_key_issues, final_comments)
 
@@ -2228,13 +2479,22 @@ class ReviewEngine:
             summary = ""
 
         walkthrough = await walkthrough_task
+        _mark("summary")
+        # One line per review saying where its time went, so a slow review can
+        # be read off the log trail instead of reconstructed from HTTP lines.
+        logger.info(
+            "Review timing: %s; %d part(s), %d file(s)",
+            ", ".join(f"{stage} {seconds:.1f}s" for stage, seconds in timings.items()),
+            len(chunks),
+            len(filtered),
+        )
 
         return ReviewResult(
             comments=final_comments,
             key_issues=all_key_issues,
             summary=summary,
             reviewed_files=len(filtered) - len(unread_paths),
-            token_usage=self.llm.usage,
+            token_usage=self._usage(),
             walkthrough=walkthrough,
             reviewed_paths=selected_paths,
             skipped_paths=skipped_paths_only,

@@ -452,7 +452,27 @@ class ReviewConfig(BaseModel):
     # gets skipped before chunking even starts.
     max_file_size: int = 50_000
     # Maximum agent groups dispatched per wave; subsequent waves run automatically.
+    # Only read with `sequential_parts`; otherwise every part is dispatched at
+    # once and `max_concurrent_chunks` alone bounds how many run together.
     max_chunks_per_review: int = Field(default=5, ge=1, le=20)
+    # Review the parts of one dependency group one after another, each reading
+    # the notes of the parts before it. Off by default: a four-part group made
+    # a four-deep chain of agent loops, which was most of the wall time of a
+    # large review, while every part can check its neighbours through the
+    # repository tools anyway. On restores the old ordering.
+    sequential_parts: bool = False
+    # Read the reviewed commit from one archive download instead of one API
+    # call per file. Serves code context, dependency discovery, the agentic
+    # tools and the manifest scan, and is what lets `grep_repo` search the
+    # whole repository. The archive is decoded as it downloads and only its
+    # text is kept, so the cap bounds transfer, not memory; a repository whose
+    # archive passes it is read file by file, as before.
+    repo_snapshot: bool = True
+    repo_snapshot_max_mb: int = Field(default=250, ge=1, le=4096)
+    # Tokens per review part for the full post-change source of the functions
+    # its changed lines sit in (see core/enclosing.py). 0 turns it off and
+    # leaves the review with the diff's three lines of context.
+    enclosing_context_tokens: int = Field(default=6_000, ge=0)
     include_summary: bool = True
     focus_only_on_problems: bool = False
     walkthrough: bool = True
@@ -476,6 +496,11 @@ class ReviewConfig(BaseModel):
     # Disable for faster reviews where the extra wall-clock time matters
     # more than catching confident-but-wrong findings.
     self_critique: bool = True
+    # Confidence a `plausible` warning or blocker needs to survive the critic.
+    # `proven` always survives and `unsupported` never does; `plausible` is the
+    # critic saying it could not see enough to be sure, which a small critic
+    # says often. Raise it to trade recall for precision.
+    critique_plausible_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
     # Run a dedicated security review pass in parallel with the main review.
     # Uses the security tier (`llm.security_model`, falling back to the

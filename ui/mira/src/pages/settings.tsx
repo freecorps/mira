@@ -1110,6 +1110,35 @@ export function SettingsPage() {
                   1,
                   20
                 )}
+                {boolField(
+                  "review",
+                  "repo_snapshot",
+                  "Read the repository from one archive",
+                  "Download the reviewed commit once instead of one API call per file. Faster context, and lets the reviewer's search cover the whole repository. Repositories over the size cap are read file by file."
+                )}
+                {boolField(
+                  "review",
+                  "sequential_parts",
+                  "Review group parts one after another",
+                  "Off: every part of a large change is reviewed at the same time. On: parts of one dependency group wait for each other and read the previous parts' notes, which is much slower."
+                )}
+                {numField(
+                  "review",
+                  "enclosing_context_tokens",
+                  "Changed-function context (tokens)",
+                  "Tokens per review part for the full source of the functions its changed lines sit in. 0 turns it off.",
+                  "500",
+                  0
+                )}
+                {numField(
+                  "review",
+                  "critique_plausible_min_confidence",
+                  "Critique: keep 'plausible' findings from",
+                  "Confidence a warning or blocker the critic could not fully confirm needs to be posted (0.0–1.0). Higher = fewer, surer comments.",
+                  "0.05",
+                  0,
+                  1
+                )}
               </div>
             </div>
 
