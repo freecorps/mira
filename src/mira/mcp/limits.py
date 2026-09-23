@@ -80,15 +80,30 @@ def _sign(payload: str) -> str:
     return hmac.new(_SIGNING_KEY, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
 
-def encode_cursor(query: dict[str, Any], offset: int) -> str:
-    """An opaque, signed position in *this* query's results."""
-    payload = json.dumps({"q": _fingerprint(query), "o": int(offset)}, separators=(",", ":"))
+def encode_cursor(query: dict[str, Any], offset: int, *, anchor: float = 0.0) -> str:
+    """An opaque, signed position in *this* query's results.
+
+    ``anchor`` pins a result set that keeps growing at the top. A listing of
+    log lines newest first shifts by one row every time a line is written, so
+    an offset alone would hand the next page rows the last one already
+    returned; the anchor is the moment the first page was read, and every page
+    after it reads as of then. Signed with the rest, so a client cannot move it.
+    """
+    data: dict[str, Any] = {"q": _fingerprint(query), "o": int(offset)}
+    if anchor:
+        data["a"] = float(anchor)
+    payload = json.dumps(data, separators=(",", ":"))
     signed = json.dumps({"p": payload, "s": _sign(payload)}, separators=(",", ":"))
     return base64.urlsafe_b64encode(signed.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 def decode_cursor(query: dict[str, Any], cursor: str) -> int:
-    """The offset a cursor stands for, or an error naming why it does not.
+    """The offset a cursor stands for, or an error naming why it does not."""
+    return decode_anchored_cursor(query, cursor)[0]
+
+
+def decode_anchored_cursor(query: dict[str, Any], cursor: str) -> tuple[int, float]:
+    """The offset and anchor a cursor stands for; ``(0, 0.0)`` for no cursor.
 
     Three ways to fail, and deliberately one message each. A cursor this server
     did not issue - including one whose offset was edited, since the signature
@@ -97,7 +112,7 @@ def decode_cursor(query: dict[str, Any], cursor: str) -> int:
     """
     text = (cursor or "").strip()
     if not text:
-        return 0
+        return 0, 0.0
     padded = text + "=" * (-len(text) % 4)
     try:
         raw = base64.urlsafe_b64decode(padded.encode("ascii"))
@@ -129,7 +144,10 @@ def decode_cursor(query: dict[str, Any], cursor: str) -> int:
             f"This server does not page past {MAX_OFFSET} rows. Narrow the "
             "filters instead - a path prefix, a pull request, a severity."
         )
-    return max(0, offset)
+    anchor = data.get("a", 0.0)
+    if isinstance(anchor, bool) or not isinstance(anchor, (int, float)):
+        raise InvalidCursor("This cursor was not issued by this server.")
+    return max(0, offset), float(anchor)
 
 
 @dataclass(frozen=True)

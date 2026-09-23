@@ -279,6 +279,26 @@ CREATE INDEX IF NOT EXISTS idx_app_logs_level
     ON app_logs(level_no, created_at);
 CREATE INDEX IF NOT EXISTS idx_app_logs_trace
     ON app_logs(trace_id, created_at);
+
+-- Read-only credentials for programs: an agent, a script, `curl`. The token
+-- itself is never stored, only its SHA-256 digest, so a copy of this table is
+-- not a copy of anybody's access. Revoking stamps `revoked_at` rather than
+-- deleting the row, so "which token was that?" still has an answer after the
+-- fact. Times are epoch seconds; 0 means never.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL DEFAULT '',
+    token_hash TEXT UNIQUE NOT NULL,
+    prefix TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    expires_at REAL NOT NULL DEFAULT 0,
+    last_used_at REAL NOT NULL DEFAULT 0,
+    revoked_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user
+    ON api_tokens(user_id);
 """
 
 _PG_SCHEMA = """
@@ -498,6 +518,26 @@ CREATE INDEX IF NOT EXISTS idx_app_logs_level
     ON app_logs(level_no, created_at);
 CREATE INDEX IF NOT EXISTS idx_app_logs_trace
     ON app_logs(trace_id, created_at);
+
+-- Read-only credentials for programs: an agent, a script, `curl`. The token
+-- itself is never stored, only its SHA-256 digest, so a copy of this table is
+-- not a copy of anybody's access. Revoking stamps `revoked_at` rather than
+-- deleting the row, so "which token was that?" still has an answer after the
+-- fact. Times are epoch seconds; 0 means never.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL DEFAULT '',
+    token_hash TEXT UNIQUE NOT NULL,
+    prefix TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_used_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    revoked_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user
+    ON api_tokens(user_id);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -1078,6 +1118,190 @@ class AppDatabase:
         else:
             with self._pg_cursor() as cur:
                 cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
+
+    # ── API tokens ──
+    #
+    # See `mira.dashboard.tokens` for what a token may do. These methods only
+    # store and find them; the read-only rule is enforced by the middleware,
+    # before any route runs, so no route has to remember it.
+
+    _API_TOKEN_COLUMNS = (
+        "t.id, t.user_id, u.username, t.name, t.prefix, t.created_at, "
+        "t.expires_at, t.last_used_at, t.revoked_at"
+    )
+
+    #: How stale `last_used_at` may get before a request writes it again. The
+    #: column answers "is anything still using this token?", which is a
+    #: question about days; writing it on every request would put a write on
+    #: every read an agent makes.
+    _TOKEN_TOUCH_INTERVAL = 60.0
+
+    @staticmethod
+    def _api_token_row(row: tuple) -> dict[str, Any]:
+        return {
+            "id": int(row[0]),
+            "user_id": int(row[1]),
+            "username": str(row[2] or ""),
+            "name": str(row[3] or ""),
+            "prefix": str(row[4] or ""),
+            "created_at": float(row[5] or 0.0),
+            "expires_at": float(row[6] or 0.0),
+            "last_used_at": float(row[7] or 0.0),
+            "revoked_at": float(row[8] or 0.0),
+        }
+
+    def create_api_token(
+        self, user_id: int, name: str, *, expires_at: float = 0.0
+    ) -> tuple[str, dict[str, Any]]:
+        """Mint a token for a user. Returns the token and its stored record.
+
+        The token is returned here and nowhere else: only its digest is
+        written, so a caller that drops it has to mint another.
+        """
+        from mira.dashboard import tokens
+
+        token = tokens.generate()
+        now = time.time()
+        params = (
+            int(user_id),
+            (name or "").strip()[: tokens.MAX_NAME_CHARS],
+            tokens.digest(token),
+            tokens.display_prefix(token),
+            now,
+            float(expires_at or 0.0),
+        )
+        insert = (
+            "INSERT INTO api_tokens (user_id, name, token_hash, prefix, created_at, expires_at) "
+            "VALUES ({p}, {p}, {p}, {p}, {p}, {p})"
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cursor = self._sqlite_conn.execute(insert.format(p="?"), params)
+            self._sqlite_conn.commit()
+            token_id = int(cursor.lastrowid or 0)
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(insert.format(p="%s") + " RETURNING id", params)
+                token_id = int(cur.fetchone()[0])
+            self._pg_commit()
+        record = self.get_api_token(token_id)
+        assert record is not None
+        return token, record
+
+    def get_api_token(self, token_id: int) -> dict[str, Any] | None:
+        rows = self._token_query("WHERE t.id = {p}", (int(token_id),))
+        return rows[0] if rows else None
+
+    def list_api_tokens(self, *, user_id: int | None = None) -> list[dict[str, Any]]:
+        """Tokens, newest first, revoked ones included.
+
+        A revoked token stays listed so the list answers "what did we hand out"
+        and not only "what works today".
+        """
+        if user_id is None:
+            return self._token_query("", ())
+        return self._token_query("WHERE t.user_id = {p}", (int(user_id),))
+
+    def _token_query(self, where: str, params: tuple) -> list[dict[str, Any]]:
+        placeholder = "?" if self._backend == "sqlite" else "%s"
+        sql = (
+            f"SELECT {self._API_TOKEN_COLUMNS} FROM api_tokens t "
+            f"JOIN users u ON u.id = t.user_id {where.format(p=placeholder)} "
+            "ORDER BY t.created_at DESC, t.id DESC"
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            rows = self._sqlite_conn.execute(sql, params).fetchall()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [self._api_token_row(row) for row in rows]
+
+    def revoke_api_token(self, token_id: int, *, user_id: int | None = None) -> bool:
+        """Revoke one token. ``user_id`` restricts it to that user's tokens.
+
+        Returns whether a live token was revoked. Revoking one twice is not an
+        error, and it does not move the time it was first revoked.
+        """
+        now = time.time()
+        placeholder = "?" if self._backend == "sqlite" else "%s"
+        sql = (
+            f"UPDATE api_tokens SET revoked_at = {placeholder} "
+            f"WHERE id = {placeholder} AND revoked_at = 0"
+        )
+        params: tuple = (now, int(token_id))
+        if user_id is not None:
+            sql += f" AND user_id = {placeholder}"
+            params = (*params, int(user_id))
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cursor = self._sqlite_conn.execute(sql, params)
+            self._sqlite_conn.commit()
+            return cursor.rowcount > 0
+        with self._pg_cursor() as cur:
+            cur.execute(sql, params)
+            changed = cur.rowcount > 0
+        self._pg_commit()
+        return changed
+
+    def validate_api_token(self, token: str) -> tuple[User, dict[str, Any]] | None:
+        """The user a live token belongs to, and the token's record.
+
+        Live means not revoked and not expired. A token whose user was deleted
+        is gone with them (the foreign key cascades), so there is no orphan to
+        check for.
+        """
+        from mira.dashboard import tokens
+
+        if not tokens.looks_like_token(token):
+            return None
+        now = time.time()
+        placeholder = "?" if self._backend == "sqlite" else "%s"
+        sql = (
+            f"SELECT {self._API_TOKEN_COLUMNS}, u.is_admin, u.theme FROM api_tokens t "
+            f"JOIN users u ON u.id = t.user_id WHERE t.token_hash = {placeholder} "
+            f"AND t.revoked_at = 0 AND (t.expires_at = 0 OR t.expires_at > {placeholder})"
+        )
+        params = (tokens.digest(token), now)
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            row = self._sqlite_conn.execute(sql, params).fetchone()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+        if not row:
+            return None
+        record = self._api_token_row(row)
+        user = User(
+            id=record["user_id"],
+            username=record["username"],
+            is_admin=bool(row[9]),
+            theme=str(row[10] or "dark"),
+        )
+        if now - record["last_used_at"] >= self._TOKEN_TOUCH_INTERVAL:
+            self._touch_api_token(record["id"], now)
+            record["last_used_at"] = now
+        return user, record
+
+    def _touch_api_token(self, token_id: int, now: float) -> None:
+        """Stamp a token's last use. Never fails the request it is part of."""
+        try:
+            if self._backend == "sqlite":
+                assert self._sqlite_conn is not None
+                self._sqlite_conn.execute(
+                    "UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (now, token_id)
+                )
+                self._sqlite_conn.commit()
+            else:
+                with self._pg_cursor() as cur:
+                    cur.execute(
+                        "UPDATE api_tokens SET last_used_at = %s WHERE id = %s", (now, token_id)
+                    )
+                self._pg_commit()
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, not authentication
+            logger.warning("Could not record the use of API token %d: %s", token_id, exc)
 
     # ── Repos ──
 
@@ -2022,8 +2246,14 @@ class AppDatabase:
         until: float = 0.0,
         limit: int = 200,
         offset: int = 0,
+        oldest_first: bool = False,
     ) -> list[dict[str, Any]]:
-        """Captured log lines matching the filters, newest first."""
+        """Captured log lines matching the filters, newest first.
+
+        ``oldest_first`` is for reading one trace as the story it is: paging
+        through a review's lines backwards puts every stack trace before the
+        thing that caused it.
+        """
         limit = max(1, min(int(limit), MAX_APP_LOG_ROWS))
         offset = max(0, int(offset))
         where, params = self._app_log_filters(
@@ -2037,7 +2267,12 @@ class AppDatabase:
         )
         sql = (
             f"SELECT id, {self._APP_LOG_COLUMNS} FROM app_logs {where}"
-            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            + (
+                "ORDER BY created_at ASC, id ASC "
+                if oldest_first
+                else "ORDER BY created_at DESC, id DESC "
+            )
+            + "LIMIT ? OFFSET ?"
         )
         rows = self._rows(sql, (*params, limit, offset))
         return [

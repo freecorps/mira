@@ -20,12 +20,14 @@ import { rulesApi } from "./api/rules"
 import { settingsApi } from "./api/settings"
 import { statsApi } from "./api/stats"
 import { systemApi } from "./api/system"
+import { tokensApi } from "./api/tokens"
 import { triageApi } from "./api/triage"
 import { usersApi } from "./api/users"
 import { vulnerabilitiesApi } from "./api/vulnerabilities"
 import { webhooksApi } from "./api/webhooks"
 
 export * from "./api/types"
+export type { ApiToken, CreatedApiToken } from "./api/tokens"
 
 export const api = {
   ...activityApi,
@@ -39,6 +41,7 @@ export const api = {
   ...relationshipsApi,
   ...rulesApi,
   ...usersApi,
+  ...tokensApi,
   ...webhooksApi,
   ...contributorsApi,
   ...reviewInsightsApi,

@@ -1,6 +1,6 @@
 """The tools this server offers, which is a list that only shrinks.
 
-Seven reads. There is no tool here that writes, approves, dismisses, triggers
+Ten reads. There is no tool here that writes, approves, dismisses, triggers
 a review, applies a fix, or runs a command, and that is a property of the
 registry rather than of the current implementations: a tool is a name, a
 schema, and a function in this module, so adding a side effect means adding it
@@ -11,21 +11,45 @@ not know. The tempting alternative - ignore what you do not recognise - turns
 a client's typo into a silent widening: `sevrity="blocker"` would quietly
 return every finding of every severity, and the caller would read the result
 as if it had been filtered.
+
+Most tools read one repository and are reached through the grant. Two read
+Mira's own log trail, which belongs to the install rather than to any
+repository, and a grant cannot reach it: those tools require the `logs`
+capability, which a session holds only when the HTTP transport authenticated an
+admin's token. A session without it is not offered them in `tools/list` and is
+refused if it calls one anyway.
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from mira.mcp import reads
 from mira.mcp.authz import Grant, Repository
-from mira.mcp.limits import decode_cursor, encode_cursor, page_size
+from mira.mcp.limits import decode_anchored_cursor, decode_cursor, encode_cursor, page_size
 
 #: The longest a string filter may be. Filters are bound parameters, so this
 #: is about not doing pointless work rather than about injection.
 MAX_FILTER_CHARS = 200
+
+#: The capability that reaches Mira's own log trail.
+LOGS = "logs"
+
+#: The widest trailing window a log search may ask for. Retention is a week by
+#: default; this only stops `hours` being a number nobody meant.
+MAX_LOG_HOURS = 24 * 365
+
+_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
 
 
 class InvalidArguments(ValueError):
@@ -38,6 +62,10 @@ class Context:
 
     grant: Grant
     max_page_size: int = 50
+    #: What this session may reach beyond its grant. Empty for a stdio session.
+    capabilities: frozenset[str] = frozenset()
+    #: The application database, for the tools that read the log trail.
+    app_db: Any = None
 
 
 @dataclass
@@ -301,6 +329,146 @@ def get_indexed_file(context: Context, arguments: dict[str, Any]) -> Result:
     )
 
 
+def list_reviews(context: Context, arguments: dict[str, Any]) -> Result:
+    _check_names(arguments, ("repository", "pr_number", "limit", "cursor"))
+    repository = _repository(context, arguments)
+    query: dict[str, Any] = {
+        "tool": "list_reviews",
+        "repository": repository.key,
+        "pr_number": _integer(arguments, "pr_number"),
+    }
+    size, offset, query = _paging(context, arguments, query)
+    rows = reads.list_reviews(
+        repository, pr_number=int(query["pr_number"]), limit=size, offset=offset
+    )
+    items, cursor = _page(rows, query=query, size=size, offset=offset)
+    return Result(
+        payload={
+            "repository": repository.key,
+            "indexed": True,
+            "items": items,
+            "next_cursor": cursor,
+            "note": (
+                "Review passes that finished. A pass that failed leaves no row "
+                "here; its trace ID is on the pull request, and its lines are "
+                "in the log trail."
+            ),
+        },
+        count=len(items),
+        repository=repository.key,
+    )
+
+
+def _level(arguments: dict[str, Any], default: str) -> int:
+    name = (_text(arguments, "level") or default).strip().upper()
+    if name not in _LOG_LEVELS:
+        raise InvalidArguments(f"level must be one of {', '.join(_LOG_LEVELS)}.")
+    return _LOG_LEVELS[name]
+
+
+def _hours(arguments: dict[str, Any], default: float) -> float:
+    value = arguments.get("hours")
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidArguments("hours must be a number.")
+    if value < 0 or value > MAX_LOG_HOURS:
+        raise InvalidArguments(f"hours must be between 0 and {MAX_LOG_HOURS}.")
+    return float(value)
+
+
+def _log_page(
+    context: Context,
+    arguments: dict[str, Any],
+    query: dict[str, Any],
+    *,
+    hours: float,
+    oldest_first: bool,
+) -> tuple[list[dict[str, Any]], str]:
+    """One page of log lines, pinned to the moment the first page was read.
+
+    The trail grows while it is being paged. Newest first, every line written
+    between two calls would push a row the last page returned onto the next
+    one, so the first page fixes an upper bound and the cursor carries it: page
+    two reads the trail as it stood when page one was read. The trailing window
+    is measured back from that same moment, so it does not slide either.
+    """
+    if context.app_db is None:
+        raise RuntimeError("the application database is not available to this session")
+    size = page_size(arguments.get("limit"), configured=context.max_page_size)
+    offset, anchor = decode_anchored_cursor(query, _text(arguments, "cursor"))
+    until = anchor or time.time()
+    rows = reads.list_logs(
+        context.app_db,
+        min_level=int(query.get("min_level", 0)),
+        logger_name=str(query.get("logger", "")),
+        query=str(query.get("query", "")),
+        trace_id=str(query.get("trace_id", "")),
+        repo=str(query.get("repository", "")),
+        since=until - hours * 3600 if hours else 0.0,
+        until=until,
+        oldest_first=oldest_first,
+        limit=size,
+        offset=offset,
+    )
+    items = rows[:size]
+    more = len(rows) > size
+    cursor = encode_cursor(query, offset + len(items), anchor=until) if more else ""
+    return items, cursor
+
+
+def search_logs(context: Context, arguments: dict[str, Any]) -> Result:
+    _check_names(
+        arguments,
+        ("level", "logger", "query", "trace_id", "repository", "hours", "limit", "cursor"),
+    )
+    hours = _hours(arguments, 24.0)
+    query: dict[str, Any] = {
+        "tool": "search_logs",
+        "min_level": _level(arguments, "INFO"),
+        "logger": _text(arguments, "logger").strip(),
+        "query": _text(arguments, "query").strip(),
+        "trace_id": _text(arguments, "trace_id").strip(),
+        # A filter on the trail, not a read of a repository: the lines of a
+        # repository since removed from Mira are still worth finding, and the
+        # session that reaches this tool is an admin's.
+        "repository": _text(arguments, "repository").strip(),
+        "hours": hours,
+    }
+    items, cursor = _log_page(context, arguments, query, hours=hours, oldest_first=False)
+    return Result(
+        payload={
+            "items": items,
+            "next_cursor": cursor,
+            "capture": reads.log_capture_state(),
+            "note": (
+                "Newest first. level is a floor, so ERROR includes CRITICAL. "
+                "hours=0 searches everything the trail still holds."
+            ),
+        },
+        count=len(items),
+    )
+
+
+def get_trace(context: Context, arguments: dict[str, Any]) -> Result:
+    _check_names(arguments, ("trace_id", "limit", "cursor"))
+    trace_id = _text(arguments, "trace_id", required=True).strip()
+    query: dict[str, Any] = {"tool": "get_trace", "trace_id": trace_id}
+    items, cursor = _log_page(context, arguments, query, hours=0.0, oldest_first=True)
+    payload: dict[str, Any] = {
+        "trace_id": trace_id,
+        "items": items,
+        "next_cursor": cursor,
+        "capture": reads.log_capture_state(),
+    }
+    if not items and not _text(arguments, "cursor"):
+        payload["note"] = (
+            "No captured line carries this trace ID. It may be older than the "
+            "retention window, or log capture may have been off when it ran."
+        )
+    return Result(payload=payload, count=len(items))
+
+
 def _unindexed(repository: Repository) -> Result:
     """The answer for a granted repository Mira has never indexed.
 
@@ -353,6 +521,11 @@ class Tool:
     #: Every field the descriptor advertises is here, so `tools/list` cannot
     #: drift from what a handler actually accepts.
     annotations: dict[str, Any] = field(default_factory=dict)
+    #: The capability a session needs to be offered this tool, or "" for none.
+    requires: str = ""
+
+    def available_to(self, context: Context) -> bool:
+        return not self.requires or self.requires in context.capabilities
 
     def run(self, context: Context, arguments: dict[str, Any]) -> Result:
         """Run the tool, turning "there is nothing stored" into an answer.
@@ -518,10 +691,93 @@ TOOLS: tuple[Tool, ...] = (
         ),
         handler=get_indexed_file,
     ),
+    Tool(
+        name="mira_list_reviews",
+        description=(
+            "The review passes Mira ran on a repository, newest first: which "
+            "pull request, how many files and lines, what it posted by "
+            "severity, and the tokens and time it took."
+        ),
+        schema=_object(
+            {
+                "repository": _REPOSITORY_ARG,
+                "pr_number": {"type": "integer", "minimum": 1, "description": "One pull request."},
+                "limit": _LIMIT_ARG,
+                "cursor": _CURSOR_ARG,
+            },
+            required=("repository",),
+        ),
+        handler=list_reviews,
+    ),
+    Tool(
+        name="mira_search_logs",
+        description=(
+            "Search Mira's own captured log trail, newest first: errors, "
+            "warnings, model retries and fallbacks, provider failures. Filter "
+            "by level floor, logger, text (matched in messages and "
+            "tracebacks), trace ID, repository and a trailing window in hours."
+        ),
+        schema=_object(
+            {
+                "level": {
+                    "type": "string",
+                    "enum": list(_LOG_LEVELS),
+                    "description": "Lowest level to include. Default INFO.",
+                },
+                "logger": {
+                    "type": "string",
+                    "description": "Logger name, matched as a substring, e.g. mira.llm.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Text to find in the message or the traceback.",
+                },
+                "trace_id": {"type": "string", "description": "One review's trace ID."},
+                "repository": {
+                    "type": "string",
+                    "description": "Only lines logged for this owner/repo.",
+                },
+                "hours": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Trailing window. Default 24; 0 for everything kept.",
+                },
+                "limit": _LIMIT_ARG,
+                "cursor": _CURSOR_ARG,
+            }
+        ),
+        handler=search_logs,
+        requires=LOGS,
+    ),
+    Tool(
+        name="mira_get_trace",
+        description=(
+            "Every log line one review emitted, oldest first, so it reads as "
+            "the story of what happened. A failed review prints its trace ID "
+            "in the failure notice on the pull request."
+        ),
+        schema=_object(
+            {
+                "trace_id": {"type": "string", "description": "The trace ID to follow."},
+                "limit": _LIMIT_ARG,
+                "cursor": _CURSOR_ARG,
+            },
+            required=("trace_id",),
+        ),
+        handler=get_trace,
+        requires=LOGS,
+    ),
 )
 
 BY_NAME: dict[str, Tool] = {tool.name: tool for tool in TOOLS}
 
 
-def descriptors() -> list[dict[str, Any]]:
-    return [tool.descriptor() for tool in TOOLS]
+def available(context: Context) -> tuple[Tool, ...]:
+    """The tools a session with this context is offered."""
+    return tuple(tool for tool in TOOLS if tool.available_to(context))
+
+
+def descriptors(context: Context | None = None) -> list[dict[str, Any]]:
+    """Descriptors for a session's tools, or for every tool when none is given."""
+    offered = TOOLS if context is None else available(context)
+    return [tool.descriptor() for tool in offered]

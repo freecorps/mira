@@ -116,6 +116,7 @@ const settingsSubItems = [
   { to: "/settings/review", label: "Review" },
   { to: "/settings/connections", label: "Connections" },
   { to: "/settings/webhooks", label: "Webhooks" },
+  { to: "/settings/api-tokens", label: "API tokens" },
 ]
 
 const PAGE_LABELS: Record<string, string> = {
@@ -143,6 +144,7 @@ const PAGE_LABELS: Record<string, string> = {
   review: "Review",
   connections: "Connections",
   webhooks: "Webhooks",
+  "api-tokens": "API tokens",
 }
 
 function AppBreadcrumb() {

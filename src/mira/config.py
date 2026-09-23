@@ -1131,6 +1131,13 @@ class McpConfig(BaseModel):
     # the process's stderr going somewhere durable, not because it is optional
     # in the sense of "usually off".
     audit: bool = True
+    # The `/mcp` endpoint on `mira serve`. Unlike `enabled` this defaults on,
+    # and the difference is deliberate: that endpoint answers only an API
+    # token, and reaches exactly what the same token already reads from the
+    # REST API - the repositories the dashboard shows, and the log trail for an
+    # admin's token. It widens no one's access; it changes the shape of it.
+    # `enabled` and `repositories` govern the stdio server and not this one.
+    http_enabled: bool = True
 
     @field_validator("repositories")
     @classmethod

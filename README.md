@@ -198,13 +198,26 @@ human approved as rules, and how those rules have performed since.
 mira mcp serve --repo acme/widgets
 ```
 
-A read-only MCP server over stdio: seven tools, all reads, no writes, no
-approvals, no command execution. Off by default, and when it is on it reads
-only the repositories your configuration names — an enabled server with an
-empty list refuses everything. Every answer is redacted and framed as data, and
-every call, answered or refused, is written to an audit trail.
+A read-only MCP server over stdio: all reads, no writes, no approvals, no
+command execution. Off by default, and when it is on it reads only the
+repositories your configuration names — an enabled server with an empty list
+refuses everything. Every answer is redacted and framed as data, and every
+call, answered or refused, is written to an audit trail.
 
 → [docs/mcp.md](docs/mcp.md)
+
+When the agent runs somewhere other than Mira, give it a read-only API token
+instead. The same MCP server answers over HTTP at `/mcp`, and the token opens
+the REST API too — including, for an admin's token, the log trail, so an agent
+can follow a failed review's trace ID from start to finish:
+
+```bash
+mira token create --user admin --name claude-code   # or Settings → API tokens
+claude mcp add --transport http mira https://mira.example.com/mcp \
+  --header "Authorization: Bearer mira_pat_..."
+```
+
+→ [docs/agent-access.md](docs/agent-access.md)
 
 ## Configuration
 
