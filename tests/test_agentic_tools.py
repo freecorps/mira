@@ -297,3 +297,203 @@ class TestAgenticLoopReplay:
         assert assistant["role"] == "assistant"
         assert assistant["items"] == raw
         assert seen[1][2]["role"] == "tool"
+
+
+class _SnapshotFetcher(_FakeFetcher):
+    """A review's shared reader once its archive has landed."""
+
+    def __init__(self, sources: dict[str, str]):
+        super().__init__(dict(sources))
+        from mira.platforms.fetch import RepoSnapshot
+
+        self._snapshot = RepoSnapshot(files=dict(sources), paths=set(sources))
+
+    def loaded(self):  # type: ignore[no-untyped-def]
+        return self._snapshot
+
+
+class TestWholeRepoGrep:
+    @pytest.mark.asyncio
+    async def test_searches_every_file_in_the_snapshot(self):
+        """The per-file path could afford 15 fetches, alphabetically: a symbol
+        defined in the 16th file was reported as absent."""
+        sources = {f"src/mod_{i:03}.py": "x = 1\n" for i in range(200)}
+        sources["src/zz_last.py"] = "def target_symbol():\n    pass\n"
+        ex = AgenticToolExecutor(source_fetcher=_SnapshotFetcher(sources), repo_tree=list(sources))
+        out = await ex.execute("grep_repo", {"pattern": r"def target_symbol"})
+        assert "src/zz_last.py:1: def target_symbol():" in out
+        assert "searched all 201 files" in out
+
+    @pytest.mark.asyncio
+    async def test_anchored_pattern_matches_inside_a_file(self):
+        sources = {"a.py": "import os\n\ndef handle():\n    pass\n"}
+        ex = AgenticToolExecutor(source_fetcher=_SnapshotFetcher(sources), repo_tree=list(sources))
+        out = await ex.execute("grep_repo", {"pattern": "^def handle"})
+        assert "a.py:3: def handle():" in out
+
+    @pytest.mark.asyncio
+    async def test_files_missing_from_the_archive_weaken_the_claim(self):
+        sources = {"a.py": "a"}
+        ex = AgenticToolExecutor(
+            source_fetcher=_SnapshotFetcher(sources), repo_tree=["a.py", "tests/ignored.py"]
+        )
+        out = await ex.execute("grep_repo", {"pattern": "nowhere"})
+        assert "could not be searched" in out and "whole repository" not in out
+
+    @pytest.mark.asyncio
+    async def test_miss_over_the_whole_repo_says_so(self):
+        sources = {"a.py": "a", "b.py": "b"}
+        ex = AgenticToolExecutor(source_fetcher=_SnapshotFetcher(sources), repo_tree=list(sources))
+        out = await ex.execute("grep_repo", {"pattern": "nowhere"})
+        assert "whole repository" in out
+
+    @pytest.mark.asyncio
+    async def test_source_hits_come_before_test_hits(self):
+        sources = {"tests/test_a.py": "call_me()\n", "src/a.py": "def call_me(): ...\n"}
+        ex = AgenticToolExecutor(source_fetcher=_SnapshotFetcher(sources), repo_tree=list(sources))
+        out = await ex.execute("grep_repo", {"pattern": "call_me"})
+        assert out.index("src/a.py") < out.index("tests/test_a.py")
+
+    @pytest.mark.asyncio
+    async def test_partial_per_file_search_does_not_claim_absence(self):
+        tree = [f"src/f{i:02}.py" for i in range(40)]
+        ex = _executor(dict.fromkeys(tree, "nothing here"), tree)
+        out = await ex.execute("grep_repo", {"pattern": "target"})
+        assert "absence here proves nothing" in out
+
+
+class TestRangedRead:
+    @pytest.mark.asyncio
+    async def test_reads_the_asked_lines(self):
+        source = "\n".join(f"line {i}" for i in range(1, 1001))
+        ex = _executor({"big.py": source}, ["big.py"])
+        out = await ex.execute("read_file", {"path": "big.py", "start_line": 500, "end_line": 502})
+        assert "lines 500-502 of 1000" in out
+        assert "  500  line 500" in out and "  502  line 502" in out
+        assert "line 503" not in out
+        assert "start_line=503" in out
+
+    @pytest.mark.asyncio
+    async def test_truncated_read_says_how_to_read_on(self):
+        ex = _executor({"big.py": "x = 1\n" * 5000}, ["big.py"])
+        out = await ex.execute("read_file", {"path": "big.py"})
+        assert "pass start_line and end_line" in out
+
+    @pytest.mark.asyncio
+    async def test_numeric_string_lines_are_accepted(self):
+        ex = _executor({"a.py": "one\ntwo\nthree"}, ["a.py"])
+        out = await ex.execute("read_file", {"path": "a.py", "start_line": "2", "end_line": "2"})
+        assert "    2  two" in out and "three" not in out
+
+
+def _call(call_id: str, name: str, arguments: str) -> dict:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+class _ScriptedLLM:
+    """An agentic provider replaying a script, with a forced review to fall back on."""
+
+    def __init__(self, hops: list[dict], review: str = '{"comments": [], "summary": "forced"}'):
+        self.hops = list(hops)
+        self.seen: list[list[dict]] = []
+        self.review_messages: list[list[dict]] = []
+        self._review = review
+
+    async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+        self.seen.append(list(messages))
+        return self.hops.pop(0)
+
+    async def review(self, messages, temperature=None):  # type: ignore[no-untyped-def]
+        self.review_messages.append(list(messages))
+        return self._review
+
+
+class _Recorder:
+    call_log: list = []
+
+    async def execute(self, name, args):  # type: ignore[no-untyped-def]
+        return f"result of {name} {args.get('path') or args.get('pattern')}"
+
+
+class TestAgenticLoopKeepsItsWork:
+    @pytest.mark.asyncio
+    async def test_broken_submission_is_sent_back_for_another_try(self):
+        llm = _ScriptedLLM(
+            [
+                {"content": "", "tool_calls": [_call("c1", "submit_review", '{"comments": "[{"')]},
+                {
+                    "content": "",
+                    "tool_calls": [
+                        _call("c2", "submit_review", '{"comments": [], "summary": "ok"}')
+                    ],
+                },
+            ]
+        )
+        result = await agentic_review_loop(llm, [{"role": "user", "content": "go"}], _Recorder())
+        assert json.loads(result)["summary"] == "ok"
+        error = llm.seen[1][-1]
+        assert error["role"] == "tool" and "could not be read" in error["content"]
+        assert llm.review_messages == []
+
+    @pytest.mark.asyncio
+    async def test_prose_answer_after_lookups_submits_with_a_digest(self):
+        llm = _ScriptedLLM(
+            [
+                {"content": "", "tool_calls": [_call("c1", "read_file", '{"path": "a.py"}')]},
+                {"content": "The caller passes None; that looks like a bug.", "tool_calls": []},
+            ]
+        )
+        result = await agentic_review_loop(llm, [{"role": "user", "content": "go"}], _Recorder())
+        assert json.loads(result)["summary"] == "forced"
+        digest = llm.review_messages[0][-1]["content"]
+        assert [m["role"] for m in llm.review_messages[0]] == ["user"]
+        assert "read_file(path='a.py')" in digest
+        assert "result of read_file a.py" in digest
+        assert "The caller passes None" in digest
+
+    @pytest.mark.asyncio
+    async def test_review_written_as_text_is_accepted(self):
+        llm = _ScriptedLLM(
+            [{"content": '{"comments": [], "summary": "as text"}', "tool_calls": []}]
+        )
+        result = await agentic_review_loop(llm, [{"role": "user", "content": "go"}], _Recorder())
+        assert json.loads(result)["summary"] == "as text"
+        assert llm.review_messages == []
+
+    @pytest.mark.asyncio
+    async def test_last_hop_is_told_to_submit(self):
+        lookups = [
+            {"content": "", "tool_calls": [_call(f"c{i}", "grep_repo", '{"pattern": "x"}')]}
+            for i in range(2)
+        ]
+        final = {
+            "content": "",
+            "tool_calls": [_call("c9", "submit_review", '{"comments": [], "summary": "last"}')],
+        }
+        llm = _ScriptedLLM([*lookups, final])
+        result = await agentic_review_loop(
+            llm, [{"role": "user", "content": "go"}], _Recorder(), max_hops=3
+        )
+        assert json.loads(result)["summary"] == "last"
+        assert "last turn" in llm.seen[2][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_hop_cap_without_submission_uses_the_digest(self):
+        llm = _ScriptedLLM(
+            [
+                {"content": "", "tool_calls": [_call(f"c{i}", "grep_repo", '{"pattern": "y"}')]}
+                for i in range(2)
+            ]
+        )
+        result = await agentic_review_loop(
+            llm, [{"role": "user", "content": "go"}], _Recorder(), max_hops=2
+        )
+        assert json.loads(result)["summary"] == "forced"
+        assert "grep_repo(pattern='y')" in llm.review_messages[0][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_nothing_learned_leaves_the_plain_review_to_the_caller(self):
+        llm = _ScriptedLLM([{"content": "", "tool_calls": []}])
+        result = await agentic_review_loop(llm, [{"role": "user", "content": "go"}], _Recorder())
+        assert result == ""
+        assert llm.review_messages == []

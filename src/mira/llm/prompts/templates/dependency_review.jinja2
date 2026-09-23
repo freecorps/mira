@@ -20,6 +20,7 @@ These are illustrative — use your own judgment about whether two packages genu
 
 ## Rules
 
+- **Line numbers come from the gutter.** Every diff line starts with its number in the file after the change, then the marker (`+` added, `-` removed, space for context; removed lines have a blank gutter). Take `line` from the gutter and never count lines yourself; copy `existing_code` without the gutter or the marker.
 - **Only flag a dependency the diff ADDS.** If both packages were already present (neither is on a `+` line), say nothing — that's a pre-existing situation, not something this PR introduced.
 - **Never flag a package as overlapping with itself.** An exact-name match between the added package and the "Already present" list just means the index already saw it — ignore that; it is not a duplicate.
 - **One comment per added dependency.** Put it on the `+` line that adds the package. Name the existing package it overlaps with, explain the shared purpose, and note the cost (bundle size, split conventions, redundant maintenance). Suggest consolidating on one.

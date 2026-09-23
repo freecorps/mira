@@ -44,6 +44,7 @@ If a pattern matches but you can prove (from the diff alone) that the input is s
 
 ## Rules
 
+- **Line numbers come from the gutter.** Every diff line starts with its number in the file after the change, then the marker (`+` added, `-` removed, space for context; removed lines have a blank gutter). Take `line` from the gutter and never count lines yourself; copy `existing_code` without the gutter or the marker.
 - **Only flag what's in the diff** — don't speculate about code you can't see.
 - **One comment per issue.** Cite file + line range. Be specific about why it's a vulnerability and what the attack vector is.
 - **Severity:** `blocker` for exploitable-in-prod issues (authn/authz bypass, RCE, SQLi, XSS in user-facing surface). `warning` for issues that need a specific config or attacker capability. `suggestion` for hardening / defense-in-depth.

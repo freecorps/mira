@@ -15,6 +15,14 @@ from mira.models import FileDiff, UnresolvedThread
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
+_REVIEW_REMINDER = (
+    "---\n"
+    'Review every hunk above, going through "How to review" for each change. '
+    "Check anything that depends on code outside the hunk before deciding. File "
+    "every real defect you can support, with `line` taken from the gutter, then "
+    "call `submit_review` once."
+)
+
 
 def _get_template_env() -> Environment:
     return Environment(
@@ -102,6 +110,11 @@ def build_review_prompt(
     if code_context:
         user_parts.append(code_context)
     user_parts.extend(file_contexts)
+    # Said again after the diffs, where the model reads last: on a long prompt a
+    # smaller model follows what is nearest the end of it, and the procedure
+    # sits in a system prompt thousands of tokens back.
+    if file_contexts:
+        user_parts.append(_REVIEW_REMINDER)
 
     return [
         {"role": "system", "content": system_content},
