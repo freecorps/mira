@@ -65,6 +65,10 @@ def isolate_index_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     from mira.llm import base as llm_base
 
     llm_base._NO_JSON_SCHEMA.clear()
+    # So are the repositories whose archive could not be had.
+    from mira.index import context as index_context
+
+    index_context._no_snapshot_until.clear()
 
 
 @pytest.fixture

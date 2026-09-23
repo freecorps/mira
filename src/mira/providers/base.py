@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+from typing import TYPE_CHECKING
 
 from mira.autofix.capabilities import (
     NO_CAPABILITIES as NO_AUTOFIX_CAPABILITIES,
@@ -36,6 +37,9 @@ from mira.triage.capabilities import (
 from mira.triage.capabilities import (
     TriageCapabilities,
 )
+
+if TYPE_CHECKING:
+    from mira.platforms.fetch import RepoSnapshot
 
 
 class BaseProvider(abc.ABC):
@@ -196,6 +200,17 @@ class BaseProvider(abc.ABC):
     async def get_repo_tree(self, pr_info: PRInfo, ref: str) -> list[str]:
         """Every file path in the repo at a ref, for JIT cross-file context."""
         return []
+
+    async def get_repo_snapshot(
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+    ) -> RepoSnapshot | None:
+        """The whole repository at ``ref`` from one archive download, or None.
+
+        None means "read files one at a time": the answer for a provider with
+        no archive endpoint, and for a repository whose archive passes
+        ``max_bytes``.
+        """
+        return None
 
     async def get_file_history(
         self, pr_info: PRInfo, paths: list[str], max_per_file: int = 5

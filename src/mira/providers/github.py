@@ -8,7 +8,7 @@ import itertools
 import logging
 import os
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from github import Github, GithubException
@@ -66,6 +66,9 @@ from mira.triage.capabilities import (
 from mira.triage.capabilities import (
     TriageCapabilities,
 )
+
+if TYPE_CHECKING:
+    from mira.platforms.fetch import RepoSnapshot
 
 # Every check-run name Mira publishes itself. Filtered out of the CI it reads
 # back, so neither the gate nor the pre-merge checks can see their own red
@@ -1070,6 +1073,22 @@ class GitHubProvider(BaseProvider):
         except Exception as exc:
             logger.debug("Failed to fetch repo tree: %s", exc)
             return []
+
+    async def get_repo_snapshot(
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+    ) -> RepoSnapshot | None:
+        """The repository at ``ref`` from one tarball download (see ``BaseProvider``)."""
+        from mira.platforms.fetch import fetch_snapshot
+
+        return await fetch_snapshot(
+            f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/tarball/{ref}",
+            {
+                "Authorization": f"token {self._token}",
+                "Accept": "application/vnd.github+json",
+            },
+            label=f"{pr_info.owner}/{pr_info.repo}@{ref[:12]}",
+            max_bytes=max_bytes,
+        )
 
     async def get_file_content(self, pr_info: PRInfo, path: str, ref: str) -> str:
         """Fetch file content at a specific ref via the REST API."""
