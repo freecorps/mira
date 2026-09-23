@@ -85,7 +85,15 @@ async def verify_fixes(
         prompt, VerifyFixesResult, name="submit_fix_verdicts", temperature=0.0
     )
     logger.debug("Verify-fixes response: %s", result)
-    return fixed_thread_ids(result)
+    # Only a thread that was asked about can be resolved. An id the model
+    # invented — or copied from somewhere in the file — would otherwise be
+    # handed to the platform and close an unrelated thread.
+    asked = {t.thread_id for _path, _content, threads in file_groups for t in threads}
+    fixed = fixed_thread_ids(result)
+    unknown = [thread_id for thread_id in fixed if thread_id not in asked]
+    if unknown:
+        logger.warning("Ignoring verify-fixes verdicts for unknown thread ids: %s", unknown)
+    return [thread_id for thread_id in fixed if thread_id in asked]
 
 
 async def resolve_verified_threads(

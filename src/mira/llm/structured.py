@@ -30,13 +30,13 @@ This module holds the two pieces that close that gap:
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from mira.exceptions import ToolCallFormatError
+from mira.llm.utils import loads_lenient
 
 # Keywords that describe a schema to people rather than constrain the value.
 # Strict mode rejects ``default`` outright, and the rest are noise in a prompt.
@@ -283,10 +283,9 @@ def _decode(text: str) -> object:
     stripped = text.strip()
     if not stripped.startswith(("[", "{")):
         return None
-    try:
-        return json.loads(stripped, strict=False)
-    except (json.JSONDecodeError, TypeError):
-        return None
+    # The lenient loader, so a stringified array gets the same repairs
+    # (unescaped backslashes, leaked tool XML) as a top-level answer.
+    return loads_lenient(stripped)
 
 
 def validation_errors(exc: ValidationError) -> str:

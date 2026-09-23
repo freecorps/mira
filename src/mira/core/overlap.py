@@ -83,11 +83,21 @@ def _is_stacked(pr_info: PRInfo, ref: OpenPRRef) -> bool:
 
 
 def _verdicts(result: _OverlapVerdicts) -> dict[int, tuple[str, str, float]]:
-    """``pr_number → (kind, reason, confidence)``, confidence clamped to [0, 1]."""
-    return {
-        v.pr_number: (v.kind, v.reason.strip(), max(0.0, min(1.0, v.confidence)))
-        for v in result.overlaps
-    }
+    """``pr_number → (kind, reason, confidence)``, confidence clamped to [0, 1].
+
+    A model that judges the same PR twice gets its most confident verdict
+    kept (the first, on a tie), not whichever it happened to write last.
+    """
+    out: dict[int, tuple[str, str, float]] = {}
+    for v in result.overlaps:
+        verdict = (v.kind, v.reason.strip(), max(0.0, min(1.0, v.confidence)))
+        seen = out.get(v.pr_number)
+        if seen is not None:
+            logger.warning("Overlap verdict for PR #%d given more than once", v.pr_number)
+            if seen[2] >= verdict[2]:
+                continue
+        out[v.pr_number] = verdict
+    return out
 
 
 async def detect_overlaps(

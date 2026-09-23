@@ -129,6 +129,11 @@ class TestNormalize:
         out = structured.normalize(data, self._SCHEMA)
         assert out["comments"] == [{"path": "a", "line": 1}]
 
+    def test_a_stringified_array_gets_the_lenient_repairs(self):
+        data = {"comments": '[{"path": "C:\\users\\a.py", "line": 1}]', "summary": "ok"}
+        out = structured.normalize(data, self._SCHEMA)
+        assert out["comments"] == [{"path": "C:\\users\\a.py", "line": 1}]
+
     def test_leaves_a_string_field_holding_json_alone(self):
         data = {"comments": [], "summary": '["not", "a", "list"]'}
         assert structured.normalize(data, self._SCHEMA) == data
@@ -259,6 +264,19 @@ class TestChatJsonSchema:
         _, bodies = await self._run(
             provider,
             [overflow, _chat_tool_call("submit_findings", _GOOD)],
+            lambda: provider.generate_object(_MESSAGES, _Findings, name="submit_findings"),
+        )
+        assert "tools" in bodies[1]
+        assert provider._takes_json_schema("m")
+
+    @pytest.mark.asyncio
+    async def test_a_complaint_about_this_schema_is_not_remembered(self):
+        # About this tool's schema, not the format: the next tool may be fine.
+        provider = LLMProvider(LLMConfig(model="m"))
+        invalid = _resp({"error": {"message": "Invalid schema: 'minimum' is not permitted"}}, 400)
+        _, bodies = await self._run(
+            provider,
+            [invalid, _chat_tool_call("submit_findings", _GOOD)],
             lambda: provider.generate_object(_MESSAGES, _Findings, name="submit_findings"),
         )
         assert "tools" in bodies[1]

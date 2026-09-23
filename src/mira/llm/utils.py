@@ -89,7 +89,8 @@ def _balance_json(text: str) -> str:
     return out + "".join(closers[c] for c in reversed(stack))
 
 
-_VALID_JSON_ESCAPES = set('"\\/bfnrtu')
+_VALID_JSON_ESCAPES = set('"\\/bfnrt')
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
 
 
 def escape_lone_backslashes(text: str) -> str:
@@ -113,7 +114,12 @@ def escape_lone_backslashes(text: str) -> str:
             i += 1
         elif ch == "\\":
             nxt = text[i + 1] if i + 1 < n else ""
-            if nxt in _VALID_JSON_ESCAPES:
+            # ``\u`` escapes only with four hex digits after it: ``C:\users``
+            # is a path, not a code point.
+            is_unicode = (
+                nxt == "u" and len(text) >= i + 6 and set(text[i + 2 : i + 6]) <= _HEX_DIGITS
+            )
+            if nxt and (nxt in _VALID_JSON_ESCAPES or is_unicode):
                 out.append(ch + nxt)
                 i += 2
             else:
