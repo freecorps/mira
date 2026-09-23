@@ -119,7 +119,7 @@ class SnapshotSourceFetcher:
         self._tree: list[str] | None = None
         # The platform's own file list, read only when the archive misses a
         # path: `git archive` leaves out `export-ignore` paths and symlinks.
-        self._api_paths: asyncio.Task[set[str]] | None = None
+        self._api_paths: asyncio.Future[set[str] | None] | None = None
         self._closed = False
 
     def _repo_key(self) -> tuple[str, str, str]:
@@ -224,25 +224,31 @@ class SnapshotSourceFetcher:
         if snap is not None:
             if path in snap.files:
                 return snap.files[path]
-            if path not in snap.paths and path not in await self._platform_paths():
-                # Not in the commit at all: the API would say the same, slower.
-                return None
+            if path not in snap.paths:
+                listed = await self._platform_paths()
+                if listed is not None and path not in listed:
+                    # Not in the commit at all: the API would say the same, slower.
+                    return None
             # In the commit but held back (size, vendored, binary). The API
             # still answers for a text file that was only too big to keep.
         return await self._api.fetch(path)
 
-    async def _platform_paths(self) -> set[str]:
-        """The platform's file list, read once and only on an archive miss."""
+    async def _platform_paths(self) -> set[str] | None:
+        """The platform's file list, read once and only on an archive miss.
+
+        None when the platform would not say: that is "unknown", and an
+        unknown path is read from the API rather than declared missing.
+        """
         if self._api_paths is None:
 
-            async def _read() -> set[str]:
+            async def _read() -> set[str] | None:
                 try:
                     fetched = await self._provider.get_repo_tree(self._pr_info, self._ref)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Repo tree fetch failed: %s", exc)
-                    return set()
-                if not isinstance(fetched, (list, set, tuple)):
-                    return set()
+                    return None
+                if not isinstance(fetched, (list, set, tuple)) or not fetched:
+                    return None
                 return {p for p in fetched if isinstance(p, str)}
 
             self._api_paths = asyncio.ensure_future(_read())

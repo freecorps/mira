@@ -39,8 +39,9 @@ _COMMENT_MARKS = ("#", "//", "/*", "*", "--", '"""', "'''")
 def _changed_and_shown_lines(file: FileDiff) -> tuple[set[int], set[int]]:
     """New-file lines the diff changes, and every new-file line it already shows.
 
-    A removal changes no new-file line, so it is counted at the line that
-    follows it — the one that now sits where the removed code was.
+    A removal changes no new-file line, so it is counted at the lines on
+    either side of it: a removal at the end of a function is followed by a
+    line that belongs to the next one.
     """
     changed: set[int] = set()
     shown: set[int] = set()
@@ -55,6 +56,8 @@ def _changed_and_shown_lines(file: FileDiff) -> tuple[set[int], set[int]]:
                 continue
             if line.startswith("-"):
                 changed.add(max(new, 1))
+                if new > 1:
+                    changed.add(new - 1)
                 continue
             if line.startswith("+"):
                 changed.add(new)
@@ -87,6 +90,10 @@ def _nested(
     """
     if depth >= 3 or symbol.end_line - symbol.start_line + 1 <= _MAX_SPAN_LINES:
         return symbol
+    # The body *without* the symbol's own first line, on purpose: with it, the
+    # extractor finds the outer symbol again and steps over everything inside
+    # it. `start_line` is 1-based, so as a 0-based index it is the line after
+    # the header — which is also why body line k is file line start_line + k.
     body = "\n".join(lines[symbol.start_line : symbol.end_line])
     try:
         inner = extract_symbols(body, language)
@@ -117,14 +124,15 @@ def _ranges_for(file: FileDiff, source: str) -> list[tuple[int, int, str]]:
     wanted: dict[tuple[int, int], str] = {}
     for line in sorted(changed):
         text = lines[line - 1].strip() if 0 < line <= total else ""
-        if 0 < line <= total and (not text or text.startswith(_COMMENT_MARKS)):
-            # A blank or comment line added between two definitions belongs to
-            # neither, and mapping it to the enclosing class shows the class.
-            continue
+        trivial = 0 < line <= total and (not text or text.startswith(_COMMENT_MARKS))
         symbol = _innermost(symbols, line)
         if symbol is None:
             continue
         symbol = _nested(lines, symbol, line, file.language or "")
+        if trivial and symbol.kind == "class":
+            # A blank or comment line between two methods belongs to neither;
+            # mapping it to the class would show the whole class.
+            continue
         first, last = symbol.start_line, min(symbol.end_line, total)
         label = symbol.qualified_name or symbol.name
         if last - first + 1 > _MAX_SPAN_LINES:

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 from github import Github, GithubException
@@ -1081,7 +1082,7 @@ class GitHubProvider(BaseProvider):
         from mira.platforms.fetch import fetch_snapshot
 
         return await fetch_snapshot(
-            f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/tarball/{ref}",
+            f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/tarball/{quote(ref, safe='')}",
             {
                 "Authorization": f"token {self._token}",
                 "Accept": "application/vnd.github+json",

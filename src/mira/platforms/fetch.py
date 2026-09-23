@@ -112,6 +112,9 @@ class RepoSnapshot:
     # True when text was left out for the memory cap rather than for what the
     # file is: a search over ``files`` then no longer covers the repository.
     partial: bool = False
+    # Source files left out only for their size: they exist and could hold a
+    # match, so a search over ``files`` has not covered them either.
+    oversized: set[str] = field(default_factory=set)
 
 
 # Never decoded into a snapshot: build output, vendored code and binary
@@ -188,7 +191,10 @@ def _snapshot_from_stream(
                     continue
                 path = parts[1]
                 snapshot.paths.add(path)
-                if (max_file_size and member.size > max_file_size) or _snapshot_skips(path):
+                if _snapshot_skips(path):
+                    continue
+                if max_file_size and member.size > max_file_size:
+                    snapshot.oversized.add(path)
                     continue
                 if max_text_bytes and held + member.size > max_text_bytes:
                     snapshot.partial = True

@@ -167,7 +167,9 @@ def _hunk_views(file: FileDiff) -> tuple[list[tuple[int, str]], ...]:
     return new_view, old_view, mixed_view
 
 
-def _match_at(view: list[tuple[int, str]], start: int, quote: list[str]) -> int | None:
+def _match_at(
+    view: list[tuple[int, str]], start: int, quote: list[str], exact: bool = False
+) -> int | None:
     """Index of the last view line when ``quote`` matches from ``start``, else None.
 
     The first quoted line may be the tail of its line and the last one the
@@ -182,7 +184,7 @@ def _match_at(view: list[tuple[int, str]], start: int, quote: list[str]) -> int 
             return None
         have = view[i][1]
         if len(quote) == 1:
-            ok = want in have
+            ok = have == want if exact else want in have
         elif n == 0:
             ok = have.endswith(want)
         elif n == len(quote) - 1:
@@ -209,15 +211,20 @@ def _locate_quote(quote: str, views: tuple) -> list[tuple[int, int]]:
         if not lines:
             return []
         lines = lines[:1]
-    for view in views:
-        for start, (_line, text) in enumerate(view):
-            if not text:
-                continue
-            end = _match_at(view, start, lines)
-            if end is not None:
-                spans.append((view[start][0], view[end][0]))
-    # A context line is in every view; one place in the file is one span.
-    return sorted(set(spans))
+    # Most specific first: a whole-line match before a fragment (`x = 1` is in
+    # `max = 10`), and the code after the change before the code it replaced.
+    # The first tier and view that match anything decide.
+    for exact in (True, False):
+        for view in views:
+            for start, (_line, text) in enumerate(view):
+                if not text:
+                    continue
+                end = _match_at(view, start, lines, exact)
+                if end is not None:
+                    spans.append((view[start][0], view[end][0]))
+            if spans:
+                return sorted(set(spans))
+    return []
 
 
 # A quote shorter than this says too little to overrule the model's own line:
