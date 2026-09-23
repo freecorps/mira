@@ -382,3 +382,143 @@ def get_indexed_file(repository: Repository, path: str) -> dict[str, Any] | None
         # silently stops is a file that reads as having fewer neighbours.
         "omitted": omitted,
     }
+
+
+def list_reviews(
+    repository: Repository, *, pr_number: int = 0, limit: int, offset: int
+) -> list[dict[str, Any]]:
+    """The review passes Mira ran on a repository, newest first.
+
+    One row per pass: what it looked at, what it posted, what it cost. The
+    author is in the stored row and is left out for the reason the evaluation
+    rows leave it out - a question about how reviews went is not a question
+    about whose pull requests they were.
+
+    Paged in memory. The store reads newest first with a limit and no offset,
+    and the offset a cursor may carry is bounded, so the over-read is too.
+    """
+    with open_index(repository) as store:
+        if pr_number:
+            events = store.list_review_events_for_pr(pr_number)
+        else:
+            events = store.list_review_events(limit=offset + limit + 1)
+    window = events[offset : offset + limit + 1]
+    return [_review_dict(event) for event in window]
+
+
+def _review_dict(event: Any) -> dict[str, Any]:
+    omitted: dict[str, int] = {}
+    return {
+        "id": event.id,
+        "pr_number": event.pr_number,
+        "pr_title": event.pr_title,
+        "pr_url": event.pr_url,
+        "comments_posted": event.comments_posted,
+        "blockers": event.blockers,
+        "warnings": event.warnings,
+        "suggestions": event.suggestions,
+        "files_reviewed": event.files_reviewed,
+        "lines_changed": event.lines_changed,
+        "tokens_used": event.tokens_used,
+        "duration_ms": event.duration_ms,
+        "categories": [c.strip() for c in (event.categories or "").split(",") if c.strip()],
+        "reviewed_paths": _bounded(_json_list(event.reviewed_paths), "reviewed_paths", omitted),
+        "created_at": event.created_at,
+        "omitted": omitted,
+    }
+
+
+def _json_list(text: str) -> list[Any]:
+    """A stored JSON array, or an empty list for anything that is not one."""
+    import json
+
+    try:
+        value = json.loads(text or "[]")
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+# --------------------------------------------------------------------------
+# Mira's own log trail
+# --------------------------------------------------------------------------
+#
+# Not repository data: the trail is install-wide, and it lives in the
+# application database rather than in any index. It is reached only by a
+# session holding the `logs` capability, which the HTTP transport grants to an
+# admin's token and nothing else grants at all - the same line the dashboard
+# draws, for the same reason: a review of a private repository logs its name.
+
+
+def _log_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "created_at": row.get("created_at"),
+        "level": row.get("level"),
+        "logger": row.get("logger"),
+        "message": row.get("message"),
+        "traceback": row.get("traceback"),
+        "trace_id": row.get("trace_id"),
+        "repository": row.get("repo"),
+        "pr_number": row.get("pr_number"),
+        "module": row.get("module"),
+        "func_name": row.get("func_name"),
+        "lineno": row.get("lineno"),
+    }
+
+
+def list_logs(
+    app_db: Any,
+    *,
+    min_level: int = 0,
+    logger_name: str = "",
+    query: str = "",
+    trace_id: str = "",
+    repo: str = "",
+    since: float = 0.0,
+    until: float = 0.0,
+    oldest_first: bool = False,
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """Captured log lines matching the filters. Reads one row past the page."""
+    rows = app_db.list_app_logs(
+        min_level=min_level,
+        logger_name=logger_name,
+        query=query,
+        trace_id=trace_id,
+        repo=repo,
+        since=since,
+        until=until,
+        oldest_first=oldest_first,
+        limit=limit + 1,
+        offset=offset,
+    )
+    return [_log_dict(row) for row in rows]
+
+
+def log_capture_state() -> dict[str, Any]:
+    """Whether the trail is being written, and whether it has gaps.
+
+    Travels with every answer about logs, because "no lines matched" and "log
+    capture is off" look identical as an empty list, and only one of them is
+    a reason to stop looking.
+    """
+    import logging
+
+    from mira.logs import active_handler, capture_level
+
+    handler = active_handler()
+    if handler is None:
+        return {
+            "enabled": False,
+            "level": logging.getLevelName(capture_level()),
+            "dropped": 0,
+            "write_errors": 0,
+        }
+    return {
+        "enabled": True,
+        "level": logging.getLevelName(handler.level),
+        "dropped": handler.dropped,
+        "write_errors": handler.write_errors,
+    }

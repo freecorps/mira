@@ -10,6 +10,12 @@ mira mcp serve          # the server itself, on stdin/stdout
 mira mcp audit          # what clients have read
 ```
 
+> **Agent somewhere else?** The same server also runs over HTTP at `/mcp` on
+> `mira serve`, opened with an API token instead of launched as a subprocess —
+> for an install on Railway, Fly or a VM that the agent cannot reach the storage
+> of. It adds the log-trail tools for an admin's token. See
+> [agent-access.md](agent-access.md).
+
 An agent reviewing a change can already read the code. What it cannot see is
 Mira's history with that code: which findings were raised on the last twenty
 pull requests and whether they held up, which conventions a human has approved
@@ -80,7 +86,8 @@ carries the protocol, so everything the server has to say goes to stderr.
 
 ## The tools
 
-Seven, all reads.
+Eight on stdio, all reads; the HTTP transport adds two more for an admin's
+token (see [agent-access.md](agent-access.md#the-tools)).
 
 | Tool | Answers |
 |---|---|
@@ -91,6 +98,11 @@ Seven, all reads.
 | `mira_list_evaluations` | One row per recorded rule exposure, with the outcome |
 | `mira_list_indexed_files` | The indexed files and the summary held for each |
 | `mira_get_indexed_file` | One file's summary, symbols, imports and dependents |
+| `mira_list_reviews` | Review passes on a repository: files and lines, what was posted by severity, tokens and time |
+
+`mira_search_logs` and `mira_get_trace` read Mira's own log trail. The trail
+belongs to the install, not to any repository, so no grant reaches it: a stdio
+session is not offered them, and a call to one is refused.
 
 There is no tool that writes, approves, dismisses, triggers a review, applies a
 fix, or runs a command. That is a property of the registry rather than of the
@@ -104,8 +116,8 @@ Two things a repository-scoped grant deliberately does not reach:
 - **Install-wide global rules.** They belong to the deployment, not to a
   repository, so a grant for one repository would otherwise see configuration
   that applies to every other.
-- **Pull-request authors.** The evaluation rows carry one; the tool does not
-  return it. How a rule performed is not a question about whose code it landed
+- **Pull-request authors.** The evaluation and review rows carry one; the
+  tools do not return it. How a rule performed is not a question about whose code it landed
   on.
 
 ### Paging
@@ -256,6 +268,7 @@ the read.
 | `mcp.max_text_chars` | `4000` | Per-field cap on free text |
 | `mcp.max_response_bytes` | `262144` | Ceiling on one response |
 | `mcp.audit` | `true` | Write the trail to the application database |
+| `mcp.http_enabled` | `true` | The HTTP transport at `/mcp` on `mira serve`; see [agent-access.md](agent-access.md) |
 
 ---
 
@@ -263,8 +276,9 @@ the read.
 
 - **Not a write surface.** No approvals, no dismissals, no re-reviews, no
   autofix, no command execution. Those live where a human can see them.
-- **Not a network service.** stdio only. There is no port to authenticate, rate
-  limit or firewall.
+- **Not a network service, on stdio.** `mira mcp serve` has no port to
+  authenticate, rate limit or firewall. The HTTP transport is a separate door
+  on `mira serve`, opened only by an API token.
 - **Not a source-code server.** What Mira stores about a file is a summary of
   it. The file itself is in the repository the caller already has.
 - **Not a way around the dashboard's permissions.** The grant is a separate,

@@ -62,6 +62,10 @@ _RULES: tuple[_Rule, ...] = (
     # GitLab personal / project / runner tokens.
     _rule("gitlab-token", r"glpat-[A-Za-z0-9\-_]{16,}"),
     _rule("gitlab-token", r"gl(?:rt|ptt|soat|cbt|dt|ft)-[A-Za-z0-9\-_]{16,}"),
+    # Mira's own API tokens. Its log trail and MCP responses go through this
+    # filter too, and a token pasted into a config file or an error message
+    # should not come back out through the surface it unlocks.
+    _rule("mira-token", r"mira_pat_[A-Za-z0-9\-_]{16,}"),
     # Slack bot/user/app tokens and webhooks.
     _rule("slack-token", r"xox[abprs]-[A-Za-z0-9\-]{10,}"),
     _rule("slack-webhook", r"https://hooks\.slack\.com/services/[A-Za-z0-9/+_-]{20,}"),

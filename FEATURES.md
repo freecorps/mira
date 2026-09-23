@@ -164,7 +164,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 ## Read-only MCP server
 
 - `mira mcp serve` exposes what Mira has recorded — findings, approved learned rules, rule evaluations and indexed file summaries — over the MCP stdio transport
-- Seven tools, all reads: nothing writes, approves, dismisses, re-reviews, applies a fix or runs a command, and every tool advertises `readOnlyHint`
+- Ten tools, all reads: nothing writes, approves, dismisses, re-reviews, applies a fix or runs a command, and every tool advertises `readOnlyHint`
 - Off by default; when enabled it reads only the repositories the configuration names, and an enabled server with an empty list refuses every read
 - A tool argument is looked up in the grant rather than parsed into a repository, so no name a client sends — another owner, a path that walks out of the index directory, a spelling that would open another store — reaches the data
 - `--repo` narrows a launch to part of the configured ceiling; it can never widen it
@@ -173,8 +173,21 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Install-wide global rules and pull-request authors are deliberately withheld from a repository-scoped grant
 - Paged with opaque cursors bound to their query, a server-enforced page cap, per-field truncation and a response-size ceiling that reduces rows before it shortens fields
 - Every call, answered or refused, is audited to the application database and to stderr — with the arguments redacted and the returned rows never copied
-- stdio only: no network listener, no port to authenticate
+- `mira_list_reviews` lists the review passes on a repository — files, lines, what was posted, tokens and time
+- `mira mcp serve` is stdio only: no network listener, no port to authenticate
 - See [docs/mcp.md](docs/mcp.md)
+
+## Agent access: API tokens and MCP over HTTP
+
+- Read-only `mira_pat_` API tokens, minted from **Settings → API tokens** or `mira token create`, belonging to one dashboard user and reaching what that user can read
+- A token only reads: anything but `GET`/`HEAD` is refused before a route runs, and so is every credential route but `/api/auth/me`
+- Only a SHA-256 digest is stored; the token is shown once, expires after 90 days by default, is revocable, and is masked by the redaction filter wherever it turns up
+- The whole dashboard REST API opens to `Authorization: Bearer`, schema at `/openapi.json`
+- The MCP server over Streamable HTTP at `/mcp` on `mira serve` — same tools, framing and audit — opened by a token only, never a session cookie
+- `mira_search_logs` and `mira_get_trace` read the log trail for an admin's token: filter by level, logger, text, trace ID, repository and window, or follow one review oldest-first
+- Log paging is pinned to the first page, so lines written mid-walk neither repeat nor go missing
+- Every HTTP call audited under the token that made it
+- See [docs/agent-access.md](docs/agent-access.md)
 
 ## Platform integrations
 

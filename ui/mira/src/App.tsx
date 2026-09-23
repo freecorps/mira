@@ -8,6 +8,7 @@ import { UninstallModal } from "@/components/dashboard/uninstall-modal"
 import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import { ActivityPage } from "@/pages/activity"
+import { ApiTokensPage } from "@/pages/api-tokens"
 import { AutofixPage } from "@/pages/autofix"
 import { ChecksPage } from "@/pages/checks"
 import { ConnectionsPage } from "@/pages/connections"
@@ -242,6 +243,7 @@ export function App() {
           />
           <Route path="settings/connections" element={<ConnectionsPage />} />
           <Route path="settings/webhooks" element={<WebhooksPage />} />
+          <Route path="settings/api-tokens" element={<ApiTokensPage />} />
           <Route path="settings/webhooks/new" element={<WebhookFormPage />} />
           <Route path="settings/webhooks/:id" element={<WebhookFormPage />} />
           <Route path="settings/:section" element={<SettingsPage />} />

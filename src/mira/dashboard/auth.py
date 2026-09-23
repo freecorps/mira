@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Request, Response
@@ -23,6 +24,18 @@ _PUBLIC_PATHS = {"/api/auth/login", "/docs", "/openapi.json", "/redoc"}
 # The badge SVG must be public so GitHub can embed it as an image
 _PUBLIC_SVG = re.compile(r"/api/repos/[^/]+/[^/]+/blast-radius\.svg")
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# What a request carrying an API token may do. Reads, and the MCP endpoint,
+# which is a POST by protocol and read-only by inventory. See
+# `mira.dashboard.tokens` for why the rest is out of reach.
+_TOKEN_METHODS = {"GET", "HEAD"}
+MCP_PATH = "/mcp"
+# The one credential route a token may call: an agent asking whose token it
+# holds is the first thing worth checking, and the answer changes nothing.
+_TOKEN_AUTH_PATHS = {"/api/auth/me"}
+# GETs with side effects. The OAuth callback finishes a login and stores a
+# grant, which is a write whatever its verb says.
+_TOKEN_REFUSED_PATHS = {"/api/oauth/callback"}
 
 
 def _normalize_origin(value: str) -> str:
@@ -82,6 +95,36 @@ class ChangePasswordRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     new_password: str
+
+
+class CreateTokenRequest(BaseModel):
+    name: str
+    # Days until the token stops working. 0 means it does not expire, which is
+    # allowed and not the default the dashboard offers.
+    expires_in_days: int = 90
+    # Admins may mint a token for another user - the usual case being a
+    # dedicated non-admin account for an agent. Everybody else mints their own.
+    user_id: int | None = None
+
+
+class ApiTokenResponse(BaseModel):
+    id: int
+    user_id: int
+    username: str
+    name: str
+    prefix: str
+    created_at: float
+    expires_at: float
+    last_used_at: float
+    revoked_at: float
+
+
+class CreatedTokenResponse(ApiTokenResponse):
+    # The token itself. In this response and no other, ever.
+    token: str
+
+
+_MAX_TOKEN_DAYS = 3650
 
 
 def create_auth_router(db: AppDatabase) -> APIRouter:
@@ -208,7 +251,87 @@ def create_auth_router(db: AppDatabase) -> APIRouter:
         db.update_password(user_id, body.new_password)
         return {"ok": True}
 
+    # ── API tokens ──
+    #
+    # Reachable from a session only: the middleware refuses a token on every
+    # /api/auth route but `me`, so a token can never list, mint or revoke one.
+
+    @router.get("/tokens", response_model=list[ApiTokenResponse])
+    def list_tokens(request: Request, all_users: bool = False) -> list[dict] | JSONResponse:
+        """The caller's tokens; an admin may ask for everybody's."""
+        user = getattr(request.state, "user", None)
+        if not user:
+            return JSONResponse(status_code=401, content={"error": "Not authenticated"})
+        if all_users and not user.is_admin:
+            return JSONResponse(status_code=403, content={"error": "Admin access required"})
+        return db.list_api_tokens(user_id=None if all_users else user.id)
+
+    @router.post("/tokens", response_model=CreatedTokenResponse)
+    def create_token(body: CreateTokenRequest, request: Request) -> dict | JSONResponse:
+        user = getattr(request.state, "user", None)
+        if not user:
+            return JSONResponse(status_code=401, content={"error": "Not authenticated"})
+        name = body.name.strip()
+        if not name:
+            return JSONResponse(status_code=400, content={"error": "Give the token a name"})
+        if not 0 <= body.expires_in_days <= _MAX_TOKEN_DAYS:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Expiry must be between 0 and {_MAX_TOKEN_DAYS} days"},
+            )
+        owner_id = user.id
+        if body.user_id is not None and body.user_id != user.id:
+            if not user.is_admin:
+                return JSONResponse(status_code=403, content={"error": "Admin access required"})
+            if not any(u.id == body.user_id for u in db.list_users()):
+                return JSONResponse(status_code=404, content={"error": "No such user"})
+            owner_id = body.user_id
+        expires_at = time.time() + body.expires_in_days * 86400 if body.expires_in_days else 0.0
+        token, record = db.create_api_token(owner_id, name, expires_at=expires_at)
+        logger.info(
+            "API token %d (%s) created for user %d by %s",
+            record["id"],
+            record["name"],
+            owner_id,
+            user.username,
+        )
+        return {**record, "token": token}
+
+    @router.delete("/tokens/{token_id}", response_model=None)
+    def revoke_token(token_id: int, request: Request) -> dict | JSONResponse:
+        """Revoke a token. Your own, or anybody's if you are an admin."""
+        user = getattr(request.state, "user", None)
+        if not user:
+            return JSONResponse(status_code=401, content={"error": "Not authenticated"})
+        record = db.get_api_token(token_id)
+        # Somebody else's token reads as missing to a non-admin: whether a
+        # token id exists is not their business.
+        if record is None or (record["user_id"] != user.id and not user.is_admin):
+            return JSONResponse(status_code=404, content={"error": "No such token"})
+        db.revoke_api_token(token_id)
+        logger.info("API token %d (%s) revoked by %s", token_id, record["name"], user.username)
+        return {"ok": True}
+
     return router
+
+
+def bearer_token(request: Request) -> str:
+    """The credential in an ``Authorization: Bearer`` header, or ``""``."""
+    header = request.headers.get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return value.strip()
+
+
+def _unauthorized(message: str) -> JSONResponse:
+    # The challenge header is what tells an MCP client, or any HTTP client,
+    # that a bearer token is what this server wants.
+    return JSONResponse(
+        status_code=401,
+        content={"error": message},
+        headers={"WWW-Authenticate": 'Bearer realm="mira"'},
+    )
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -225,9 +348,19 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Allow the badge SVG for GitHub image embedding
         if _PUBLIC_SVG.fullmatch(request.url.path):
             return await call_next(request)
+        is_mcp = request.url.path == MCP_PATH
         # Non-API paths (frontend assets) don't need auth
-        if not request.url.path.startswith("/api/"):
+        if not request.url.path.startswith("/api/") and not is_mcp:
             return await call_next(request)
+
+        bearer = bearer_token(request)
+        if bearer:
+            return await self._dispatch_token(request, call_next, bearer, is_mcp=is_mcp)
+        if is_mcp:
+            # The MCP endpoint takes a token and nothing else. A cookie would
+            # make a cross-site POST from any page the admin has open an
+            # authenticated MCP call, and no MCP client carries one anyway.
+            return _unauthorized("The MCP endpoint needs an API token (Authorization: Bearer)")
 
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
@@ -246,4 +379,36 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(status_code=403, content={"error": "Invalid request origin"})
 
         request.state.user = user
+        return await call_next(request)
+
+    async def _dispatch_token(  # type: ignore[no-untyped-def]
+        self, request: Request, call_next, token: str, *, is_mcp: bool
+    ):
+        """Authenticate a request by API token, and hold it to reading.
+
+        The method and path checks run before the token is looked up, so a
+        write attempted with a token is refused the same way whether or not
+        the token is any good: a caller probing for what a stolen token can
+        do learns nothing from the difference.
+        """
+        path = request.url.path
+        if not is_mcp:
+            if request.method not in _TOKEN_METHODS:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "API tokens are read-only; sign in to make changes"},
+                )
+            if (path.startswith("/api/auth/") and path not in _TOKEN_AUTH_PATHS) or (
+                path in _TOKEN_REFUSED_PATHS
+            ):
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "API tokens cannot manage credentials; sign in instead"},
+                )
+        found = self.db.validate_api_token(token)
+        if found is None:
+            return _unauthorized("Invalid, expired or revoked API token")
+        user, record = found
+        request.state.user = user
+        request.state.api_token = record
         return await call_next(request)

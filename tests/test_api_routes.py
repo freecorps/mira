@@ -52,6 +52,12 @@ EXPECTED_ROUTES = {
     ("/api/logs", "DELETE"),
     ("/api/logs/export", "GET"),
     ("/api/logs/loggers", "GET"),
+    # The read-only MCP server over HTTP. Only POST does anything; GET and
+    # DELETE answer 405, because there is no stream to open and no session to
+    # end. The middleware lets nothing but an API token reach any of them.
+    ("/mcp", "POST"),
+    ("/mcp", "GET"),
+    ("/mcp", "DELETE"),
     # OAuth logins for LLM backends (all admin-only). No route returns token
     # material: /providers reports who is connected, not what with.
     ("/api/oauth/providers", "GET"),

@@ -42,7 +42,7 @@ def _exchange(session: MiraMcpServer, *messages: dict[str, Any]) -> list[dict[st
 
 
 class TestTheInventoryIsReadOnly:
-    def test_the_server_offers_exactly_these_seven_tools(self) -> None:
+    def test_the_server_offers_exactly_these_ten_tools(self) -> None:
         # Written out so that adding a tool means editing this list, in a test
         # whose subject is that none of them writes.
         assert set(tools.BY_NAME) == {
@@ -53,7 +53,19 @@ class TestTheInventoryIsReadOnly:
             "mira_list_evaluations",
             "mira_list_indexed_files",
             "mira_get_indexed_file",
+            "mira_list_reviews",
+            "mira_search_logs",
+            "mira_get_trace",
         }
+
+    def test_a_stdio_session_is_not_offered_the_log_tools(self) -> None:
+        # The log trail is install-wide and a grant is per repository, so no
+        # grant reaches it; only the HTTP transport, for an admin, adds it.
+        offered = {d["name"] for d in server("acme/widgets").list_tools({})["tools"]}
+
+        assert "mira_search_logs" not in offered
+        assert "mira_get_trace" not in offered
+        assert "mira_list_reviews" in offered
 
     def test_every_tool_declares_itself_read_only(self) -> None:
         for descriptor in tools.descriptors():

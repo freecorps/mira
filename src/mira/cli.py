@@ -860,11 +860,15 @@ def mcp_tools(config_path: str | None) -> None:
     click.echo(f"repositories: {', '.join(config.repositories) or 'none (every read is refused)'}")
     click.echo(f"page size: up to {config.max_page_size} rows")
     click.echo("")
+    click.echo(f"http endpoint (/mcp on `mira serve`): {'on' if config.http_enabled else 'off'}")
+    click.echo("")
     for tool in mcp_tools_module.TOOLS:
         arguments = ", ".join(sorted(tool.schema.get("properties", {}))) or "none"
         click.echo(f"{tool.name}")
         click.echo(f"    {tool.description}")
         click.echo(f"    arguments: {arguments}")
+        if tool.requires == mcp_tools_module.LOGS:
+            click.echo("    over HTTP, with an admin's API token only; not on stdio")
 
 
 @mcp_group.command("audit")
@@ -900,6 +904,108 @@ def mcp_audit(repository: str, limit: int) -> None:
         )
         if entry["detail"]:
             click.echo(f"    {entry['detail']}")
+
+
+@main.group("token")
+def token_group() -> None:
+    """Create, list and revoke API tokens, on the host that holds the database.
+
+    The dashboard does the same under Settings → API tokens. This is for an
+    install with no one signed in to it yet, or a script: run it wherever
+    DATABASE_URL (or MIRA_INDEX_DIR) points at the install's database.
+    """
+
+
+def _token_db():  # type: ignore[no-untyped-def]
+    from mira.dashboard.db import AppDatabase
+
+    return AppDatabase(
+        os.environ.get("DATABASE_URL", ""), admin_password=os.environ.get("ADMIN_PASSWORD", "")
+    )
+
+
+def _when(epoch: float, never: str = "never") -> str:
+    from datetime import datetime
+
+    if not epoch:
+        return never
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat(timespec="seconds")
+
+
+@token_group.command("create")
+@click.option("--user", "username", required=True, help="The user the token acts as.")
+@click.option("--name", required=True, help="What the token is for, e.g. claude-code.")
+@click.option(
+    "--expires-days",
+    default=90,
+    show_default=True,
+    type=click.IntRange(0, 3650),
+    help="Days until it stops working. 0 for never.",
+)
+def token_create(username: str, name: str, expires_days: int) -> None:
+    """Mint a read-only API token. It is printed once, on stdout.
+
+    The token reads what the user can read in the dashboard. Give an agent a
+    dedicated non-admin user unless it needs the log trail, which only an
+    admin's token reaches.
+    """
+    import time
+
+    database = _token_db()
+    user = next((u for u in database.list_users() if u.username == username), None)
+    if user is None:
+        raise click.ClickException(f"No user named {username!r}.")
+    if not name.strip():
+        raise click.UsageError("--name cannot be empty.")
+    expires_at = time.time() + expires_days * 86400 if expires_days else 0.0
+    token, record = database.create_api_token(user.id, name, expires_at=expires_at)
+    # The token alone on stdout, so `$(mira token create ...)` captures it and
+    # nothing else; the rest is for the person reading the terminal.
+    click.echo(
+        f"Token {record['id']} ({record['name']}) for {username}"
+        f"{' (admin: can read logs)' if user.is_admin else ''}, "
+        f"expires {_when(record['expires_at'])}. It will not be shown again.",
+        err=True,
+    )
+    click.echo(token)
+
+
+@token_group.command("list")
+@click.option("--user", "username", default="", help="Only this user's tokens.")
+def token_list(username: str) -> None:
+    """Show tokens, newest first. Never the tokens themselves."""
+    database = _token_db()
+    user_id = None
+    if username:
+        user = next((u for u in database.list_users() if u.username == username), None)
+        if user is None:
+            raise click.ClickException(f"No user named {username!r}.")
+        user_id = user.id
+    records = database.list_api_tokens(user_id=user_id)
+    if not records:
+        click.echo("No API tokens.")
+        return
+    for record in records:
+        state = "revoked" if record["revoked_at"] else "active"
+        click.echo(
+            f"{record['id']:>4}  {state:<8} {record['prefix']}…  {record['username']:<16} "
+            f"{record['name']:<24} last used {_when(record['last_used_at'])}, "
+            f"expires {_when(record['expires_at'])}"
+        )
+
+
+@token_group.command("revoke")
+@click.argument("token_id", type=int)
+def token_revoke(token_id: int) -> None:
+    """Revoke a token by id. It stops working on the next request."""
+    database = _token_db()
+    record = database.get_api_token(token_id)
+    if record is None:
+        raise click.ClickException(f"No token with id {token_id}.")
+    if not database.revoke_api_token(token_id):
+        click.echo(f"Token {token_id} ({record['name']}) was already revoked.")
+        return
+    click.echo(f"Revoked token {token_id} ({record['name']}).")
 
 
 @main.group("triage")
