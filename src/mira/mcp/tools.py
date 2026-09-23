@@ -385,29 +385,52 @@ def _log_page(
     hours: float,
     oldest_first: bool,
 ) -> tuple[list[dict[str, Any]], str]:
-    """One page of log lines, pinned to the moment the first page was read.
+    """One page of a trail that is written and pruned while it is being read.
 
-    The trail grows while it is being paged. Newest first, every line written
-    between two calls would push a row the last page returned onto the next
-    one, so the first page fixes an upper bound and the cursor carries it: page
-    two reads the trail as it stood when page one was read. The trailing window
-    is measured back from that same moment, so it does not slide either.
+    Two orders, and each pages the way that order stays stable.
+
+    Newest first, the trail grows at the top: every line written between two
+    calls would push a row the last page returned onto the next one. So the
+    first page fixes an upper bound in time and the cursor carries it, and page
+    two reads the trail as it stood when page one was read; the trailing window
+    is measured back from that same moment. Retention prunes the oldest rows,
+    which are the bottom of this order, so an offset into it does not move.
+
+    Oldest first, it is the other way round: pruning eats the head, and an
+    offset would skip one line for every row deleted between pages. So this
+    order pages by key - the cursor carries the id of the last line returned -
+    and new lines at the end are simply the rest of the story.
     """
     if context.app_db is None:
         raise RuntimeError("the application database is not available to this session")
     size = page_size(arguments.get("limit"), configured=context.max_page_size)
     offset, anchor = decode_anchored_cursor(query, _text(arguments, "cursor"))
+    filters: dict[str, Any] = {
+        "min_level": int(query.get("min_level", 0)),
+        "logger_name": str(query.get("logger", "")),
+        "query": str(query.get("query", "")),
+        "trace_id": str(query.get("trace_id", "")),
+        "repo": str(query.get("repository", "")),
+    }
+    if oldest_first:
+        rows = reads.list_logs(
+            context.app_db,
+            **filters,
+            oldest_first=True,
+            after_id=int(anchor),
+            limit=size,
+            offset=0,
+        )
+        items = rows[:size]
+        more = len(rows) > size and bool(items)
+        cursor = encode_cursor(query, 0, anchor=int(items[-1]["id"])) if more else ""
+        return items, cursor
     until = anchor or time.time()
     rows = reads.list_logs(
         context.app_db,
-        min_level=int(query.get("min_level", 0)),
-        logger_name=str(query.get("logger", "")),
-        query=str(query.get("query", "")),
-        trace_id=str(query.get("trace_id", "")),
-        repo=str(query.get("repository", "")),
+        **filters,
         since=until - hours * 3600 if hours else 0.0,
         until=until,
-        oldest_first=oldest_first,
         limit=size,
         offset=offset,
     )

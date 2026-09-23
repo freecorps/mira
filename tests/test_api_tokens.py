@@ -198,6 +198,12 @@ class TestTheRoutes:
     def test_a_token_needs_a_name(self, signed_in: TestClient) -> None:
         assert signed_in.post("/api/auth/tokens", json={"name": "  "}).status_code == 400
 
+    def test_a_name_too_long_is_refused_not_cut(self, signed_in: TestClient) -> None:
+        response = signed_in.post("/api/auth/tokens", json={"name": "x" * 81})
+
+        assert response.status_code == 400
+        assert signed_in.get("/api/auth/tokens").json() == []
+
     def test_zero_days_means_no_expiry(self, signed_in: TestClient) -> None:
         created = signed_in.post(
             "/api/auth/tokens", json={"name": "ci", "expires_in_days": 0}

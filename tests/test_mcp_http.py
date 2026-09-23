@@ -181,6 +181,25 @@ class TestTheLogTools:
         assert [i["message"] for i in first["items"]] == ["line 2", "line 1"]
         assert [i["message"] for i in second["items"]] == ["line 0"]
 
+    def test_a_trace_skips_nothing_when_older_lines_are_pruned_between_pages(
+        self, db: AppDatabase
+    ) -> None:
+        # Retention deletes from the head of an oldest-first order. An offset
+        # would then point one row too far for every row deleted.
+        for i in range(4):
+            _log(db, f"step {i}", trace_id="t1")
+        session = _session(db)
+
+        first = payload_of(call(session, "mira_get_trace", trace_id="t1", limit=2))
+        db._exec("DELETE FROM app_logs WHERE id = ?", (first["items"][0]["id"],))  # noqa: SLF001
+        second = payload_of(
+            call(session, "mira_get_trace", trace_id="t1", limit=2, cursor=first["next_cursor"])
+        )
+
+        assert [i["message"] for i in first["items"]] == ["step 0", "step 1"]
+        assert [i["message"] for i in second["items"]] == ["step 2", "step 3"]
+        assert second["next_cursor"] == ""
+
     def test_an_unknown_level_is_named(self, db: AppDatabase) -> None:
         response = call(_session(db), "mira_search_logs", level="LOUD")
 

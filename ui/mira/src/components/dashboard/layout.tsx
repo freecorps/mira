@@ -109,14 +109,16 @@ const navItems = [
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
 ]
 
-// Settings is rendered as a collapsible group (admin-only) with these
-// children rather than a flat nav item.
+// Settings is rendered as a collapsible group with these children rather than
+// a flat nav item. Everything in it is admin-only except API tokens: any user
+// may mint a token for themselves, so a non-admin sees the group with that
+// one entry.
 const settingsSubItems = [
-  { to: "/settings/models", label: "Models" },
-  { to: "/settings/review", label: "Review" },
-  { to: "/settings/connections", label: "Connections" },
-  { to: "/settings/webhooks", label: "Webhooks" },
-  { to: "/settings/api-tokens", label: "API tokens" },
+  { to: "/settings/models", label: "Models", adminOnly: true },
+  { to: "/settings/review", label: "Review", adminOnly: true },
+  { to: "/settings/connections", label: "Connections", adminOnly: true },
+  { to: "/settings/webhooks", label: "Webhooks", adminOnly: true },
+  { to: "/settings/api-tokens", label: "API tokens", adminOnly: false },
 ]
 
 const PAGE_LABELS: Record<string, string> = {
@@ -226,6 +228,9 @@ export function DashboardLayout() {
   const visibleNav = navItems.filter(
     (item) => !("adminOnly" in item && item.adminOnly) || user?.is_admin
   )
+  const visibleSettings = settingsSubItems.filter(
+    (item) => !item.adminOnly || user?.is_admin
+  )
 
   // Active styling keys off aria-current, which NavLink sets on the active
   // link — single source of truth, no parallel route-matching here.
@@ -304,7 +309,7 @@ export function DashboardLayout() {
                   </SidebarMenuItem>
                 ))}
 
-                {user?.is_admin && (
+                {visibleSettings.length > 0 && (
                   <Collapsible
                     asChild
                     defaultOpen={onSettings}
@@ -320,7 +325,7 @@ export function DashboardLayout() {
                       </CollapsibleTrigger>
                       <CollapsibleContent>
                         <SidebarMenuSub>
-                          {settingsSubItems.map((sub) => (
+                          {visibleSettings.map((sub) => (
                             <SidebarMenuSubItem key={sub.to}>
                               <SidebarMenuSubButton
                                 asChild

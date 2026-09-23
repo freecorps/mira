@@ -37,9 +37,11 @@ when the agent runs where Mira's storage is — see [mcp.md](mcp.md).
 A token belongs to one dashboard user and reaches what that user can read in
 the dashboard, with two cuts that hold whatever the user is allowed to do:
 
-- **It only reads.** A request carrying a token is refused before any route
-  runs unless it is a `GET` or `HEAD`. The one exception is `/mcp`, a `POST` by
-  protocol and read-only by inventory.
+- **It only reads.** A token is honoured on `GET` and `HEAD` only: any other
+  request that carries one is refused before a route runs. The exception is
+  `/mcp`, a `POST` by protocol and read-only by inventory. (The public login
+  route is not an exception in any useful sense: it ignores the header and
+  asks for a password, as it always has.)
 - **It cannot manage credentials.** Every `/api/auth` route except `me` refuses
   a token, and so does the OAuth callback. A leaked token is a leak of what it
   can read; it is not a way to mint the next one.
@@ -56,9 +58,11 @@ line or an MCP response comes back out as `[REDACTED:mira-token]`.
 
 ### Creating one
 
-**Dashboard → Settings → API tokens**: name, expiry (30 days to never) and, for
-an admin, which user it acts as. The page shows the token once, with the
-`claude mcp add` and `curl` lines already filled in.
+**Dashboard → Settings → API tokens**, for any user: a name (up to 80
+characters), an expiry — 30 days, 90 days, a year, or never — and, for an
+admin, which user it acts as. The API behind it takes any whole number of days
+from 1 to 3650, or 0 for never, and defaults to 90. The page shows the token
+once, with the `claude mcp add` and `curl` lines already filled in.
 
 **CLI**, on the host that holds the database — useful before anybody has signed
 in, or from a script. The token alone goes to stdout:
@@ -128,16 +132,22 @@ claude mcp add --transport http mira https://mira.example.com/mcp \
 | `mira_search_logs` | The log trail, newest first, by level floor, logger, text, trace ID, repository, window | admin |
 | `mira_get_trace` | Every line one review logged, oldest first | admin |
 
-`mira_search_logs` and `mira_get_trace` page through a trail that is still being
-written. The first page pins the moment it was read, and the cursor carries it,
-so a line written between two calls neither repeats a row nor pushes one off the
-page. Every answer about logs carries the capture state, so "nothing matched"
-and "capture is off" do not look the same.
+Both log tools page through a trail that is still being written and pruned.
+`mira_search_logs` pins the moment its first page was read, and the cursor
+carries it, so a line written between two calls neither repeats a row nor
+pushes one off the page. `mira_get_trace` pages by the id of the last line
+returned, so retention pruning older lines mid-walk skips nothing. Every answer
+about logs carries the capture state, so "nothing matched" and "capture is off"
+do not look the same.
 
 ### The audit trail
 
-Every call over HTTP lands in the same trail as stdio, grouped by credential —
-`session_id` is `token-<id>` and `client` names the token and its user:
+Every *tool call* over `/mcp` — answered or refused — lands in the same trail
+as stdio, grouped by credential: `session_id` is `token-<id>` and `client`
+names the token and its user. A request turned away before it reaches the
+server (no token, a revoked one, a foreign `Origin`, an oversized body) is not a
+tool call and is not in this trail. REST requests made with a token are not
+audited either; `last used` on the token is their only trace.
 
 ```bash
 mira mcp audit --limit 20

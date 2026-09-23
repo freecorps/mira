@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from mira.dashboard import tokens
 from mira.dashboard.db import AppDatabase
 
 logger = logging.getLogger(__name__)
@@ -274,6 +275,13 @@ def create_auth_router(db: AppDatabase) -> APIRouter:
         name = body.name.strip()
         if not name:
             return JSONResponse(status_code=400, content={"error": "Give the token a name"})
+        if len(name) > tokens.MAX_NAME_CHARS:
+            # Refused rather than cut: a created token whose name is not the
+            # one that was asked for is a token nobody can find in the list.
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Token names are at most {tokens.MAX_NAME_CHARS} characters"},
+            )
         if not 0 <= body.expires_in_days <= _MAX_TOKEN_DAYS:
             return JSONResponse(
                 status_code=400,
