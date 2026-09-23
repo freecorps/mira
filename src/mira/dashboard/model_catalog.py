@@ -301,13 +301,34 @@ async def endpoint_entries(base: LLMConfig, db: Any = None) -> list[dict]:
                 "backend": active_backend(config),
                 "catalog": await fetch_catalog(config),
                 "group": f"{endpoint.label} · {endpoint_host(endpoint.base_url)}",
-                "detail": (
-                    f"{'Responses API' if endpoint.api_style == 'responses' else 'Chat Completions'}"
-                    f" · {'stored key' if store.key_source(endpoint, db) == 'stored' else 'API key'}"
+                "key_detail": (
+                    "stored key" if store.key_source(endpoint, db) == "stored" else "API key"
                 ),
             }
         )
     return entries
+
+
+def protocol_detail(config: LLMConfig, model: str, suffix: str) -> str:
+    """An option's detail line: the protocol a call to ``model`` goes out on, then ``suffix``.
+
+    The model's protocol, not the endpoint's: on OpenCode Go a Muse Spark
+    option says Responses API while its neighbours say Chat Completions,
+    because that is how each is called (see :mod:`mira.llm.protocols`). A
+    model its provider serves over a protocol Mira does not speak says that
+    too, so choosing it is not a surprise.
+    """
+    from mira.llm import protocols
+
+    style = protocols.api_style_for(config, model)
+    detail = f"{protocols.LABELS.get(style, style)} · {suffix}"
+    unsupported = protocols.unsupported_protocol(config, model)
+    if unsupported:
+        detail += (
+            f" · served natively over the {protocols.LABELS.get(unsupported, unsupported)},"
+            " which Mira does not speak"
+        )
+    return detail
 
 
 def endpoint_options(entries: list[dict], purpose: str, *, bare: str = "") -> list[dict]:
@@ -323,9 +344,10 @@ def endpoint_options(entries: list[dict], purpose: str, *, bare: str = "") -> li
         endpoint = entry["endpoint"]
         if endpoint.id == bare:
             continue
+        config = entry.get("config")
         options = build_options(entry["backend"], entry["catalog"], purpose)
-        if entry.get("config") is not None:
-            options = with_reasoning_levels(options, entry["config"])
+        if config is not None:
+            options = with_reasoning_levels(options, config)
         for option in options:
             out.append(
                 {
@@ -333,7 +355,11 @@ def endpoint_options(entries: list[dict], purpose: str, *, bare: str = "") -> li
                     "recommended": False,
                     "value": endpoint_route(endpoint.id, option["value"]),
                     "group": entry["group"],
-                    "detail": entry["detail"],
+                    "detail": (
+                        protocol_detail(config, option["value"], entry.get("key_detail", ""))
+                        if config is not None
+                        else entry.get("key_detail", "")
+                    ),
                 }
             )
     return out
