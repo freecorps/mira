@@ -78,6 +78,13 @@ def _create_one(config: LLMConfig) -> LLMProviderProtocol:
 
         return BedrockProvider(config)
 
+    # The endpoint's protocol, unless this model is served over the other one
+    # (see mira.llm.protocols) — a config from mira.yaml or the CLI has not
+    # been through the dashboard's binding, so the factory settles it too.
+    from mira.llm.protocols import with_model_protocol
+
+    config = with_model_protocol(config)
+
     if config.api_style == "responses":
         from mira.llm.responses import ResponsesProvider
 
