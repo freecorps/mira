@@ -108,6 +108,19 @@ review:
   max_chunks_per_review: 5
   # Retry failed parts without re-running successful parts.
   chunk_retries: 1
+  # Review the parts of one dependency group one after another, each reading
+  # the previous parts' notes. Off: all parts run side by side (much faster).
+  sequential_parts: false
+  # Read the reviewed commit from one archive download (falls back to one API
+  # call per file above the size cap, in MB). Also lets grep_repo search the
+  # whole repository.
+  repo_snapshot: true
+  repo_snapshot_max_mb: 250
+  # Tokens per review part for the full source of the functions its changed
+  # lines sit in. 0 turns it off.
+  enclosing_context_tokens: 6000
+  # Confidence a finding the critic grades "plausible" needs to be posted.
+  critique_plausible_min_confidence: 0.7
   # Lines of context around hunks
   context_lines: 3
   # Legacy total diff cap in characters (only when auto_complete: false)

@@ -250,9 +250,8 @@ async def run_pr_review(
 
     # The walkthrough comment already carries the "more accurate after indexing"
     # nudge for unindexed repos, so we don't post a separate note here — that
-    # would repeat on every push.
-
-    logger.info("Review complete for %s", pr_url)
+    # would repeat on every push. "Review complete" is logged by the engine,
+    # inside the review's trace.
 
     from mira.models import Severity, build_review_stats
     from mira.outbound_webhooks import (

@@ -281,13 +281,52 @@ async def test_same_group_runs_sequentially_with_previous_notes(monkeypatch):
         '{"comments": [], "summary": "contract requires nullable input"}',
         '{"comments": []}',
     ]
-    result = await ReviewEngine(config=engine_config(), llm=model).review_diff(
-        diff(["a.py", "b.py"])
-    )
+    config = engine_config()
+    config.review.sequential_parts = True
+    result = await ReviewEngine(config=config, llm=model).review_diff(diff(["a.py", "b.py"]))
     second = model.review.call_args_list[1].args[0][-1]["content"]
     assert "contract requires nullable input" in second
     assert "a.py" in second and "b.py" in second
     assert result.reviewed_files == 2
+
+
+async def test_same_group_parts_run_side_by_side_by_default(monkeypatch):
+    """A group's parts used to run one after another, each waiting for the
+    last one's notes; a four-part group was a four-deep chain of agent loops.
+    They now run together, each told which files the others hold."""
+    import mira.core.engine as module
+
+    monkeypatch.setattr(
+        module,
+        "chunk_files",
+        lambda files, **kw: [
+            ReviewChunk([f], group_id=0, related_paths=[x.path for x in files]) for f in files
+        ],
+    )
+    model = llm()
+    active = peak = 0
+    prompts: list[str] = []
+
+    async def review(messages):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        prompts.append(messages[-1]["content"])
+        await asyncio.sleep(0.01)
+        active -= 1
+        return '{"comments": []}'
+
+    model.review.side_effect = review
+    result = await ReviewEngine(config=engine_config(), llm=model).review_diff(
+        diff(["a.py", "b.py", "c.py"])
+    )
+
+    assert peak == 3
+    assert result.reviewed_files == 3
+    a_prompt = next(p for p in prompts if "### `a.py`" in p)
+    assert "Changed in the other parts of this group" in a_prompt
+    assert "b.py" in a_prompt and "c.py" in a_prompt
+    assert "Previous parts' review notes" not in a_prompt
 
 
 async def test_all_parts_failing_raises():
@@ -512,3 +551,49 @@ async def test_agentic_context_and_dependency_reads_share_revision(monkeypatch, 
     assert engine._agentic_source_fetcher is None
     assert len(verified) == 1
     assert provider.get_file_content.call_args.args[2] == "next-sha"
+
+
+async def test_parts_read_their_changed_functions_from_the_snapshot():
+    """One archive serves the review: no per-file API calls, and each part sees
+    the whole function its changed lines sit in."""
+    from mira.models import PRInfo
+    from mira.platforms.fetch import RepoSnapshot
+
+    config = engine_config()
+    config.review.agentic_tools = False
+    source = (
+        "def compute():\n" + "".join(f"    a{i} = {i}\n" for i in range(30)) + "    return a0\n"
+    )
+    provider = MagicMock()
+    provider.get_repo_snapshot = AsyncMock(
+        return_value=RepoSnapshot(files={"src/a.py": source}, paths={"src/a.py"})
+    )
+    provider.get_file_content = AsyncMock(return_value="")
+    provider.get_repo_tree = AsyncMock(return_value=[])
+    diff_text = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -20,1 +20,1 @@\n-    a18 = 0\n+    a18 = 18\n"
+    )
+    scope = PRInfo(
+        title="t",
+        description="",
+        base_branch="main",
+        head_branch="feature",
+        url="https://github.com/o/r/pull/1",
+        number=1,
+        owner="o",
+        repo="r",
+        head_sha="abc123",
+    )
+    model = llm()
+
+    await ReviewEngine(config=config, llm=model, provider=provider).review_diff(
+        diff_text, repo_scope=scope
+    )
+
+    prompt = model.review.call_args.args[0][-1]["content"]
+    assert "Changed functions in full" in prompt
+    assert "`compute`" in prompt and "   32      return a0" in prompt
+    assert "   20 +    a18 = 18" in prompt
+    provider.get_file_content.assert_not_awaited()
+    provider.get_repo_snapshot.assert_awaited_once()
