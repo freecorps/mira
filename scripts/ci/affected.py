@@ -34,7 +34,8 @@ EVERY_JOB = (
     "scripts/ci/affected.py",
 )
 
-# A trailing slash is a directory prefix; anything else is one exact path.
+# An entry matches the path itself and, if it is a directory, everything
+# under it; a trailing slash only makes that reading explicit.
 PYTHON_INPUTS = (
     "src/",
     "tests/",
@@ -93,6 +94,9 @@ def dockerfile_sources(dockerfile: Path) -> list[str]:
     return sources
 
 
+JOB_NAMES = ("python", "ui", "docker")
+
+
 def job_inputs() -> dict[str, tuple[str, ...]]:
     docker = (*dockerfile_sources(ROOT / "Dockerfile"), *DOCKER_EXTRA_INPUTS)
     return {"python": PYTHON_INPUTS, "ui": UI_INPUTS, "docker": docker}
@@ -100,10 +104,8 @@ def job_inputs() -> dict[str, tuple[str, ...]]:
 
 def matches(path: str, inputs: tuple[str, ...]) -> bool:
     for entry in inputs:
-        if entry.endswith("/") or entry == "":
-            if path.startswith(entry):
-                return True
-        elif path == entry:
+        directory = entry.rstrip("/")
+        if not directory or path == directory or path.startswith(directory + "/"):
             return True
     return False
 
@@ -123,7 +125,12 @@ def changed_files(base: str) -> list[str] | None:
 
 def decide(files: list[str] | None) -> tuple[str, dict[str, list[str] | None]]:
     """Per job, the changed files that need it, or None when it runs anyway."""
-    inputs = job_inputs()
+    try:
+        inputs = job_inputs()
+    except (OSError, ValueError) as error:
+        # A Dockerfile this cannot read must not decide anything.
+        print(f"::warning::could not read the job inputs: {error}")
+        return "job inputs unreadable: every job runs", dict.fromkeys(JOB_NAMES)
     if files is None:
         return "no comparison available: every job runs", dict.fromkeys(inputs)
     whole = [path for path in files if path in EVERY_JOB]
