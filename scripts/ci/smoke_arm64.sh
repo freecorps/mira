@@ -306,13 +306,18 @@ docker push "$registry_image" >/dev/null
 # registry serves the deliberately broken candidate on the same deployment tag.
 docker tag "$baseline_id" "$registry_image"
 
+# The broken candidate exits at once, so the updater always spends its whole
+# health budget before it rolls back: the budget is a fixed wait, not a
+# margin. Fifteen one-second attempts are still five times what the rollback
+# image needs to come up on a native runner, and the rollback has to be
+# healthy within them for the updater to exit 1.
 set +e
 MIRA_STACK_DIR="$update_stack_dir" \
   MIRA_SERVICE=mira \
   MIRA_IMAGE="$registry_image" \
   MIRA_HEALTH_URL="http://127.0.0.1:${host_port}/health" \
   MIRA_UPDATE_LOCK_FILE="${data_dir}/updater.lock" \
-  MIRA_HEALTH_ATTEMPTS=60 \
+  MIRA_HEALTH_ATTEMPTS=15 \
   MIRA_HEALTH_INTERVAL_SECONDS=1 \
   MIRA_SMOKE_CONTAINER_NAME="$container_name" \
   MIRA_SMOKE_DATA_DIR="$data_dir" \
