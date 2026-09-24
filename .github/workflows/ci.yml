@@ -97,8 +97,10 @@ jobs:
         continue-on-error: true
         run: uv run --no-sync pre-commit run --all-files --hook-stage manual mypy
 
+  # Each version's suite is split over three runners; together the shards
+  # of one version run every test exactly once (scripts/ci/pytest_shard.py).
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-24.04
@@ -106,6 +108,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -121,11 +124,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev --extra serve --extra bedrock
 
-      # `-n auto` spreads the suite over every runner core; the slowest tests
+      # `-n auto` spreads the shard over every runner core; the slowest tests
       # are retry/backoff waits that parallelise perfectly.
       - name: Test
+        env:
+          MIRA_TEST_SHARD: ${{ matrix.shard }}/3
+          PYTHONPATH: scripts/ci
         run: >-
           uv run --no-sync pytest tests/
+          -p pytest_shard
           -n auto
           -rfE --durations=10
           --ignore=tests/evals --ignore=tests/test_integration.py
@@ -158,10 +165,11 @@ jobs:
   # Build the unified UI+backend image for each architecture on a native
   # runner and smoke-test it boots. Catches packaging issues (missing extras,
   # broken Dockerfile, bad UI assets) before they hit `edge` or a release tag.
-  # The arm64 leg also runs the SQLite-upgrade and updater-rollback checks
-  # against the deployed image, since that is the reference deployment.
+  # The arm64 legs also run the SQLite-upgrade and updater-rollback checks
+  # against the deployed image, since that is the reference deployment; the
+  # two halves of that smoke test run on their own runners, side by side.
   docker:
-    name: Image (${{ matrix.arch }})
+    name: Image (${{ matrix.arch }}${{ matrix.smoke && format(', {0}', matrix.smoke) || '' }})
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     runs-on: ${{ matrix.runner }}
@@ -178,6 +186,11 @@ jobs:
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm
+            smoke: compat
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            smoke: updater
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -224,8 +237,9 @@ jobs:
         run: docker run --rm --entrypoint ls mira:ci /app/ui_dist/index.html
 
       - name: Smoke test ARM64, SQLite migration, and app rollback
-        if: matrix.arch == 'arm64'
+        if: matrix.smoke
         env:
+          MIRA_SMOKE_PART: ${{ matrix.smoke }}
           MIRA_CANDIDATE_IMAGE: mira:ci
           MIRA_BASELINE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge
         run: bash scripts/ci/smoke_arm64.sh

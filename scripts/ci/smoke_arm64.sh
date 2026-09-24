@@ -2,6 +2,17 @@
 set -Eeuo pipefail
 
 candidate_image="${MIRA_CANDIDATE_IMAGE:-mira:ci-arm64}"
+# `all` by default. CI runs `compat` and `updater` on two runners side by
+# side: both start the candidate on the deployed image's database first, so
+# the updater still rolls back onto a database the candidate has opened.
+smoke_part="${MIRA_SMOKE_PART:-all}"
+case "$smoke_part" in
+  all | compat | updater) ;;
+  *)
+    echo "MIRA_SMOKE_PART must be all, compat or updater, not ${smoke_part}" >&2
+    exit 2
+    ;;
+esac
 baseline_image="${MIRA_BASELINE_IMAGE:?MIRA_BASELINE_IMAGE must point to the deployed edge image}"
 host_port="${MIRA_SMOKE_PORT:-18080}"
 registry_port="${MIRA_SMOKE_REGISTRY_PORT:-15000}"
@@ -232,19 +243,28 @@ cp "${data_dir}/app.db" "${data_dir}/app.db.pre-upgrade"
 echo "Starting the candidate against the existing SQLite database"
 start_server "$candidate_image" candidate
 verify_canary "$candidate_image"
-echo "Confirming the candidate creates and uses its check tables on ARM64"
-verify_checks "$candidate_image"
-echo "Confirming the candidate creates and uses its triage tables on ARM64"
-verify_triage "$candidate_image"
-echo "Confirming the local review surface on ARM64"
-verify_local_cli_without_git "$candidate_image"
-verify_local_cli_with_git "$candidate_image"
-echo "Confirming the read-only MCP server on ARM64"
-verify_mcp "$candidate_image"
 
-echo "Starting the deployed image against the candidate-opened database"
-start_server "$baseline_image" rollback
-verify_canary "$baseline_image"
+if [[ "$smoke_part" != updater ]]; then
+  echo "Confirming the candidate creates and uses its check tables on ARM64"
+  verify_checks "$candidate_image"
+  echo "Confirming the candidate creates and uses its triage tables on ARM64"
+  verify_triage "$candidate_image"
+  echo "Confirming the local review surface on ARM64"
+  verify_local_cli_without_git "$candidate_image"
+  verify_local_cli_with_git "$candidate_image"
+  echo "Confirming the read-only MCP server on ARM64"
+  verify_mcp "$candidate_image"
+
+  echo "Starting the deployed image against the candidate-opened database"
+  start_server "$baseline_image" rollback
+  verify_canary "$baseline_image"
+fi
+
+if [[ "$smoke_part" == compat ]]; then
+  test -s "${data_dir}/app.db.pre-upgrade"
+  echo "ARM64 runtime and SQLite compatibility passed"
+  exit 0
+fi
 
 echo "Exercising the real Orange Pi updater failure-and-restore path"
 mkdir -p "$update_stack_dir"
