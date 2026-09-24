@@ -121,7 +121,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: false
 
+      # Compiling the bytecode here, across every core, is cheaper than the
+      # first import doing it on one: pytest's own start-up on a fresh venv
+      # otherwise spends most of its time writing .pyc files.
       - name: Install dependencies
+        env:
+          UV_COMPILE_BYTECODE: "1"
         run: uv sync --locked --extra dev --extra serve --extra bedrock
 
       # `-n auto` spreads the shard over every runner core; the slowest tests
@@ -196,12 +201,13 @@ jobs:
 
       # Not made the default builder: the arm64 smoke test runs a plain
       # `docker build` FROM the loaded `mira:ci`, which only the daemon's own
-      # builder can see.
+      # builder can see. No cleanup: the runner is thrown away with it.
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           use: false
+          cleanup: false
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
