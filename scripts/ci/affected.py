@@ -44,6 +44,8 @@ PYTHON_INPUTS = (
     "deploy/orangepi/mira-update.sh",
     # tests/test_import_golden.py loads the script as a module.
     "scripts/import_golden_comments.py",
+    # Picks which tests each shard of the job runs.
+    "scripts/ci/pytest_shard.py",
 )
 
 UI_INPUTS = ("ui/",)
@@ -139,7 +141,12 @@ def main() -> int:
     files = changed_files(args.base) if args.base else None
     reason, jobs = decide(files)
 
-    lines = [f"### Affected jobs ({reason})", "", "| Job | Runs | Because of |", "| --- | --- | --- |"]
+    lines = [
+        f"### Affected jobs ({reason})",
+        "",
+        "| Job | Runs | Because of |",
+        "| --- | --- | --- |",
+    ]
     outputs = []
     for job, hits in jobs.items():
         runs = hits is None or bool(hits)
