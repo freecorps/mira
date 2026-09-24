@@ -23,10 +23,18 @@ def _shard() -> tuple[int, int] | None:
     if not value:
         return None
     index, _, total = value.partition("/")
-    shard, count = int(index), int(total)
+    try:
+        shard, count = int(index), int(total)
+    except ValueError:
+        shard = count = 0
     if not 1 <= shard <= count:
         raise pytest.UsageError(f"MIRA_TEST_SHARD={value!r}: expected k/n with 1 <= k <= n")
     return shard, count
+
+
+def shard_of(nodeid: str, count: int) -> int:
+    """The 1-based shard a test belongs to when the suite is cut in `count`."""
+    return zlib.crc32(nodeid.encode()) % count + 1
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -36,8 +44,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     index, count = shard
     keep, drop = [], []
     for item in items:
-        bucket = zlib.crc32(item.nodeid.encode()) % count + 1
-        (keep if bucket == index else drop).append(item)
+        (keep if shard_of(item.nodeid, count) == index else drop).append(item)
     if drop:
         config.hook.pytest_deselected(items=drop)
     items[:] = keep
