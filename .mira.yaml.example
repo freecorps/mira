@@ -187,6 +187,31 @@ review:
     #   above_ceiling  — red when anything above approve_max_severity was
     fail_on: "blocker"
 
+# ── Generated PR description and title ──
+#
+# Mira can write a summary into the pull request's description and a title in
+# place of a bare `@mira`. It only ever touches text it owns: a marked section,
+# a body that was empty, or a title that was nothing but the mention. Comment
+# `@mira describe` on a pull request to regenerate on demand.
+#
+# Full reference: docs/pr-summary.md
+pr_summary:
+  description:
+    # Off by default. The description is the author's text.
+    enabled: false
+    #   section    — write/refresh a section between <!-- mira:summary:start -->
+    #                and <!-- mira:summary:end --> (appended, or where a
+    #                `@mira summary` placeholder stood), refreshed on each push;
+    #                everything outside it is left exactly as written (default)
+    #   empty_only — only fill a body that has no human-written text
+    mode: "section"
+  title:
+    #   off        — never touch the title
+    #   on_mention — only while the title is just `@mira` (default)
+    #   always     — also on the first review; a title a human sets afterwards
+    #                is never overwritten
+    mode: "on_mention"
+
 # ── Merge gate (Phase 4) ──
 #
 # A conservative approval decision, kept separate from `review.verdict`. The

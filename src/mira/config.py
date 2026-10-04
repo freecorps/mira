@@ -1222,6 +1222,63 @@ class McpConfig(BaseModel):
         return seen
 
 
+class PRDescriptionConfig(BaseModel):
+    """Whether Mira writes a summary into the pull request's own description.
+
+    Off by default: the description is the author's text, and writing into it
+    is a step further than commenting next to it. When it is on, Mira only
+    ever touches what it owns — a marked section, or a body that was empty —
+    and everything a human wrote around it stays byte for byte.
+
+      "section"    — write a section between ``<!-- mira:summary:start -->``
+                     and ``<!-- mira:summary:end -->``, appended to the body
+                     (or put where a ``@mira summary`` placeholder stood), and
+                     refresh it on later pushes
+      "empty_only" — fill the body only while it has no human-written text
+    """
+
+    enabled: bool = False
+    mode: str = "section"
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        allowed = {"section", "empty_only"}
+        if v not in allowed:
+            raise ValueError(
+                f"pr_summary.description.mode must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+
+class PRTitleConfig(BaseModel):
+    """When Mira may write the pull request's title.
+
+    "off"        — never
+    "on_mention" — only while the title is the bot mention alone
+                   (``@mira``), the way an author asks for one (default)
+    "always"     — also on the first review of a pull request; a title a
+                   human sets after that is never overwritten
+    """
+
+    mode: str = "on_mention"
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        allowed = {"off", "on_mention", "always"}
+        if v not in allowed:
+            raise ValueError(f"pr_summary.title.mode must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+
+class PRSummaryConfig(BaseModel):
+    """Generated pull request description and title. See docs/pr-summary.md."""
+
+    description: PRDescriptionConfig = Field(default_factory=PRDescriptionConfig)
+    title: PRTitleConfig = Field(default_factory=PRTitleConfig)
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -1235,6 +1292,7 @@ class MiraConfig(BaseModel):
     checks: ChecksConfig = Field(default_factory=ChecksConfig)
     triage: TriageConfig = Field(default_factory=TriageConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
+    pr_summary: PRSummaryConfig = Field(default_factory=PRSummaryConfig)
 
     @model_validator(mode="after")
     def _apply_review_profile(self) -> MiraConfig:

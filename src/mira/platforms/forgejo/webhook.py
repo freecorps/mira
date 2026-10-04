@@ -173,6 +173,7 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
             bot_name,
             platform="forgejo",
             pr_title=pr.get("title", "") or "",
+            bot_identity=await auth.get_bot_identity(),
         )
     except Exception:
         logger.exception(
@@ -426,6 +427,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             actor,
             bot_name,
             platform="forgejo",
+            bot_identity=await auth.get_bot_identity(),
         )
     except Exception:
         logger.exception(

@@ -765,6 +765,34 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to update comment: {e}") from e
 
+    async def update_pr(
+        self,
+        pr_info: PRInfo,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {}
+        if title is not None:
+            fields["title"] = title
+        if body is not None:
+            fields["body"] = body
+        if not fields:
+            return
+
+        @_retry_transient
+        def _edit() -> None:
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            pr = gh_repo.get_pull(pr_info.number)
+            pr.edit(**fields)
+
+        try:
+            await asyncio.to_thread(_edit)
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to update pull request: {e}") from e
+
     async def reply_to_review_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
         """Post a reply to an existing review (line) comment, threading it.
 

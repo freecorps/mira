@@ -14,6 +14,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from mira.autofix.redact import redact
 from mira.config import load_config
+from mira.core import pr_summary
 from mira.core.diff_parser import parse_diff
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
@@ -40,6 +41,7 @@ from mira.platforms.chat_commands import (
     render_config_reply,
     run_resolve_command,
 )
+from mira.platforms.mentions import mention_names
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,8 @@ _REJECT_KEYWORDS = {"reject", "dismiss", "resolve", "ignore"}
 _REVIEW_REST_KEYWORDS = {"review-rest", "review rest", "rest", "continue"}
 
 _HELP_KEYWORDS = {"help", "?", "commands"}
+
+_DESCRIBE_KEYWORDS = {"describe", "summary", "summarize", "summarise"}
 
 _THREAD_REPLY_ENV = Environment(
     loader=FileSystemLoader(
@@ -183,6 +187,7 @@ def _help_message(bot_name: str) -> str:
         f"| `@{bot_name} resolve` | Resolve every open review thread Mira posted on this PR. Not recorded as false-positive feedback. |\n"
         f"| `@{bot_name} config` | Show the effective configuration for this repository, with credentials omitted. Alias: `configuration`. |\n"
         f"| `@{bot_name} fix all` | Have Mira write fixes for the most serious open findings on this PR, each on its own branch and stacked PR. Bounded by a configured limit, and the reply lists whatever it left out. Disabled unless a maintainer turned autofix on. |\n"
+        f"| `@{bot_name} describe` | Regenerate the PR description summary, and the title if it is just `@{bot_name}`. Needs `pr_summary.description.enabled` for the description. Alias: `summary`. |\n"
         f"| `@{bot_name} help` | Show this message. Aliases: `?`, `commands`. |\n"
         f"| `@{bot_name} <anything else>` | Ask a free-form question about the PR. Mira will reply inline using the PR diff as context. |\n\n"
         f"On an inline review comment Mira posted, reply with `@{bot_name} reject` "
@@ -204,12 +209,16 @@ async def run_pr_review(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
+    bot_identity: str | None = None,
 ) -> None:
     """Platform-neutral review core: review a PR/MR and post the result.
 
     Shared by the GitHub and GitLab webhook handlers — everything here goes
     through the ``provider`` abstraction and the engine, so it's the same for
     every platform.
+
+    ``bot_identity`` is the bot's real platform handle, so a title of
+    ``@<identity>`` asks for a generated title as ``@<bot_name>`` does.
     """
     repo_full = f"{owner}/{repo}"
 
@@ -245,6 +254,10 @@ async def run_pr_review(
 
     repo_record = _app_db.get_repo(owner, repo, platform=platform)
     is_indexed = bool(repo_record and repo_record.status == "ready")
+
+    # Asked before the review records this one, or every review would look
+    # like a follow-up to itself.
+    first_review = pr_summary.is_first_review(owner, repo, number, platform)
 
     logger.info("Reviewing %s (indexed=%s)", pr_url, is_indexed)
     try:
@@ -283,6 +296,23 @@ async def run_pr_review(
     await dispatch_event(REVIEW_COMPLETED, event_data)
     if any(sev >= Severity.WARNING for sev in stats):
         await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
+
+    # After the review is posted, so it never delays it; best-effort, so it
+    # never fails it.
+    if pr_summary.summary_config(config) is not None:
+        covers_pr = getattr(engine, "last_walkthrough_covers_pr", False) is True
+        full_diff = getattr(engine, "last_full_diff", "")
+        await pr_summary.update_pr_summary(
+            provider,
+            pr_url,
+            config=config,
+            llm=llm,
+            names=mention_names(bot_name, bot_identity),
+            first_review=first_review,
+            walkthrough=result.walkthrough if covers_pr else None,
+            diff_text=full_diff if isinstance(full_diff, str) and full_diff else None,
+            has_new_changes=getattr(engine, "last_review_had_changes", True) is not False,
+        )
 
 
 async def run_gate_evaluation(
@@ -384,6 +414,7 @@ async def run_pr_command(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
+    bot_identity: str | None = None,
 ) -> None:
     """Platform-neutral handler for an @-mention command on a PR/MR.
 
@@ -484,6 +515,10 @@ async def run_pr_command(
             review_tracker.fail(repo_full, number, str(exc))
             await engine.report_review_failure(exc)
             raise
+    elif normalized in _DESCRIBE_KEYWORDS:
+        await run_pr_describe(
+            provider, owner, repo, number, pr_url, actor, bot_name, platform, bot_identity
+        )
     else:
         pr_info = await provider.get_pr_info(pr_url)
         diff_text = await provider.get_pr_diff(pr_info)
@@ -496,6 +531,69 @@ async def run_pr_command(
         response = await llm.complete(messages, json_mode=False)
         await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
         logger.info("Replied to comment on %s", pr_url)
+
+
+async def run_pr_describe(
+    provider: Any,
+    owner: str,
+    repo: str,
+    number: int,
+    pr_url: str,
+    actor: str,
+    bot_name: str,
+    platform: str = "github",
+    bot_identity: str | None = None,
+) -> None:
+    """``@mira describe``: regenerate the description section (and the title,
+    when the title rules allow) now, and say what happened."""
+    config = load_config()
+    llm = create_llm(llm_config_for("review", config.llm))
+    names = mention_names(bot_name, bot_identity)
+    pr_info = await provider.get_pr_info(pr_url)
+    if pr_summary.opted_out(pr_info.description, names):
+        await provider.post_comment(
+            pr_info,
+            f"> @{actor}: this PR opted out with `@{bot_name} ignore` in its description, "
+            "so I left it alone.",
+        )
+        return
+    try:
+        paused = PAUSE_LABEL in await provider.get_pr_labels(pr_info)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not read labels for %s: %s", pr_url, exc)
+        paused = False
+    if paused:
+        await provider.post_comment(
+            pr_info,
+            f"> @{actor}: Mira is paused on this PR. Comment `@{bot_name} resume` first.",
+        )
+        return
+
+    cfg = pr_summary.summary_config(config)
+    written = await pr_summary.update_pr_summary(
+        provider,
+        pr_url,
+        config=config,
+        llm=llm,
+        names=names,
+        first_review=pr_summary.is_first_review(owner, repo, number, platform),
+        force=True,
+    )
+    if written["description"] or written["title"]:
+        done = " and ".join(k for k, v in written.items() if v)
+        reply = f"> @{actor}: updated the {done}."
+    elif cfg is not None and not cfg.description.enabled:
+        reply = (
+            f"> @{actor}: description generation is off for this repository "
+            "(`pr_summary.description.enabled`), and the title is not mine to change."
+        )
+    else:
+        reply = (
+            f"> @{actor}: nothing changed — the description is already current, "
+            "or it could not be written (Mira's logs say which)."
+        )
+    await provider.post_comment(pr_info, reply)
+    logger.info("Describe on %s by @%s: %s", pr_url, actor, written)
 
 
 async def run_thread_reply(

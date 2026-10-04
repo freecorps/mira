@@ -401,6 +401,22 @@ class ForgejoProvider(BaseProvider):
             json={"body": body},
         )
 
+    async def update_pr(
+        self,
+        pr_info: PRInfo,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> None:
+        fields: dict[str, str] = {}
+        if title is not None:
+            fields["title"] = title
+        if body is not None:
+            fields["body"] = body
+        if not fields:
+            return
+        await self._request("PATCH", self._pr(pr_info), json=fields)
+
     async def get_comment_body(self, pr_info: PRInfo, comment_id: int) -> str:
         """Fetch an issue comment's body by id. Best-effort."""
         try:

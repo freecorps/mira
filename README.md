@@ -277,6 +277,14 @@ failures show as a *neutral* check naming the failure, never red.
 
 → [Review status and approvals](docs/review-status.md)
 
+Mira can also **write the PR's description summary and title**. Opt in with
+`pr_summary.description.enabled: true` and the summary goes into a marked
+section of the description, refreshed on each push, with the author's text
+left untouched. Open a PR titled just `@mira` and Mira gives it a title.
+`@mira describe` regenerates both on demand.
+
+→ [Generated PR description and title](docs/pr-summary.md)
+
 The **merge gate** is a separate, conservative approval decision — the review
 verdict says whether the code is good, the gate says whether Mira may put its
 name on merging it. It ships off. Turn it on in shadow first, which records the
