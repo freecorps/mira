@@ -717,6 +717,6 @@ def test_snapshot_wait_is_bounded():
 
         async def snapshot(self, max_wait=None):  # type: ignore[no-untyped-def]
             await asyncio.sleep(max_wait or 0)
-            return None
+            return
 
     assert asyncio.run(cg.repo_snapshot(_Slow(), 0.01)) is None

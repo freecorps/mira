@@ -203,6 +203,8 @@ async def handle_forgejo_merged(payload: dict[str, Any], auth: PlatformAuth) -> 
     from mira.platforms.handlers import run_escaped_bug_detection
 
     await run_escaped_bug_detection(provider, pr_info, platform="forgejo")
+
+
 def _schedule_escaped_bug_push(
     payload: dict[str, Any], auth: PlatformAuth, background_tasks: Any
 ) -> None:
