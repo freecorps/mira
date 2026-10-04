@@ -593,6 +593,22 @@ async def dispatch_gitlab_event(
                 logger.debug("push skipped — author %s filtered", actor)
                 return "ignored"
             background_tasks.add_task(handle_gitlab_push, payload, auth, bot_name)
+            # Escaped-bug tracking (off by default): reverts/hotfixes pushed
+            # straight to the default branch.
+            from mira.quality import webhooks as quality_hooks
+
+            owner, repo = _split_project_path(
+                payload.get("project", {}).get("path_with_namespace", "")
+            )
+            if quality_hooks.tracked(owner, repo):
+                background_tasks.add_task(
+                    quality_hooks.on_push,
+                    "gitlab",
+                    owner,
+                    repo,
+                    quality_hooks.push_commits(payload),
+                    auth.get_token,
+                )
             return "processing"
 
     return "ignored"

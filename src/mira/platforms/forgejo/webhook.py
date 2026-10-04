@@ -182,18 +182,50 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
 
 
 async def handle_forgejo_merged(payload: dict[str, Any], auth: PlatformAuth) -> None:
-    """Record delivery analytics for a merged pull request. Best-effort."""
+    """Delivery analytics and escaped-bug detection for a merged PR. Best-effort."""
     pr_url = payload.get("pull_request", {}).get("html_url", "") or ""
     if not pr_url:
         return
     try:
-        from mira.analytics.collect import record_merge_analytics
-
         provider = create_provider("forgejo", await auth.get_token())
         pr_info = await provider.get_pr_info(pr_url)
+    except Exception as exc:  # noqa: BLE001 - never fail a webhook
+        logger.debug("Forgejo merge handling failed for %s: %s", pr_url, exc)
+        return
+    try:
+        from mira.analytics.collect import record_merge_analytics
+
         await record_merge_analytics(provider, pr_info)
     except Exception as exc:  # noqa: BLE001 - analytics never fail a webhook
         logger.debug("Forgejo merge analytics failed for %s: %s", pr_url, exc)
+    # Escaped bugs (off by default; checks its config before any request):
+    # is this merge a revert or hotfix of something Mira reviewed?
+    from mira.platforms.handlers import run_escaped_bug_detection
+
+    await run_escaped_bug_detection(provider, pr_info, platform="forgejo")
+def _schedule_escaped_bug_push(
+    payload: dict[str, Any], auth: PlatformAuth, background_tasks: Any
+) -> None:
+    """Queue the revert/hotfix scan for a push to the default branch, when tracked."""
+    from mira.quality import webhooks as quality_hooks
+
+    repo_data = payload.get("repository", {})
+    default_branch = repo_data.get("default_branch", "main")
+    if payload.get("ref", "") != f"refs/heads/{default_branch}":
+        return
+    try:
+        owner, repo_name = _split_repo_path(repo_data.get("full_name", ""))
+    except ValueError:
+        return
+    if quality_hooks.tracked(owner, repo_name):
+        background_tasks.add_task(
+            quality_hooks.on_push,
+            "forgejo",
+            owner,
+            repo_name,
+            quality_hooks.push_commits(payload),
+            auth.get_token,
+        )
 
 
 async def handle_forgejo_push(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
@@ -554,6 +586,7 @@ async def dispatch_forgejo_event(
             logger.debug("push ignored — author %s filtered", actor)
             return "ignored"
         background_tasks.add_task(handle_forgejo_push, payload, auth, bot_name)
+        _schedule_escaped_bug_push(payload, auth, background_tasks)
         return "processing"
 
     # A new issue gets an implementation plan when the planner is on.

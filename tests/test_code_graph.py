@@ -189,7 +189,11 @@ class TestParsePython:
             "  }\n"
             "}\n",
             {"Billing", "Billing.Billing", "Billing.charge"},
-            {("audit", "Billing.charge"), ("post", "Billing.charge"), ("Receipt", "Billing.charge")},
+            {
+                ("audit", "Billing.charge"),
+                ("post", "Billing.charge"),
+                ("Receipt", "Billing.charge"),
+            },
         ),
     ],
 )
@@ -342,7 +346,9 @@ class TestChangedSymbols:
         assert sym.new_signature == "def compute(a, b)"
 
     def test_a_body_edit_is_not(self):
-        assert self._changes("m.py", "def f(a):\n    return a\n", "def f(a):\n    return -a\n") == []
+        assert (
+            self._changes("m.py", "def f(a):\n    return a\n", "def f(a):\n    return -a\n") == []
+        )
 
     def test_a_reformatted_signature_is_not(self):
         assert (
@@ -505,7 +511,9 @@ class TestBlastRadius:
         before = "def legacy_load(p):\n    pass\n\ndef keep():\n    pass\n"
         after = "def keep():\n    pass\n"
         sources = {"lib.py": after, "cli.py": "from lib import legacy_load\nlegacy_load('x')\n"}
-        radius = await build_blast_radius([_file("lib.py", before, after)], _SnapshotFetcher(sources))
+        radius = await build_blast_radius(
+            [_file("lib.py", before, after)], _SnapshotFetcher(sources)
+        )
         [sym] = radius.symbols
         assert sym.change == "removed"
         assert [(r.path, r.line) for r in sym.callers] == [("cli.py", 2)]
@@ -617,9 +625,7 @@ async def _review_prompt(config: MiraConfig) -> str:
         "src/app.py": "from .lib import compute\n\ndef run():\n    return compute(1)\n",
     }
     provider = MagicMock()
-    provider.get_repo_snapshot = AsyncMock(
-        return_value=RepoSnapshot(files=files, paths=set(files))
-    )
+    provider.get_repo_snapshot = AsyncMock(return_value=RepoSnapshot(files=files, paths=set(files)))
     provider.get_file_content = AsyncMock(return_value="")
     provider.get_repo_tree = AsyncMock(return_value=list(files))
     model = MagicMock()

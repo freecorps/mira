@@ -988,3 +988,37 @@ async def run_pr_merged_learning(
         await record_merge_analytics(provider, pr_info)
     except Exception as exc:  # noqa: BLE001 - nothing here depends on it
         logger.debug("Could not record delivery analytics for %s: %s", pr_url, exc)
+    # Escaped bugs: is this merge a revert or hotfix of something Mira reviewed?
+    # Off unless `escaped_bugs.enabled`; checks the config before any request
+    # and never raises.
+    await run_escaped_bug_detection(provider, pr_info, platform=platform)
+
+
+async def run_escaped_bug_detection(provider: Any, pr_info: Any, *, platform: str) -> None:
+    """Classify a merged pull request as a revert/hotfix and link it back. Never raises."""
+    try:
+        config = load_config()
+        if not config.escaped_bugs.tracks(pr_info.owner, pr_info.repo):
+            return
+        from mira.quality.escaped import process_merged_pull_request
+
+        await process_merged_pull_request(provider, pr_info, platform=platform, config=config)
+    except Exception as exc:  # noqa: BLE001 - merge-time side task
+        logger.debug("Escaped-bug detection skipped for %s: %s", pr_info.url, exc)
+
+
+async def run_escaped_bug_push(
+    provider: Any, owner: str, repo: str, commits: list[dict[str, Any]], *, platform: str
+) -> None:
+    """Look for reverts/hotfixes pushed straight to the default branch. Never raises."""
+    try:
+        config = load_config()
+        if not config.escaped_bugs.tracks(owner, repo):
+            return
+        from mira.quality.escaped import process_pushed_commits
+
+        await process_pushed_commits(
+            provider, owner, repo, commits, platform=platform, config=config
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Escaped-bug push scan skipped for %s/%s: %s", owner, repo, exc)

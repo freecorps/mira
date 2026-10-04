@@ -1658,3 +1658,7 @@ from mira.sbom.cli import licenses_command, sbom_command  # noqa: E402
 
 main.add_command(sbom_command)
 main.add_command(licenses_command)
+# Review-quality measurement: `mira backtest` and `mira escaped-bugs`.
+from mira.quality.cli import register as _register_quality_commands  # noqa: E402
+
+_register_quality_commands(main)

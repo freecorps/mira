@@ -502,6 +502,12 @@ class MergedPullRequest:
     base_branch: str = ""
     labels: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
+    # The pull request's own revisions and branch, for replaying its review
+    # (backtests) and recognising a revert/hotfix branch (escaped bugs).
+    # Empty when the listing did not report them.
+    head_branch: str = ""
+    base_sha: str = ""
+    head_sha: str = ""
 
 
 @dataclass
@@ -736,3 +742,12 @@ class CIJobFailure:
     excerpt: str = ""
     # True when the provider could name the job but not read its output.
     log_unavailable: bool = False
+
+
+@dataclass
+class BlameRange:
+    """Lines ``start..end`` (inclusive, at the blamed ref) last changed by ``sha``."""
+
+    start: int
+    end: int
+    sha: str

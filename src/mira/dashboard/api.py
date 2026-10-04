@@ -1422,6 +1422,7 @@ import mira.dashboard.routers.logs  # noqa: E402,F401
 import mira.dashboard.routers.mcp  # noqa: E402,F401
 import mira.dashboard.routers.oauth  # noqa: E402,F401
 import mira.dashboard.routers.providers  # noqa: E402,F401
+import mira.dashboard.routers.quality  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.repos  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401

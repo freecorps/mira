@@ -701,6 +701,29 @@ async def dispatch_github_event(
                 logger.debug("push to %s skipped — author %s filtered", ref, sender)
                 return "ignored"
             background_tasks.add_task(handle_push_index, payload, app_auth, bot_name)
+            # Escaped-bug tracking (off by default): reverts/hotfixes pushed
+            # straight to the default branch.
+            from mira.quality import webhooks as quality_hooks
+
+            push_repo = payload.get("repository", {})
+            push_owner = (push_repo.get("owner") or {}).get("login") or (
+                push_repo.get("owner") or {}
+            ).get("name", "")
+            push_name = push_repo.get("name", "")
+            if quality_hooks.tracked(push_owner, push_name):
+                installation_id = (payload.get("installation") or {}).get("id", 0)
+
+                async def _token() -> str:
+                    return await app_auth.get_installation_token(installation_id)
+
+                background_tasks.add_task(
+                    quality_hooks.on_push,
+                    "github",
+                    push_owner,
+                    push_name,
+                    quality_hooks.push_commits(payload),
+                    _token,
+                )
             return "processing"
 
     return "ignored"

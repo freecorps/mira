@@ -1304,6 +1304,9 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
                                 merged_at=merged_at,
                                 merge_commit_sha=str(item.get("merge_commit_sha") or ""),
                                 base_branch=base_ref,
+                                head_branch=str((item.get("head") or {}).get("ref") or ""),
+                                base_sha=str((item.get("base") or {}).get("sha") or ""),
+                                head_sha=str((item.get("head") or {}).get("sha") or ""),
                                 labels=[
                                     str(lb.get("name") or "")
                                     for lb in item.get("labels") or []
@@ -1422,6 +1425,98 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
             raise ProviderError(f"Failed to read commit {sha}: {e}") from e
         files = (resp.json() or {}).get("files") or []
         return [str(f.get("filename") or "") for f in files[:limit]]
+
+    # ── Review-quality measurement (backtests, escaped bugs) ──
+    #
+    # `get_blame` is deliberately absent: the Forgejo/Gitea API has no blame
+    # endpoint, so the base class's NotImplementedError stands and escaped-bug
+    # linking falls back to comparing the fix against earlier diffs.
+
+    @staticmethod
+    def _landed_pr(item: dict[str, Any]) -> MergedPullRequest:
+        base = item.get("base") or {}
+        head = item.get("head") or {}
+        return MergedPullRequest(
+            number=int(item.get("number") or 0),
+            title=str(item.get("title") or ""),
+            url=str(item.get("html_url") or ""),
+            body=str(item.get("body") or ""),
+            author=str((item.get("user") or {}).get("login") or ""),
+            base_branch=str(base.get("ref") or ""),
+            head_branch=str(head.get("ref") or ""),
+            base_sha=str(base.get("sha") or ""),
+            head_sha=str(head.get("sha") or ""),
+            merge_commit_sha=str(item.get("merge_commit_sha") or ""),
+            merged_at=iso_to_epoch(str(item.get("merged_at") or "")),
+            labels=[str(label.get("name") or "") for label in item.get("labels") or []],
+        )
+
+    async def get_landed_pull_request(
+        self, pr_info: PRInfo, number: int
+    ) -> MergedPullRequest | None:
+        resp = await self._request(
+            "GET", f"{self._repo(pr_info)}/pulls/{int(number)}", ok=(200, 404)
+        )
+        if resp.status_code == 404:
+            return None
+        data = resp.json() or {}
+        if not data.get("merged"):
+            return None
+        return self._landed_pr(data)
+
+    async def get_commit(self, pr_info: PRInfo, sha: str) -> CommitInfo | None:
+        resp = await self._request(
+            "GET", f"{self._repo(pr_info)}/git/commits/{quote(sha, safe='')}", ok=(200, 404, 422)
+        )
+        if resp.status_code != 200:
+            return None
+        return self._commit_from(resp.json() or {})
+
+    async def get_commit_diff(self, pr_info: PRInfo, sha: str) -> str:
+        resp = await self._request(
+            "GET",
+            f"{self._repo(pr_info)}/git/commits/{quote(sha, safe='')}.diff",
+            headers={"Accept": "text/plain"},
+        )
+        return resp.text
+
+    async def list_path_commits(
+        self,
+        pr_info: PRInfo,
+        path: str,
+        *,
+        since: float = 0.0,
+        until: float = 0.0,
+        ref: str = "",
+        limit: int = 20,
+    ) -> list[CommitInfo]:
+        params: dict[str, Any] = {"path": path, "limit": max(1, min(limit, 50))}
+        if since:
+            params["since"] = epoch_to_iso(since)
+        if until:
+            params["until"] = epoch_to_iso(until)
+        if ref:
+            params["sha"] = ref
+        resp = await self._request("GET", f"{self._repo(pr_info)}/commits", params=params)
+        commits = [self._commit_from(item) for item in resp.json() or []]
+        # Older Forgejo releases ignore `since`/`until`; filter here as well so
+        # the window means the same thing on every version.
+        return [
+            c
+            for c in commits
+            if (not since or not c.date or c.date >= since)
+            and (not until or not c.date or c.date <= until)
+        ][:limit]
+
+    async def get_prs_for_commit(self, pr_info: PRInfo, sha: str) -> list[int]:
+        resp = await self._request(
+            "GET", f"{self._repo(pr_info)}/commits/{quote(sha, safe='')}/pull", ok=(200, 404)
+        )
+        if resp.status_code == 404:
+            return []
+        data = resp.json() or {}
+        number = int(data.get("number") or 0)
+        return [number] if number and data.get("merged") else []
 
 
 def _next_link(link_header: str) -> str | None:
