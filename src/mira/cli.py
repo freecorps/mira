@@ -499,8 +499,9 @@ def autofix_worker(
 
     from mira.autofix.runtime import provider_factory
     from mira.autofix.worker import AutofixWorker
-    from mira.platforms.auth import ForgejoTokenAuth, GitLabTokenAuth
+    from mira.platforms.forgejo.auth import ForgejoTokenAuth
     from mira.platforms.github.auth import GitHubAppAuth
+    from mira.platforms.gitlab.auth import GitLabTokenAuth
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
