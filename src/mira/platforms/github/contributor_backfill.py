@@ -159,6 +159,41 @@ def _pr_state(pr: Any) -> str:
     return "open"
 
 
+def _safe_attr(read: Any) -> Any:
+    """``read()``, or None when the attribute is missing or lazily fails."""
+    try:
+        return read()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _str_or_empty(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _label_names(pr: Any) -> list[str] | None:
+    labels = _safe_attr(lambda: list(pr.labels))
+    if labels is None:
+        return None
+    return [n for n in (_str_or_empty(getattr(lbl, "name", "")) for lbl in labels) if n]
+
+
+def _first_commit_at(pr: Any) -> float:
+    """Earliest commit date on a merged PR, for DORA lead time. One API call;
+    0.0 when it cannot be read (lead time then falls back to PR creation)."""
+    try:
+        times = [
+            _dt_to_epoch(c.commit.author.date)
+            for c in pr.get_commits()[:100]
+            if c.commit and c.commit.author and c.commit.author.date
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Commit fetch failed for PR #%s: %s", getattr(pr, "number", "?"), exc)
+        return 0.0
+    times = [t for t in times if t > 0]
+    return min(times) if times else 0.0
+
+
 def _record_pr_insights(db: Any, owner: str, repo: str, pr: Any) -> None:
     """Upsert the PR lifecycle row + currently-requested reviewers for the
     review-insights views. No extra API calls (all fields are on `pr`)."""
@@ -175,6 +210,9 @@ def _record_pr_insights(db: Any, owner: str, repo: str, pr: Any) -> None:
         updated_at=_dt_to_epoch(pr.updated_at),
         merged_at=_dt_to_epoch(pr.merged_at) if pr.merged_at else 0.0,
         closed_at=_dt_to_epoch(pr.closed_at) if pr.closed_at else 0.0,
+        base_branch=_str_or_empty(_safe_attr(lambda: pr.base.ref)),
+        labels=_label_names(pr),
+        first_commit_at=_first_commit_at(pr) if pr.merged_at else 0.0,
     )
     # Currently-pending reviewers. No timeline call, so approximate the request
     # time with PR creation (webhooks record the precise time going forward).
@@ -242,6 +280,8 @@ def _record_reviews(db: Any, owner: str, repo: str, pr: Any, counts: dict[str, i
             bare_approval=int(bare),
         )
         db.set_pr_first_review(owner, repo, pr.number, submitted)
+        if state == "approved":
+            db.set_pr_first_approval(owner, repo, pr.number, submitted)
 
 
 def _backfill_commits(

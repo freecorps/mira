@@ -22,6 +22,7 @@ from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     CIJobFailure,
+    CommitChurn,
     CommitInfo,
     FileChangeStat,
     FileHistoryEntry,
@@ -30,6 +31,7 @@ from mira.models import (
     MergedPullRequest,
     PathAuthorship,
     PRInfo,
+    ReleaseRef,
     ReviewResult,
     UnresolvedThread,
 )
@@ -256,6 +258,43 @@ class BaseProvider(abc.ABC):
     ) -> dict[str, list[FileHistoryEntry]]:
         """Recent commit history per path, for decision archaeology."""
         return {}
+
+    # ── Delivery analytics (change-frequency heatmap, DORA) ──
+    #
+    # All three are best-effort enrichment for dashboard analytics: nothing a
+    # review decides depends on them, so the defaults answer "nothing known"
+    # and callers treat an exception the same way.
+
+    async def get_commit_churn(
+        self,
+        pr_info: PRInfo,
+        *,
+        since: float,
+        ref: str = "",
+        max_commits: int = 100,
+    ) -> list[CommitChurn]:
+        """Commits on ``ref`` (default: the PR's base branch) since ``since``
+        (epoch seconds), newest first, each with the files it changed.
+
+        Bounded by ``max_commits`` because most platforms need one request per
+        commit for its file list — a backfill must not become a rate-limit
+        incident.
+        """
+        return []
+
+    async def list_deployment_releases(
+        self, pr_info: PRInfo, *, since: float = 0.0
+    ) -> list[ReleaseRef]:
+        """Releases published since ``since`` (epoch seconds), newest first."""
+        return []
+
+    async def get_pr_first_commit_at(self, pr_info: PRInfo) -> float:
+        """Epoch seconds of the earliest commit on the PR, or ``0.0``.
+
+        The start of DORA's "lead time for changes". ``0.0`` makes the caller
+        fall back to the PR's creation time.
+        """
+        return 0.0
 
     async def reply_to_review_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
         """Reply to an existing line comment, threading it."""

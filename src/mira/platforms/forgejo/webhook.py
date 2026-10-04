@@ -181,6 +181,21 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
         )
 
 
+async def handle_forgejo_merged(payload: dict[str, Any], auth: PlatformAuth) -> None:
+    """Record delivery analytics for a merged pull request. Best-effort."""
+    pr_url = payload.get("pull_request", {}).get("html_url", "") or ""
+    if not pr_url:
+        return
+    try:
+        from mira.analytics.collect import record_merge_analytics
+
+        provider = create_provider("forgejo", await auth.get_token())
+        pr_info = await provider.get_pr_info(pr_url)
+        await record_merge_analytics(provider, pr_info)
+    except Exception as exc:  # noqa: BLE001 - analytics never fail a webhook
+        logger.debug("Forgejo merge analytics failed for %s: %s", pr_url, exc)
+
+
 async def handle_forgejo_push(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Incrementally index a push to the default branch."""
     from mira.platforms.index_handlers import _get_app_db, run_incremental_index
@@ -526,7 +541,12 @@ async def dispatch_forgejo_event(
                 return "ignored"
             background_tasks.add_task(handle_forgejo_pr, payload, auth, bot_name)
             return "processing"
-        # Ignore other PR actions (closed, edited, labeled, merged, etc.)
+        if action == "closed" and payload.get("pull_request", {}).get("merged"):
+            # Delivery analytics only (hotspot churn, DORA); Forgejo has no
+            # merge-time learning yet.
+            background_tasks.add_task(handle_forgejo_merged, payload, auth)
+            return "processing"
+        # Ignore other PR actions (edited, labeled, etc.)
         return "ignored"
 
     if event == "push":

@@ -1660,6 +1660,66 @@ class DigestsConfig(BaseModel):
         return value
 
 
+class HotspotsConfig(BaseModel):
+    """Change-frequency heatmap and hotspot ranking. See docs/analytics.md.
+
+    Hotspot score = churn × complexity × (1 + finding density). Churn comes
+    from what Mira already stores about reviewed and merged PRs, plus a
+    bounded one-time pull of the default branch's commit history.
+    """
+
+    enabled: bool = True
+    # Default look-back window for the dashboard and the review note.
+    window_days: int = Field(default=90, ge=7, le=730)
+    # On the first merge Mira sees for a repository, pull this many commits of
+    # default-branch history so the heatmap is not empty for months. 0 = off.
+    history_max_commits: int = Field(default=200, ge=0, le=2000)
+    # Add a short note to the review context when a PR touches one of the
+    # repository's top hotspots, so the reviewer scrutinizes those files.
+    review_note: bool = True
+    # How many of the top-ranked files count as "top hotspots" for the note.
+    review_top_n: int = Field(default=10, ge=1, le=100)
+    # A file needs at least this many recorded changes in the window to be
+    # called a hotspot in a review — a single edit is not a pattern.
+    review_min_changes: int = Field(default=3, ge=1)
+
+
+class DoraConfig(BaseModel):
+    """DORA metrics and cycle time on the review-health page."""
+
+    enabled: bool = True
+    # What counts as a deployment: "merges" (PRs merged into the default
+    # branch) or "releases" (published releases, recorded from release
+    # webhooks and synced from the platform after merges).
+    deployment_source: str = "merges"
+    # A merged PR is a "failure fix" (change failure rate, MTTR) when its
+    # title starts with one of these words (case-insensitive) ...
+    failure_title_prefixes: list[str] = Field(
+        default_factory=lambda: ["revert", "hotfix", "rollback"]
+    )
+    # ... or it carries one of these labels.
+    failure_labels: list[str] = Field(
+        default_factory=lambda: ["hotfix", "revert", "incident", "rollback"]
+    )
+
+    @field_validator("deployment_source")
+    @classmethod
+    def _valid_source(cls, v: str) -> str:
+        allowed = {"merges", "releases"}
+        if v not in allowed:
+            raise ValueError(
+                f"analytics.dora.deployment_source must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+
+class AnalyticsConfig(BaseModel):
+    """Delivery analytics: change-frequency hotspots and DORA metrics."""
+
+    hotspots: HotspotsConfig = Field(default_factory=HotspotsConfig)
+    dora: DoraConfig = Field(default_factory=DoraConfig)
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -1677,6 +1737,7 @@ class MiraConfig(BaseModel):
     issue_planner: IssuePlannerConfig = Field(default_factory=IssuePlannerConfig)
     licenses: LicensesConfig = Field(default_factory=LicensesConfig)
     digests: DigestsConfig = Field(default_factory=DigestsConfig)
+    analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
 
     @model_validator(mode="after")
     def _apply_review_profile(self) -> MiraConfig:

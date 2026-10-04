@@ -150,6 +150,10 @@ EXPECTED_ROUTES = {
     ("/api/review-insights/summary", "GET"),
     ("/api/review-insights/open-prs", "GET"),
     ("/api/review-insights/reviewers", "GET"),
+    # Delivery analytics: DORA is admin-only like the rest of review health;
+    # hotspots are per-repo browsing data like the Files tab.
+    ("/api/review-insights/dora", "GET"),
+    ("/api/repos/{owner}/{repo}/hotspots", "GET"),
     ("/api/repos/sync", "POST"),
     ("/api/repos/{owner}/{repo}", "GET"),
     ("/api/repos/{owner}/{repo}/blast-radius", "GET"),

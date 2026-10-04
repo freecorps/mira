@@ -55,6 +55,7 @@ from mira.models import (
 from mira.platforms import profiles
 from mira.providers._time import epoch_to_iso, iso_to_epoch
 from mira.providers.base import BaseProvider
+from mira.providers.delivery import ForgejoDeliveryMixin
 from mira.providers.formatting import format_comment_body, format_key_issues
 from mira.triage.capabilities import (
     FORGEJO_CAPABILITIES as FORGEJO_TRIAGE_CAPABILITIES,
@@ -93,7 +94,7 @@ def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
     return match.group("owner"), match.group("repo"), int(match.group("number"))
 
 
-class ForgejoProvider(BaseProvider):
+class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
     """Forgejo code hosting provider (Gitea-compatible REST API)."""
 
     def __init__(self, token: str) -> None:

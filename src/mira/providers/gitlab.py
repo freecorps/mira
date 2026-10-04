@@ -49,6 +49,7 @@ from mira.models import (
 from mira.platforms import profiles
 from mira.providers._time import epoch_to_iso, iso_to_epoch
 from mira.providers.base import BaseProvider
+from mira.providers.delivery import GitLabDeliveryMixin
 from mira.providers.formatting import format_comment_body, format_key_issues
 from mira.triage.capabilities import (
     GITLAB_CAPABILITIES as GITLAB_TRIAGE_CAPABILITIES,
@@ -114,7 +115,7 @@ def _build_unified_diff(changes: list[dict[str, Any]]) -> str:
     return "".join(p if p.endswith("\n") else p + "\n" for p in parts)
 
 
-class GitLabProvider(BaseProvider):
+class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
     """GitLab code hosting provider (REST v4)."""
 
     def __init__(self, token: str) -> None:

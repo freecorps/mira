@@ -181,9 +181,29 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     first_review_at REAL NOT NULL DEFAULT 0,  -- 0 = not yet reviewed
     merged_at REAL NOT NULL DEFAULT 0,
     closed_at REAL NOT NULL DEFAULT 0,
+    -- DORA / cycle time. base_branch vs default_branch tells a merge to the
+    -- default branch (a "deployment" in merges mode) from one into a feature
+    -- branch; labels (comma-joined, lowercase) flag hotfixes/reverts.
+    base_branch TEXT NOT NULL DEFAULT '',
+    default_branch TEXT NOT NULL DEFAULT '',
+    labels TEXT NOT NULL DEFAULT '',
+    first_commit_at REAL NOT NULL DEFAULT 0,    -- 0 = unknown, lead time falls back to created_at
+    first_approval_at REAL NOT NULL DEFAULT 0,  -- 0 = never approved
     PRIMARY KEY (owner, repo, number)
 );
 CREATE INDEX IF NOT EXISTS idx_pr_state ON pull_requests(state);
+
+-- Releases/tags, the deployment proxy when analytics.dora.deployment_source
+-- is "releases". Keyed so a redelivered webhook or a re-sync is a no-op.
+CREATE TABLE IF NOT EXISTS deployments (
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'release',   -- release | tag
+    ref TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    deployed_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner, repo, kind, ref)
+);
 
 -- One row per (PR, reviewer): when they were asked, when they first responded,
 -- and their latest review state. Powers reviewer responsiveness + waiting-on.
@@ -458,9 +478,29 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     first_review_at REAL NOT NULL DEFAULT 0,
     merged_at REAL NOT NULL DEFAULT 0,
     closed_at REAL NOT NULL DEFAULT 0,
+    -- DORA / cycle time. base_branch vs default_branch tells a merge to the
+    -- default branch (a "deployment" in merges mode) from one into a feature
+    -- branch; labels (comma-joined, lowercase) flag hotfixes/reverts.
+    base_branch TEXT NOT NULL DEFAULT '',
+    default_branch TEXT NOT NULL DEFAULT '',
+    labels TEXT NOT NULL DEFAULT '',
+    first_commit_at REAL NOT NULL DEFAULT 0,    -- 0 = unknown, lead time falls back to created_at
+    first_approval_at REAL NOT NULL DEFAULT 0,  -- 0 = never approved
     PRIMARY KEY (owner, repo, number)
 );
 CREATE INDEX IF NOT EXISTS idx_pr_state ON pull_requests(state);
+
+-- Releases/tags, the deployment proxy when analytics.dora.deployment_source
+-- is "releases". Keyed so a redelivered webhook or a re-sync is a no-op.
+CREATE TABLE IF NOT EXISTS deployments (
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'release',   -- release | tag
+    ref TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    deployed_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner, repo, kind, ref)
+);
 
 CREATE TABLE IF NOT EXISTS pr_reviewers (
     owner TEXT NOT NULL,
@@ -583,6 +623,16 @@ CREATE TABLE IF NOT EXISTS digests (
 CREATE INDEX IF NOT EXISTS idx_digests_created
     ON digests(created_at);
 """
+
+# pull_requests columns added for DORA / cycle time, as (name, DDL). Shared by
+# both backends' migrations so the two cannot drift.
+_PR_DORA_COLUMNS = (
+    ("base_branch", "TEXT NOT NULL DEFAULT ''"),
+    ("default_branch", "TEXT NOT NULL DEFAULT ''"),
+    ("labels", "TEXT NOT NULL DEFAULT ''"),
+    ("first_commit_at", "REAL NOT NULL DEFAULT 0"),
+    ("first_approval_at", "REAL NOT NULL DEFAULT 0"),
+)
 
 SESSION_DURATION = 86400 * 7  # 7 days
 
@@ -801,6 +851,13 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE pr_reviewers ADD COLUMN bare_approval INTEGER NOT NULL DEFAULT 0"
             )
+        # DORA / cycle-time columns added to pull_requests post-launch.
+        pr_cols = {
+            r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(pull_requests)").fetchall()
+        }
+        for col, ddl in _PR_DORA_COLUMNS:
+            if pr_cols and col not in pr_cols:
+                self._sqlite_conn.execute(f"ALTER TABLE pull_requests ADD COLUMN {col} {ddl}")
         # Adding `platform` to the primary key requires a table rebuild (SQLite
         # can't alter a PK in place). Rename the old table, recreate it from the
         # current schema, and copy rows in as 'github'.
@@ -864,6 +921,8 @@ class AppDatabase:
                     "ALTER TABLE pr_reviewers ADD COLUMN IF NOT EXISTS "
                     "bare_approval INTEGER NOT NULL DEFAULT 0"
                 )
+                for col, ddl in _PR_DORA_COLUMNS:
+                    cur.execute(f"ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS {col} {ddl}")
                 # Add `platform` to the key on existing DBs. Postgres can swap
                 # the PK in place; guard so it only rebuilds when needed.
                 cur.execute(
@@ -3269,14 +3328,24 @@ class AppDatabase:
         updated_at: float = 0.0,
         merged_at: float = 0.0,
         closed_at: float = 0.0,
+        base_branch: str = "",
+        default_branch: str = "",
+        labels: list[str] | None = None,
+        first_commit_at: float = 0.0,
     ) -> None:
         """Insert/update a PR's lifecycle row. Never clears first_review_at
-        (set separately) or an earlier created_at."""
+        (set separately) or an earlier created_at.
+
+        ``labels=None`` leaves the stored labels alone (a caller that did not
+        read them); a list — even an empty one — replaces them.
+        """
+        labels_text = ",".join(sorted({lbl.strip().lower() for lbl in labels or [] if lbl}))
         self._exec(
             "INSERT INTO pull_requests "
             "(owner, repo, number, author, title, url, state, draft, "
-            "created_at, updated_at, merged_at, closed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "created_at, updated_at, merged_at, closed_at, "
+            "base_branch, default_branch, labels, first_commit_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(owner, repo, number) DO UPDATE SET "
             "author=CASE WHEN excluded.author!='' THEN excluded.author ELSE pull_requests.author END, "
             "title=CASE WHEN excluded.title!='' THEN excluded.title ELSE pull_requests.title END, "
@@ -3284,7 +3353,13 @@ class AppDatabase:
             "state=excluded.state, draft=excluded.draft, updated_at=excluded.updated_at, "
             "created_at=CASE WHEN pull_requests.created_at=0 THEN excluded.created_at ELSE pull_requests.created_at END, "
             "merged_at=CASE WHEN excluded.merged_at>0 THEN excluded.merged_at ELSE pull_requests.merged_at END, "
-            "closed_at=CASE WHEN excluded.closed_at>0 THEN excluded.closed_at ELSE pull_requests.closed_at END",
+            "closed_at=CASE WHEN excluded.closed_at>0 THEN excluded.closed_at ELSE pull_requests.closed_at END, "
+            "base_branch=CASE WHEN excluded.base_branch!='' THEN excluded.base_branch ELSE pull_requests.base_branch END, "
+            "default_branch=CASE WHEN excluded.default_branch!='' THEN excluded.default_branch ELSE pull_requests.default_branch END, "
+            "labels=CASE WHEN ?=1 THEN excluded.labels ELSE pull_requests.labels END, "
+            "first_commit_at=CASE WHEN excluded.first_commit_at>0 AND (pull_requests.first_commit_at=0 "
+            "OR excluded.first_commit_at<pull_requests.first_commit_at) "
+            "THEN excluded.first_commit_at ELSE pull_requests.first_commit_at END",
             (
                 owner,
                 repo,
@@ -3298,8 +3373,105 @@ class AppDatabase:
                 updated_at,
                 merged_at,
                 closed_at,
+                base_branch,
+                default_branch,
+                labels_text,
+                first_commit_at,
+                1 if labels is not None else 0,
             ),
         )
+
+    def set_pr_first_approval(self, owner: str, repo: str, number: int, ts: float) -> None:
+        """Record the earliest approval time on a PR (no-op if an earlier one exists)."""
+        if ts <= 0:
+            return
+        self._exec(
+            "UPDATE pull_requests SET first_approval_at=? "
+            "WHERE owner=? AND repo=? AND number=? AND (first_approval_at=0 OR ?<first_approval_at)",
+            (ts, owner, repo, number, ts),
+        )
+
+    def get_delivery_rows(
+        self, since: float, *, owner: str = "", repo: str = ""
+    ) -> list[dict[str, Any]]:
+        """Merged PRs (merged_at >= since) with everything DORA and cycle time
+        need — aggregated in Python so it works the same on both backends."""
+        sql = (
+            "SELECT owner, repo, number, title, labels, base_branch, default_branch, "
+            "created_at, first_commit_at, first_review_at, first_approval_at, merged_at, url "
+            "FROM pull_requests WHERE merged_at > 0 AND merged_at >= ?"
+        )
+        params: list[Any] = [since]
+        if owner:
+            sql += " AND owner=?"
+            params.append(owner)
+        if repo:
+            sql += " AND repo=?"
+            params.append(repo)
+        rows = self._rows(sql + " ORDER BY merged_at ASC", tuple(params))
+        return [
+            {
+                "owner": r[0],
+                "repo": r[1],
+                "number": int(r[2] or 0),
+                "title": r[3] or "",
+                "labels": [lbl for lbl in (r[4] or "").split(",") if lbl],
+                "base_branch": r[5] or "",
+                "default_branch": r[6] or "",
+                "created_at": float(r[7] or 0.0),
+                "first_commit_at": float(r[8] or 0.0),
+                "first_review_at": float(r[9] or 0.0),
+                "first_approval_at": float(r[10] or 0.0),
+                "merged_at": float(r[11] or 0.0),
+                "url": r[12] or "",
+            }
+            for r in rows
+        ]
+
+    def record_deployment(
+        self,
+        owner: str,
+        repo: str,
+        ref: str,
+        deployed_at: float,
+        *,
+        kind: str = "release",
+        url: str = "",
+    ) -> None:
+        """Record a release/tag as a deployment. Idempotent per (repo, kind, ref)."""
+        if not ref or deployed_at <= 0:
+            return
+        self._exec(
+            "INSERT INTO deployments (owner, repo, kind, ref, url, deployed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(owner, repo, kind, ref) DO UPDATE SET "
+            "url=CASE WHEN excluded.url!='' THEN excluded.url ELSE deployments.url END, "
+            "deployed_at=excluded.deployed_at",
+            (owner, repo, kind, ref, url, deployed_at),
+        )
+
+    def get_deployments(
+        self, since: float, *, owner: str = "", repo: str = ""
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT owner, repo, kind, ref, url, deployed_at FROM deployments WHERE deployed_at >= ?"
+        params: list[Any] = [since]
+        if owner:
+            sql += " AND owner=?"
+            params.append(owner)
+        if repo:
+            sql += " AND repo=?"
+            params.append(repo)
+        rows = self._rows(sql + " ORDER BY deployed_at ASC", tuple(params))
+        return [
+            {
+                "owner": r[0],
+                "repo": r[1],
+                "kind": r[2],
+                "ref": r[3],
+                "url": r[4] or "",
+                "deployed_at": float(r[5] or 0.0),
+            }
+            for r in rows
+        ]
 
     def set_pr_first_review(self, owner: str, repo: str, number: int, ts: float) -> None:
         """Record the earliest review time on a PR (no-op if an earlier one exists)."""

@@ -979,3 +979,12 @@ async def run_pr_merged_learning(
         await record_merged_pull_request(provider, pr_info)
     except Exception as exc:  # noqa: BLE001 - nothing here depends on it
         logger.debug("Could not record path history for %s: %s", pr_url, exc)
+
+    # Delivery analytics: file churn for the hotspot heatmap, and the merged
+    # PR's DORA fields. Background, best-effort, config-gated inside.
+    try:
+        from mira.analytics.collect import record_merge_analytics
+
+        await record_merge_analytics(provider, pr_info)
+    except Exception as exc:  # noqa: BLE001 - nothing here depends on it
+        logger.debug("Could not record delivery analytics for %s: %s", pr_url, exc)
