@@ -94,6 +94,7 @@ def build_review_prompt(
         confidence_threshold=config.filter.confidence_threshold,
         max_comments=config.filter.max_comments,
         focus_only_on_problems=config.review.focus_only_on_problems,
+        review_profile=config.review.profile,
         existing_comments=cleaned_comments,
         has_code_context=bool(code_context),
         learned_rules=learned_rules,

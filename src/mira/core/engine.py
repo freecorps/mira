@@ -457,8 +457,14 @@ class ReviewEngine:
         dry_run: bool = False,
         indexing_llm: LLMProviderProtocol | None = None,
         security_llm: LLMProviderProtocol | None = None,
+        *,
+        full_review: bool = False,
     ) -> None:
         self.config = config
+        # `@mira full review`: review the whole pull request as a first pass
+        # would — the full diff and round-1 thresholds — even when earlier
+        # passes left threads behind and a compare base is stored.
+        self.full_review = full_review
         self.llm = llm
         self.indexing_llm = indexing_llm or llm
         self.security_llm = security_llm or llm
@@ -853,11 +859,13 @@ class ReviewEngine:
         # dripping new findings on every push. review-rest is a continuation of
         # round 1 onto never-reviewed files, so it stays round 1 (full
         # thresholds, full diff) even though the first pass left threads behind.
+        # A requested full review stays round 1 for the same reason, which is
+        # also what keeps it off the incremental (compare) diff below.
         review_round = 1
         is_review_rest = getattr(self, "_review_only_paths", None) is not None
         resolved_thread_dicts: list[dict] = []
         if all_bot_threads:
-            if not is_review_rest:
+            if not is_review_rest and not self.full_review:
                 review_round = 2
             resolved_thread_dicts = [
                 {

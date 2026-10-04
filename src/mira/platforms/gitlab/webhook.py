@@ -24,6 +24,7 @@ from mira.feedback.service import (
 )
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
+from mira.platforms.chat_commands import is_review_request
 from mira.platforms.fetch import _next_link, make_fetcher
 from mira.platforms.mentions import (
     author_is_filtered,
@@ -475,7 +476,7 @@ async def dispatch_gitlab_event(
             has_mention(attrs.get("note") or "", names) or is_inline_reply
         ):
             cmd_word = command_after_mention(attrs.get("note") or "", names)
-            if cmd_word != "review":
+            if not is_review_request(attrs.get("note") or "", names, cmd_word):
                 cfg = load_config()
                 if author_is_filtered(
                     actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors

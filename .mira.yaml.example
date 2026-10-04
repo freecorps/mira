@@ -65,12 +65,16 @@ llm:
   # model: "gpt-5-codex"   # or gpt-5; the account's models, not OpenRouter ids
 
 filter:
+  # The next three knobs are set by `review.profile` (below) unless written
+  # here. A value set here always wins over the profile, so leave them
+  # commented out to let the profile decide. Shown with the `balanced` values.
   # Minimum confidence threshold (0.0 - 1.0)
-  confidence_threshold: 0.7
-  # Maximum number of comments to post
-  max_comments: 5
+  # confidence_threshold: 0.7
+  # Maximum number of suggestion/nitpick comments to post (blockers and
+  # warnings are never capped)
+  # max_comments: 5
   # Minimum severity level: blocker, warning, suggestion, nitpick
-  min_severity: "nitpick"
+  # min_severity: "nitpick"
   # Glob patterns for files to exclude
   exclude_patterns:
     - "*.lock"
@@ -98,6 +102,16 @@ filter:
   max_files: 50
 
 review:
+  # Review profile: how many comments Mira leaves.
+  #   chill      fewer, higher-signal comments: confidence 0.8, at most 3
+  #              suggestions, no nitpicks, stricter self-critique
+  #   balanced   the defaults (confidence 0.7, at most 5, nitpicks allowed)
+  #   assertive  a more thorough pass: confidence 0.55, at most 10, nitpicks
+  #              included, more lenient self-critique
+  # The profile only fills filter.confidence_threshold, filter.max_comments,
+  # filter.min_severity and review.critique_plausible_min_confidence where
+  # they are not set explicitly; an explicit value always wins.
+  profile: balanced
   # Automatically review every eligible file, across as many agents as needed.
   auto_complete: true
   # Diff token budget and soft file target per agent. Related files stay together.
@@ -120,7 +134,8 @@ review:
   # lines sit in. 0 turns it off.
   enclosing_context_tokens: 6000
   # Confidence a finding the critic grades "plausible" needs to be posted.
-  critique_plausible_min_confidence: 0.7
+  # Set by `profile` unless written here (balanced: 0.7).
+  # critique_plausible_min_confidence: 0.7
   # Lines of context around hunks
   context_lines: 3
   # Legacy total diff cap in characters (only when auto_complete: false)

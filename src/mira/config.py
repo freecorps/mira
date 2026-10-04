@@ -433,7 +433,27 @@ class ReviewStatusConfig(BaseModel):
         return v
 
 
+# Review profiles: presets over the noise knobs, so a team can ask for "fewer,
+# louder comments" or "everything you see" without tuning four numbers. A
+# preset only fills a knob the configuration left unset: any value written down
+# (mira.yaml, the dashboard, `.mira.yaml`) wins over the profile. `balanced` is
+# the built-in defaults, unchanged.
+REVIEW_PROFILES = ("chill", "balanced", "assertive")
+_PROFILE_FILTER_PRESETS: dict[str, dict[str, Any]] = {
+    "chill": {"confidence_threshold": 0.8, "max_comments": 3, "min_severity": "suggestion"},
+    "balanced": {},
+    "assertive": {"confidence_threshold": 0.55, "max_comments": 10, "min_severity": "nitpick"},
+}
+_PROFILE_REVIEW_PRESETS: dict[str, dict[str, Any]] = {
+    "chill": {"critique_plausible_min_confidence": 0.8},
+    "balanced": {},
+    "assertive": {"critique_plausible_min_confidence": 0.6},
+}
+
+
 class ReviewConfig(BaseModel):
+    # `chill` | `balanced` | `assertive`; see REVIEW_PROFILES above.
+    profile: str = "balanced"
     context_lines: int = Field(default=3, ge=0)
     # Automatically drain all eligible changes, respecting explicit exclusions.
     # The legacy file/size caps only apply when auto_complete is disabled.
@@ -565,6 +585,28 @@ class ReviewConfig(BaseModel):
     # Disabling this saves tokens and reduces noise when you batch commits
     # locally before pushing — only the final diff gets reviewed.
     review_on_synchronize: bool = True
+
+    @field_validator("profile")
+    @classmethod
+    def _valid_profile(cls, v: str) -> str:
+        value = (v or "balanced").strip().lower()
+        if value not in REVIEW_PROFILES:
+            raise ValueError(f"review.profile must be one of {', '.join(REVIEW_PROFILES)}")
+        return value
+
+
+def _apply_preset(model: BaseModel, preset: dict[str, Any]) -> None:
+    """Fill each knob in ``preset`` that the configuration did not set itself.
+
+    The field is taken back out of ``model_fields_set`` afterwards: a preset is
+    not something the user wrote, and code that asks "was this set explicitly?"
+    should still hear "no".
+    """
+    for name, value in preset.items():
+        if name in model.model_fields_set:
+            continue
+        setattr(model, name, value)
+        model.__pydantic_fields_set__.discard(name)
 
 
 class IndexConfig(BaseModel):
@@ -1193,6 +1235,13 @@ class MiraConfig(BaseModel):
     checks: ChecksConfig = Field(default_factory=ChecksConfig)
     triage: TriageConfig = Field(default_factory=TriageConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
+
+    @model_validator(mode="after")
+    def _apply_review_profile(self) -> MiraConfig:
+        profile = self.review.profile
+        _apply_preset(self.filter, _PROFILE_FILTER_PRESETS.get(profile, {}))
+        _apply_preset(self.review, _PROFILE_REVIEW_PRESETS.get(profile, {}))
+        return self
 
 
 def find_config_file(start_dir: Path | None = None) -> Path | None:
