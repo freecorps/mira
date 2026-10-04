@@ -22,7 +22,7 @@ import re
 from typing import Any
 
 from mira.models import MergedPullRequest, PRInfo
-from mira.quality.lines import changed_lines, to_ranges
+from mira.quality.lines import changed_lines, lines_near, to_ranges
 from mira.quality.models import (
     SIGNAL_FEEDBACK_NEGATIVE,
     SIGNAL_FEEDBACK_POSITIVE,
@@ -109,8 +109,14 @@ async def fix_commit_signals(
     max_files: int,
     max_commits: int,
     notes: list[str],
+    line_tolerance: int = 3,
 ) -> list[Signal]:
-    """Lines later fix/revert commits touched in files this pull request changed."""
+    """Lines this pull request changed that later fix/revert commits touched.
+
+    A fix elsewhere in the same file says nothing about this pull request, so
+    only the fix's lines within ``line_tolerance`` of lines this pull request
+    added count.
+    """
     if merged is None or not merged.merged_at or max_files <= 0:
         return []
     files = changed_lines(diff_text)
@@ -141,7 +147,7 @@ async def fix_commit_signals(
             notes.append(f"history of {entry.path} unavailable: {exc}")
             continue
         for commit in commits:
-            if commit.sha in own or any(commit.sha.startswith(s) for s in own):
+            if _is_own_commit(commit.sha, own):
                 continue
             kind = classify_commit_message(commit.message)
             if not kind:
@@ -155,7 +161,12 @@ async def fix_commit_signals(
             touched = changed_lines(diff_cache[commit.sha]).get(entry.path)
             if touched is None:
                 continue
-            for start, end in to_ranges(touched.removed):
+            overlapping = {
+                line
+                for line in touched.removed
+                if lines_near(line, line, entry.added, line_tolerance)
+            }
+            for start, end in to_ranges(overlapping):
                 out.append(
                     Signal(
                         kind=kind,
@@ -169,6 +180,13 @@ async def fix_commit_signals(
                     )
                 )
     return out
+
+
+def _is_own_commit(sha: str, own: set[str]) -> bool:
+    """Whether ``sha`` is one of ``own``, allowing either side to be abbreviated."""
+    if not sha:
+        return False
+    return any(s and (sha.startswith(s) or s.startswith(sha)) for s in own)
 
 
 def feedback_signals(quality_store: Any, pr_number: int) -> list[Signal]:
@@ -233,6 +251,7 @@ async def collect_signals(
     max_files: int,
     max_commits: int,
     quality_store: Any = None,
+    line_tolerance: int = 3,
 ) -> tuple[list[Signal], list[str]]:
     """All ground-truth signals for one pull request, plus notes on what was missing."""
     notes: list[str] = []
@@ -248,6 +267,7 @@ async def collect_signals(
             max_files=max_files,
             max_commits=max_commits,
             notes=notes,
+            line_tolerance=line_tolerance,
         )
     )
     try:

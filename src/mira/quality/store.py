@@ -156,11 +156,20 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
+_QUALITY_TABLES = ("quality_backtest_runs", "quality_backtest_results", "quality_escaped_bugs")
+
+
+class QualityStoreUnavailable(RuntimeError):
+    """The quality tables do not exist and could not be created on this handle."""
+
+
 class QualityStore:
     """Backtest and escaped-bug rows for one repository (or, on Postgres, all)."""
 
     def __init__(self, store: Any) -> None:
         self._store = store
+        # Why the tables are unusable, or "" when they are fine.
+        self.unavailable_reason = ""
         self._ensure_schema()
 
     @property
@@ -189,16 +198,40 @@ class QualityStore:
         return str(getattr(self._store, "_repo", "") or "")
 
     def _ensure_schema(self) -> None:
+        failures: list[str] = []
         for statement in _SCHEMA:
             try:
                 self._exec(statement.strip())
             except Exception as exc:  # noqa: BLE001 - a read-only handle cannot create
-                logger.debug("Quality schema statement skipped: %s", exc)
+                failures.append(str(exc))
+        if not failures:
+            return
+        # A read-only handle refuses even ``CREATE ... IF NOT EXISTS``; that is
+        # fine as long as the tables are already there.
+        missing = []
+        for table in _QUALITY_TABLES:
+            try:
+                self._query(f"SELECT 1 FROM {table} LIMIT 1")
+            except Exception:  # noqa: BLE001
+                missing.append(table)
+        if missing:
+            self.unavailable_reason = (
+                f"quality tables unavailable ({', '.join(missing)}): {failures[0]}"
+            )
+            logger.error("Quality store unusable, nothing will be persisted: %s", failures[0])
+        else:
+            logger.warning("Quality schema statement(s) failed on an existing schema: %s", failures)
+
+    def _require_schema(self) -> None:
+        """Make a write fail loudly instead of vanishing when the tables are missing."""
+        if self.unavailable_reason:
+            raise QualityStoreUnavailable(self.unavailable_reason)
 
     # ------------------------------------------------------------ backtests
 
     def save_backtest_run(self, run: BacktestRun) -> None:
         """Insert or update the run row (not its results)."""
+        self._require_schema()
         self._exec(
             "INSERT INTO quality_backtest_runs ("
             + _RUN_COLUMNS
@@ -223,7 +256,12 @@ class QualityStore:
             ),
         )
 
-    def save_backtest_result(self, run_id: str, result: PRBacktest) -> None:
+    def save_backtest_result(
+        self, run_id: str, result: PRBacktest, *, owner: str = "", repo: str = ""
+    ) -> None:
+        """Insert one result row; ``owner``/``repo`` are the run's, used when the
+        handle itself is not pinned to a repository (as ``save_backtest_run`` does)."""
+        self._require_schema()
         row_id = f"{run_id}:{result.variant}:{result.pr_number}"
         score = result.score
         self._exec(
@@ -234,8 +272,8 @@ class QualityStore:
             (
                 row_id,
                 run_id,
-                self._owner(),
-                self._repo(),
+                self._owner() or owner,
+                self._repo() or repo,
                 result.variant,
                 int(result.pr_number),
                 result.pr_title,
@@ -359,6 +397,7 @@ class QualityStore:
 
     def record_escaped_bug(self, bug: EscapedBug) -> bool:
         """Insert unless this exact (fix, original PR, path) is known. True when new."""
+        self._require_schema()
         bug.detected_at = bug.detected_at or time.time()
         changed = self._exec(
             "INSERT INTO quality_escaped_bugs ("
@@ -394,6 +433,7 @@ class QualityStore:
         return changed > 0
 
     def set_escaped_bug_candidate(self, bug_id: str, candidate_id: int) -> None:
+        self._require_schema()
         clause, params = self._scope()
         self._exec(
             f"UPDATE quality_escaped_bugs SET learning_candidate_id = ? WHERE id = ?{clause}",
@@ -521,23 +561,37 @@ class QualityStore:
         to reviewed pull requests that touched the file before anyone fetches
         a diff.
         """
-        try:
-            events = self._store.list_review_events(limit=500)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("review_events unavailable: %s", exc)
-            return []
+        clause, params = self._scope()
+        page = 500
+        offset = 0
         out: list[int] = []
-        for event in events:
-            if float(getattr(event, "created_at", 0.0) or 0.0) < since:
-                continue
-            paths = str(getattr(event, "reviewed_paths", "") or "")
-            listed = _loads(paths, None)
-            names = {str(p) for p in listed} if isinstance(listed, list) else set(paths.split(","))
-            number = int(getattr(event, "pr_number", 0) or 0)
-            if path in names and number and number not in out:
-                out.append(number)
-            if len(out) >= limit:
+        # The window is filtered in the query and read page by page, so a busy
+        # repository's in-window reviews are not cut off by a fixed row cap.
+        while len(out) < limit:
+            try:
+                rows = self._query(
+                    "SELECT pr_number, reviewed_paths FROM review_events "
+                    f"WHERE created_at >= ?{clause} ORDER BY created_at DESC, id DESC "
+                    "LIMIT ? OFFSET ?",
+                    (float(since), *params, page, offset),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("review_events unavailable: %s", exc)
                 break
+            for row in rows:
+                number = int(row[0] or 0)
+                paths = str(row[1] or "")
+                listed = _loads(paths, None)
+                names = (
+                    {str(p) for p in listed} if isinstance(listed, list) else set(paths.split(","))
+                )
+                if path in names and number and number not in out:
+                    out.append(number)
+                    if len(out) >= limit:
+                        break
+            if len(rows) < page:
+                break
+            offset += page
         return out
 
 

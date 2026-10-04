@@ -27,7 +27,7 @@ from mira.quality.backtest import (
     select_prs,
 )
 from mira.quality.config_models import BacktestConfig
-from mira.quality.ground_truth import classify_commit_message
+from mira.quality.ground_truth import classify_commit_message, fix_commit_signals
 from mira.quality.lines import changed_lines, ranges_overlap, to_ranges
 from mira.quality.models import (
     LABEL_FP,
@@ -510,3 +510,138 @@ def test_backtest_config_is_bounded() -> None:
     with pytest.raises(ValueError):
         BacktestConfig(max_prs=0)
     assert MiraConfig().backtest.max_prs == 25
+
+
+# ──────────────────────────────────────────────── review-bot regressions ──
+
+
+async def _fix_signals(provider: FakeHistoryProvider, merged: Any, diff: str) -> list[Signal]:
+    return await fix_commit_signals(
+        provider,
+        _pr_info(),
+        merged,
+        diff,
+        window_days=30,
+        max_files=5,
+        max_commits=10,
+        notes=[],
+        line_tolerance=3,
+    )
+
+
+async def test_fix_commit_far_from_the_prs_lines_is_not_evidence() -> None:
+    pr_diff = file_diff("a.py", 9, [], 10, ["x1", "x2", "x3"])  # adds lines 10-12
+    provider = FakeHistoryProvider(
+        path_commits={
+            "a.py": [
+                CommitInfo(sha="near", message="fix: off by one", date=MERGED_AT + DAY),
+                CommitInfo(sha="far", message="fix: unrelated typo", date=MERGED_AT + DAY),
+            ]
+        },
+        commit_diffs={
+            "near": file_diff("a.py", 11, ["x2"], 11, ["y2"]),
+            "far": file_diff("a.py", 200, ["old"], 200, ["new"]),
+        },
+    )
+    merged = merged_pr(7, merged_at=MERGED_AT)
+    signals = await _fix_signals(provider, merged, pr_diff)
+    assert {s.ref for s in signals} == {"near"}
+    assert all(s.start >= 7 and s.end <= 15 for s in signals)
+
+
+async def test_the_prs_own_commit_is_skipped_when_either_sha_is_abbreviated() -> None:
+    pr_diff = file_diff("a.py", 9, [], 10, ["x1"])
+    provider = FakeHistoryProvider(
+        path_commits={
+            "a.py": [
+                CommitInfo(sha="abcdef1", message="fix: merge #7", date=MERGED_AT + 1),
+                CommitInfo(sha="", message="fix: no sha", date=MERGED_AT + 1),
+            ]
+        },
+        commit_diffs={
+            "abcdef1": file_diff("a.py", 10, ["x1"], 10, ["x1!"]),
+            "": file_diff("a.py", 10, ["x1"], 10, ["x1?"]),
+        },
+    )
+    merged = merged_pr(7, merged_at=MERGED_AT, merge_commit_sha="abcdef1234567890", head_sha="")
+    signals = await _fix_signals(provider, merged, pr_diff)
+    assert {s.ref for s in signals} == {""}  # the own commit is skipped; an empty sha is not
+
+
+async def test_blocked_writes_return_values_of_their_declared_type() -> None:
+    import inspect as _inspect
+
+    from mira.providers.base import BaseProvider
+
+    guard = ReadOnlyProvider(MagicMock())
+    assert await guard.commit_files(_pr_info(), {}) == ""
+    assert await guard.create_pull_request(_pr_info()) == (0, "")
+    for name in blocked_base_methods():
+        declared = _inspect.signature(getattr(BaseProvider, name)).return_annotation
+        if declared in (None, "None"):
+            continue
+        result = getattr(guard, name)(_pr_info())
+        if hasattr(result, "__await__"):
+            result = await result
+        assert result is not None, f"blocked {name}() returns None but promises {declared}"
+
+
+async def test_unknown_members_mirror_sync_and_async_and_missing_ones_raise() -> None:
+    class Inner(FakeHistoryProvider):
+        def sync_write(self, value: int) -> int:
+            self.writes.append("sync_write")
+            return value
+
+        async def async_write(self) -> None:
+            self.writes.append("async_write")
+
+    inner = Inner()
+    guard = ReadOnlyProvider(inner)
+    result = guard.sync_write(1)  # type: ignore[attr-defined]
+    assert not _is_awaitable(result)
+    await guard.async_write()  # type: ignore[attr-defined]
+    assert [c.method for c in guard.blocked_calls] == ["sync_write", "async_write"]
+    assert inner.writes == []
+    assert not hasattr(guard, "no_such_method")
+
+
+def _is_awaitable(value: Any) -> bool:
+    return hasattr(value, "__await__")
+
+
+async def test_concurrent_workers_reserve_spend_before_reviewing() -> None:
+    import asyncio
+
+    started: list[int] = []
+
+    def engine_factory(config: Any, clients: Any, provider: Any) -> Any:
+        engine = _FakeEngine([])
+
+        async def review_diff(diff_text: str, **kwargs: Any) -> ReviewResult:
+            started.append(kwargs["repo_scope"].number)
+            await asyncio.sleep(0.01)  # both workers are in flight at once
+            return ReviewResult(comments=[])
+
+        engine.review_diff = review_diff  # type: ignore[method-assign]
+        return engine
+
+    runner = BacktestRunner(
+        _ab_provider(),
+        [Variant("A", "default", MiraConfig())],
+        owner="acme",
+        repo="app",
+        platform="github",
+        limits=BacktestConfig(max_concurrency=2, store_results=False),
+        llm_factory=lambda _c: _clients(prompt=1_000_000),
+        engine_factory=engine_factory,
+    )
+    plan = await runner.plan(limit=5)
+    one_review = plan.prs[0].estimated_cost_usd["A"]
+    assert one_review > 0
+    # Room for one review's estimate, not two.
+    runner.limits = BacktestConfig(
+        max_concurrency=2, store_results=False, max_estimated_cost_usd=one_review * 0.9
+    )
+    run = await runner.run(plan)
+    assert len(started) == 1
+    assert run.status == "stopped"

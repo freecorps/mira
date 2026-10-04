@@ -223,13 +223,53 @@ async def _revert_links(
         originals.setdefault(number, LINK_REVERT_BRANCH)
     links = []
     for number, method in originals.items():
+        # Only files the original pull request itself changed: a revert that
+        # also edits other files (or reverts several pull requests at once)
+        # must not pin those files on this original.
+        theirs = await _original_paths(provider, scope, number)
+        if theirs is None and len(originals) > 1:
+            logger.debug("Diff of reverted #%s unavailable; not linked", number)
+            continue
         for path, entry in touched.items():
+            if theirs is not None and not ({path, entry.old_path} & theirs):
+                continue
             # The revert's old side is the original's new side: the lines
             # the original added are exactly what a revert removes.
             lines = entry.removed or entry.added
             if lines:
                 links.append(_Link(number, path, set(lines), method))
     return links
+
+
+def _pr_scope(scope: PRInfo, number: int) -> PRInfo:
+    return PRInfo(
+        title="",
+        description="",
+        base_branch="",
+        head_branch="",
+        url="",
+        number=number,
+        owner=scope.owner,
+        repo=scope.repo,
+        platform=scope.platform,
+    )
+
+
+async def _original_paths(provider: Any, scope: PRInfo, number: int) -> set[str] | None:
+    """Paths (both sides) a pull request changed, or None when its diff is unreadable."""
+    try:
+        files = changed_lines(await provider.get_pr_diff(_pr_scope(scope, number)))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Diff of #%s unavailable: %s", number, exc)
+        return None
+    if not files:
+        return None
+    paths: set[str] = set()
+    for entry in files.values():
+        paths.add(entry.path)
+        if entry.old_path and entry.old_path != "/dev/null":
+            paths.add(entry.old_path)
+    return paths
 
 
 async def _blame_links(
@@ -276,19 +316,10 @@ async def _overlap_links(
         if number == event.fix_pr_number:
             continue
         if number not in diff_cache:
-            pr = PRInfo(
-                title="",
-                description="",
-                base_branch="",
-                head_branch="",
-                url="",
-                number=number,
-                owner=scope.owner,
-                repo=scope.repo,
-                platform=scope.platform,
-            )
             try:
-                diff_cache[number] = changed_lines(await provider.get_pr_diff(pr))
+                diff_cache[number] = changed_lines(
+                    await provider.get_pr_diff(_pr_scope(scope, number))
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Diff of #%s unavailable: %s", number, exc)
                 diff_cache[number] = {}
@@ -340,8 +371,9 @@ async def link_fix_event(
             except NotImplementedError:
                 can_blame = False
             except Exception as exc:  # noqa: BLE001 - one unreadable file
-                logger.debug("Blame of %s failed: %s", entry.path, exc)
-                continue
+                # Fall through to the diff-overlap fallback for this file
+                # rather than dropping it.
+                logger.debug("Blame of %s failed, using diff overlap: %s", entry.path, exc)
         links.extend(
             await _overlap_links(provider, scope, event, entry, quality_store, config, diff_cache)
         )
@@ -400,7 +432,12 @@ async def record_links(
             logger.debug("Original #%s unreadable: %s", number, exc)
             original = None
         merged_at = original.merged_at if original else 0.0
-        if merged_at and (merged_at < earliest or merged_at > event.happened_at):
+        if not merged_at:
+            # Without a merge time the window cannot be checked, and an
+            # unchecked link could pin a fix on any old reviewed PR.
+            logger.debug("%s → #%s: merge time unknown, skipped", event.fix_ref, number)
+            continue
+        if merged_at < earliest or merged_at > event.happened_at:
             continue
         findings = quality_store.findings_for_pr(number)
         for (pr, path), link in by_key.items():
@@ -642,11 +679,16 @@ async def process_pushed_commits(
             if not sha or classify_commit(CommitInfo(sha=sha, message=message), settings) is None:
                 continue
             # The payload has no parents; ask once, for the commits that matter.
-            commit = await reader.get_commit(scope, sha)
-            if commit is None:
-                continue
-            # A merge commit for a pull request is handled by the merge event.
-            if len(commit.parents) > 1 or await reader.get_prs_for_commit(scope, sha):
+            # One unreadable commit must not drop the rest of the push.
+            try:
+                commit = await reader.get_commit(scope, sha)
+                if commit is None:
+                    continue
+                # A merge commit for a pull request is handled by the merge event.
+                if len(commit.parents) > 1 or await reader.get_prs_for_commit(scope, sha):
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pushed commit %s unreadable, skipped: %s", sha[:10], exc)
                 continue
             event = classify_commit(commit, settings)
             if event is not None:
@@ -656,16 +698,19 @@ async def process_pushed_commits(
         recorded: list[EscapedBug] = []
         with open_quality_store(owner, repo, platform) as quality_store:
             for event in events:
-                recorded.extend(
-                    await process_fix_event(
-                        reader,
-                        scope,
-                        event,
-                        quality_store,
-                        settings,
-                        learning_config=config.learning,
+                try:
+                    recorded.extend(
+                        await process_fix_event(
+                            reader,
+                            scope,
+                            event,
+                            quality_store,
+                            settings,
+                            learning_config=config.learning,
+                        )
                     )
-                )
+                except Exception:  # noqa: BLE001 - one event does not sink the push
+                    logger.exception("Escaped-bug detection failed for %s", event.fix_ref)
         return recorded
     except Exception:  # noqa: BLE001
         logger.exception("Escaped-bug detection failed for a push to %s/%s", owner, repo)

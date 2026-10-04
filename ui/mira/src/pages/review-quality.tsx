@@ -301,7 +301,7 @@ function ScoreCells({ score }: { score: QualityScore }) {
 function RunDetail({ run }: { run: BacktestRun }) {
   const { data, loading, error } = useAsync(
     () => api.getBacktest(run.owner, run.repo, run.id, run.platform),
-    [run.id]
+    [run.platform, run.owner, run.repo, run.id]
   )
   if (loading) return <Skeleton className="h-16 w-full" />
   if (error) return <p className="text-sm text-destructive">{error}</p>
@@ -410,15 +410,17 @@ function BacktestsCard() {
             </TableHeader>
             <TableBody>
               {runs.map((run) => {
-                const isOpen = open === run.id
+                // Run ids are unique per repository store only.
+                const runKey = `${run.platform}/${run.owner}/${run.repo}/${run.id}`
+                const isOpen = open === runKey
                 const summaries = run.summaries.length ? run.summaries : []
                 return (
-                  <Fragment key={run.id}>
+                  <Fragment key={runKey}>
                     {summaries.map((s, i) => (
                       <TableRow
-                        key={`${run.id}-${s.variant}`}
+                        key={`${runKey}-${s.variant}`}
                         className="cursor-pointer"
-                        onClick={() => setOpen(isOpen ? null : run.id)}
+                        onClick={() => setOpen(isOpen ? null : runKey)}
                       >
                         <TableCell className="pl-6">
                           {i === 0 && (
