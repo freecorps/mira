@@ -277,6 +277,10 @@ class BacktestRunner:
 
         semaphore = asyncio.Semaphore(self.limits.max_concurrency)
         spent = [0.0]
+        # Estimated cost of reviews already started but not yet finished.
+        # Counted against the limit so concurrent workers cannot all pass the
+        # check before any of them has reported what it actually spent.
+        reserved = [0.0]
         stopped = [False]
         lock = asyncio.Lock()
 
@@ -285,16 +289,26 @@ class BacktestRunner:
                 signals, notes = await self._signals(entry)
                 results = []
                 for variant in self.variants:
+                    estimate = float(entry.estimated_cost_usd.get(variant.name, 0.0))
                     async with lock:
-                        exhausted = spent[0] >= self.limits.max_estimated_cost_usd
+                        committed = spent[0] + reserved[0]
+                        exhausted = committed >= self.limits.max_estimated_cost_usd
+                        if not exhausted:
+                            reserved[0] += estimate
                     if exhausted:
                         stopped[0] = True
                         result = self._skeleton(variant, entry, signals)
                         result.skipped_reason = "spend limit reached"
                     else:
-                        result = await self._review(variant, entry, signals)
-                        async with lock:
-                            spent[0] += result.cost_usd
+                        cost = 0.0
+                        try:
+                            result = await self._review(variant, entry, signals)
+                            cost = result.cost_usd
+                        finally:
+                            # Swap the reservation for the actual cost in one step.
+                            async with lock:
+                                reserved[0] -= estimate
+                                spent[0] += cost
                     results.append(result)
                     await self._emit(run, result, on_result)
                 for note in notes:
@@ -332,6 +346,7 @@ class BacktestRunner:
                 max_files=self.limits.max_files_for_fix_search,
                 max_commits=self.limits.max_fix_commits_per_file,
                 quality_store=self.quality_store,
+                line_tolerance=self.limits.line_tolerance,
             )
         except Exception as exc:  # noqa: BLE001
             return [], [f"ground truth unavailable: {exc}"]
@@ -400,7 +415,9 @@ class BacktestRunner:
     ) -> None:
         if self.quality_store is not None and self.limits.store_results:
             try:
-                self.quality_store.save_backtest_result(run.id, result)
+                self.quality_store.save_backtest_result(
+                    run.id, result, owner=run.owner, repo=run.repo
+                )
             except Exception as exc:  # noqa: BLE001 - the report still has it
                 logger.warning("Could not store backtest result: %s", exc)
         if on_result is not None:

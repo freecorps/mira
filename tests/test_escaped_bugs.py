@@ -35,8 +35,9 @@ from mira.quality.models import (
     LINK_DIFF_OVERLAP,
     LINK_REVERT_BRANCH,
     LINK_REVERT_SHA,
+    EscapedBug,
 )
-from mira.quality.store import open_quality_store
+from mira.quality.store import QualityStore, QualityStoreUnavailable, open_quality_store
 from mira.quality.webhooks import push_commits
 from tests.quality_support import DAY, FakeHistoryProvider, file_diff, merged_pr
 
@@ -592,3 +593,182 @@ async def test_github_default_branch_push_schedules_the_scan(monkeypatch: Any) -
     await github_webhook.dispatch_github_event("push", payload, SimpleNamespace(), "mira", tasks)
     [(_fn, args)] = [t for t in tasks.tasks if t[0] is quality_hooks.on_push]
     assert args[:4] == ("github", "acme", "app", [{"id": "r1", "message": "Revert x"}])
+
+
+# ──────────────────────────────────────────────── review-bot regressions ──
+
+
+async def test_revert_links_only_files_each_original_changed() -> None:
+    _reviewed(5, paths=["a.py"])
+    _reviewed(7, paths=["c.py"])
+    provider = FakeHistoryProvider(
+        merged={
+            5: merged_pr(5, merged_at=NOW - 3 * DAY),
+            7: merged_pr(7, merged_at=NOW - 2 * DAY),
+            9: merged_pr(
+                9,
+                title="Revert two changes",
+                body="This reverts commit abc1234.\nThis reverts commit def5678.",
+                merged_at=NOW,
+            ),
+        },
+        diffs={
+            9: file_diff("a.py", 10, ["a1", "a2"], 10, [])
+            + file_diff("c.py", 4, ["c1"], 4, [])
+            + file_diff("z.py", 1, ["z"], 1, ["zz"]),
+            5: file_diff("a.py", 9, [], 10, ["a1", "a2"]),
+            7: file_diff("c.py", 3, [], 4, ["c1"]),
+        },
+        prs_for_commit={"abc1234": [5], "def5678": [7]},
+    )
+    bugs = await process_merged_pull_request(
+        provider, await provider.get_pr_info("x/9"), config=_mira_config(feed_learning=False)
+    )
+    assert sorted((b.original_pr_number, b.path) for b in bugs) == [(5, "a.py"), (7, "c.py")]
+
+
+async def test_original_with_unknown_merge_time_is_not_recorded() -> None:
+    _reviewed(6, findings=[("b.py", 80)])
+    provider = _hotfix_provider(blame=True)
+    del provider.merged[6]  # the original cannot be loaded, so no merge time
+    assert (
+        await process_merged_pull_request(
+            provider, await provider.get_pr_info("x/20"), config=_mira_config()
+        )
+        == []
+    )
+
+
+async def test_blame_error_falls_back_to_diff_overlap() -> None:
+    _reviewed(6, paths=["b.py"], findings=[("b.py", 31)])
+    provider = _hotfix_provider(blame=True)
+    provider.get_blame = AsyncMock(side_effect=RuntimeError("502"))  # type: ignore[method-assign]
+    [bug] = await process_merged_pull_request(
+        provider, await provider.get_pr_info("x/20"), config=_mira_config()
+    )
+    assert bug.link_method == LINK_DIFF_OVERLAP and bug.original_pr_number == 6
+
+
+async def test_one_unreadable_pushed_commit_does_not_drop_the_push() -> None:
+    _reviewed(5, findings=[("a.py", 40)])
+    provider = _revert_provider()
+    message = 'Revert "Add cache"\n\nThis reverts commit abc1234.'
+    for sha in ("r0", "r1"):
+        provider.commits[sha] = CommitInfo(sha=sha, message=message, parents=["p0"])
+        provider.commit_diffs[sha] = file_diff("a.py", 10, ["c1", "c2"], 10, [])
+    original = provider.get_prs_for_commit
+
+    async def flaky(pr_info: PRInfo, sha: str) -> list[int]:
+        if sha == "r0":
+            raise RuntimeError("provider hiccup")
+        return await original(pr_info, sha)
+
+    provider.get_prs_for_commit = flaky  # type: ignore[method-assign]
+    payload = {"commits": [{"id": "r0", "message": message}, {"id": "r1", "message": message}]}
+    [bug] = await process_pushed_commits(
+        provider, "acme", "app", push_commits(payload), config=_mira_config(feed_learning=False)
+    )
+    assert bug.fix_ref == "commit:r1"
+
+
+def test_reviewed_prs_touching_reads_past_the_newest_500_reviews() -> None:
+    with open_quality_store("acme", "app") as store:
+        index = store.index_store
+        common = {"pr_url": "", "comments_posted": 0, "blockers": 0, "warnings": 0}
+        index.record_review(
+            pr_number=1,
+            pr_title="old",
+            reviewed_paths=json.dumps(["target.py"]),
+            created_at=NOW - 20 * DAY,
+            **common,
+        )
+        for n in range(2, 603):
+            index.record_review(
+                pr_number=n,
+                pr_title="busy",
+                reviewed_paths=json.dumps(["other.py"]),
+                created_at=NOW - DAY + n,
+                **common,
+            )
+        assert store.reviewed_prs_touching("target.py", since=NOW - 30 * DAY) == [1]
+        assert store.reviewed_prs_touching("target.py", since=NOW - 10 * DAY) == []
+
+
+def test_backtest_result_rows_carry_the_run_repository() -> None:
+    from mira.quality.models import PRBacktest
+
+    with open_quality_store("acme", "app") as store:
+        store.index_store._owner = ""  # a handle not pinned to a repository
+        store.index_store._repo = ""
+        store.save_backtest_result(
+            "run-1", PRBacktest(variant="A", pr_number=3), owner="acme", repo="app"
+        )
+        rows = store._query("SELECT owner, repo FROM quality_backtest_results")
+    assert [tuple(r) for r in rows] == [("acme", "app")]
+
+
+class _NoDDLStore:
+    """A handle that cannot create tables; ``tables_exist`` says whether they are there."""
+
+    _owner = "acme"
+    _repo = "app"
+
+    def __init__(self, *, tables_exist: bool) -> None:
+        self.tables_exist = tables_exist
+
+    def _gate_query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        if not self.tables_exist:
+            raise RuntimeError("no such table")
+        return []
+
+    def _gate_exec(self, sql: str, params: tuple = ()) -> int:
+        if sql.lstrip().upper().startswith("CREATE"):
+            raise RuntimeError("read-only database")
+        return 1
+
+    def _gate_scope(self) -> tuple[str, tuple]:
+        return "", ()
+
+
+def _bug() -> EscapedBug:
+    return EscapedBug(
+        id="x",
+        platform="github",
+        owner="acme",
+        repo="app",
+        kind=KIND_HOTFIX,
+        fix_ref="pr:1",
+        original_pr_number=2,
+        path="a.py",
+    )
+
+
+def test_schema_failure_makes_writes_fail_loudly() -> None:
+    broken = QualityStore(_NoDDLStore(tables_exist=False))
+    assert "quality tables unavailable" in broken.unavailable_reason
+    with pytest.raises(QualityStoreUnavailable):
+        broken.record_escaped_bug(_bug())
+
+    # A read-only handle over an existing schema stays usable.
+    existing = QualityStore(_NoDDLStore(tables_exist=True))
+    assert existing.unavailable_reason == ""
+    assert existing.record_escaped_bug(_bug())
+
+
+async def test_webhook_survives_an_unusable_quality_store() -> None:
+    provider = _revert_provider()
+    broken = QualityStore(_NoDDLStore(tables_exist=False))
+    broken.was_reviewed = lambda _n: True  # type: ignore[method-assign]
+
+    class _Ctx:
+        def __enter__(self) -> Any:
+            return broken
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+    with patch("mira.quality.store.open_quality_store", lambda *a, **k: _Ctx()):
+        bugs = await process_merged_pull_request(
+            provider, await provider.get_pr_info("x/9"), config=_mira_config()
+        )
+    assert bugs == []

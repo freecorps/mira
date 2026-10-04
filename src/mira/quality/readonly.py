@@ -87,8 +87,12 @@ READ_METHODS: frozenset[str] = frozenset(
 
 # What a blocked call hands back, chosen so a caller that ignores the result
 # keeps going exactly as it would after a successful no-op.
+# Every write whose contract returns a value has one here, of the promised
+# type, so a caller never trips over ``None`` before ``assert_no_writes`` runs.
 _BLOCKED_RESULTS: dict[str, Any] = {
     "post_review": [],
+    "commit_files": "",
+    "create_pull_request": (0, ""),
     "submit_verdict": False,
     "publish_review_status": "",
     "publish_gate_status": "",
@@ -137,17 +141,31 @@ class ReadOnlyProvider(BaseProvider):
     def _record(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         self.blocked_calls.append(BlockedCall(name, args, kwargs))
         logger.info("Read-only provider blocked %s()", name)
-        return _BLOCKED_RESULTS.get(name)
+        result = _BLOCKED_RESULTS.get(name)
+        # Fresh copies, so one caller mutating a returned list cannot leak into the next.
+        return list(result) if isinstance(result, list) else result
 
     def __getattr__(self, name: str) -> Any:
         # Only reached for names not defined on the class — i.e. methods a
         # concrete provider adds beyond BaseProvider.
         if name.startswith("_"):
             raise AttributeError(name)
+        # Raises AttributeError for a name the wrapped provider does not have,
+        # so feature detection (``hasattr``/``getattr(..., None)``) stays honest.
+        target = getattr(self._inner, name)
         if name in READ_METHODS:
-            return getattr(self._inner, name)
+            return target
 
-        async def _blocked(*args: Any, **kwargs: Any) -> Any:
+        # Mirror the inner member's calling convention: a sync write must be
+        # recorded when called, not handed back as a coroutine nobody awaits.
+        if inspect.iscoroutinefunction(target):
+
+            async def _blocked_async(*args: Any, **kwargs: Any) -> Any:
+                return self._record(name, args, kwargs)
+
+            return _blocked_async
+
+        def _blocked(*args: Any, **kwargs: Any) -> Any:
             return self._record(name, args, kwargs)
 
         return _blocked
