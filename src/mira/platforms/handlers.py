@@ -32,6 +32,14 @@ from mira.llm import create_llm, untrusted
 from mira.llm.prompts.review import build_conversation_prompt
 from mira.llm.tool_schemas import SUBMIT_FINDING_RECHECK_TOOL, SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
+from mira.platforms.chat_commands import CONFIG_KEYWORDS as _CONFIG_KEYWORDS
+from mira.platforms.chat_commands import FULL_REVIEW_KEYWORDS as _FULL_REVIEW_KEYWORDS
+from mira.platforms.chat_commands import RESOLVE_KEYWORDS as _RESOLVE_KEYWORDS
+from mira.platforms.chat_commands import (
+    normalize_command,
+    render_config_reply,
+    run_resolve_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,10 +175,13 @@ def _help_message(bot_name: str) -> str:
         f"Mention `@{bot_name}` in a PR comment followed by one of these verbs:\n\n"
         f"| Command | What it does |\n"
         f"|---|---|\n"
-        f"| `@{bot_name} review` | Re-run the full review on this PR. Useful after force-pushes or when you want a fresh pass. |\n"
+        f"| `@{bot_name} review` | Re-run the review on this PR. After a first pass, only the commits pushed since Mira's last review are reviewed. |\n"
+        f"| `@{bot_name} full review` | Re-review the whole PR from scratch, ignoring what earlier passes covered. Useful after force-pushes or a rebase. Alias: `full-review`. |\n"
         f"| `@{bot_name} review-rest` | Retry files left incomplete by failed review parts or configured limits. Large PRs continue automatically by default. Aliases: `rest`, `continue`. |\n"
         f"| `@{bot_name} pause` | Pause Mira on this PR. No more reviews until you resume. Adds a `mira-paused` label. |\n"
         f"| `@{bot_name} resume` | Resume Mira on a paused PR and re-review the latest diff. |\n"
+        f"| `@{bot_name} resolve` | Resolve every open review thread Mira posted on this PR. Not recorded as false-positive feedback. |\n"
+        f"| `@{bot_name} config` | Show the effective configuration for this repository, with credentials omitted. Alias: `configuration`. |\n"
         f"| `@{bot_name} fix all` | Have Mira write fixes for the most serious open findings on this PR, each on its own branch and stacked PR. Bounded by a configured limit, and the reply lists whatever it left out. Disabled unless a maintainer turned autofix on. |\n"
         f"| `@{bot_name} help` | Show this message. Aliases: `?`, `commands`. |\n"
         f"| `@{bot_name} <anything else>` | Ask a free-form question about the PR. Mira will reply inline using the PR diff as context. |\n\n"
@@ -376,7 +387,8 @@ async def run_pr_command(
 ) -> None:
     """Platform-neutral handler for an @-mention command on a PR/MR.
 
-    Dispatches help / review / review-rest / free-form Q&A through the provider
+    Dispatches help / review / full review / review-rest / resolve / config /
+    free-form Q&A through the provider
     and engine. Shared by the GitHub and GitLab comment handlers.
     """
     repo_full = f"{owner}/{repo}"
@@ -387,10 +399,24 @@ async def run_pr_command(
     indexing_llm = create_llm(llm_config_for("indexing", config.llm))
     security_llm = create_llm(llm_config_for("security", config.llm))
 
-    normalized = question.lower().strip()
-    is_review = normalized in _REVIEW_KEYWORDS
+    normalized = normalize_command(question)
+    is_full_review = normalized in _FULL_REVIEW_KEYWORDS
+    is_review = is_full_review or normalized in _REVIEW_KEYWORDS
     is_review_rest = normalized in _REVIEW_REST_KEYWORDS
     is_help = normalized in _HELP_KEYWORDS
+
+    if normalized in _CONFIG_KEYWORDS:
+        pr_info_for_config = await provider.get_pr_info(pr_url)
+        await provider.post_comment(pr_info_for_config, render_config_reply(config, actor))
+        logger.info("Config requested on %s by @%s", pr_url, actor)
+        return
+
+    if normalized in _RESOLVE_KEYWORDS:
+        # PR-level only: an inline `resolve` is routed to the reject path by
+        # every webhook layer before it could reach here.
+        pr_info_for_resolve = await provider.get_pr_info(pr_url)
+        await run_resolve_command(provider, pr_info_for_resolve, actor)
+        return
 
     if is_help:
         pr_info_for_help = await provider.get_pr_info(pr_url)
@@ -440,11 +466,17 @@ async def run_pr_command(
             bot_name=bot_name,
             indexing_llm=indexing_llm,
             security_llm=security_llm,
+            full_review=is_full_review,
         )
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
             logger.info("Review already in progress for %s, skipping", pr_url)
             return
-        logger.info("Re-review triggered for %s by @%s", pr_url, actor)
+        logger.info(
+            "%s triggered for %s by @%s",
+            "Full review" if is_full_review else "Re-review",
+            pr_url,
+            actor,
+        )
         try:
             await engine.review_pr(pr_url)
             review_tracker.complete(repo_full, number)

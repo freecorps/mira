@@ -19,6 +19,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Mira's own failures are neutral on that check, never red: a status that goes red when the model times out is a status people learn to ignore
 - Approves clean pull requests by default, on two independent conditions — nothing above the severity ceiling, and a merge-readiness confidence of at least 4/5. Requesting changes stays opt-in, because it takes the merge button away
 - Never approves over a human who requested changes, its own pull request, or a review that only read part of the diff
+- Chat commands on the pull request: `@mira review` (commits since the last pass), `@mira full review` (the whole PR from scratch, bypassing the incremental diff), `@mira review-rest`, `@mira pause` / `resume`, `@mira resolve` (closes every open Mira thread without recording false-positive feedback), `@mira config` (the effective configuration, credentials omitted), `@mira fix all` and `@mira help` — the same on GitHub, GitLab and Forgejo
 
 ## Codebase intelligence
 
@@ -238,6 +239,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Repo-level `.mira.yaml` configuration file
 - Per-repo context entries (architecture docs, coding guidelines)
 - Confidence thresholds (global and per-category), severity thresholds, comment caps
+- Review profiles (`review.profile`): `chill` (fewer, higher-signal comments), `balanced` (default) or `assertive` (more thorough, nitpicks included) — presets over the confidence, severity, cap and critique knobs, where an explicitly set knob always wins
 - Exclude patterns and per-language overrides
 - PR author allow/deny lists (`filter.allowed_authors` / `filter.blocked_authors`) for muting bots or scoping auto-review
 - Cross-PR overlap tuning (`review.overlap`): candidate cap, confidence floor, title-similarity threshold

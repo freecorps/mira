@@ -25,6 +25,7 @@ from mira.feedback.service import (
 )
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
+from mira.platforms.chat_commands import is_review_request
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.mentions import (
     author_is_filtered,
@@ -492,8 +493,8 @@ async def dispatch_forgejo_event(
         is_inline_reply = bool(payload.get("comment", {}).get("in_reply_to_id"))
         if has_mention(comment_body, names) or is_inline_reply:
             cmd_word = command_after_mention(comment_body, names)
-            if cmd_word == "review":
-                pass  # review command bypasses author filter
+            if is_review_request(comment_body, names, cmd_word):
+                pass  # review / full review bypass the author filter
             elif author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
                 logger.debug("issue_comment skipped — author %s filtered", actor)
                 return "ignored"

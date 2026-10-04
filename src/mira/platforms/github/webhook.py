@@ -25,6 +25,7 @@ from mira.feedback.service import (
 from mira.index.indexer import _should_index
 from mira.index.store import IndexStore
 from mira.models import PRInfo
+from mira.platforms.chat_commands import is_review_request
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.github.auth import GitHubAppAuth
 from mira.platforms.handlers import (
@@ -564,8 +565,8 @@ async def dispatch_github_event(
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         if "pull_request" in payload.get("issue", {}) and has_mention(comment_body, names):
             cmd_word = command_after_mention(comment_body, names)
-            if cmd_word == "review":
-                pass  # review command bypasses author filter
+            if is_review_request(comment_body, names, cmd_word):
+                pass  # review / full review bypass the author filter
             elif author_is_filtered(
                 comment_user, cfg.filter.allowed_authors, cfg.filter.blocked_authors
             ):
