@@ -50,6 +50,7 @@ from mira.models import (
 )
 from mira.providers._time import epoch_to_iso, iso_to_epoch
 from mira.providers.base import BaseProvider
+from mira.providers.delivery import GitHubDeliveryMixin
 
 # Shared comment-formatting helpers (re-exported for back-compat — callers and
 # tests import these names from this module).
@@ -228,7 +229,7 @@ def _file_to_diff(f: dict[str, Any]) -> str:
     return "\n".join(header) + "\n" + patch
 
 
-class GitHubProvider(BaseProvider):
+class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
     """GitHub code hosting provider."""
 
     def __init__(self, token: str) -> None:

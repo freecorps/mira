@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
+from mira.analytics.persistence import HotspotStoreMixin
 from mira.autofix.persistence import AutofixStoreMixin
 from mira.checks.persistence import ChecksStoreMixin
 from mira.db.sqltext import like_contains, like_prefix
@@ -662,6 +663,36 @@ CREATE TABLE IF NOT EXISTS path_history_fetches (
     PRIMARY KEY (platform, owner, repo, path)
 );
 
+-- Change-frequency heatmap: which files each default-branch change touched,
+-- with its line counts. `reference` is `commit:<sha>` (provider history) or
+-- `pr:<number>` (a merge Mira watched), so re-observing either is a no-op.
+CREATE TABLE IF NOT EXISTS file_churn (
+    id BIGSERIAL PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    reference TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'commit',
+    additions INTEGER NOT NULL DEFAULT 0,
+    deletions INTEGER NOT NULL DEFAULT 0,
+    event_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE (owner, repo, path, reference)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_churn_event ON file_churn(event_at);
+
+-- When the repository's commit history was pulled for the heatmap. One row
+-- per repository: the backfill runs once, and merges keep it current after.
+CREATE TABLE IF NOT EXISTS churn_history_fetches (
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    fetched_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    commits INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, owner, repo)
+);
+
 CREATE TABLE IF NOT EXISTS package_manifests (
     id SERIAL PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -1134,6 +1165,7 @@ class PgIndexStore(
     AutofixStoreMixin,
     ChecksStoreMixin,
     TriageStoreMixin,
+    HotspotStoreMixin,
 ):
     """PostgreSQL-backed index store with owner/repo scoping.
 

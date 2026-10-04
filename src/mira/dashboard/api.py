@@ -1414,6 +1414,7 @@ import mira.dashboard.routers.analytics  # noqa: E402,F401
 import mira.dashboard.routers.autofix  # noqa: E402,F401
 import mira.dashboard.routers.checks  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
+import mira.dashboard.routers.delivery  # noqa: E402,F401
 import mira.dashboard.routers.digests  # noqa: E402,F401
 import mira.dashboard.routers.gate  # noqa: E402,F401
 import mira.dashboard.routers.labels  # noqa: E402,F401

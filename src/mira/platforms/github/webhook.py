@@ -153,9 +153,37 @@ def _record_pr_lifecycle(payload: dict[str, Any]) -> None:
             updated_at=_parse_iso(pr.get("updated_at") or "") or time.time(),
             merged_at=_parse_iso(pr["merged_at"]) if pr.get("merged_at") else 0.0,
             closed_at=_parse_iso(pr["closed_at"]) if pr.get("closed_at") else 0.0,
+            base_branch=(pr.get("base") or {}).get("ref") or "",
+            default_branch=repo.get("default_branch") or "",
+            labels=(
+                [lbl.get("name", "") for lbl in pr["labels"] if isinstance(lbl, dict)]
+                if isinstance(pr.get("labels"), list)
+                else None
+            ),
         )
     except Exception as exc:
         logger.debug("PR lifecycle record failed: %s", exc)
+
+
+def _record_release(payload: dict[str, Any]) -> None:
+    """Record a published release as a deployment (DORA). Best-effort."""
+    try:
+        release = payload.get("release") or {}
+        repo = payload.get("repository") or {}
+        owner = (repo.get("owner") or {}).get("login", "")
+        name = repo.get("name", "")
+        if not owner or not name or release.get("draft"):
+            return
+        _get_app_db().record_deployment(
+            owner,
+            name,
+            str(release.get("tag_name") or ""),
+            _parse_iso(release.get("published_at") or "") or time.time(),
+            kind="release",
+            url=str(release.get("html_url") or ""),
+        )
+    except Exception as exc:
+        logger.debug("Release record failed: %s", exc)
 
 
 async def handle_pr_review_meta(
@@ -266,6 +294,8 @@ async def handle_pull_request_review(
             owner, name, number, reviewer, responded_at=submitted, state=state, bare_approval=bare
         )
         app_db.set_pr_first_review(owner, name, number, submitted)
+        if state == "approved":
+            app_db.set_pr_first_approval(owner, name, number, submitted)
         # Also count it as a review contribution for the heatmap.
         app_db.record_contribution_for_login(
             "github",
@@ -482,6 +512,11 @@ async def dispatch_github_event(
     # PRs. Doesn't return; falls through to the review-trigger branches.
     if event == "pull_request" and payload.get("sender", {}).get("login", "") != f"{bot_name}[bot]":
         background_tasks.add_task(handle_pr_review_meta, payload, app_auth, bot_name)
+
+    # A published release is a deployment for DORA's releases mode.
+    if event == "release" and action == "published":
+        _record_release(payload)
+        return "processing"
 
     # A human submitted a review — capture responsiveness + the review event.
     if event == "pull_request_review" and action == "submitted":

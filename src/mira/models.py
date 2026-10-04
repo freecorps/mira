@@ -624,6 +624,33 @@ class PathAuthorship:
 
 
 @dataclass
+class CommitChurn:
+    """One commit on the default branch and the files it changed.
+
+    Feeds the change-frequency heatmap: a file that keeps being edited is a
+    hotspot candidate whether or not Mira reviewed the pull request that
+    edited it. ``files`` carries per-file line counts where the platform
+    reports them; a provider that only knows *which* files changed leaves the
+    counts at zero, which still counts as a touch.
+    """
+
+    sha: str
+    at: float = 0.0  # epoch seconds of the commit
+    message: str = ""
+    files: list[FileChangeStat] = field(default_factory=list)
+
+
+@dataclass
+class ReleaseRef:
+    """A published release (or tag), used as a deployment proxy for DORA."""
+
+    tag: str
+    at: float = 0.0  # epoch seconds it was published
+    url: str = ""
+    kind: str = "release"  # "release" | "tag"
+
+
+@dataclass
 class ReviewChunk:
     """A chunk of files that fits within a single LLM context window."""
 

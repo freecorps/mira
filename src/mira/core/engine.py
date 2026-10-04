@@ -2030,6 +2030,12 @@ class ReviewEngine:
                     except Exception as exc:
                         logger.debug("Cross-repo context lookup failed: %s", exc)
 
+                    # Point the reviewer at frequently-changed, finding-prone
+                    # files (analytics.hotspots.review_note; never raises).
+                    from mira.analytics.hotspots import hotspot_review_note
+
+                    ctx += hotspot_review_note(store, changed_paths, self.config.analytics.hotspots)
+
                     store.close()
                     return ctx
             except Exception as exc:
