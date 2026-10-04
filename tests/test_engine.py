@@ -2046,6 +2046,57 @@ class TestManifestFileSelection:
         assert result.reviewed_paths == ["src/app.py"], "manifest should be culled"
         assert seen.get("paths") == ["package.json"], "pass must still see the manifest"
 
+    @pytest.mark.asyncio
+    async def test_a_failed_pass_stops_the_license_pass(self, monkeypatch):
+        """When one pass fails, the license pass must not outlive the review
+        (and the source fetcher it reads through, closed in cleanup)."""
+        import asyncio
+
+        from mira.config import MiraConfig
+        from mira.core import engine as engine_mod
+        from mira.core.engine import ReviewEngine
+
+        state: dict = {}
+
+        async def failing_sec_pass(*a, **kw):
+            await asyncio.sleep(0)
+            raise RuntimeError("security pass broke")
+
+        async def slow_licenses(self, manifest_files, source_fetcher):
+            state["started"] = True
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+            return []
+
+        monkeypatch.setattr(engine_mod, "security_review_pass", failing_sec_pass)
+        monkeypatch.setattr(ReviewEngine, "_license_findings", slow_licenses)
+        monkeypatch.setattr(engine_mod, "chunk_files", lambda *a, **kw: [])
+
+        diff = (
+            "diff --git a/src/app.py b/src/app.py\n"
+            "index 3333333..4444444 100644\n"
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " import os\n"
+            "+x = 1\n"
+            " y = 2\n"
+        )
+        config = MiraConfig()
+        config.review.walkthrough = False
+        config.review.self_critique = False
+        config.review.security_pass = True
+        config.review.auto_complete = False
+        engine = ReviewEngine(
+            config=config, llm=MagicMock(count_tokens=lambda text: 100), provider=None
+        )
+        with pytest.raises(RuntimeError, match="security pass broke"):
+            await asyncio.wait_for(engine._review_diff_internal(diff), 10)
+        assert state == {"started": True, "cancelled": True}
+
 
 class TestRegenerateSummary:
     """Summary prose must describe only issues that were actually filed."""

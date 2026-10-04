@@ -542,13 +542,18 @@ def parse_file(path: str, source: str, *, use_tree_sitter: bool = True) -> FileG
 class CodeGraph:
     """Parsed files, cached by path, shared by whoever asks during one review.
 
-    Parsing runs in worker threads (see :meth:`add_files`); the cache is a
-    plain dict, and two threads parsing the same file only waste the work.
+    Parsing runs in worker threads (see :meth:`add_files`), and the review's
+    blast-radius task and the agentic tools parse into one graph at the same
+    time while the event loop reads it. ``_lock`` guards the dict: readers
+    iterate a copy, so an insert from a worker thread cannot break a scan
+    mid-way, and the first parse of a path wins. Two threads parsing the same
+    file only waste the work.
     """
 
     def __init__(self, *, use_tree_sitter: bool = True) -> None:
         self.use_tree_sitter = use_tree_sitter
         self._files: dict[str, FileGraph | None] = {}
+        self._lock = threading.Lock()
 
     def __contains__(self, path: str) -> bool:
         return path in self._files
@@ -557,11 +562,12 @@ class CodeGraph:
         return self._files.get(path)
 
     def add_file(self, path: str, source: str) -> FileGraph | None:
-        if path in self._files:
-            return self._files[path]
+        with self._lock:
+            if path in self._files:
+                return self._files[path]
         parsed = parse_file(path, source, use_tree_sitter=self.use_tree_sitter)
-        self._files[path] = parsed
-        return parsed
+        with self._lock:
+            return self._files.setdefault(path, parsed)
 
     def add_files(
         self, sources: Iterable[tuple[str, str]], deadline: float | None = None
@@ -580,7 +586,9 @@ class CodeGraph:
         return done, False
 
     def files(self) -> list[FileGraph]:
-        return [g for g in self._files.values() if g is not None]
+        with self._lock:
+            values = list(self._files.values())
+        return [g for g in values if g is not None]
 
     def definitions_of(self, symbol: str) -> list[Definition]:
         """Definitions named ``symbol``, plain (`bar`) or qualified (`Foo.bar`)."""

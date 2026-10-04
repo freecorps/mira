@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from mira.sbom.formats import CYCLONEDX_VERSIONS, FORMATS, render, to_cyclonedx, to_spdx
+from mira.sbom.formats import (
+    CYCLONEDX_VERSIONS,
+    FORMATS,
+    SPDX_VERSIONS,
+    render,
+    to_cyclonedx,
+    to_spdx,
+)
 from mira.sbom.inventory import (
     Component,
     RepoInventory,
@@ -23,6 +30,7 @@ __all__ = [
     "CYCLONEDX_VERSIONS",
     "FORMATS",
     "Component",
+    "SPDX_VERSIONS",
     "RepoInventory",
     "build_components",
     "build_repo_inventory",

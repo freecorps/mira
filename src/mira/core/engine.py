@@ -2624,10 +2624,22 @@ class ReviewEngine:
             self._license_findings(manifest_files, pr_source_fetcher)
         )
 
-        chunk_results, security_comments, dependency_comments, osv_comments = await _asyncio.gather(
-            review_task, security_task, dependency_task, osv_task
-        )
-        license_comments = await license_task
+        passes = (review_task, security_task, dependency_task, osv_task, license_task)
+        try:
+            (
+                chunk_results,
+                security_comments,
+                dependency_comments,
+                osv_comments,
+                license_comments,
+            ) = await _asyncio.gather(*passes)
+        except BaseException:
+            # gather leaves the other passes running when one fails; they read
+            # through the source fetcher `_review_diff_internal` closes next.
+            for task in passes:
+                task.cancel()
+            await _asyncio.gather(*passes, return_exceptions=True)
+            raise
         _mark("review")
 
         if chunks and len(chunk_failures) == len(chunks):

@@ -3383,14 +3383,19 @@ class IndexStore(
     ) -> dict[tuple[str, str, str], tuple[str, str, float]]:
         """Cached registry licenses: ``(kind, name, version)`` → ``(license, source, fetched_at)``."""
         out: dict[tuple[str, str, str], tuple[str, str, float]] = {}
-        for key in dict.fromkeys(keys):
-            row = self._conn.execute(
-                "SELECT license, source, fetched_at FROM package_licenses "
-                "WHERE kind = ? AND name = ? AND version = ?",
-                key,
-            ).fetchone()
-            if row:
-                out[key] = (row[0], row[1], row[2])
+        unique = list(dict.fromkeys(keys))
+        # OR-ed primary-key matches rather than a row-value IN, which needs
+        # SQLite 3.15; 200 keys is 600 parameters, under the old 999 limit.
+        for start in range(0, len(unique), 200):
+            batch = unique[start : start + 200]
+            where = " OR ".join(["(kind = ? AND name = ? AND version = ?)"] * len(batch))
+            rows = self._conn.execute(
+                "SELECT kind, name, version, license, source, fetched_at FROM package_licenses "
+                f"WHERE {where}",
+                [v for key in batch for v in key],
+            ).fetchall()
+            for r in rows:
+                out[(r[0], r[1], r[2])] = (r[3], r[4], r[5])
         return out
 
     def upsert_package_licenses(self, rows: list[tuple[str, str, str, str, str]]) -> None:

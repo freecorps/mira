@@ -15,7 +15,7 @@ from fastapi import HTTPException, Response
 from mira.dashboard import api as _api
 from mira.dashboard.api import _open_store, router
 from mira.index.store import IndexStore
-from mira.sbom import CYCLONEDX_VERSIONS, FORMATS, render
+from mira.sbom import CYCLONEDX_VERSIONS, FORMATS, SPDX_VERSIONS, render
 from mira.sbom.inventory import build_repo_inventory, repo_label
 
 _FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -24,9 +24,13 @@ _FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 def _check(fmt: str, spec_version: str) -> None:
     if fmt not in FORMATS:
         raise HTTPException(status_code=400, detail=f"format must be one of {list(FORMATS)}")
-    if spec_version not in CYCLONEDX_VERSIONS:
+    # SPDX output is always 2.3. `spec_version` defaults to a CycloneDX
+    # version, so an SPDX request that leaves it at (or passes) one still works.
+    allowed = CYCLONEDX_VERSIONS if fmt == "cyclonedx" else SPDX_VERSIONS + CYCLONEDX_VERSIONS
+    if spec_version not in allowed:
         raise HTTPException(
-            status_code=400, detail=f"spec_version must be one of {list(CYCLONEDX_VERSIONS)}"
+            status_code=400,
+            detail=f"spec_version for {fmt} must be one of {list(allowed)}",
         )
 
 
@@ -69,6 +73,9 @@ async def get_org_sbom(format: str = "cyclonedx", spec_version: str = "1.6") -> 
             inv = await build_repo_inventory(
                 store, repo_label(record.owner, record.repo, record.platform)
             )
+        except Exception as exc:  # noqa: BLE001 - nor is one unreadable inventory
+            _api.logger.warning("SBOM: %s/%s skipped: %s", record.owner, record.repo, exc)
+            continue
         finally:
             store.close()
         if inv.components:

@@ -19,7 +19,12 @@ from mira.config import LicensesConfig, MiraConfig
 from mira.dependency_updates import fetch as fetch_mod
 from mira.index.manifests import parse_manifest
 from mira.index.store import IndexStore
-from mira.licenses.expressions import LicenseParseError, normalize, parse_expression
+from mira.licenses.expressions import (
+    LicenseParseError,
+    is_spdx_expression,
+    normalize,
+    parse_expression,
+)
 from mira.licenses.lookup import PackageRef, concrete_version, lookup_registry, resolve_licenses
 from mira.licenses.policy import ALLOWED, DENIED, UNKNOWN, Policy, evaluate
 from mira.licenses.review import check_manifest_licenses
@@ -104,6 +109,13 @@ def test_normalize(raw: str | None, expected: str) -> None:
 def test_parse_errors(bad: str) -> None:
     with pytest.raises(LicenseParseError):
         parse_expression(bad)
+
+
+def test_is_spdx_expression_checks_with_exceptions() -> None:
+    assert is_spdx_expression("Apache-2.0 WITH LLVM-exception")
+    assert is_spdx_expression("MIT OR (GPL-2.0-only WITH AdditionRef-mine)")
+    assert not is_spdx_expression("GPL-2.0-only WITH Made-Up-exception")
+    assert not is_spdx_expression("MIT OR (GPL-2.0-only WITH Made-Up-exception)")
 
 
 def test_precedence_and_over_or() -> None:
@@ -419,6 +431,45 @@ async def test_resolve_refreshes_stale_cache_and_respects_limits(store) -> None:
     async with _client(_registry, seen) as client:
         got = await resolve_licenses(refs, _config(), store, lookup=False, client=client)
     assert seen == []
+
+
+def test_get_package_licenses_batches_across_chunks(store) -> None:
+    rows = [("npm", f"pkg-{i}", "1.0.0", "MIT" if i % 2 else "", "npm") for i in range(450)]
+    store.upsert_package_licenses(rows)
+    keys = [(k, n, v) for k, n, v, _, _ in rows] + [("npm", "absent", "1.0.0"), rows[0][:3]]
+    statements: list[str] = []
+    store._conn.set_trace_callback(statements.append)
+    try:
+        got = store.get_package_licenses(keys)
+    finally:
+        store._conn.set_trace_callback(None)
+    assert len(got) == 450
+    assert got[("npm", "pkg-1", "1.0.0")][:2] == ("MIT", "npm")
+    assert got[("npm", "pkg-0", "1.0.0")][:2] == ("", "npm")
+    assert ("npm", "absent", "1.0.0") not in got
+    assert len([s for s in statements if s.lstrip().upper().startswith("SELECT")]) == 3
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        PackageRef("npm", "left-pad", "1.3.0"),
+        PackageRef("pip", "requests", "2.32.3"),
+        PackageRef("rust", "serde", "1.0.0"),
+        PackageRef("go", "github.com/a/b", "v1.0.0"),
+        PackageRef("composer", "monolog/monolog", "3.0.0"),
+    ],
+)
+async def test_a_failed_registry_fetch_is_not_cached_as_none(store, ref: PackageRef) -> None:
+    def down(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    seen: list[str] = []
+    async with _client(down, seen) as client:
+        got = await resolve_licenses([ref], _config(), store, client=client)
+    assert seen  # the registry was asked
+    assert ref.key not in got
+    assert store.get_package_licenses([ref.key]) == {}
 
 
 async def test_resolve_never_raises() -> None:
