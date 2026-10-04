@@ -170,6 +170,8 @@ def test_title_is_one_plain_line() -> None:
         "Add retry to delivery"
     )
     assert sanitize_title("# `Add retry`", NAMES) == "Add retry"
+    # Only heading markers go: an issue reference or a hashtag keeps its `#`.
+    assert sanitize_title("#123 Fix the login redirect", NAMES) == "#123 Fix the login redirect"
 
 
 def test_title_never_mentions_anyone() -> None:
@@ -416,6 +418,34 @@ async def test_bare_mention_title_is_replaced() -> None:
     # The title prompt frames the PR as data.
     prompt = llm.generate_object.await_args.args[0][0]["content"]
     assert "<<<MIRA-UNTRUSTED-FILE>>>" in prompt
+
+
+async def test_an_edit_made_while_generating_is_built_on() -> None:
+    provider, llm = _provider(_pr(body="Why.")), _llm()
+    provider.get_pr_info.side_effect = [_pr(body="Why."), _pr(body="Why, and how.")]
+    await update_pr_summary(
+        provider,
+        "u",
+        config=_config(),
+        llm=llm,
+        names=NAMES,
+        first_review=True,
+        walkthrough=_walkthrough(),
+        diff_text=DIFF,
+    )
+    assert provider.update_pr.await_args.kwargs["body"].startswith(
+        "Why, and how.\n\n" + SUMMARY_START
+    )
+
+
+async def test_a_title_changed_while_generating_is_kept() -> None:
+    provider, llm = _provider(_pr(title="@mira")), _llm()
+    provider.get_pr_info.side_effect = [_pr(title="@mira"), _pr(title="Their own title")]
+    written = await update_pr_summary(
+        provider, "u", config=_config(enabled=False), llm=llm, names=NAMES, first_review=False
+    )
+    assert written == {"description": False, "title": False}
+    provider.update_pr.assert_not_awaited()
 
 
 async def test_human_title_and_disabled_description_cost_nothing() -> None:

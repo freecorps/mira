@@ -34,12 +34,13 @@ import ast
 import difflib
 import hashlib
 import logging
+import re
 import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from mira.autofix import capabilities as caps
 from mira.autofix.authorization import authorize_delivery, authorize_requester
@@ -303,7 +304,7 @@ _COMMENT_STYLES: dict[str, tuple[str, ...]] = {
     ".lua": ("--",),
 }
 
-DOCSTRING_EXTENSIONS: frozenset[str] = frozenset({".py", *_COMMENT_STYLES})
+DOCSTRING_EXTENSIONS: frozenset[str] = frozenset({".py", ".pyi", *_COMMENT_STYLES})
 
 
 def _comment_lines(lines: list[str], style: tuple[str, ...]) -> list[bool]:
@@ -391,6 +392,15 @@ def check_docstring_only(
     :class:`~mira.autofix.patch.PatchRefused`; returns nothing when the patch
     is acceptable.
     """
+    # A shebang reads as a `#` comment to both checks below, but it picks the
+    # interpreter: editing it, or writing anything above it, changes how the
+    # file runs.
+    first_before = before.split("\n", 1)[0]
+    if first_before.startswith("#!") and after.split("\n", 1)[0] != first_before:
+        raise _refuse(
+            ReasonCode.BEHAVIOUR_CHANGED,
+            f"The docstring patch changes or moves the interpreter line of {path}",
+        )
     if PurePosixPath(path).suffix.lower() in {".py", ".pyi"}:
         _check_python_docstrings(path, before, after, changed)
         return
@@ -578,15 +588,16 @@ def related_tests(source: str, layout: TestLayout, *, limit: int = 2) -> list[st
         candidate = PurePosixPath(path)
         if _family(candidate.suffix.lower()) != family:
             continue
-        name = candidate.stem.lower()
+        # `FooTest` / `FooTests` (Java, C#, Kotlin) by their case boundary, so a
+        # stem that merely ends in the letters — `contest`, `latest` — is kept.
+        name = re.sub(r"(?<=[a-z0-9])Tests?$", "", candidate.stem).lower()
         trimmed = (
             name.removeprefix("test_")
             .removesuffix("_test")
             .removesuffix(".test")
             .removesuffix(".spec")
             .removesuffix("_spec")
-            .removesuffix("tests")
-            .removesuffix("test")
+            .removesuffix("_tests")
         )
         if trimmed == stem:
             matches.append(path)
@@ -833,10 +844,10 @@ async def build_plan(
 
 # ──────────────────────────────────────────────────────────────── prompt ──
 
-SUBMIT_CHANGE_TOOL = {
+SUBMIT_CHANGE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        **SUBMIT_FIX_TOOL["function"],
+        **cast("dict[str, Any]", SUBMIT_FIX_TOOL["function"]),
         "name": "submit_change",
         "description": (
             "Submit the change. Every edit to an existing file must quote existing code "
@@ -1351,7 +1362,26 @@ async def run_finishing(
         )
 
     # The job is for the commit it was asked on. Reading a newer head would
-    # document code nobody asked about, under a key that says otherwise.
+    # document code nobody asked about, under a key that says otherwise. The
+    # scope (changed files, diff) can only be read as the pull request is now,
+    # so a pull request pushed to since then is asked about again rather than
+    # planned from today's diff against yesterday's files.
+    current_head = getattr(pr_info, "head_sha", "") or ""
+    if job.head_sha and current_head and current_head != job.head_sha:
+        return _fail(
+            store,
+            job,
+            recorder,
+            "generate",
+            [
+                Reason(
+                    ReasonCode.HEAD_MOVED,
+                    "The pull request has new commits since this was asked for; "
+                    "ask again to cover them",
+                )
+            ],
+            policy,
+        )
     plan = await build_plan(provider, pr_info, job.job_kind, policy, ref=job.head_sha)
     if plan.empty:
         return _fail(

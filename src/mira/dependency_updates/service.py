@@ -23,12 +23,16 @@ from mira.dependency_updates.fetch import (
     CACHE_TTL_SECONDS,
     Budget,
     Fetcher,
+    PinnedTransport,
     allowed_hosts,
     fetch_release_notes,
     resolve_repo,
 )
 from mira.dependency_updates.models import DependencyUpdate
 from mira.dependency_updates.summarize import summarize
+
+#: Where `mira.security.osv` sends its queries.
+OSV_HOST = "api.osv.dev"
 
 if TYPE_CHECKING:
     from mira.config import DependencyUpdatesConfig
@@ -181,7 +185,7 @@ async def _collect(
 
     token = os.environ.get(config.github_token_env, "") if config.github_token_env else ""
     fetch_window = max(0.0, config.timeout_seconds * _FETCH_SHARE - (time.monotonic() - started))
-    async with httpx.AsyncClient(follow_redirects=False) as client:
+    async with httpx.AsyncClient(follow_redirects=False, transport=PinnedTransport()) as client:
         fetcher = Fetcher(
             client,
             hosts=hosts,
@@ -190,7 +194,9 @@ async def _collect(
             github_token=token,
         )
         jobs = [asyncio.create_task(_fill_notes(fetcher, u)) for u in to_fetch]
-        if osv_scan:
+        # OSV is a host like any other: only when the allowlist names it, so an
+        # install that narrowed `allowed_hosts` contacts nothing else.
+        if osv_scan and OSV_HOST in hosts:
             jobs.append(
                 asyncio.create_task(
                     _fill_vulns(updates, min(config.request_timeout_seconds * 2, fetch_window))

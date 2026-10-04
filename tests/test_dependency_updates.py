@@ -89,7 +89,7 @@ def _mock_http(monkeypatch: pytest.MonkeyPatch, handler: Any) -> list[str]:
     monkeypatch.setattr(
         httpx,
         "AsyncClient",
-        lambda **kw: real(transport=httpx.MockTransport(recording), **kw),
+        lambda **kw: real(**{**kw, "transport": httpx.MockTransport(recording)}),
     )
     return seen
 
@@ -358,8 +358,28 @@ class TestRegistries:
             bump = _bump(name="github.com/gin-gonic/gin/v2", kind="go")
             assert await resolve_repo(_fetcher(client), bump) == ("gin-gonic", "gin")
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/a/b",
+            "https://www.github.com/a/b.git",
+            "git+https://github.com/a/b.git",
+            "git@github.com:a/b.git",
+            "github.com/a/b",
+        ],
+    )
+    def test_github_is_read_from_the_host_alone(self, url: str) -> None:
+        assert github_repo(url) == ("a", "b")
+
+    @pytest.mark.parametrize(
+        "url",
+        ["https://evilgithub.com/a/b", "https://notgithub.com/a/b", "https://x.io/github.com/a/b"],
+    )
+    def test_a_host_that_only_ends_in_github_is_not_github(self, url: str) -> None:
+        assert github_repo(url) is None
+
     def test_registry_urls_never_become_requests_as_given(self) -> None:
-        assert github_repo("https://evil.example/github.com/a/b") == ("a", "b")
+        assert github_repo("https://evil.example/github.com/a/b") is None
         assert github_repo("https://gitlab.com/a/b") is None
         assert github_repo("https://github.com/a/b%2F..") is None
 
@@ -578,6 +598,21 @@ class TestCollect:
         assert [v[0] for v in update.vulns_fixed] == ["GHSA-old"]
         assert [v[0] for v in update.vulns_in_new] == ["GHSA-both"]
 
+    async def test_osv_is_asked_only_when_the_allowlist_names_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mock_http(monkeypatch, _registry_handler([]))
+        monkeypatch.setenv("MIRA_DEPENDENCY_UPDATES_HOSTS", HOSTS.replace(",api.osv.dev", ""))
+        asked: list[Any] = []
+
+        async def query_batch(queries, **_):
+            asked.append(queries)
+            return {}
+
+        monkeypatch.setattr("mira.security.osv.query_batch", query_batch)
+        await collect_dependency_updates(_FILES, _READ, DependencyUpdatesConfig(), None)
+        assert asked == []
+
     async def test_the_package_limit_lists_the_rest_without_looking(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -707,6 +742,34 @@ class TestSummaryAndRendering:
         u = _update(releases=[ReleaseNote("3.0.0", "https://github.com/a/b/releases/tag/v3", "")])
         apply_summary([u], _summary("https://evil.example/phish"))
         assert u.breaking_changes[0].url == u.notes_url
+
+    def test_the_same_name_in_two_ecosystems_keeps_two_summaries(self) -> None:
+        url = "https://github.com/a/b/releases/tag/v3"
+        pip = _update(releases=[ReleaseNote("3.0.0", url, "")])
+        npm = DependencyUpdate(bump=_bump(kind="npm"), notes_url="https://github.com/n/r/releases")
+        npm.releases = [ReleaseNote("3.0.0", url, "")]
+        assert "# Package: npm:requests" in build_messages([pip, npm])[1]["content"]
+        summary = ReleaseSummary.model_validate(
+            {
+                "packages": [
+                    {"package": "pip:requests", "breaking_changes": [{"text": "Py.", "url": ""}]},
+                    {"package": "npm:requests", "breaking_changes": [{"text": "JS.", "url": ""}]},
+                ]
+            }
+        )
+        apply_summary([pip, npm], summary)
+        assert [i.text for i in pip.breaking_changes] == ["Py."]
+        assert [i.text for i in npm.breaking_changes] == ["JS."]
+
+    def test_a_bare_name_is_matched_only_when_it_is_unambiguous(self) -> None:
+        pip = _update(releases=[ReleaseNote("3.0.0", "u", "")])
+        apply_summary([pip], _summary())
+        assert pip.summarized
+        npm = DependencyUpdate(bump=_bump(kind="npm"), notes_url="n")
+        npm.releases = [ReleaseNote("3.0.0", "u", "")]
+        pip = _update(releases=[ReleaseNote("3.0.0", "u", "")])
+        apply_summary([pip, npm], _summary())
+        assert not pip.summarized and not npm.summarized
 
     def test_review_context(self) -> None:
         assert review_context([_update()]) == ""
@@ -960,3 +1023,53 @@ class TestEngineIntegration:
         result = await engine.review_diff(_REQUIREMENTS_DIFF)
         assert result.walkthrough is not None
         assert result.walkthrough.dependency_updates == []
+
+
+class TestPinnedTransport:
+    async def test_connects_to_the_checked_address_and_verifies_the_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def resolve(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        monkeypatch.setattr(fetch_mod, "_public_addresses", resolve)
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, text="{}")
+
+        transport = fetch_mod.PinnedTransport()
+        transport._inner = httpx.MockTransport(handler)  # type: ignore[assignment]
+        async with httpx.AsyncClient(transport=transport) as client:
+            resp = await client.get("https://pypi.org/pypi/x/json")
+        assert resp.status_code == 200
+        (request,) = seen
+        assert request.url.host == "93.184.216.34"
+        assert request.headers["Host"] == "pypi.org"
+        assert request.extensions["sni_hostname"] == "pypi.org"
+
+    async def test_a_name_that_rebinds_to_a_private_address_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def resolve(host: str) -> list[str]:
+            return []
+
+        monkeypatch.setattr(fetch_mod, "_public_addresses", resolve)
+
+        def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+            raise AssertionError("no connection expected")
+
+        transport = fetch_mod.PinnedTransport()
+        transport._inner = httpx.MockTransport(handler)  # type: ignore[assignment]
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(httpx.ConnectError):
+                await client.get("https://pypi.org/pypi/x/json")
+
+    async def test_every_private_answer_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def getaddrinfo(host, port, **_):  # noqa: ANN001, ANN202
+            return [(0, 0, 0, "", ("93.184.216.34", port)), (0, 0, 0, "", ("10.0.0.5", port))]
+
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "getaddrinfo", getaddrinfo)
+        assert await fetch_mod._public_addresses("pypi.org") == []

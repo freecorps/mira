@@ -250,7 +250,8 @@ def apply_description(
 def sanitize_title(raw: str, names: list[str]) -> str:
     """One line, bounded, plain, and never mentioning anyone."""
     line = next((ln.strip() for ln in (raw or "").splitlines() if ln.strip()), "")
-    line = line.lstrip("#").strip()
+    # Markdown heading markers only: `#123 fix` and `#hashtag` keep their `#`.
+    line = re.sub(r"^(?:#+\s+)+", "", line).strip()
     for _ in range(2):
         if len(line) >= 2 and line[0] == line[-1] and line[0] in "\"'`":
             line = line[1:-1].strip()
@@ -447,6 +448,7 @@ async def update_pr_summary(
             diff_text = await provider.get_pr_diff(pr_info)
 
         new_body: str | None = None
+        content = ""
         if want_description:
             if walkthrough is None:
                 try:
@@ -480,7 +482,23 @@ async def update_pr_summary(
 
         if new_body is None and new_title is None:
             return written
-        await provider.update_pr(pr_info, title=new_title, body=new_body)
+        # Generating took seconds, and the update replaces the whole field.
+        # Read once more so an edit made meanwhile is built on, not overwritten:
+        # the section is re-applied to the fresh body, and a title somebody
+        # changed in the meantime is theirs.
+        latest = await provider.get_pr_info(pr_url)
+        latest_body = latest.description or ""
+        if new_body is not None and latest_body != body:
+            if opted_out(latest_body, names):
+                return written
+            new_body = apply_description(
+                latest_body, content, names, mode=cfg.description.mode, force=force
+            )
+        if new_title is not None and (latest.title or "") != (pr_info.title or ""):
+            new_title = None
+        if new_body is None and new_title is None:
+            return written
+        await provider.update_pr(latest, title=new_title, body=new_body)
         written["description"] = new_body is not None
         written["title"] = new_title is not None
         logger.info(

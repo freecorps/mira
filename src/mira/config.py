@@ -479,7 +479,8 @@ class DependencyUpdatesConfig(BaseModel):
     timeout_seconds: float = Field(default=15.0, gt=0, le=120)
     # Per HTTP request.
     request_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
-    # Bytes downloaded across every request of one review.
+    # Bytes of release notes and registry metadata downloaded per review. The
+    # OSV lookup is a separate, small query bounded by its own timeout.
     max_bytes: int = Field(default=2_000_000, ge=10_000, le=50_000_000)
     # How long the review prompt waits for the notes after its own preparation
     # is done. Past it the review runs without them, and the walkthrough waits
@@ -493,6 +494,7 @@ class DependencyUpdatesConfig(BaseModel):
             "repo.packagist.org",
             "api.github.com",
             "raw.githubusercontent.com",
+            "api.osv.dev",
         ]
     )
     # Name of an environment variable holding a GitHub token for the releases

@@ -25,11 +25,13 @@ from mira.autofix.commands import (
     render_finishing_reply,
 )
 from mira.autofix.finishing import (
+    DOCSTRING_EXTENSIONS,
     FinishingRequest,
     TestLayout,
     check_docstring_only,
     detect_test_layout,
     public_python_symbols,
+    related_tests,
     request_finishing_touch,
     suggest_test_path,
 )
@@ -413,6 +415,50 @@ def test_commenting_code_out_is_refused() -> None:
     assert caught.value.reason.code == ReasonCode.BEHAVIOUR_CHANGED
 
 
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        # Changing the interpreter.
+        ("bin/run.sh", "#!/bin/sh\necho hi\n", "#!/bin/bash\necho hi\n"),
+        # Writing a comment above it, which stops it being an interpreter line.
+        ("bin/run.sh", "#!/bin/sh\necho hi\n", "# Runs it.\n#!/bin/sh\necho hi\n"),
+        # Python compares syntax trees, where a shebang is invisible.
+        ("tool.py", "#!/usr/bin/env python3\nx = 1\n", "#!/usr/bin/python2\nx = 1\n"),
+    ],
+)
+def test_the_interpreter_line_is_not_documentation(path: str, before: str, after: str) -> None:
+    with pytest.raises(PatchRefused) as caught:
+        check_docstring_only(path, before, after)
+    assert caught.value.reason.code == ReasonCode.BEHAVIOUR_CHANGED
+
+
+def test_a_comment_below_the_interpreter_line_is_fine() -> None:
+    check_docstring_only("bin/run.sh", "#!/bin/sh\necho hi\n", "#!/bin/sh\n# Says hi.\necho hi\n")
+
+
+def test_stub_files_are_offered_for_docstrings() -> None:
+    assert ".pyi" in DOCSTRING_EXTENSIONS
+
+
+@pytest.mark.parametrize(
+    ("source", "tree", "expected"),
+    [
+        ("src/contest.py", ["src/contest.py", "tests/test_contest.py"], ["tests/test_contest.py"]),
+        ("src/latest.ts", ["src/latest.ts", "src/latest.spec.ts"], ["src/latest.spec.ts"]),
+        (
+            "src/main/java/acme/Div.java",
+            ["src/main/java/acme/Div.java", "src/test/java/acme/DivTest.java"],
+            ["src/test/java/acme/DivTest.java"],
+        ),
+        ("src/Div.cs", ["src/Div.cs", "tests/DivTests.cs"], ["tests/DivTests.cs"]),
+    ],
+)
+def test_related_tests_match_the_source_they_test(
+    source: str, tree: list[str], expected: list[str]
+) -> None:
+    assert related_tests(source, detect_test_layout(tree)) == expected
+
+
 def test_a_language_without_a_known_comment_syntax_is_refused() -> None:
     with pytest.raises(PatchRefused):
         check_docstring_only("src/thing.ex", "x\n", "# y\nx\n")
@@ -452,7 +498,15 @@ def test_finishing_branches_name_the_work_and_the_commit() -> None:
         head_sha="head456abcdef",
         title="../../ evil $(rm -rf /)",
     )
-    assert name == "mira/fix/pr-7/tests-head456"
+    assert name == "mira/fix/pr-7/tests-head456abcde"
+
+
+def test_two_heads_sharing_seven_characters_get_two_branches() -> None:
+    names = {
+        branch_name(prefix="mira/fix", pr_number=7, finding_id="", job_kind="tests", head_sha=sha)
+        for sha in ("abcdef1111111", "abcdef1222222")
+    }
+    assert len(names) == 2
 
 
 def _job(kind: str) -> AutofixJob:
@@ -693,6 +747,23 @@ async def test_a_finished_request_says_so_when_asked_again() -> None:
     again = await _request(provider, config, "docstrings")
     assert not again.accepted
     assert again.reasons[0].code == ReasonCode.REUSED_EXISTING
+
+
+async def test_a_job_whose_pull_request_moved_is_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FinishingProvider()
+    config = _config()
+    await _request(provider, config, "tests")
+
+    async def moved(pr_url: str) -> Any:
+        return _pr(url=pr_url, head_sha="newer789")
+
+    monkeypatch.setattr(provider, "get_pr_info", moved)
+    result = await _run_one(provider, config, FakeLLM(TEST_PAYLOAD))
+    assert result.job.state == "dead_letter"
+    assert result.reasons[0].code == ReasonCode.HEAD_MOVED
+    assert provider.commits == []
 
 
 async def test_turning_the_toggle_off_stops_a_queued_job() -> None:
