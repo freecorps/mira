@@ -33,6 +33,7 @@ from mira.gate.capabilities import GITHUB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
 from mira.gate.models import CIState
 from mira.models import (
+    BlameRange,
     BotThreadRecord,
     CIJobFailure,
     CommitInfo,
@@ -110,6 +111,40 @@ def _normalize_login(login: str) -> str:
     suffix and lower-case so both forms match reliably.
     """
     return login.removesuffix("[bot]").lower()
+
+
+_BLAME_QUERY = """
+query($owner: String!, $repo: String!, $ref: String!, $path: String!) {
+  repository(owner: $owner, name: $repo) {
+    object(expression: $ref) {
+      ... on Commit {
+        blame(path: $path) {
+          ranges { startingLine endingLine commit { oid } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _merged_pr_from_json(item: dict[str, Any]) -> MergedPullRequest:
+    base = item.get("base") or {}
+    head = item.get("head") or {}
+    return MergedPullRequest(
+        number=int(item.get("number") or 0),
+        title=str(item.get("title") or ""),
+        url=str(item.get("html_url") or ""),
+        body=str(item.get("body") or ""),
+        author=str((item.get("user") or {}).get("login") or ""),
+        base_branch=str(base.get("ref") or ""),
+        head_branch=str(head.get("ref") or ""),
+        base_sha=str(base.get("sha") or ""),
+        head_sha=str(head.get("sha") or ""),
+        merge_commit_sha=str(item.get("merge_commit_sha") or ""),
+        merged_at=iso_to_epoch(str(item.get("merged_at") or "")),
+        labels=[str(label.get("name") or "") for label in item.get("labels") or []],
+    )
 
 
 _REVIEW_THREADS_QUERY = """
@@ -2156,6 +2191,9 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
                                 merged_at=merged_at,
                                 merge_commit_sha=str(item.get("merge_commit_sha") or ""),
                                 base_branch=str((item.get("base") or {}).get("ref") or ""),
+                                head_branch=str((item.get("head") or {}).get("ref") or ""),
+                                base_sha=str((item.get("base") or {}).get("sha") or ""),
+                                head_sha=str((item.get("head") or {}).get("sha") or ""),
                                 labels=[
                                     str(lb.get("name") or "")
                                     for lb in item.get("labels") or []
@@ -2276,3 +2314,111 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to read commit {sha}: {e}") from e
         return [str(f.get("filename") or "") for f in (data.get("files") or [])[:limit]]
+
+    # ── Review-quality measurement (backtests, escaped bugs) ──
+
+    async def _rest_get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        accept: str = "application/vnd.github+json",
+        ok: tuple[int, ...] = (200,),
+    ) -> httpx.Response:
+        """One GET against the REST API. Statuses outside ``ok`` raise ProviderError."""
+        headers = {"Authorization": f"token {self._token}", "Accept": accept}
+
+        @_retry_transient
+        async def _get() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=30) as client:
+                return await client.get(
+                    f"{_GITHUB_API_URL}{path}",
+                    headers=headers,
+                    params=params,
+                    follow_redirects=True,
+                )
+
+        try:
+            resp = await _get()
+        except Exception as exc:
+            raise ProviderError(f"GitHub GET {path} failed: {exc}") from exc
+        if resp.status_code not in ok:
+            raise ProviderError(f"GitHub GET {path} → {resp.status_code}")
+        return resp
+
+    @staticmethod
+    def _repo_path(pr_info: PRInfo) -> str:
+        return f"/repos/{pr_info.owner}/{pr_info.repo}"
+
+    async def get_landed_pull_request(
+        self, pr_info: PRInfo, number: int
+    ) -> MergedPullRequest | None:
+        resp = await self._rest_get(
+            f"{self._repo_path(pr_info)}/pulls/{int(number)}", ok=(200, 404)
+        )
+        if resp.status_code == 404:
+            return None
+        data = resp.json() or {}
+        if not data.get("merged_at"):
+            return None
+        return _merged_pr_from_json(data)
+
+    async def get_commit(self, pr_info: PRInfo, sha: str) -> CommitInfo | None:
+        resp = await self._rest_get(
+            f"{self._repo_path(pr_info)}/commits/{quote(sha, safe='')}", ok=(200, 404, 422)
+        )
+        if resp.status_code != 200:
+            return None
+        return self._commit_from(resp.json() or {})
+
+    async def get_commit_diff(self, pr_info: PRInfo, sha: str) -> str:
+        resp = await self._rest_get(
+            f"{self._repo_path(pr_info)}/commits/{quote(sha, safe='')}",
+            accept="application/vnd.github.v3.diff",
+        )
+        return resp.text
+
+    async def list_path_commits(
+        self,
+        pr_info: PRInfo,
+        path: str,
+        *,
+        since: float = 0.0,
+        until: float = 0.0,
+        ref: str = "",
+        limit: int = 20,
+    ) -> list[CommitInfo]:
+        params: dict[str, Any] = {"path": path, "per_page": max(1, min(limit, 100))}
+        if since:
+            params["since"] = epoch_to_iso(since)
+        if until:
+            params["until"] = epoch_to_iso(until)
+        if ref:
+            params["sha"] = ref
+        resp = await self._rest_get(f"{self._repo_path(pr_info)}/commits", params=params)
+        return [self._commit_from(item) for item in (resp.json() or [])[:limit]]
+
+    async def get_prs_for_commit(self, pr_info: PRInfo, sha: str) -> list[int]:
+        resp = await self._rest_get(
+            f"{self._repo_path(pr_info)}/commits/{quote(sha, safe='')}/pulls",
+            ok=(200, 404, 422),
+        )
+        if resp.status_code != 200:
+            return []
+        numbers = [int(i.get("number") or 0) for i in resp.json() or [] if i.get("merged_at")]
+        return [n for n in numbers if n]
+
+    async def get_blame(self, pr_info: PRInfo, path: str, ref: str) -> list[BlameRange]:
+        data = await self._graphql_request(
+            _BLAME_QUERY,
+            {"owner": pr_info.owner, "repo": pr_info.repo, "ref": ref, "path": path},
+        )
+        target = ((data.get("repository") or {}).get("object") or {}).get("blame") or {}
+        return [
+            BlameRange(
+                start=int(r.get("startingLine") or 0),
+                end=int(r.get("endingLine") or 0),
+                sha=str((r.get("commit") or {}).get("oid") or ""),
+            )
+            for r in target.get("ranges") or []
+        ]

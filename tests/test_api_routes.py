@@ -73,6 +73,12 @@ EXPECTED_ROUTES = {
     # Endpoints reached with a key (admin-only): where each one points, what
     # opens it, and a metered subscription's allowance. A key is written
     # here and never read back, so no route returns one.
+    # Review quality: escaped bugs and stored backtests. Read-only; backtests
+    # are started from the CLI and escaped bugs come from webhooks.
+    ("/api/quality/summary", "GET"),
+    ("/api/quality/escaped-bugs", "GET"),
+    ("/api/quality/backtests", "GET"),
+    ("/api/quality/backtests/{owner}/{repo}/{run_id}", "GET"),
     ("/api/providers", "GET"),
     ("/api/providers", "POST"),
     ("/api/providers/active", "PUT"),

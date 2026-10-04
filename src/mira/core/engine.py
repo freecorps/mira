@@ -1744,7 +1744,12 @@ class ReviewEngine:
             return ""
 
     async def review_diff(
-        self, diff_text: str, *, repo_scope: PRInfo | None = None, title: str = ""
+        self,
+        diff_text: str,
+        *,
+        repo_scope: PRInfo | None = None,
+        title: str = "",
+        description: str = "",
     ) -> ReviewResult:
         """Review a diff with no provider attached.
 
@@ -1762,7 +1767,9 @@ class ReviewEngine:
         to.
         """
         self._pr_info = repo_scope
-        return await self._review_diff_internal(diff_text, pr_title=title)
+        return await self._review_diff_internal(
+            diff_text, pr_title=title, pr_description=description
+        )
 
     async def _review_diff_internal(
         self,

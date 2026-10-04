@@ -26,6 +26,13 @@ from mira.checks.config_models import (  # noqa: F401
 )
 from mira.exceptions import ConfigError
 
+# Review-quality measurement (backtests, escaped bugs). Its own module so this
+# one only mounts it; both features stay off unless asked for.
+from mira.quality.config_models import (  # noqa: F401
+    BacktestConfig,
+    EscapedBugsConfig,
+)
+
 # Triage's configuration follows the same rule as the check framework's and is
 # kept behind the same file boundary for the same reason: nothing in a pull
 # request reaches a value in it, and the module that says so is easier to audit
@@ -1738,6 +1745,8 @@ class MiraConfig(BaseModel):
     licenses: LicensesConfig = Field(default_factory=LicensesConfig)
     digests: DigestsConfig = Field(default_factory=DigestsConfig)
     analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    escaped_bugs: EscapedBugsConfig = Field(default_factory=EscapedBugsConfig)
 
     @model_validator(mode="after")
     def _apply_review_profile(self) -> MiraConfig:

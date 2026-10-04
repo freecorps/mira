@@ -20,6 +20,7 @@ from mira.checks.capabilities import (
 from mira.gate.capabilities import NO_CAPABILITIES, GateCapabilities
 from mira.gate.models import CIState
 from mira.models import (
+    BlameRange,
     BotThreadRecord,
     CIJobFailure,
     CommitChurn,
@@ -683,3 +684,52 @@ class BaseProvider(abc.ABC):
     async def get_commit_files(self, repo: PRInfo, sha: str, *, limit: int = 100) -> list[str]:
         """Paths one commit changed. ``[]`` when the commit touched none."""
         raise NotImplementedError(f"{type(self).__name__} cannot list a commit's files")
+
+    # ── Review-quality measurement (backtests, escaped bugs) ──
+    #
+    # Read-only history, all of it, alongside the digest methods above (which
+    # backtests reuse to list merged pull requests). ``pr_info`` scopes the
+    # repository, as :func:`repository_ref` builds it. Every
+    # default raises: "this provider cannot look" must never read as "there is
+    # no history", or a backtest would score a review against nothing and an
+    # escaped-bug scan would report a clean record it never checked.
+
+    async def get_landed_pull_request(
+        self, pr_info: PRInfo, number: int
+    ) -> MergedPullRequest | None:
+        """Pull request ``number`` if it exists and was merged, else None."""
+        raise NotImplementedError(f"{type(self).__name__} cannot read pull request history")
+
+    async def get_commit(self, pr_info: PRInfo, sha: str) -> CommitInfo | None:
+        """One commit's message, date and parents. None when it does not exist."""
+        raise NotImplementedError(f"{type(self).__name__} cannot read commits")
+
+    async def get_commit_diff(self, pr_info: PRInfo, sha: str) -> str:
+        """Unified diff of one commit against its first parent."""
+        raise NotImplementedError(f"{type(self).__name__} cannot read commit diffs")
+
+    async def list_path_commits(
+        self,
+        pr_info: PRInfo,
+        path: str,
+        *,
+        since: float = 0.0,
+        until: float = 0.0,
+        ref: str = "",
+        limit: int = 20,
+    ) -> list[CommitInfo]:
+        """Commits touching ``path`` within ``since..until`` (epoch seconds, 0 = open)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot list path history")
+
+    async def get_prs_for_commit(self, pr_info: PRInfo, sha: str) -> list[int]:
+        """Numbers of the merged pull requests that introduced commit ``sha``."""
+        raise NotImplementedError(f"{type(self).__name__} cannot map commits to pull requests")
+
+    async def get_blame(self, pr_info: PRInfo, path: str, ref: str) -> list[BlameRange]:
+        """Which commit last changed each line of ``path`` at ``ref``.
+
+        Optional: escaped-bug linking falls back to comparing diffs when a
+        provider cannot blame, so the default raises ``NotImplementedError``
+        and the caller treats that as "use the fallback", not as an error.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot blame files")

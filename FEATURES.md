@@ -109,6 +109,18 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Regression detection that suggests a downgrade but never disables a rule on its own
 - CSV/JSON export and an audit trail for suggestions, overrides, and admin changes
 
+## Review quality measurement
+
+- `mira backtest` replays merged pull requests through the current engine, in dry-run behind a read-only provider that cannot post anything
+- Findings scored against later human review comments, fix/revert commits on the same lines, and recorded 👍/👎 feedback: strict and labelled precision, recall, tokens, cost and latency per PR
+- A/B comparison of two configurations on the same pull requests (`--config-b`), with B − A deltas
+- Bounded spend: max PRs, max concurrency, a pessimistic pre-run cost estimate, `--confirm` required, and a stop once actual spend reaches the limit
+- Markdown or JSON report; runs stored per repository and shown on the dashboard
+- Escaped-bug tracking (opt-in): reverts and hotfixes detected on merge and push webhooks, linked to the reviewed pull request by reverted sha, blame (GitHub, GitLab) or diff overlap (Forgejo)
+- Real-world recall — escaped bugs Mira had flagged vs ones it missed — per repository via API and the **Review quality** page; `mira escaped-bugs scan` backfills history
+- Missed escapes become pending, path-scoped learning candidates with the escape as a positive example, inactive until approved
+- See [docs/backtest.md](docs/backtest.md) and [docs/escaped-bugs.md](docs/escaped-bugs.md)
+
 ## Merge gate
 
 - A conservative approval decision, in its own domain and kept apart from the review's quality score

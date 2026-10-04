@@ -34,6 +34,7 @@ from mira.gate.capabilities import GITLAB_CAPABILITIES, GateCapabilities
 from mira.gate.codeowners import CODEOWNERS_LOCATIONS
 from mira.gate.models import CIState
 from mira.models import (
+    BlameRange,
     BotThreadRecord,
     CIJobFailure,
     CommitInfo,
@@ -1206,6 +1207,9 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
                                     or ""
                                 ),
                                 base_branch=str(item.get("target_branch") or ""),
+                                head_branch=str(item.get("source_branch") or ""),
+                                base_sha=str((item.get("diff_refs") or {}).get("base_sha") or ""),
+                                head_sha=str(item.get("sha") or ""),
                                 labels=[str(lb) for lb in item.get("labels") or [] if lb],
                             )
                         )
@@ -1308,6 +1312,111 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
         return [
             str(d.get("new_path") or d.get("old_path") or "") for d in (resp.json() or [])[:limit]
         ]
+
+    # ── Review-quality measurement (backtests, escaped bugs) ──
+
+    @staticmethod
+    def _landed_mr(item: dict[str, Any]) -> MergedPullRequest:
+        return MergedPullRequest(
+            number=int(item.get("iid") or 0),
+            title=str(item.get("title") or ""),
+            url=str(item.get("web_url") or ""),
+            body=str(item.get("description") or ""),
+            author=str((item.get("author") or {}).get("username") or ""),
+            base_branch=str(item.get("target_branch") or ""),
+            head_branch=str(item.get("source_branch") or ""),
+            base_sha=str((item.get("diff_refs") or {}).get("base_sha") or ""),
+            head_sha=str(item.get("sha") or ""),
+            merge_commit_sha=str(
+                item.get("merge_commit_sha") or item.get("squash_commit_sha") or ""
+            ),
+            merged_at=iso_to_epoch(str(item.get("merged_at") or "")),
+            labels=[str(label) for label in item.get("labels") or []],
+        )
+
+    async def get_landed_pull_request(
+        self, pr_info: PRInfo, number: int
+    ) -> MergedPullRequest | None:
+        resp = await self._request(
+            "GET", f"{self._project(pr_info)}/merge_requests/{int(number)}", ok=(200, 404)
+        )
+        if resp.status_code == 404:
+            return None
+        data = resp.json() or {}
+        if data.get("state") != "merged":
+            return None
+        return self._landed_mr(data)
+
+    async def get_commit(self, pr_info: PRInfo, sha: str) -> CommitInfo | None:
+        resp = await self._request(
+            "GET",
+            f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}",
+            ok=(200, 404),
+        )
+        if resp.status_code == 404:
+            return None
+        return self._commit_from(resp.json() or {})
+
+    async def get_commit_diff(self, pr_info: PRInfo, sha: str) -> str:
+        resp = await self._request(
+            "GET", f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}/diff"
+        )
+        return _build_unified_diff(resp.json() or [])
+
+    async def list_path_commits(
+        self,
+        pr_info: PRInfo,
+        path: str,
+        *,
+        since: float = 0.0,
+        until: float = 0.0,
+        ref: str = "",
+        limit: int = 20,
+    ) -> list[CommitInfo]:
+        params: dict[str, Any] = {"path": path, "per_page": max(1, min(limit, 100))}
+        if since:
+            params["since"] = epoch_to_iso(since)
+        if until:
+            params["until"] = epoch_to_iso(until)
+        if ref:
+            params["ref_name"] = ref
+        resp = await self._request(
+            "GET", f"{self._project(pr_info)}/repository/commits", params=params
+        )
+        return [self._commit_from(item) for item in (resp.json() or [])[:limit]]
+
+    async def get_prs_for_commit(self, pr_info: PRInfo, sha: str) -> list[int]:
+        resp = await self._request(
+            "GET",
+            f"{self._project(pr_info)}/repository/commits/{quote(sha, safe='')}/merge_requests",
+            ok=(200, 404),
+        )
+        if resp.status_code == 404:
+            return []
+        return [
+            int(item.get("iid") or 0)
+            for item in resp.json() or []
+            if item.get("state") == "merged" and item.get("iid")
+        ]
+
+    async def get_blame(self, pr_info: PRInfo, path: str, ref: str) -> list[BlameRange]:
+        resp = await self._request(
+            "GET",
+            f"{self._project(pr_info)}/repository/files/{quote(path, safe='')}/blame",
+            params={"ref": ref},
+        )
+        # GitLab answers with consecutive groups of lines, each with the commit
+        # that last changed them; their positions are what make the ranges.
+        ranges: list[BlameRange] = []
+        line = 1
+        for group in resp.json() or []:
+            count = len(group.get("lines") or [])
+            if not count:
+                continue
+            sha = str((group.get("commit") or {}).get("id") or "")
+            ranges.append(BlameRange(start=line, end=line + count - 1, sha=sha))
+            line += count
+        return ranges
 
 
 def _next_link(link_header: str) -> str | None:
