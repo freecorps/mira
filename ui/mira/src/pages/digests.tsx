@@ -149,7 +149,10 @@ function DigestBody({ id }: { id: number }) {
 }
 
 function GenerateForm({ onDone }: { onDone: () => void }) {
-  const { data: repos } = useAsync(() => api.listRepos().catch(() => []), [])
+  const { data: repos, error: reposError } = useAsync(
+    () => api.listRepos(),
+    []
+  )
   const [repoKey, setRepoKey] = useState("")
   const [days, setDays] = useState("7")
   const [busy, setBusy] = useState(false)
@@ -177,6 +180,14 @@ function GenerateForm({ onDone }: { onDone: () => void }) {
     } finally {
       setBusy(false)
     }
+  }
+
+  if (reposError) {
+    return (
+      <p className="text-sm text-destructive">
+        Couldn't load repositories: {reposError}
+      </p>
+    )
   }
 
   return (
@@ -222,7 +233,7 @@ export function DigestsPage() {
   const { user } = useAuth()
   const [refreshKey, setRefreshKey] = useState(0)
   const [open, setOpen] = useState<number | null>(null)
-  const { data, loading } = useAsync(
+  const { data, loading, error } = useAsync(
     () => api.listDigests({ limit: 100 }),
     [refreshKey]
   )
@@ -271,6 +282,10 @@ export function DigestsPage() {
                 <Skeleton key={i} className="h-4 w-full max-w-md" />
               ))}
             </div>
+          ) : error ? (
+            <p className="px-6 py-12 text-center text-sm text-destructive">
+              Couldn't load digests: {error}
+            </p>
           ) : digests.length === 0 ? (
             <div className="flex flex-col items-center gap-2 px-6 py-12 text-center">
               <Newspaper className="h-8 w-8 text-muted-foreground" />

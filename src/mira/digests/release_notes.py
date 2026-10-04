@@ -185,8 +185,10 @@ class _LLMReleaseNotes(BaseModel):
     classifications: list[_Classification] = Field(default_factory=list)
 
 
-def build_messages(entries: list[Entry], *, max_chars: int = 30_000) -> list[dict[str, str]]:
+def _entry_lines(entries: list[Entry], max_chars: int) -> tuple[list[str], int]:
+    """The listing the model sees, and how many entries it actually shows."""
     lines: list[str] = []
+    shown = 0
     total = 0
     for i, entry in enumerate(entries[:MAX_LLM_ENTRIES]):
         category = entry.category if entry.by_rule else "?"
@@ -201,15 +203,32 @@ def build_messages(entries: list[Entry], *, max_chars: int = 30_000) -> list[dic
             break
         total += len(line)
         lines.append(line)
+        shown += 1
+    return lines, shown
+
+
+def offered_count(entries: list[Entry], *, max_chars: int = 30_000) -> int:
+    """How many leading entries :func:`build_messages` puts in front of the model."""
+    return _entry_lines(entries, max_chars)[1]
+
+
+def build_messages(entries: list[Entry], *, max_chars: int = 30_000) -> list[dict[str, str]]:
+    lines, _ = _entry_lines(entries, max_chars)
     return [
         {"role": "system", "content": _SYSTEM},
         {"role": "user", "content": untrusted.block("CHANGES", "\n".join(lines), redactor=redact)},
     ]
 
 
-def apply_llm(notes: ReleaseNotes, answer: _LLMReleaseNotes) -> None:
+def apply_llm(notes: ReleaseNotes, answer: _LLMReleaseNotes, *, shown: int | None = None) -> None:
+    """Take the narrative and the categories of entries the model was shown.
+
+    ``shown`` is how many leading entries the prompt held (it stops early at
+    ``max_chars``); an id past it names an entry the model never saw.
+    """
     notes.narrative = prose(answer.narrative, MAX_NARRATIVE_CHARS)
-    offered = notes.entries[:MAX_LLM_ENTRIES]
+    limit = MAX_LLM_ENTRIES if shown is None else min(shown, MAX_LLM_ENTRIES)
+    offered = notes.entries[:limit]
     for item in answer.classifications:
         key = item.id.strip().strip("[]")
         if not key.isdigit() or int(key) >= len(offered):
@@ -263,7 +282,7 @@ async def build_release_notes(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Release notes model call failed: %s", exc)
         else:
-            apply_llm(result, answer)
+            apply_llm(result, answer, shown=offered_count(result.entries, max_chars=max_chars))
             result.llm_used = True
     return result
 

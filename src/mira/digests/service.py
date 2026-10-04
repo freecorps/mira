@@ -7,7 +7,8 @@ The entry points the CLI, the dashboard and the scheduler share:
 * :func:`publish_digest` — store it and send it to the outbound webhooks (and
   email, when configured). Never raises.
 * :func:`run_scheduled` — one scheduler tick: if a boundary has passed that no
-  process has run yet, claim it and build every configured digest for it.
+  process has run yet, claim it and build every configured digest for it. A
+  run in which every digest failed hands the claim back for the next tick.
 * :func:`build_release_notes_for` — release notes for a repository.
 """
 
@@ -214,21 +215,40 @@ def scheduled_repositories(cfg: DigestsConfig, db: Any) -> list[tuple[str, str, 
     return [(r.platform or "github", r.owner, r.repo) for r in db.list_repos()]
 
 
+def _claim(db: Any, boundary_ts: float) -> tuple[bool, str | None]:
+    current = db.get_setting(LAST_BOUNDARY_KEY)
+    try:
+        if current is not None and float(current) >= boundary_ts:
+            return False, current
+    except ValueError:
+        pass
+    return bool(db.compare_and_set_setting(LAST_BOUNDARY_KEY, current, repr(boundary_ts))), current
+
+
 def claim_boundary(db: Any, boundary_ts: float) -> bool:
     """Take the boundary for this process. False when it was already run.
 
     A compare-and-set on the settings table, so two processes (or a restart
     mid-tick) cannot both deliver the same week. The claim comes before the
-    work: a run that dies half way leaves the rest of that period undelivered
-    rather than delivered twice.
+    work, so a digest is delivered at most once; see :func:`run_scheduled`
+    for when a claim is handed back.
     """
-    current = db.get_setting(LAST_BOUNDARY_KEY)
+    return _claim(db, boundary_ts)[0]
+
+
+def release_boundary(db: Any, boundary_ts: float, previous: str | None) -> bool:
+    """Hand a claimed boundary back so the next tick runs it again.
+
+    Only undoes this process's own claim: if anything moved the setting on
+    since, it is left alone.
+    """
     try:
-        if current is not None and float(current) >= boundary_ts:
-            return False
-    except ValueError:
-        pass
-    return bool(db.compare_and_set_setting(LAST_BOUNDARY_KEY, current, repr(boundary_ts)))
+        return bool(
+            db.compare_and_set_setting(LAST_BOUNDARY_KEY, repr(boundary_ts), previous or "0")
+        )
+    except Exception as exc:  # noqa: BLE001 - the claim stands; the period is skipped
+        logger.warning("Could not release the digest boundary: %s", exc)
+        return False
 
 
 async def run_scheduled(
@@ -239,13 +259,48 @@ async def run_scheduled(
     llm: Any = None,
     now: datetime | None = None,
 ) -> list[int]:
-    """One scheduler tick. Returns the ids of the digests it stored."""
+    """One scheduler tick. Returns the ids of the digests it stored.
+
+    The boundary is claimed before any work, so a digest that was delivered is
+    never delivered again. When nothing in the run succeeded — every
+    repository failed (no provider, or the digest could not be built) or the
+    run raised — the claim is handed back and the next tick retries the
+    period. A run where some repositories succeeded keeps the claim: the
+    failed ones miss that period rather than the others being sent twice.
+    """
     cfg = config.digests
     if not cfg.enabled or db is None:
         return []
     boundary = schedule.latest_boundary(now or datetime.now(tz=UTC), cfg)
-    if not claim_boundary(db, boundary.timestamp()):
+    claimed, previous = _claim(db, boundary.timestamp())
+    if not claimed:
         return []
+    try:
+        stored, attempted, succeeded = await _run_period(
+            cfg, boundary, db=db, provider_for=provider_for, llm=llm
+        )
+    except BaseException:
+        release_boundary(db, boundary.timestamp(), previous)
+        raise
+    if attempted and not succeeded:
+        logger.warning("Every digest in this run failed; the period will be retried")
+        release_boundary(db, boundary.timestamp(), previous)
+    return stored
+
+
+async def _run_period(
+    cfg: DigestsConfig,
+    boundary: datetime,
+    *,
+    db: Any,
+    provider_for: ProviderFor,
+    llm: Any,
+) -> tuple[list[int], int, int]:
+    """Build and publish every digest for the period ending at ``boundary``.
+
+    Returns the stored ids, how many digests were attempted, and how many
+    succeeded (built, whether published or skipped as empty).
+    """
     since, until = schedule.period_ending(boundary, cfg)
     logger.info("Digest run for %s to %s", day(since), day(until))
 
@@ -256,7 +311,9 @@ async def run_scheduled(
         groups.setdefault(key, []).append((platform, owner, repo))
 
     stored: list[int] = []
+    attempted = succeeded = 0
     for (platform, owner, _), members in groups.items():
+        attempted += 1
         targets: list[DigestTarget] = []
         for _platform, _owner, repo in members:
             try:
@@ -282,11 +339,12 @@ async def run_scheduled(
         except Exception as exc:  # noqa: BLE001 - the next repository still gets one
             logger.warning("Digest for %s/%s failed: %s", owner, members[0][2], exc)
             continue
+        succeeded += 1
         if digest.is_empty and cfg.skip_empty:
             logger.info("Digest for %s: nothing landed, skipped", digest.scope_name)
             continue
         stored.append(await publish_digest(digest, cfg=cfg, db=db))
-    return stored
+    return stored, attempted, succeeded
 
 
 # ── Release notes ──────────────────────────────────────────────────────────

@@ -849,9 +849,12 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
 
         GitLab keeps issue notes apart from merge-request notes, so this cannot
         reuse ``find_bot_comment``. A note by anyone else is skipped even when
-        it quotes the marker.
+        it quotes the marker, and so is every note when the token's own
+        username cannot be read (``None``: post rather than risk overwriting).
         """
         me = await self._self_username()
+        if not me:
+            return None
         try:
             notes = await self._paginate(self._issue_notes(issue_ref))
         except Exception as e:
@@ -860,7 +863,7 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
             if note.get("system"):
                 continue
             author = (note.get("author") or {}).get("username") or ""
-            if me and author != me:
+            if author != me:
                 continue
             if marker in (note.get("body") or ""):
                 return int(note["id"])

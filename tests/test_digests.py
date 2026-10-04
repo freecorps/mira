@@ -22,7 +22,7 @@ from mira.digests.areas import (
     areas_for_path,
     group_by_area,
 )
-from mira.digests.collect import collect_window, find_direct_commits
+from mira.digests.collect import collect_between, collect_window, find_direct_commits
 from mira.digests.models import AreaDigest, Change, Digest
 from mira.digests.render import render_markdown, webhook_payload
 from mira.digests.service import (
@@ -299,6 +299,39 @@ class TestCollectWindow:
         )
         assert got.changes == []
         assert not [c for c in provider.calls if c[0] == "commits"]
+
+    async def test_max_files_zero_keeps_direct_commits(self) -> None:
+        provider = FakeProvider(
+            prs=[],
+            commits=[_commit("d1", "Bump version", ["p0"], at=T0 + DAY)],
+            commit_files={"d1": ["pyproject.toml"]},
+        )
+        got = await collect_window(
+            provider, repository_ref("github", "o", "r"), since=T0, until=T1, max_files=0
+        )
+        assert got.direct_commits == 1
+        assert [c.ref for c in got.changes] == ["d1"]
+        assert not [c for c in provider.calls if c[0] == "files"]
+
+
+class TestCollectBetween:
+    async def test_pr_without_merge_sha_kept_beside_matched_ones(self) -> None:
+        provider = FakeProvider(
+            prs=[
+                _pr(5, "Has sha", ["a"], at=T0 + DAY, sha="m5"),
+                _pr(6, "No sha", ["b"], at=T0 + DAY + 100, sha=""),
+                _pr(7, "Other branch", ["c"], at=T0 + DAY + 200, sha="elsewhere"),
+            ],
+            compare=[
+                _commit("m5", "Has sha (#5)", ["p0"], at=T0 + DAY),
+                _commit("m6", "No sha (#6)", ["m5"], at=T0 + DAY + 100),
+            ],
+        )
+        got = await collect_between(
+            provider, repository_ref("github", "o", "r"), base="a", head="b"
+        )
+        assert sorted(c.number for c in got.changes if c.kind == "pr") == [5, 6]
+        assert any("date alone" in n for n in got.notes)
 
 
 # ── Summarising ────────────────────────────────────────────────────────────
@@ -659,6 +692,31 @@ class TestRunScheduled:
                 now=datetime.fromtimestamp(T1, UTC),
             )
         assert len(stored) == 1
+
+    async def test_a_run_where_everything_failed_is_retried(self, app_db: AppDatabase) -> None:
+        app_db.register_repo("o", "r", platform="github")
+        app_db.set_setting(LAST_BOUNDARY_KEY, repr(T0))
+        down = AsyncMock(side_effect=RuntimeError("provider down"))
+        now = datetime.fromtimestamp(T1, UTC)
+        assert await run_scheduled(_enabled(), db=app_db, provider_for=down, now=now) == []
+        assert float(app_db.get_setting(LAST_BOUNDARY_KEY) or 0) == T0  # handed back
+
+        up = AsyncMock(return_value=_provider_with_week())
+        with patch("mira.outbound_webhooks.dispatch_event", AsyncMock()):
+            stored = await run_scheduled(_enabled(), db=app_db, provider_for=up, now=now)
+        assert len(stored) == 1
+        assert float(app_db.get_setting(LAST_BOUNDARY_KEY) or 0) == T1
+
+    async def test_a_crashed_run_hands_the_claim_back(self, app_db: AppDatabase) -> None:
+        app_db.register_repo("o", "r", platform="github")
+        now = datetime.fromtimestamp(T1, UTC)
+        with (
+            patch("mira.digests.service._run_period", AsyncMock(side_effect=RuntimeError("boom"))),
+            pytest.raises(RuntimeError),
+        ):
+            await run_scheduled(_enabled(), db=app_db, provider_for=AsyncMock(), now=now)
+        assert float(app_db.get_setting(LAST_BOUNDARY_KEY) or 0) < T1
+        assert claim_boundary(app_db, T1)
 
     def test_claim_is_compare_and_set(self, app_db: AppDatabase) -> None:
         assert claim_boundary(app_db, T0)

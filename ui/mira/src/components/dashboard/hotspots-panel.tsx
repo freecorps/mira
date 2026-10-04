@@ -71,9 +71,11 @@ export function HotspotsPanel({
 
   const files = useMemo(() => {
     const all = data?.files ?? []
-    return dir
-      ? all.filter((f) => f.path.startsWith(dir === "." ? "" : `${dir}/`))
-      : all
+    if (!dir) return all
+    // "." is the repository root: only top-level files, not everything.
+    return dir === "."
+      ? all.filter((f) => !f.path.includes("/"))
+      : all.filter((f) => f.path.startsWith(`${dir}/`))
   }, [data, dir])
 
   const noData = !loading && data?.enabled && (data?.files.length ?? 0) === 0

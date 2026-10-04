@@ -978,8 +978,14 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
         )
 
     async def find_issue_comment(self, issue_ref: PRInfo, marker: str) -> int | None:
-        """The token user's own comment on the issue carrying ``marker``."""
+        """The token user's own comment on the issue carrying ``marker``.
+
+        ``None`` when the token's own login cannot be read: without it there
+        is no telling Mira's comment from someone else's that quotes the marker.
+        """
         me = await self._self_username()
+        if not me:
+            return None
         try:
             comments = await self._paginate(
                 f"{self._repo(issue_ref)}/issues/{int(issue_ref.number)}/comments"
@@ -988,7 +994,7 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
             raise ProviderError(f"Failed to list issue comments: {e}") from e
         for comment in comments:
             author = (comment.get("user") or {}).get("login") or ""
-            if me and author != me:
+            if author != me:
                 continue
             if marker in (comment.get("body") or ""):
                 return int(comment["id"])

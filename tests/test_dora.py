@@ -266,9 +266,17 @@ def test_sqlite_migration_adds_dora_columns(tmp_path: Path) -> None:
 
 
 class _Provider:
-    def __init__(self, *, labels: Any = ("hotfix",), fail: bool = False) -> None:
+    def __init__(
+        self, *, labels: Any = ("hotfix",), fail: bool = False, merged_at: float = 0.0
+    ) -> None:
         self.labels = labels
         self.fail = fail
+        self.merged_at = merged_at
+
+    async def get_pr_landed_at(self, pr_info: PRInfo) -> float:
+        if self.fail:
+            raise RuntimeError("boom")
+        return self.merged_at
 
     async def get_pr_first_commit_at(self, pr_info: PRInfo) -> float:
         if self.fail:
@@ -325,6 +333,24 @@ async def test_merge_enrichment_degrades_and_syncs_releases(db: AppDatabase) -> 
     assert row["labels"] == ["keep"]  # unreadable labels leave stored ones alone
     assert row["first_commit_at"] == 0.0
     assert [d["ref"] for d in db.get_deployments(0)] == ["v9"]
+
+
+@pytest.mark.asyncio
+async def test_merge_enrichment_uses_the_platform_merge_time(db: AppDatabase) -> None:
+    await collect.record_merge_delivery(
+        _Provider(merged_at=1234.0), _pr_info(), config=MiraConfig(), app_db=db, now=9999.0
+    )
+    [row] = db.get_delivery_rows(0)
+    assert row["merged_at"] == 1234.0
+
+
+@pytest.mark.asyncio
+async def test_merge_enrichment_falls_back_to_now_without_a_merge_time(db: AppDatabase) -> None:
+    await collect.record_merge_delivery(
+        _Provider(fail=True), _pr_info(), config=MiraConfig(), app_db=db, now=9999.0
+    )
+    [row] = db.get_delivery_rows(0)
+    assert row["merged_at"] == 9999.0
 
 
 @pytest.mark.asyncio

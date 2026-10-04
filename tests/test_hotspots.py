@@ -504,6 +504,41 @@ async def test_providers_degrade_to_empty_on_http_errors(monkeypatch: pytest.Mon
         assert await provider.get_pr_first_commit_at(_pr(platform)) == 0.0
 
 
+@pytest.mark.asyncio
+async def test_listings_keep_what_they_read_when_the_connection_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    def route(url: str, params: dict) -> _Resp:
+        if url.endswith("/commits") and params.get("page") == 1:
+            return _Resp(data=[{"sha": f"c{i}", "parents": [{}]} for i in range(100)])
+        if "/commits/" in url:
+            return _Resp(data={"commit": {"message": "m"}, "files": []})
+        raise httpx.ConnectError("reset")
+
+    _fake_client(monkeypatch, route)
+    gh = GitHubProvider("t")
+    out = await gh.get_commit_churn(_pr(), since=0, max_commits=150)
+    assert len(out) == 100
+    assert await gh.list_deployment_releases(_pr()) == []
+    assert await gh.get_pr_first_commit_at(_pr()) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_github_first_commit_reads_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    late = {"commit": {"author": {"date": "2026-01-05T00:00:00Z"}}}
+    early = {"commit": {"author": {"date": "2026-01-03T00:00:00Z"}}}
+
+    def route(url: str, params: dict) -> _Resp:
+        assert url.endswith("/pulls/7/commits")
+        return _Resp(data=[late] * 100 if params["page"] == 1 else [early])
+
+    calls = _fake_client(monkeypatch, route)
+    assert await GitHubProvider("t").get_pr_first_commit_at(_pr()) == pytest.approx(1767398400.0)
+    assert len(calls) == 2
+
+
 # ── API ──
 
 

@@ -889,6 +889,20 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
             result: dict[str, Any] = data["data"]
             return result
 
+    async def _viewer_login(self) -> str:
+        """The token's own login (cached), or ``""`` when it cannot be read."""
+        cached = getattr(self, "_viewer_login_cache", "")
+        if cached:
+            return str(cached)
+        try:
+            data = await self._graphql_request("query { viewer { login } }", {})
+            login = str((data.get("viewer") or {}).get("login") or "")
+        except Exception as exc:  # noqa: BLE001 - unknown identity, callers decide
+            logger.debug("Could not read the token's own login: %s", exc)
+            return ""
+        self._viewer_login_cache = login
+        return login
+
     async def resolve_outdated_review_threads(self, pr_info: PRInfo) -> int:
         @_retry_transient
         async def _resolve() -> int:
@@ -1751,20 +1765,24 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
         return await asyncio.to_thread(_fetch)
 
     async def find_issue_comment(self, issue_ref: PRInfo, marker: str) -> int | None:
-        """The bot's own comment carrying ``marker``.
+        """The token's own comment carrying ``marker``.
 
-        Mira comments on GitHub as an App, so its comments are authored by a
-        ``Bot`` account. A human's comment that quotes the marker is skipped:
-        editing it would fail, and it is not Mira's to edit anyway.
+        Matched on the token's login (``viewer``: the App's ``slug[bot]`` for
+        an installation token), so neither a human's comment nor another
+        bot's that quotes the marker is ever edited. ``None`` when the login
+        cannot be read: posting a second plan beats overwriting someone else's.
         """
+        me = _normalize_login(await self._viewer_login())
+        if not me:
+            return None
 
         @_retry_transient
         def _find() -> int | None:
             gh_repo = self._github.get_repo(f"{issue_ref.owner}/{issue_ref.repo}")
             issue = gh_repo.get_issue(issue_ref.number)
             for comment in issue.get_comments():
-                user = getattr(comment, "user", None)
-                if getattr(user, "type", "") != "Bot":
+                login = str(getattr(getattr(comment, "user", None), "login", "") or "")
+                if _normalize_login(login) != me:
                     continue
                 if marker in (comment.body or ""):
                     return int(comment.id)
