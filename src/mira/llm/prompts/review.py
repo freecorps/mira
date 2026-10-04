@@ -45,8 +45,13 @@ def build_review_prompt(
     review_round: int = 1,
     resolved_threads: list[dict] | None = None,
     team_conventions: str = "",
+    dependency_updates: str = "",
 ) -> list[dict[str, str]]:
     """Build the review prompt messages for the LLM.
+
+    ``dependency_updates`` is the rendered block from
+    :func:`mira.dependency_updates.review_context` — upstream release notes,
+    already inside an untrusted block — placed ahead of the diffs.
 
     Returns a list of message dicts with 'role' and 'content' keys.
     """
@@ -104,12 +109,15 @@ def build_review_prompt(
         resolved_threads=resolved_threads,
         team_conventions=team_conventions,
         footguns=footguns,
+        has_dependency_updates=bool(dependency_updates),
     )
 
     # Build user message with optional code context before diffs
     user_parts = []
     if code_context:
         user_parts.append(code_context)
+    if dependency_updates:
+        user_parts.append(dependency_updates)
     user_parts.extend(file_contexts)
     # Said again after the diffs, where the model reads last: on a long prompt a
     # smaller model follows what is nearest the end of it, and the procedure

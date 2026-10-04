@@ -149,6 +149,37 @@ review:
   # Include a Mermaid sequence diagram in the walkthrough
   walkthrough_sequence_diagram: true
 
+  # Upstream release notes for the dependency versions a PR bumps. The review
+  # model checks the PR's code against their breaking changes, and the
+  # walkthrough lists each bump with its notes and OSV advisories. Best effort:
+  # bounded by the budgets below, never fails or holds up a review.
+  # MIRA_DEPENDENCY_UPDATES_HOSTS="" turns it off for an offline install.
+  # Full reference: docs/dependency-updates.md
+  dependency_updates:
+    enabled: true
+    # `mira local review` contacts only the model unless this is true here AND
+    # in the .mira.yaml committed at the review's base.
+    local: false
+    # Bumps looked up per PR; the rest are listed without notes.
+    max_packages: 8
+    # Wall-clock budget for the whole lookup, summary included.
+    timeout_seconds: 15
+    request_timeout_seconds: 5
+    # Bytes downloaded across every request of one review.
+    max_bytes: 2000000
+    # How long the review prompt waits for the notes after its own preparation.
+    context_wait_seconds: 3
+    # The only hosts contacted (HTTPS; private addresses are refused).
+    allowed_hosts:
+      - pypi.org
+      - registry.npmjs.org
+      - proxy.golang.org
+      - repo.packagist.org
+      - api.github.com
+      - raw.githubusercontent.com
+    # Env var holding a GitHub token for the releases API (unauthenticated: 60/h per IP).
+    github_token_env: ""
+
   # Submit a real review event, not just comments. Approving is the default;
   # requesting changes is not. An APPROVE adds a signal a human can dismiss —
   # note it counts toward branch-protection approvals — while a

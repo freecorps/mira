@@ -451,6 +451,55 @@ _PROFILE_REVIEW_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+class DependencyUpdatesConfig(BaseModel):
+    """Upstream release notes for the dependency versions a pull request bumps.
+
+    When a changed manifest moves a package from one version to another, Mira
+    reads the registry's metadata for the package, finds its source repository
+    and reads the GitHub releases (or the changelog at the new tag) between the
+    two versions. A small indexing-tier call pulls out breaking changes and
+    deprecations; the review model checks the pull request's code against them
+    and the walkthrough lists each bump.
+
+    Everything here is best effort: a registry that is slow or down costs the
+    review that section, never the review. ``allowed_hosts`` is the complete
+    list of hosts contacted; ``MIRA_DEPENDENCY_UPDATES_HOSTS`` overrides it
+    from the environment, and an empty value turns the feature off for an
+    offline install. Local review (``mira local review``) never runs it unless
+    ``local`` is set in the ``.mira.yaml`` committed at the review's base.
+    """
+
+    enabled: bool = True
+    # `mira local review` promises to contact nothing but the model. Off there
+    # unless this is set — in the committed configuration, not the working tree.
+    local: bool = False
+    # Bumps looked up per pull request; the rest are listed without notes.
+    max_packages: int = Field(default=8, ge=1, le=50)
+    # Wall-clock budget for the whole lookup, summary included.
+    timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    # Per HTTP request.
+    request_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    # Bytes downloaded across every request of one review.
+    max_bytes: int = Field(default=2_000_000, ge=10_000, le=50_000_000)
+    # How long the review prompt waits for the notes after its own preparation
+    # is done. Past it the review runs without them, and the walkthrough waits
+    # the same again at the end of the review before leaving them out.
+    context_wait_seconds: float = Field(default=3.0, ge=0, le=60)
+    allowed_hosts: list[str] = Field(
+        default_factory=lambda: [
+            "pypi.org",
+            "registry.npmjs.org",
+            "proxy.golang.org",
+            "repo.packagist.org",
+            "api.github.com",
+            "raw.githubusercontent.com",
+        ]
+    )
+    # Name of an environment variable holding a GitHub token for the releases
+    # API (60 unauthenticated requests an hour per IP). Empty: unauthenticated.
+    github_token_env: str = ""
+
+
 class ReviewConfig(BaseModel):
     # `chill` | `balanced` | `assertive`; see REVIEW_PROFILES above.
     profile: str = "balanced"
@@ -536,6 +585,11 @@ class ReviewConfig(BaseModel):
     # (the background poller only re-scans the repo hourly, post-merge). No
     # LLM involved — one batch HTTP request per PR with manifest changes.
     osv_scan: bool = True
+
+    # Upstream release notes for bumped dependencies: review context and a
+    # walkthrough section. See DependencyUpdatesConfig and
+    # docs/dependency-updates.md.
+    dependency_updates: DependencyUpdatesConfig = Field(default_factory=DependencyUpdatesConfig)
 
     # Give the reviewer LLM tools (`read_file`, `grep_repo`) to fetch
     # cross-file context on demand. On unindexed repos this closes the

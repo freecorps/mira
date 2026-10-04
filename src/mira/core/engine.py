@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -501,6 +502,11 @@ class ReviewEngine:
         self.last_full_diff = ""
         self.last_walkthrough_covers_pr = False
         self.last_review_had_changes = True
+        # Dependency release notes (mira.dependency_updates): the lookup for the
+        # review in progress, and how it reads manifests when there is no
+        # provider to ask — set by local review only when the repository opted in.
+        self._dependency_updates_task: asyncio.Task | None = None
+        self.dependency_reader: Callable[[str, str], Awaitable[str | None]] | None = None
 
     def _output_reserve(self) -> int:
         """Context left free for the answer when sizing a review prompt.
@@ -1573,6 +1579,59 @@ class ReviewEngine:
         except Exception as exc:
             logger.warning("Merge gate failed for %s: %s", pr_info.url, exc)
 
+    def _start_dependency_updates(self, files: list) -> asyncio.Task | None:
+        """Start the release-notes lookup for this review's bumps, or None.
+
+        Needs a way to read each manifest at both ends of the review: the
+        platform provider on a pull request, or ``dependency_reader`` when the
+        caller set one (local review does, only when the repository opted in).
+        With neither — ``review_diff`` with no provider — it does not run.
+        """
+        cfg = self.config.review.dependency_updates
+        if not cfg.enabled:
+            return None
+        from mira.dependency_updates import collect_dependency_updates, provider_reader
+        from mira.dependency_updates.bumps import candidate_manifests
+
+        if not candidate_manifests(files):
+            return None
+        reader = self.dependency_reader
+        pr_info = getattr(self, "_pr_info", None)
+        if reader is None and self.provider is not None and pr_info is not None:
+            reader = provider_reader(self.provider, pr_info)
+        if reader is None:
+            return None
+        return asyncio.create_task(
+            collect_dependency_updates(
+                files,
+                reader,
+                cfg,
+                self.indexing_llm,
+                osv_scan=self.config.review.osv_scan,
+            )
+        )
+
+    async def _dependency_context(self, task: asyncio.Task | None) -> str:
+        """The review prompt's dependency block, if the lookup is done in time.
+
+        Waits at most ``context_wait_seconds`` past the rest of preparation; a
+        lookup still running then is left to finish for the walkthrough.
+        """
+        if task is None:
+            return ""
+        wait = self.config.review.dependency_updates.context_wait_seconds
+        done, _ = await asyncio.wait({task}, timeout=wait)
+        if not done:
+            logger.info("Dependency updates not ready; reviewing without release notes")
+            return ""
+        try:
+            from mira.dependency_updates import review_context
+
+            return review_context(task.result())
+        except Exception as exc:
+            logger.debug("Dependency update context unavailable: %s", exc)
+            return ""
+
     async def review_diff(
         self, diff_text: str, *, repo_scope: PRInfo | None = None, title: str = ""
     ) -> ReviewResult:
@@ -1635,6 +1694,9 @@ class ReviewEngine:
                 threads_source=threads_source,
             )
         finally:
+            pending_updates, self._dependency_updates_task = self._dependency_updates_task, None
+            if pending_updates is not None and not pending_updates.done():
+                pending_updates.cancel()
             source, self._source = self._source, None
             if source is not None:
                 await source.aclose()
@@ -1728,6 +1790,13 @@ class ReviewEngine:
             if self.config.review.dependency_overlap
             else []
         )
+
+        # Release notes for bumped dependencies: network-bound and slow, so
+        # started now and awaited only where the prompt needs them.
+        dependency_updates_task = self._start_dependency_updates(
+            [f for f in filtered if only_paths is None or f.path in only_paths]
+        )
+        self._dependency_updates_task = dependency_updates_task
 
         filtered = selected
 
@@ -2026,6 +2095,7 @@ class ReviewEngine:
             existing_comments = open_threads or None
             resolved_threads = settled_threads or None
         _mark("threads")
+        dependency_context = await self._dependency_context(dependency_updates_task)
         overhead_messages = build_review_prompt(
             files=[],
             config=self.config,
@@ -2040,6 +2110,7 @@ class ReviewEngine:
             review_round=review_round,
             resolved_threads=resolved_threads,
             team_conventions=team_conventions,
+            dependency_updates=dependency_context,
         )
         overhead = sum(self.llm.count_tokens(m["content"]) for m in overhead_messages)
         if part_context_on:
@@ -2115,6 +2186,7 @@ class ReviewEngine:
                         review_round=review_round,
                         resolved_threads=resolved_threads,
                         team_conventions=team_conventions,
+                        dependency_updates=dependency_context,
                     )
 
                 def _size(msgs: list[dict[str, str]]) -> int:
@@ -2500,6 +2572,15 @@ class ReviewEngine:
             summary = ""
 
         walkthrough = await walkthrough_task
+        if walkthrough is not None and dependency_updates_task is not None:
+            # Usually long finished: it started with the review. A lookup still
+            # running gets the same short grace the prompt gave it, no more.
+            done, _ = await asyncio.wait(
+                {dependency_updates_task},
+                timeout=self.config.review.dependency_updates.context_wait_seconds,
+            )
+            if done and not dependency_updates_task.cancelled():
+                walkthrough.dependency_updates = dependency_updates_task.result()
         _mark("summary")
         # One line per review saying where its time went, so a slow review can
         # be read off the log trail instead of reconstructed from HTTP lines.

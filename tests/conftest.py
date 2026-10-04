@@ -57,6 +57,9 @@ def isolate_index_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     # models.dev is a network document; a test that wants its levels loads
     # a document of its own with ``models_dev.load``.
     monkeypatch.setenv("MIRA_MODELS_DEV_URL", "")
+    # Dependency release notes come from public registries; tests that want
+    # them set the hosts and mock the transport.
+    monkeypatch.setenv("MIRA_DEPENDENCY_UPDATES_HOSTS", "")
     from mira.llm import models_dev
 
     models_dev.reset()
