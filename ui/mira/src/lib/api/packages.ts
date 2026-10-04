@@ -1,5 +1,7 @@
-import { fetchJson } from "./http"
+import { API_BASE, fetchJson } from "./http"
 import type { PackageSearchHit } from "./types"
+
+export type SbomFormat = "cyclonedx" | "spdx"
 
 // Cross-repo package search.
 export const packagesApi = {
@@ -17,5 +19,16 @@ export const packagesApi = {
     return fetchJson<PackageSearchHit[]>(
       `/api/packages/search?${qs.toString()}`
     )
+  },
+
+  // SBOM downloads are plain links so the browser handles the file and the
+  // session cookie rides along. Without owner/repo: every tracked repository.
+  sbomUrl: (format: SbomFormat, owner?: string, repo?: string) => {
+    const qs = new URLSearchParams({ format })
+    const path =
+      owner && repo
+        ? `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/sbom`
+        : "/api/sbom"
+    return `${API_BASE}${path}?${qs.toString()}`
   },
 }

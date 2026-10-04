@@ -2,6 +2,7 @@ import { AlertTriangle, Loader2, Search } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Link } from "react-router"
 
+import { SbomDownload } from "@/components/dashboard/sbom-download"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -80,13 +81,16 @@ export function PackagesPage() {
 
   return (
     <div className="space-y-6 p-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Packages</h1>
-        <p className="text-sm text-muted-foreground">
-          Search every repo in your org for a package + version. Built for
-          incident response — find which repos are running a vulnerable version
-          in seconds.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Packages</h1>
+          <p className="text-sm text-muted-foreground">
+            Search every repo in your org for a package + version. Built for
+            incident response — find which repos are running a vulnerable
+            version in seconds.
+          </p>
+        </div>
+        <SbomDownload />
       </div>
 
       <>

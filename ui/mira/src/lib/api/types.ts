@@ -69,6 +69,8 @@ export interface PackageModel {
   version: string
   file_path: string
   is_dev: boolean
+  // SPDX expression from the lockfile or the license cache; "" when unknown.
+  license?: string
 }
 
 export interface PackageSearchHit {
