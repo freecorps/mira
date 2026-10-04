@@ -137,7 +137,14 @@ async def record_merge_delivery(
     default_branch = await _try(provider.get_default_branch(pr_info), "")
     labels = await _try(provider.get_pr_labels(pr_info), None)
     platform = str(getattr(pr_info, "platform", "github") or "github")
-    merged_at = 0.0 if platform == "github" else now
+    merged_at = 0.0
+    if platform != "github":
+        # The platform's own merge time: the webhook may arrive late or be
+        # redelivered, so "now" is only the fallback.
+        read_landed_at = getattr(provider, "get_pr_landed_at", None)
+        if read_landed_at is not None:
+            merged_at = float(await _try(read_landed_at(pr_info), 0.0) or 0.0)
+        merged_at = merged_at or now
     app_db.upsert_pull_request(
         pr_info.owner,
         pr_info.repo,
@@ -148,7 +155,7 @@ async def record_merge_delivery(
         state="merged",
         updated_at=now,
         # GitHub's pull_request webhook already recorded the exact merge time;
-        # elsewhere the merge event is the best clock there is.
+        # elsewhere the platform's merged_at, else the merge event's clock.
         merged_at=merged_at,
         closed_at=merged_at,
         base_branch=str(getattr(pr_info, "base_branch", "") or ""),

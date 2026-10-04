@@ -53,10 +53,14 @@ class ReleaseNotesResponse(BaseModel):
     notes: dict
 
 
-def _require_repo(platform: str, owner: str, repo: str) -> None:
+def _db():  # type: ignore[no-untyped-def]
     if _api._app_db is None:
         raise HTTPException(503, "The repository registry is unavailable")
-    if not _api._app_db.get_repo(owner, repo, platform=platform):
+    return _api._app_db
+
+
+def _require_repo(platform: str, owner: str, repo: str) -> None:
+    if not _db().get_repo(owner, repo, platform=platform):
         raise HTTPException(404, "Repository not found")
 
 
@@ -81,7 +85,7 @@ def list_digests(
 ) -> DigestPage:
     limit = max(1, min(limit, _MAX_PAGE))
     offset = max(0, offset)
-    rows, total = _api._app_db.list_digests(
+    rows, total = _db().list_digests(
         kind=kind, platform=platform, owner=owner, repo=repo, limit=limit, offset=offset
     )
     return DigestPage(digests=rows, total=total, limit=limit, offset=offset)
@@ -89,7 +93,7 @@ def list_digests(
 
 @router.get("/api/digests/{digest_id}")
 def get_digest(digest_id: int) -> dict:
-    found = _api._app_db.get_digest(digest_id)
+    found = _db().get_digest(digest_id)
     if found is None:
         raise HTTPException(404, "Digest not found")
     return found

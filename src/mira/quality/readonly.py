@@ -70,6 +70,7 @@ READ_METHODS: frozenset[str] = frozenset(
         "get_commit_churn",
         "list_deployment_releases",
         "get_pr_first_commit_at",
+        "get_pr_landed_at",
         # History reads used by backtests and escaped-bug tracking.
         "list_landed_pull_requests",
         "get_landed_pull_request",

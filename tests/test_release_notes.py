@@ -122,6 +122,28 @@ class TestBuild:
         md = render_markdown(notes)
         assert "<b>" not in md and "&lt;b&gt;" in md
 
+    async def test_model_cannot_move_entries_cut_from_the_prompt(self) -> None:
+        changes = [_c(f"Change number {n}", n=n) for n in range(1, 4)]
+        llm = SimpleNamespace(
+            generate_object=AsyncMock(
+                side_effect=object_from(
+                    {
+                        "classifications": [
+                            {"id": "0", "category": "fixes"},
+                            {"id": "2", "category": "breaking"},  # never shown
+                        ],
+                    }
+                )
+            )
+        )
+        notes = await build_release_notes(changes, title="t", cfg=CFG, llm=llm, max_chars=70)
+        user = llm.generate_object.call_args.args[0][1]["content"]
+        assert "[0]" in user and "[2]" not in user
+        sections = notes.by_category()
+        assert [e.change.number for e in sections["fixes"]] == [1]
+        assert sections["breaking"] == []
+        assert 3 in [e.change.number for e in sections["other"]]
+
     async def test_model_failure_keeps_the_notes(self) -> None:
         llm = SimpleNamespace(generate_object=AsyncMock(side_effect=RuntimeError("down")))
         notes = await build_release_notes([_c("Something")], title="t", cfg=CFG, llm=llm)

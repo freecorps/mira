@@ -221,6 +221,15 @@ class TestRoutes:
             routes.get_digest(12345)
         assert exc.value.status_code == 404
 
+    def test_reads_without_a_database_are_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mira.dashboard.routers import digests as routes
+
+        monkeypatch.setattr("mira.dashboard.api._app_db", None)
+        for call in (lambda: routes.list_digests(), lambda: routes.get_digest(1)):
+            with pytest.raises(HTTPException) as exc:
+                call()
+            assert exc.value.status_code == 503
+
     async def test_generate_refuses_unregistered_and_non_admin(self, app_db: AppDatabase) -> None:
         from mira.dashboard.routers import digests as routes
 

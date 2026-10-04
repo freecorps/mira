@@ -297,6 +297,10 @@ class BaseProvider(abc.ABC):
         """
         return 0.0
 
+    async def get_pr_landed_at(self, pr_info: PRInfo) -> float:
+        """Epoch seconds the PR was merged, as the platform recorded it, or ``0.0``."""
+        return 0.0
+
     async def reply_to_review_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
         """Reply to an existing line comment, threading it."""
         return

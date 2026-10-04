@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -550,7 +551,9 @@ async def find_candidates(
             branch = await fetcher.default_branch(owner, repo)
             paths = list(await fetcher.repo_tree(owner, repo, branch) or [])
         else:
-            paths = list(await provider.get_repo_tree(issue_ref, "HEAD") or [])
+            # Name the branch: not every platform's tree endpoint resolves "HEAD".
+            branch = await provider.get_default_branch(issue_ref) or "HEAD"
+            paths = list(await provider.get_repo_tree(issue_ref, branch) or [])
     except Exception as exc:  # noqa: BLE001 - a plan without files is still a plan
         logger.warning("Could not list files for issue plan on %s/%s: %s", owner, repo, exc)
     paths = paths[: _MAX_SCANNED_FILES * 2]
@@ -779,8 +782,37 @@ def issue_ref(owner: str, repo: str, number: int, platform: str) -> PRInfo:
     )
 
 
+# One lock per issue while its plan comment is found and written, held only
+# by callers in this process: an `issues.opened` webhook and an `@mira plan`
+# comment arriving together would otherwise both find nothing and both post.
+# Entries are dropped once nobody holds or waits on them. Several workers
+# behind one webhook URL can still race; the worst case is a second comment.
+_PLAN_LOCKS: dict[tuple[str, str, str, int], tuple[asyncio.Lock, int]] = {}
+
+
+@asynccontextmanager
+async def _plan_lock(ref: PRInfo) -> AsyncIterator[None]:
+    key = (ref.platform, ref.owner.lower(), ref.repo.lower(), int(ref.number))
+    lock, users = _PLAN_LOCKS.get(key, (asyncio.Lock(), 0))
+    _PLAN_LOCKS[key] = (lock, users + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        lock, users = _PLAN_LOCKS[key]
+        if users <= 1:
+            del _PLAN_LOCKS[key]
+        else:
+            _PLAN_LOCKS[key] = (lock, users - 1)
+
+
 async def upsert_plan_comment(provider: Any, ref: PRInfo, body: str) -> str:
     """Edit the existing plan comment, or post one. Returns "updated" or "posted"."""
+    async with _plan_lock(ref):
+        return await _upsert_plan_comment(provider, ref, body)
+
+
+async def _upsert_plan_comment(provider: Any, ref: PRInfo, body: str) -> str:
     existing: int | None = None
     try:
         existing = await provider.find_issue_comment(ref, PLAN_MARKER)

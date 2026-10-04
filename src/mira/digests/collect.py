@@ -210,8 +210,8 @@ async def collect_window(
         direct = find_direct_commits(commits, prs)
         if direct and max_files > 0:
             await _fill_commit_files(provider, ref, direct, max_files=max_files)
-            out.changes.extend(change_from_commit(c, repo=label) for c in direct)
-            out.direct_commits = len(direct)
+        out.changes.extend(change_from_commit(c, repo=label) for c in direct)
+        out.direct_commits = len(direct)
     return out
 
 
@@ -256,7 +256,11 @@ async def collect_between(
             out.notes.append(f"Only {max_pull_requests} pull requests were read.")
         shas = {c.sha for c in commits}
         if any(pr.merge_commit_sha for pr in prs):
-            prs = [pr for pr in prs if pr.merge_commit_sha in shas]
+            # A pull request whose merge commit is unknown stays matched by
+            # date; one whose merge commit is known must be in the range.
+            prs = [pr for pr in prs if not pr.merge_commit_sha or pr.merge_commit_sha in shas]
+            if any(not pr.merge_commit_sha for pr in prs):
+                out.notes.append("Some pull requests were matched to the range by date alone.")
         elif prs:
             out.notes.append("Pull requests were matched to the range by date alone.")
     out.changes = [change_from_pr(pr) for pr in prs]

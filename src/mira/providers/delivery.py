@@ -65,6 +65,53 @@ def fragment_line_counts(fragment: str) -> tuple[int, int]:
     return added, deleted
 
 
+async def _get_ok(client: Any, url: str, **kw: Any) -> Any:
+    """One GET: the response on 200, ``None`` on any other status or error.
+
+    The listings below stop on ``None`` and return what they had, which is the
+    module's best-effort contract: a dropped connection on page three still
+    yields pages one and two.
+    """
+    try:
+        resp = await client.get(url, **kw)
+    except Exception as exc:  # noqa: BLE001 - best effort, see the module docstring
+        logger.debug("Delivery analytics listing failed for %s: %s", url, exc)
+        return None
+    return resp if resp.status_code == 200 else None
+
+
+def _json_list(resp: Any) -> list[Any]:
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001 - an unreadable page lists nothing
+        return []
+    return data if isinstance(data, list) else []
+
+
+async def _first_commit_at(
+    client: Any,
+    url: str,
+    *,
+    headers: dict[str, str],
+    params: dict[str, Any],
+    page_param: str,
+    page_size: int,
+    max_pages: int,
+    date_of: Any,
+) -> float:
+    """The earliest commit date across every page of a PR's commit listing."""
+    times: list[float] = []
+    for page in range(1, max_pages + 1):
+        resp = await _get_ok(client, url, headers=headers, params={**params, page_param: page})
+        if resp is None:
+            break
+        data = _json_list(resp)
+        times.extend(t for t in (iso_to_epoch(date_of(c) or "") for c in data) if t > 0)
+        if len(data) < page_size:
+            break
+    return min(times) if times else 0.0
+
+
 async def _gather_bounded(items: list[Any], fn: Any) -> list[Any]:
     sem = asyncio.Semaphore(_CONCURRENCY)
 
@@ -116,10 +163,10 @@ class GitHubDeliveryMixin:
                 params: dict[str, Any] = {"since": _iso(since), "per_page": _PAGE, "page": page}
                 if branch:
                     params["sha"] = branch
-                resp = await client.get(f"{base}/commits", headers=headers, params=params)
-                if resp.status_code != 200:
+                resp = await _get_ok(client, f"{base}/commits", headers=headers, params=params)
+                if resp is None:
                     break
-                data = resp.json() or []
+                data = _json_list(resp)
                 listed.extend(c for c in data if len(c.get("parents") or []) <= 1)
                 if len(data) < _PAGE:
                     break
@@ -158,15 +205,16 @@ class GitHubDeliveryMixin:
         self, pr_info: PRInfo, *, since: float = 0.0
     ) -> list[ReleaseRef]:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
+            resp = await _get_ok(
+                client,
                 f"{self._delivery_base(pr_info)}/releases",
                 headers=self._delivery_headers(),
                 params={"per_page": _PAGE},
             )
-        if resp.status_code != 200:
+        if resp is None:
             return []
         out: list[ReleaseRef] = []
-        for item in resp.json() or []:
+        for item in _json_list(resp):
             if item.get("draft"):
                 continue
             at = iso_to_epoch(item.get("published_at") or item.get("created_at") or "")
@@ -181,20 +229,19 @@ class GitHubDeliveryMixin:
         return out
 
     async def get_pr_first_commit_at(self, pr_info: PRInfo) -> float:
+        # GitHub lists at most 250 commits of a pull request, oldest first;
+        # read them all rather than trust the first page to hold the earliest.
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
+            return await _first_commit_at(
+                client,
                 f"{self._delivery_base(pr_info)}/pulls/{pr_info.number}/commits",
                 headers=self._delivery_headers(),
                 params={"per_page": _PAGE},
+                page_param="page",
+                page_size=_PAGE,
+                max_pages=3,
+                date_of=lambda c: ((c.get("commit") or {}).get("author") or {}).get("date"),
             )
-        if resp.status_code != 200:
-            return 0.0
-        times = [
-            iso_to_epoch(((c.get("commit") or {}).get("author") or {}).get("date") or "")
-            for c in resp.json() or []
-        ]
-        times = [t for t in times if t > 0]
-        return min(times) if times else 0.0
 
 
 # ───────────────────────────────────────────────────────────── GitLab ──
@@ -226,12 +273,12 @@ class GitLabDeliveryMixin:
                 params: dict[str, Any] = {"since": _iso(since), "per_page": _PAGE, "page": page}
                 if branch:
                     params["ref_name"] = branch
-                resp = await client.get(
-                    f"{project}/repository/commits", headers=headers, params=params
+                resp = await _get_ok(
+                    client, f"{project}/repository/commits", headers=headers, params=params
                 )
-                if resp.status_code != 200:
+                if resp is None:
                     break
-                data = resp.json() or []
+                data = _json_list(resp)
                 listed.extend(c for c in data if len(c.get("parent_ids") or []) <= 1)
                 if len(data) < _PAGE:
                     break
@@ -268,15 +315,16 @@ class GitLabDeliveryMixin:
         self, pr_info: PRInfo, *, since: float = 0.0
     ) -> list[ReleaseRef]:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
+            resp = await _get_ok(
+                client,
                 f"{self._project(pr_info)}/releases",
                 headers={"PRIVATE-TOKEN": self._token},
                 params={"per_page": _PAGE},
             )
-        if resp.status_code != 200:
+        if resp is None:
             return []
         out: list[ReleaseRef] = []
-        for item in resp.json() or []:
+        for item in _json_list(resp):
             at = iso_to_epoch(item.get("released_at") or item.get("created_at") or "")
             if at and at >= since:
                 links = item.get("_links") or {}
@@ -291,19 +339,30 @@ class GitLabDeliveryMixin:
 
     async def get_pr_first_commit_at(self, pr_info: PRInfo) -> float:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
+            return await _first_commit_at(
+                client,
                 f"{self._project(pr_info)}/merge_requests/{pr_info.number}/commits",
                 headers={"PRIVATE-TOKEN": self._token},
                 params={"per_page": _PAGE},
+                page_param="page",
+                page_size=_PAGE,
+                max_pages=5,
+                date_of=lambda c: c.get("authored_date") or c.get("created_at"),
             )
-        if resp.status_code != 200:
+
+    async def get_pr_landed_at(self, pr_info: PRInfo) -> float:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await _get_ok(
+                client,
+                f"{self._project(pr_info)}/merge_requests/{pr_info.number}",
+                headers={"PRIVATE-TOKEN": self._token},
+            )
+        if resp is None:
             return 0.0
-        times = [
-            iso_to_epoch(c.get("authored_date") or c.get("created_at") or "")
-            for c in resp.json() or []
-        ]
-        times = [t for t in times if t > 0]
-        return min(times) if times else 0.0
+        try:
+            return iso_to_epoch(str((resp.json() or {}).get("merged_at") or ""))
+        except Exception:  # noqa: BLE001 - an unknown merge time
+            return 0.0
 
 
 # ──────────────────────────────────────────────────────────── Forgejo ──
@@ -343,10 +402,10 @@ class ForgejoDeliveryMixin:
                 }
                 if branch:
                     params["sha"] = branch
-                resp = await client.get(f"{base}/commits", headers=headers, params=params)
-                if resp.status_code != 200:
+                resp = await _get_ok(client, f"{base}/commits", headers=headers, params=params)
+                if resp is None:
                     break
-                data = resp.json() or []
+                data = _json_list(resp)
                 for item in data:
                     at = iso_to_epoch(
                         (((item.get("commit") or {}).get("committer") or {}).get("date")) or ""
@@ -392,15 +451,16 @@ class ForgejoDeliveryMixin:
         self, pr_info: PRInfo, *, since: float = 0.0
     ) -> list[ReleaseRef]:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
+            resp = await _get_ok(
+                client,
                 f"{self._repo(pr_info)}/releases",
                 headers={"Authorization": f"token {self._token}"},
                 params={"limit": 50},
             )
-        if resp.status_code != 200:
+        if resp is None:
             return []
         out: list[ReleaseRef] = []
-        for item in resp.json() or []:
+        for item in _json_list(resp):
             if item.get("draft"):
                 continue
             at = iso_to_epoch(item.get("published_at") or item.get("created_at") or "")
@@ -416,16 +476,27 @@ class ForgejoDeliveryMixin:
 
     async def get_pr_first_commit_at(self, pr_info: PRInfo) -> float:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
+            return await _first_commit_at(
+                client,
                 f"{self._repo(pr_info)}/pulls/{pr_info.number}/commits",
                 headers={"Authorization": f"token {self._token}"},
                 params={"limit": 50, "stat": "false", "verification": "false", "files": "false"},
+                page_param="page",
+                page_size=50,
+                max_pages=10,
+                date_of=lambda c: ((c.get("commit") or {}).get("author") or {}).get("date"),
             )
-        if resp.status_code != 200:
+
+    async def get_pr_landed_at(self, pr_info: PRInfo) -> float:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await _get_ok(
+                client,
+                f"{self._repo(pr_info)}/pulls/{pr_info.number}",
+                headers={"Authorization": f"token {self._token}"},
+            )
+        if resp is None:
             return 0.0
-        times = [
-            iso_to_epoch(((c.get("commit") or {}).get("author") or {}).get("date") or "")
-            for c in resp.json() or []
-        ]
-        times = [t for t in times if t > 0]
-        return min(times) if times else 0.0
+        try:
+            return iso_to_epoch(str((resp.json() or {}).get("merged_at") or ""))
+        except Exception:  # noqa: BLE001 - an unknown merge time
+            return 0.0

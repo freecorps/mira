@@ -8,6 +8,7 @@ and nothing here ever raises into a webhook.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -385,7 +386,11 @@ def test_skip_reason() -> None:
 
 
 class FakeIssueProvider:
-    """An issue and its comments, in memory."""
+    """An issue and its comments, in memory.
+
+    Like the real providers, only comments this provider posted (``own``) are
+    found by marker; anyone else's that quotes it is never Mira's to edit.
+    """
 
     def __init__(self, issue: IssueInfo | None) -> None:
         self.issue = issue
@@ -393,17 +398,24 @@ class FakeIssueProvider:
         self.posted: list[str] = []
         self.updated: list[tuple[int, str]] = []
         self.fail_update = False
+        self.tree_refs: list[str] = []
+        self.own: set[int] = set()
         self._next = 100
 
     async def get_issue(self, ref: Any, number: int, **_: Any) -> IssueInfo | None:
         return self.issue
 
     async def find_issue_comment(self, ref: Any, marker: str) -> int | None:
-        return next((cid for cid, body in self.comments.items() if marker in body), None)
+        await asyncio.sleep(0)  # a real lookup yields; lets concurrent runs interleave
+        return next(
+            (cid for cid, body in self.comments.items() if cid in self.own and marker in body),
+            None,
+        )
 
     async def post_issue_comment(self, ref: Any, body: str) -> None:
         self._next += 1
         self.comments[self._next] = body
+        self.own.add(self._next)
         self.posted.append(body)
 
     async def update_issue_comment(self, ref: Any, comment_id: int, body: str) -> None:
@@ -412,7 +424,11 @@ class FakeIssueProvider:
         self.comments[comment_id] = body
         self.updated.append((comment_id, body))
 
+    async def get_default_branch(self, ref: Any) -> str:
+        return "trunk"
+
     async def get_repo_tree(self, ref: Any, sha: str) -> list[str]:
+        self.tree_refs.append(sha)
         return PATHS
 
 
@@ -455,11 +471,31 @@ async def test_plan_is_posted_then_edited_in_place() -> None:
 async def test_a_failed_edit_posts_a_new_plan() -> None:
     provider = FakeIssueProvider(_issue())
     provider.comments[5] = f"{PLAN_MARKER} old"
+    provider.own.add(5)
     provider.fail_update = True
     assert await upsert_plan_comment(provider, issue_ref("acme", "app", 12, "github"), "new") == (
         "posted"
     )
     assert provider.posted == ["new"]
+
+
+async def test_a_quoted_marker_in_someone_elses_comment_is_left_alone() -> None:
+    provider = FakeIssueProvider(_issue())
+    provider.comments[5] = f"> {PLAN_MARKER} quoted by a human"
+    assert await _run(provider, _config(), _llm()) == "posted"
+    assert provider.updated == []
+    assert provider.comments[5].startswith("> ")
+
+
+async def test_simultaneous_runs_post_one_plan_and_edit_it() -> None:
+    provider = FakeIssueProvider(_issue())
+    ref = issue_ref("acme", "app", 12, "github")
+    outcomes = await asyncio.gather(
+        upsert_plan_comment(provider, ref, f"{PLAN_MARKER} a"),
+        upsert_plan_comment(provider, ref, f"{PLAN_MARKER} b"),
+    )
+    assert sorted(outcomes) == ["posted", "updated"]
+    assert len(provider.posted) == 1
 
 
 async def test_disabled_is_silent_on_open_and_answered_on_command() -> None:
@@ -514,6 +550,7 @@ async def test_unindexed_repo_without_fetcher_uses_the_provider_tree() -> None:
     body = provider.posted[0]
     assert "`src/app/webhooks/retry.py`" in body
     assert "not indexed" in body
+    assert provider.tree_refs == ["trunk"]
 
 
 # ── Providers ───────────────────────────────────────────────────────────────
@@ -553,15 +590,25 @@ class _FakeClient:
 REF = issue_ref("acme", "app", 12, "github")
 
 
-async def test_github_issue_comments_only_match_bot_comments() -> None:
+async def test_github_issue_comments_only_match_the_tokens_own_comments() -> None:
     provider = GitHubProvider.__new__(GitHubProvider)
     provider._token = "t"
     provider._github = MagicMock()
+    provider._graphql_request = AsyncMock(  # type: ignore[method-assign]
+        return_value={"viewer": {"login": "mira-app[bot]"}}
+    )
     repo = provider._github.get_repo.return_value
     issue = repo.get_issue.return_value
-    human = SimpleNamespace(id=1, body=f"quoting {PLAN_MARKER}", user=SimpleNamespace(type="User"))
-    ours = SimpleNamespace(id=2, body=f"{PLAN_MARKER}\nplan", user=SimpleNamespace(type="Bot"))
-    issue.get_comments.return_value = [human, ours]
+    human = SimpleNamespace(
+        id=1, body=f"quoting {PLAN_MARKER}", user=SimpleNamespace(type="User", login="alice")
+    )
+    other_bot = SimpleNamespace(
+        id=3, body=f"{PLAN_MARKER}\ncopied", user=SimpleNamespace(type="Bot", login="other[bot]")
+    )
+    ours = SimpleNamespace(
+        id=2, body=f"{PLAN_MARKER}\nplan", user=SimpleNamespace(type="Bot", login="mira-app[bot]")
+    )
+    issue.get_comments.return_value = [human, other_bot, ours]
 
     assert await provider.find_issue_comment(REF, PLAN_MARKER) == 2
     repo.get_issue.assert_called_with(12)
@@ -572,6 +619,38 @@ async def test_github_issue_comments_only_match_bot_comments() -> None:
     await provider.update_issue_comment(REF, 2, "edited")
     issue.get_comment.assert_called_once_with(2)
     issue.get_comment.return_value.edit.assert_called_once_with("edited")
+
+
+async def test_github_issue_comment_unknown_identity_finds_nothing() -> None:
+    provider = GitHubProvider.__new__(GitHubProvider)
+    provider._token = "t"
+    provider._github = MagicMock()
+    provider._graphql_request = AsyncMock(side_effect=RuntimeError("403"))  # type: ignore[method-assign]
+    ours = SimpleNamespace(id=2, body=PLAN_MARKER, user=SimpleNamespace(type="Bot", login="x[bot]"))
+    provider._github.get_repo.return_value.get_issue.return_value.get_comments.return_value = [ours]
+    assert await provider.find_issue_comment(REF, PLAN_MARKER) is None
+
+
+async def test_gitlab_and_forgejo_unknown_identity_finds_nothing() -> None:
+    def handler(method: str, url: str, **kw: Any) -> _FakeResp:
+        if url.endswith("/user"):
+            raise RuntimeError("401")
+        return _FakeResp(200, [{"id": 1, "body": PLAN_MARKER, "author": {"username": "a"}}])
+
+    gitlab = GitLabProvider.__new__(GitLabProvider)
+    gitlab._token = "t"
+    gitlab._api = "https://gitlab.example/api/v4"
+    gitlab._username = ""
+    forgejo = ForgejoProvider.__new__(ForgejoProvider)
+    forgejo._token = "t"
+    forgejo._api = "https://forge.example/api/v1"
+    forgejo._username = ""
+    with (
+        patch("mira.providers.gitlab.httpx.AsyncClient", lambda *a, **k: _FakeClient(handler)),
+        patch("mira.providers.forgejo.httpx.AsyncClient", lambda *a, **k: _FakeClient(handler)),
+    ):
+        assert await gitlab.find_issue_comment(REF, PLAN_MARKER) is None
+        assert await forgejo.find_issue_comment(REF, PLAN_MARKER) is None
 
 
 async def test_gitlab_issue_notes() -> None:
