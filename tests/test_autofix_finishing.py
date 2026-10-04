@@ -422,6 +422,8 @@ def test_commenting_code_out_is_refused() -> None:
         ("bin/run.sh", "#!/bin/sh\necho hi\n", "#!/bin/bash\necho hi\n"),
         # Writing a comment above it, which stops it being an interpreter line.
         ("bin/run.sh", "#!/bin/sh\necho hi\n", "# Runs it.\n#!/bin/sh\necho hi\n"),
+        # Adding one where there was none.
+        ("bin/run.sh", "echo hi\n", "#!/bin/bash\necho hi\n"),
         # Python compares syntax trees, where a shebang is invisible.
         ("tool.py", "#!/usr/bin/env python3\nx = 1\n", "#!/usr/bin/python2\nx = 1\n"),
     ],

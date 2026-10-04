@@ -393,10 +393,11 @@ def check_docstring_only(
     is acceptable.
     """
     # A shebang reads as a `#` comment to both checks below, but it picks the
-    # interpreter: editing it, or writing anything above it, changes how the
-    # file runs.
+    # interpreter: adding one, editing it, or writing anything above it changes
+    # how the file runs.
     first_before = before.split("\n", 1)[0]
-    if first_before.startswith("#!") and after.split("\n", 1)[0] != first_before:
+    first_after = after.split("\n", 1)[0]
+    if "#!" in (first_before[:2], first_after[:2]) and first_after != first_before:
         raise _refuse(
             ReasonCode.BEHAVIOUR_CHANGED,
             f"The docstring patch changes or moves the interpreter line of {path}",
