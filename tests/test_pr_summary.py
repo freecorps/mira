@@ -86,7 +86,12 @@ def _walkthrough(summary: str = "Adds b.") -> WalkthroughResult:
 
 def _config(enabled: bool = True, mode: str = "section", title: str = "on_mention") -> MiraConfig:
     return MiraConfig.model_validate(
-        {"pr_summary": {"description": {"enabled": enabled, "mode": mode}, "title": {"mode": title}}}
+        {
+            "pr_summary": {
+                "description": {"enabled": enabled, "mode": mode},
+                "title": {"mode": title},
+            }
+        }
     )
 
 
@@ -274,7 +279,9 @@ def test_rendered_section_cannot_carry_a_command_or_a_marker() -> None:
     assert "@mira" not in content.lower()
     assert SUMMARY_END not in content
     assert "Adds b \\| c" in content  # table cells escaped
-    assert not pr_summary.opted_out(apply_description("", content, NAMES, mode="section") or "", NAMES)
+    assert not pr_summary.opted_out(
+        apply_description("", content, NAMES, mode="section") or "", NAMES
+    )
 
 
 # ── Providers ───────────────────────────────────────────────────────────────
@@ -366,7 +373,9 @@ async def test_forgejo_patches_title_and_body() -> None:
     provider._username = "mira"
     with patch("mira.providers.forgejo.httpx.AsyncClient", lambda *a, **k: _FakeClient(handler)):
         await provider.update_pr(_pr(platform="forgejo"), title="T")
-    assert calls == [("PATCH", "https://forge.example/api/v1/repos/acme/app/pulls/7", {"title": "T"})]
+    assert calls == [
+        ("PATCH", "https://forge.example/api/v1/repos/acme/app/pulls/7", {"title": "T"})
+    ]
 
 
 # ── Orchestration ───────────────────────────────────────────────────────────
@@ -615,7 +624,9 @@ async def test_incremental_review_does_not_hand_over_its_walkthrough(
 
     mock_config.return_value = _config()
     engine = MagicMock()
-    engine.review_pr = AsyncMock(return_value=ReviewResult(summary="ok", walkthrough=_walkthrough()))
+    engine.review_pr = AsyncMock(
+        return_value=ReviewResult(summary="ok", walkthrough=_walkthrough())
+    )
     engine.last_walkthrough_covers_pr = False
     engine.last_full_diff = DIFF
     engine.last_review_had_changes = True
@@ -709,7 +720,6 @@ def test_help_lists_describe() -> None:
     from mira.platforms.handlers import _help_message
 
     assert "`@mira describe`" in _help_message("mira")
-
 
 
 async def test_engine_reviews_the_authors_text_and_reports_coverage(monkeypatch) -> None:
