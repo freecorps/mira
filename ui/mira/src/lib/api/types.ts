@@ -810,6 +810,11 @@ export type AutofixMode = "branch_pr" | "pr_branch" | "handoff"
 
 export type AutofixRequestKind = "single" | "all"
 
+// What the job is for: a fix for one finding, or a finishing touch
+// (`@mira generate tests` / `@mira generate docstrings`). Rows written before
+// the column existed read back as "fix".
+export type AutofixJobKind = "fix" | "tests" | "docstrings"
+
 export interface AutofixReason {
   code: string
   message: string
@@ -840,6 +845,7 @@ export interface AutofixJobModel {
   state: AutofixJobState
   mode: AutofixMode
   request_kind: AutofixRequestKind
+  job_kind: AutofixJobKind
   platform: string
   owner: string
   repo: string

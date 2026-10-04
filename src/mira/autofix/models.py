@@ -78,6 +78,16 @@ RequestKind = Literal["single", "all"]
 
 REQUEST_KINDS: tuple[RequestKind, ...] = ("single", "all")
 
+# What the job is for. `fix` resolves one review finding. The finishing touches
+# — `tests` and `docstrings` — are PR-level requests that ride the same queue,
+# the same permission check, the same limits, the same validation and the same
+# delivery, and differ only in what the model is asked for and in one extra
+# structural guard each (tests may only touch test files; docstrings may only
+# touch comments and docstrings).
+JobKind = Literal["fix", "tests", "docstrings"]
+
+JOB_KINDS: tuple[JobKind, ...] = ("fix", "tests", "docstrings")
+
 # `suggest` generates, validates and *renders* a patch without writing anything
 # to the platform. It is the dry run this phase is rolled out with, and it is
 # what "autofix is enabled but nothing may be written yet" means.
@@ -111,6 +121,9 @@ class ReasonCode:
     REQUEST_LIMIT = "request_limit"
     CONCURRENCY_LIMIT = "concurrency_limit"
     MODE_NOT_PERMITTED = "mode_not_permitted"
+    FEATURE_DISABLED = "feature_disabled"
+    NOTHING_TO_TEST = "nothing_to_test"
+    NOTHING_TO_DOCUMENT = "nothing_to_document"
 
     # Refused while generating or applying.
     NO_PATCH = "no_patch"
@@ -126,6 +139,9 @@ class ReasonCode:
     TOO_MANY_FILES = "too_many_files"
     TOO_MANY_LINES = "too_many_lines"
     PATCH_TOO_LARGE = "patch_too_large"
+    NOT_A_TEST_FILE = "not_a_test_file"
+    BEHAVIOUR_CHANGED = "behaviour_changed"
+    OUT_OF_SCOPE = "out_of_scope"
     ATTEMPT_LIMIT = "attempt_limit"
     JOB_TIMEOUT = "job_timeout"
 
@@ -172,6 +188,9 @@ NON_RETRYABLE_CODES: frozenset[str] = frozenset(
         ReasonCode.FINDING_NOT_FOUND,
         ReasonCode.FINDING_OTHER_PR,
         ReasonCode.MODE_NOT_PERMITTED,
+        ReasonCode.FEATURE_DISABLED,
+        ReasonCode.NOTHING_TO_TEST,
+        ReasonCode.NOTHING_TO_DOCUMENT,
         ReasonCode.PATH_PROTECTED,
         ReasonCode.PATH_TRAVERSAL,
         ReasonCode.PATH_OUTSIDE_REPO,
@@ -352,6 +371,10 @@ class AutofixJob:
     state: JobState = "queued"
     mode: FixMode = "branch_pr"
     request_kind: RequestKind = "single"
+    # `fix`, or a finishing touch. Persisted, and part of the job key, so a
+    # `generate tests` and a `generate docstrings` on the same commit are two
+    # jobs rather than one.
+    job_kind: JobKind = "fix"
     platform: str = "github"
     owner: str = ""
     repo: str = ""
@@ -455,6 +478,7 @@ def job_key(
     head_sha: str,
     finding_id: str,
     mode: str,
+    job_kind: str = "fix",
 ) -> str:
     """Identity of one piece of correction work, for idempotent enqueueing.
 
@@ -464,8 +488,15 @@ def job_key(
     mode, because a finding re-raised after a push is a different fix, and a
     commit onto the pull request's branch is a different act from a stacked
     pull request.
+
+    ``job_kind`` joins the hash only when it is not ``fix``, so every key a
+    fix job was ever given stays the key it has: a finishing touch is a
+    different piece of work on the same commit, and a fix is still a fix.
     """
-    return _digest([platform, owner, repo, str(pr_number), head_sha, finding_id, mode])
+    parts = [platform, owner, repo, str(pr_number), head_sha, finding_id, mode]
+    if job_kind and job_kind != "fix":
+        parts.append(f"kind:{job_kind}")
+    return _digest(parts)
 
 
 def request_id(*, platform: str, owner: str, repo: str, pr_number: int, head_sha: str) -> str:
@@ -498,6 +529,8 @@ def branch_name(
     finding_id: str,
     request_kind: str = "single",
     title: str = "",
+    job_kind: str = "fix",
+    head_sha: str = "",
 ) -> str:
     """A deterministic, collision-resistant, git-legal branch name.
 
@@ -507,7 +540,22 @@ def branch_name(
     findings on one pull request must never share a branch — so the identity
     comes from the finding id, and the title is decoration that can be dropped
     entirely without changing which branch this is.
+
+    A finishing touch has no finding, so its identity is the kind of work and
+    the commit it was asked for on: ``<prefix>/pr-7/tests-1a2b3c4``. The commit
+    is part of it because a request after a push is new work on new code, and
+    stacking it onto the branch an older request made would mix the two.
     """
+    if job_kind and job_kind != "fix":
+        kind = sanitize_slug(job_kind, limit=16) or "touch"
+        sha = sanitize_slug(head_sha, limit=7)
+        leaf = f"{kind}-{sha}" if sha else kind
+        candidate = "/".join(
+            part for part in (prefix.strip("/"), f"pr-{int(pr_number)}", leaf) if part
+        )
+        if _INVALID_REF.search(candidate) or not candidate:
+            candidate = "/".join(["mira-fix", f"pr-{int(pr_number)}", leaf])
+        return candidate
     stem = sanitize_slug(finding_id.replace("-", ""), limit=12) or _digest([finding_id])[:12]
     parts = [prefix.strip("/"), f"pr-{int(pr_number)}"]
     if request_kind == "all":

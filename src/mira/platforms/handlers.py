@@ -188,6 +188,8 @@ def _help_message(bot_name: str) -> str:
         f"| `@{bot_name} config` | Show the effective configuration for this repository, with credentials omitted. Alias: `configuration`. |\n"
         f"| `@{bot_name} fix all` | Have Mira write fixes for the most serious open findings on this PR, each on its own branch and stacked PR. Bounded by a configured limit, and the reply lists whatever it left out. Disabled unless a maintainer turned autofix on. |\n"
         f"| `@{bot_name} describe` | Regenerate the PR description summary, and the title if it is just `@{bot_name}`. Needs `pr_summary.description.enabled` for the description. Alias: `summary`. |\n"
+        f"| `@{bot_name} generate tests` | Have Mira write tests for the code this PR changed, following the repo's existing test layout, on its own branch and stacked PR. Touches test files only. Aliases: `generate unit tests`, `tests`. Disabled unless autofix and `autofix.finishing_touches.tests` are on. |\n"
+        f"| `@{bot_name} generate docstrings` | Have Mira add docstrings to the public functions and classes this PR changed, on its own branch and stacked PR. A patch that changes anything but documentation is refused. Alias: `docstrings`. Disabled unless autofix and `autofix.finishing_touches.docstrings` are on. |\n"
         f"| `@{bot_name} help` | Show this message. Aliases: `?`, `commands`. |\n"
         f"| `@{bot_name} <anything else>` | Ask a free-form question about the PR. Mira will reply inline using the PR diff as context. |\n\n"
         f"On an inline review comment Mira posted, reply with `@{bot_name} reject` "

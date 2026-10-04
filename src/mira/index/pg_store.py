@@ -436,7 +436,8 @@ CREATE TABLE IF NOT EXISTS autofix_jobs (
     cancelled_by TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    job_kind TEXT NOT NULL DEFAULT 'fix'
 );
 
 CREATE INDEX IF NOT EXISTS idx_pg_autofix_jobs_claim
@@ -865,6 +866,12 @@ def _get_conn(url: str, *, read_only: bool = False) -> Any:
                 cur.execute(
                     "ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS pr_author "
                     "TEXT NOT NULL DEFAULT ''"
+                )
+                # The finishing touches' job kind. Rows written before it
+                # existed were all fixes, which is what the default says.
+                cur.execute(
+                    "ALTER TABLE autofix_jobs ADD COLUMN IF NOT EXISTS job_kind "
+                    "TEXT NOT NULL DEFAULT 'fix'"
                 )
             _schema_initialized = True
         return _pg_conn

@@ -95,6 +95,9 @@ class RequestOutcome:
     request_id: str = ""
     policy: EffectivePolicy | None = None
     mode: str = ""
+    # What a finishing touch will look at: the changed files it selected.
+    # Empty for a fix, whose scope is its findings.
+    scope: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -579,6 +582,23 @@ async def _run_phases(
     reload_config: Callable[[], MiraConfig] | None = None,
 ) -> RunResult:
     pr_info = await provider.get_pr_info(job.pr_url)
+    if job.job_kind != "fix":
+        # A finishing touch has no finding. It generates and applies under its
+        # own guards, then rejoins this pipeline at validation: the same
+        # checks, the same last read before the first write, the same publish.
+        from mira.autofix.finishing import run_finishing
+
+        return await run_finishing(
+            provider,
+            pr_info,
+            job,
+            policy,
+            config,
+            llm,
+            store,
+            recorder,
+            reload_config=reload_config,
+        )
     finding = store.get_review_finding(job.finding_id)
     if finding is None:
         return _fail(
@@ -627,6 +647,35 @@ async def _run_phases(
     except PatchRefused as exc:
         recorder.record("apply", "refused", reasons=[exc.reason])
         return _fail(store, job, recorder, "apply", [exc.reason], policy, record=False)
+    return await _validate_and_publish(
+        provider,
+        pr_info,
+        job,
+        patch,
+        policy,
+        store,
+        recorder,
+        reload_config=reload_config,
+    )
+
+
+async def _validate_and_publish(
+    provider: Any,
+    pr_info: Any,
+    job: AutofixJob,
+    patch: FixPatch,
+    policy: EffectivePolicy,
+    store: Any,
+    recorder: _Recorder,
+    *,
+    reload_config: Callable[[], MiraConfig] | None = None,
+) -> RunResult:
+    """Everything after an applied patch exists: validate, then publish.
+
+    Shared by fixes and finishing touches, so the evidence a patch needs and
+    the last checks before a write are one piece of code rather than two that
+    could drift apart.
+    """
     store.update_autofix_job(
         job.job_key,
         state="validating",
@@ -699,6 +748,25 @@ async def _run_phases(
                     ReasonCode.KILL_SWITCH,
                     "Assisted correction was turned off while this patch was being "
                     "prepared; nothing was written",
+                )
+            ],
+            policy,
+            patch=patch,
+        )
+    if not policy.allows_job_kind(job.job_kind):
+        # A finishing touch's own toggle is consulted at the same moment the
+        # kill switch is: turning `generate tests` off means no more tests are
+        # written, including by a job that was already running.
+        return _fail(
+            store,
+            job,
+            recorder,
+            "publish",
+            [
+                Reason(
+                    ReasonCode.FEATURE_DISABLED,
+                    f"`{job.job_kind}` finishing touches were turned off while this "
+                    "patch was being prepared; nothing was written",
                 )
             ],
             policy,

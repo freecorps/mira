@@ -34,6 +34,8 @@ type Draft = {
   allow_commit_to_pr_branch: boolean
   restrict_to_changed_files: boolean
   allow_new_files: boolean
+  finishing_tests: boolean
+  finishing_docstrings: boolean
   branch_prefix: string
   max_files: number
   max_lines: number
@@ -57,6 +59,8 @@ const EMPTY: Draft = {
   allow_commit_to_pr_branch: false,
   restrict_to_changed_files: true,
   allow_new_files: false,
+  finishing_tests: false,
+  finishing_docstrings: false,
   branch_prefix: "mira/fix",
   max_files: 3,
   max_lines: 120,
@@ -83,6 +87,18 @@ function toList(value: string): string[] {
     .filter(Boolean)
 }
 
+// `finishing_touches` is a nested block; read it defensively so a missing or
+// malformed one renders as "off" rather than breaking the form.
+function finishing(config: Record<string, unknown>): {
+  tests?: boolean
+  docstrings?: boolean
+} {
+  const block = config.finishing_touches
+  return block && typeof block === "object"
+    ? (block as { tests?: boolean; docstrings?: boolean })
+    : {}
+}
+
 function draftFrom(config: Record<string, unknown>): Draft {
   const pick = <T,>(key: string, fallback: T): T =>
     (config[key] as T | undefined) ?? fallback
@@ -106,6 +122,10 @@ function draftFrom(config: Record<string, unknown>): Draft {
       EMPTY.restrict_to_changed_files
     ),
     allow_new_files: pick("allow_new_files", EMPTY.allow_new_files),
+    finishing_tests: Boolean(finishing(config).tests ?? EMPTY.finishing_tests),
+    finishing_docstrings: Boolean(
+      finishing(config).docstrings ?? EMPTY.finishing_docstrings
+    ),
     branch_prefix: pick("branch_prefix", EMPTY.branch_prefix),
     max_files: pick("max_files", EMPTY.max_files),
     max_lines: pick("max_lines", EMPTY.max_lines),
@@ -137,6 +157,10 @@ function payloadFrom(draft: Draft): Record<string, unknown> {
     allow_commit_to_pr_branch: draft.allow_commit_to_pr_branch,
     restrict_to_changed_files: draft.restrict_to_changed_files,
     allow_new_files: draft.allow_new_files,
+    finishing_touches: {
+      tests: draft.finishing_tests,
+      docstrings: draft.finishing_docstrings,
+    },
     branch_prefix: draft.branch_prefix,
     max_files: Number(draft.max_files),
     max_lines: Number(draft.max_lines),
@@ -267,8 +291,7 @@ function PolicyForm({ config: data }: { config: AutofixConfigResponse }) {
   )
   const commands = useMemo(() => {
     const validation = data?.effective?.validation as
-      | { commands?: { name?: string; command?: string[] }[] }
-      | undefined
+      { commands?: { name?: string; command?: string[] }[] } | undefined
     return validation?.commands ?? []
   }, [data])
 
@@ -423,6 +446,18 @@ function PolicyForm({ config: data }: { config: AutofixConfigResponse }) {
               onChange={(value) => set("allow_new_files", value)}
             />
             <Toggle
+              label="Allow `@mira generate tests`"
+              hint="Writes tests for the changed code, touching test files only. Needs autofix on."
+              checked={draft.finishing_tests}
+              onChange={(value) => set("finishing_tests", value)}
+            />
+            <Toggle
+              label="Allow `@mira generate docstrings`"
+              hint="Documents changed public functions and classes; a patch that changes code is refused."
+              checked={draft.finishing_docstrings}
+              onChange={(value) => set("finishing_docstrings", value)}
+            />
+            <Toggle
               label="Run the worker in this process"
               hint="On for a single container. Off if you run `mira autofix-worker` separately."
               checked={draft.inline_worker}
@@ -526,7 +561,9 @@ function PolicyForm({ config: data }: { config: AutofixConfigResponse }) {
               <SelectContent>
                 <SelectItem value="blocker">Blockers only</SelectItem>
                 <SelectItem value="warning">Warnings and above</SelectItem>
-                <SelectItem value="suggestion">Suggestions and above</SelectItem>
+                <SelectItem value="suggestion">
+                  Suggestions and above
+                </SelectItem>
                 <SelectItem value="nitpick">Everything</SelectItem>
               </SelectContent>
             </Select>

@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import BackgroundTasks
 
 from mira.autofix.commands import FIX_KEYWORDS as _FIX_KEYWORDS
+from mira.autofix.commands import parse_finishing_command
 from mira.config import load_config
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
@@ -580,7 +581,11 @@ async def dispatch_github_event(
                     handle_pause_resume, payload, app_auth, bot_name, cmd_word
                 )
                 return "processing"
-            if cmd_word in _FIX_KEYWORDS:
+            # `generate tests` / `generate docstrings` write too, so they take
+            # the same handler as `fix all` rather than the free-form path.
+            if cmd_word in _FIX_KEYWORDS or (
+                parse_finishing_command(strip_mentions(comment_body, names)) is not None
+            ):
                 background_tasks.add_task(
                     handle_fix_request, payload, app_auth, bot_name, inline=False
                 )
@@ -862,18 +867,26 @@ async def handle_fix_request(
     The two entry points differ only in where the finding comes from and where
     the answer goes. On a review comment the finding is read from the hidden
     marker in the comment being replied to; on the pull request there is no
-    single finding, so only ``fix all`` is meaningful there.
+    single finding, so only ``fix all`` is meaningful there — along with the
+    finishing touches, ``generate tests`` and ``generate docstrings``, which
+    are pull-request-level by nature.
     """
     installation_id: int = payload.get("installation", {}).get("id", 0)
     try:
-        from mira.autofix.commands import handle_fix_command, parse_fix_command
+        from mira.autofix.commands import (
+            handle_finishing_command,
+            handle_fix_command,
+            parse_fix_command,
+        )
 
         comment = payload.get("comment", {})
         names = mention_names(bot_name, await app_auth.get_bot_identity())
-        parsed = parse_fix_command(strip_mentions(comment.get("body", ""), names))
-        if parsed is None:
+        text = strip_mentions(comment.get("body", ""), names)
+        finishing = None if inline else parse_finishing_command(text)
+        parsed = parse_fix_command(text)
+        if parsed is None and finishing is None:
             return
-        kind, mode = parsed
+        kind, mode = parsed or ("", "")
 
         owner = payload["repository"]["owner"]["login"]
         repo = payload["repository"]["name"]
@@ -886,6 +899,17 @@ async def handle_fix_request(
         # what a fix is anchored to, and a stub carrying "" for both would
         # produce a job keyed on nothing.
         pr_info = await provider.get_pr_info(pr_url)
+
+        if finishing is not None:
+            job_kind, finishing_mode = finishing
+            await handle_finishing_command(
+                provider,
+                pr_info,
+                actor=comment.get("user", {}).get("login", ""),
+                job_kind=job_kind,
+                mode=finishing_mode,
+            )
+            return
 
         original = ""
         reply = None

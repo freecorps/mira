@@ -56,6 +56,7 @@ import { api } from "@/lib/api"
 import type {
   AutofixCheck,
   AutofixJobDetail,
+  AutofixJobKind,
   AutofixJobModel,
   AutofixJobPage,
   AutofixJobState,
@@ -102,6 +103,24 @@ const STATE_ICON: Record<AutofixJobState, typeof CheckCircle2> = {
   failed: AlertTriangle,
   dead_letter: XCircle,
   cancelled: Ban,
+}
+
+const KIND_LABEL: Record<string, string> = {
+  fix: "Fix",
+  tests: "Tests",
+  docstrings: "Docstrings",
+}
+
+function KindBadge({ kind }: { kind?: string }) {
+  const value = kind || "fix"
+  return (
+    <Badge
+      variant={value === "fix" ? "outline" : "secondary"}
+      className="text-[10px]"
+    >
+      {KIND_LABEL[value] ?? value}
+    </Badge>
+  )
 }
 
 const MODE_LABEL: Record<string, string> = {
@@ -390,11 +409,18 @@ function JobDetail({
       </div>
 
       <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
-        <span>
-          Finding:{" "}
-          <span className="font-mono">{job.finding_id.slice(0, 12)}</span>
-          {job.finding_title ? ` — ${job.finding_title}` : ""}
-        </span>
+        {(job.job_kind ?? "fix") === "fix" ? (
+          <span>
+            Finding:{" "}
+            <span className="font-mono">{job.finding_id.slice(0, 12)}</span>
+            {job.finding_title ? ` — ${job.finding_title}` : ""}
+          </span>
+        ) : (
+          <span>
+            Task: {KIND_LABEL[job.job_kind] ?? job.job_kind}
+            {job.finding_title ? ` — ${job.finding_title}` : ""}
+          </span>
+        )}
         <span>Requested by @{job.requested_by || "unknown"}</span>
         <span>
           Delivery: {MODE_LABEL[job.mode] ?? job.mode}
@@ -515,6 +541,7 @@ function JobDetail({
 function JobHistory() {
   const [state, setState] = useState<string>(ALL)
   const [mode, setMode] = useState<string>(ALL)
+  const [kind, setKind] = useState<string>(ALL)
   const [repo, setRepo] = useState("")
   const [page, setPage] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
@@ -534,8 +561,9 @@ function JobHistory() {
       repo: repoName,
       state: state === ALL ? undefined : (state as AutofixJobState),
       mode: mode === ALL ? undefined : (mode as "branch_pr"),
+      jobKind: kind === ALL ? undefined : (kind as AutofixJobKind),
     }),
-    [owner, repoName, state, mode]
+    [owner, repoName, state, mode, kind]
   )
 
   const { data: summary, loading: summaryLoading } = useAsync<AutofixSummary>(
@@ -609,6 +637,23 @@ function JobHistory() {
                 <SelectItem value="handoff">Handed off</SelectItem>
               </SelectContent>
             </Select>
+            <Select
+              value={kind}
+              onValueChange={(value) => {
+                setKind(value)
+                setPage(0)
+              }}
+            >
+              <SelectTrigger className="h-9 w-40">
+                <SelectValue placeholder="Any kind" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL}>Any kind</SelectItem>
+                <SelectItem value="fix">Fixes</SelectItem>
+                <SelectItem value="tests">Tests</SelectItem>
+                <SelectItem value="docstrings">Docstrings</SelectItem>
+              </SelectContent>
+            </Select>
             <Button variant="outline" size="sm" onClick={refresh}>
               <RefreshCw className="mr-1 h-3.5 w-3.5" />
               Refresh
@@ -640,7 +685,7 @@ function JobHistory() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Pull request</TableHead>
-                  <TableHead>Finding</TableHead>
+                  <TableHead>Work</TableHead>
                   <TableHead>State</TableHead>
                   <TableHead>Result</TableHead>
                   <TableHead>Requested</TableHead>
@@ -679,12 +724,17 @@ function JobHistory() {
                         </span>
                       </TableCell>
                       <TableCell className="max-w-xs">
-                        <span className="block truncate text-sm">
-                          {job.finding_title || "—"}
+                        <span className="flex items-center gap-2">
+                          <KindBadge kind={job.job_kind} />
+                          <span className="block truncate text-sm">
+                            {job.finding_title || "—"}
+                          </span>
                         </span>
-                        <span className="font-mono text-xs text-muted-foreground">
-                          {job.finding_id.slice(0, 12)}
-                        </span>
+                        {job.finding_id && (
+                          <span className="font-mono text-xs text-muted-foreground">
+                            {job.finding_id.slice(0, 12)}
+                          </span>
+                        )}
                       </TableCell>
                       <TableCell>
                         <StateBadge state={job.state} />

@@ -3,6 +3,7 @@ import type {
   AutofixCancelResult,
   AutofixConfigResponse,
   AutofixJobDetail,
+  AutofixJobKind,
   AutofixJobPage,
   AutofixJobState,
   AutofixMode,
@@ -15,6 +16,7 @@ export interface AutofixJobFilters {
   platform?: string
   state?: AutofixJobState | ""
   mode?: AutofixMode | ""
+  jobKind?: AutofixJobKind | ""
   prNumber?: number
   requestedBy?: string
   findingId?: string
@@ -53,6 +55,7 @@ function filterParams(f: AutofixJobFilters) {
     platform: f.platform,
     state: f.state,
     mode: f.mode,
+    job_kind: f.jobKind,
     pr_number: f.prNumber,
     requested_by: f.requestedBy,
     finding_id: f.findingId,

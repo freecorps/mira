@@ -434,6 +434,29 @@ checks:
   #       - name: "ruff"
   #         enabled: false
 
+# ── Assisted correction (Phase 5) ─────────────────────────────────────────────
+#
+# `@mira fix`, `@mira fix all`, and the finishing touches `@mira generate tests`
+# and `@mira generate docstrings`. Off by default; start with `suggest`, which
+# generates and validates a patch and writes nothing. When it writes, it writes
+# to Mira's own branch and a stacked pull request, never to the default branch.
+#
+# NOTE: like the gate, autofix policy is deployment configuration — a block
+# committed inside a reviewed repository does not change it.
+#
+# Full reference: docs/autofix.md
+autofix:
+  mode: "off"                # off | suggest | on
+  # Each finishing touch is off on its own, even with `mode` on. Tests touch
+  # test files only; a docstring patch that changes code is refused.
+  finishing_touches:
+    tests: false             # @mira generate tests
+    docstrings: false        # @mira generate docstrings
+  # repositories:
+  #   acme/app:
+  #     mode: "on"
+  #     finishing_touches: { tests: true, docstrings: true }
+
 # ── Reviewer triage (Phase 7C) ────────────────────────────────────────────────
 #
 # What a change is, and who is closest to it. Mira suggests; a human decides.

@@ -80,6 +80,9 @@ _JOB_COLUMNS = (
     "error",
     "created_at",
     "updated_at",
+    # Added after the table shipped, so it is last: both stores add it with an
+    # `ALTER TABLE` on open, and an older row reads back as `fix`.
+    "job_kind",
 )
 
 _ATTEMPT_COLUMNS = (
@@ -120,6 +123,7 @@ def job_from_row(row: tuple) -> AutofixJob:
         state=str(data.get("state") or "queued"),  # type: ignore[arg-type]
         mode=str(data.get("mode") or "branch_pr"),  # type: ignore[arg-type]
         request_kind=str(data.get("request_kind") or "single"),  # type: ignore[arg-type]
+        job_kind=str(data.get("job_kind") or "fix"),  # type: ignore[arg-type]
         platform=str(data.get("platform") or "github"),
         owner=str(data.get("owner") or ""),
         repo=str(data.get("repo") or ""),
@@ -375,13 +379,14 @@ class AutofixStoreMixin:
             dumps(job.validation.as_dict()),
             created_at,
             job.updated_at or created_at,
+            job.job_kind or "fix",
         )
         columns = (
             "(job_key, state, mode, request_kind, platform, owner, repo, pr_number, "
             "pr_url, base_branch, head_branch, head_sha, finding_id, finding_title, "
             "requested_by, request_id, policy_version, attempts, max_attempts, "
             "ci_attempts, max_ci_attempts, available_at, model, reasons_json, "
-            "validation_json, created_at, updated_at)"
+            "validation_json, created_at, updated_at, job_kind)"
         )
         values = ", ".join("?" for _ in params)
         if max_active > 0:
@@ -444,6 +449,7 @@ class AutofixStoreMixin:
             ("request_id", "request_id"),
             ("head_sha", "head_sha"),
             ("request_kind", "request_kind"),
+            ("job_kind", "job_kind"),
         ):
             value = active.get(key)
             if value:
