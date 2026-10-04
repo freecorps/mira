@@ -585,6 +585,44 @@ def test_graph_definitions_of_qualified_names():
     assert [d.path for d in graph.definitions_of("B.run_job")] == ["b.py"]
 
 
+def test_graph_reads_survive_concurrent_parsing():
+    """The blast-radius task and the agentic tools share one graph: a worker
+    thread parsing into it must not break a scan the event loop is running."""
+    import threading
+
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        graph = CodeGraph(use_tree_sitter=False)
+        for i in range(2000):
+            graph.add_file(f"seed{i}.py", "def f():\n    pass\n")
+        stop = threading.Event()
+
+        def writer() -> None:
+            i = 0
+            while not stop.is_set():
+                graph.add_file(f"w{i}.py", "def g():\n    pass\n")
+                i += 1
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            for _ in range(300):
+                graph.definitions_of("f")
+                graph.references_to("f")
+        finally:
+            stop.set()
+            t.join()
+    finally:
+        sys.setswitchinterval(old)
+
+
+def test_graph_first_parse_wins():
+    graph = CodeGraph(use_tree_sitter=False)
+    first = graph.add_file("a.py", "def a():\n    pass\n")
+    assert graph.add_file("a.py", "def b():\n    pass\n") is first
+
+
 # ── Config ──
 
 

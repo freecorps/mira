@@ -475,7 +475,10 @@ class AgenticToolExecutor:
         )
         return f"`{path}`:\n```\n{numbered}{suffix}\n```"
 
-    async def _grep_repo(self, pattern: str, path_glob: str | None, path_only: bool) -> str:
+    async def _grep_repo(
+        self, pattern: str, path_glob: str | None, path_only: bool, *, scope: str | None = None
+    ) -> str:
+        """``scope`` narrows like the graph tools' ``path``: a glob, a directory or a file."""
         if not self.repo_tree:
             return "[grep unavailable: repo tree not loaded]"
 
@@ -484,6 +487,8 @@ class AgenticToolExecutor:
             candidates = [p for p in self.repo_tree if fnmatch.fnmatch(p, path_glob)]
         else:
             candidates = list(self.repo_tree)
+        if scope:
+            candidates = [p for p in candidates if match_path(p, scope)]
 
         if path_only:
             try:
@@ -620,11 +625,10 @@ class AgenticToolExecutor:
         return parsed, complete
 
     async def _text_fallback(self, name: str, scope: str | None, why: str) -> str:
-        glob = None
-        if scope:
-            glob = scope if any(ch in scope for ch in "*?[") else scope.rstrip("/") + "*"
+        # The same scope rules as the graph search: `src/api` is a directory,
+        # not the prefix of `src/apix`.
         found = await self._grep_repo(
-            rf"(?<![\w$]){re.escape(name)}(?![\w$])", glob, path_only=False
+            rf"(?<![\w$]){re.escape(name)}(?![\w$])", None, path_only=False, scope=scope
         )
         return f"[{why}; word-boundary text matches instead — comments and strings count]\n{found}"
 

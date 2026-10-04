@@ -609,6 +609,15 @@ class TestFindUsages:
         assert "src/api/routes.py:5" in out
 
     @pytest.mark.asyncio
+    async def test_fallback_directory_scope_is_not_a_prefix(self):
+        sources = dict(_GRAPH_SOURCES)
+        sources["src/apix/other.py"] = "charge_card(1)\n"
+        ex = AgenticToolExecutor(source_fetcher=_FakeFetcher(sources), repo_tree=list(sources))
+        out = await ex.execute("find_usages", {"symbol": "charge_card", "path": "src/api"})
+        assert "src/api/routes.py:5" in out
+        assert "src/apix/other.py" not in out
+
+    @pytest.mark.asyncio
     async def test_works_without_tree_sitter(self, monkeypatch):  # type: ignore[no-untyped-def]
         import sys
 

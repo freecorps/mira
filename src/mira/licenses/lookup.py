@@ -166,25 +166,30 @@ def _composer_license(data: Any, name: str, version: str) -> str:
 
 
 async def _lookup_one(fetcher: Fetcher, kind: str, name: str, version: str) -> tuple[str, str]:
-    """``(raw license, source)`` from the package's registry, ``("", "")`` when none."""
+    """``(raw license, source)`` from the package's registry.
+
+    ``("", "")`` — no source — when the registry did not answer (a network
+    error, a timeout, an error status, the budget spent): that is not "the
+    registry had none", so the caller must not cache it.
+    """
     if kind == "npm":
         base = f"https://registry.npmjs.org/{quote(name, safe='@/')}"
         data = await fetcher.json(f"{base}/{quote(version, safe='')}") if version else None
         if data is None:
             data = await fetcher.json(f"{base}/latest")
-        return _npm_license(data), "npm"
+        return ("", "") if data is None else (_npm_license(data), "npm")
     if kind == "pip":
         base = f"https://pypi.org/pypi/{quote(name, safe='')}"
         data = await fetcher.json(f"{base}/{quote(version, safe='')}/json") if version else None
         if data is None:
             data = await fetcher.json(f"{base}/json")
-        return _pypi_license(data), "pypi"
+        return ("", "") if data is None else (_pypi_license(data), "pypi")
     if kind == "rust":
         base = f"https://crates.io/api/v1/crates/{quote(name, safe='')}"
         data = await fetcher.json(f"{base}/{quote(version, safe='')}") if version else None
         if data is None:
             data = await fetcher.json(base)
-        return _crates_license(data), "crates.io"
+        return ("", "") if data is None else (_crates_license(data), "crates.io")
     if kind == "go":
         if not version:
             return "", ""
@@ -193,6 +198,8 @@ async def _lookup_one(fetcher: Fetcher, kind: str, name: str, version: str) -> t
             f"https://api.deps.dev/v3/systems/go/packages/{quote(name, safe='')}"
             f"/versions/{quote(v, safe='')}"
         )
+        if data is None:
+            return "", ""
         licenses = (data or {}).get("licenses") if isinstance(data, dict) else None
         if isinstance(licenses, list):
             names = [x for x in licenses if isinstance(x, str) and x and x != "non-standard"]
@@ -200,7 +207,7 @@ async def _lookup_one(fetcher: Fetcher, kind: str, name: str, version: str) -> t
         return "", "deps.dev"
     if kind == "composer":
         data = await fetcher.json(f"https://repo.packagist.org/p2/{quote(name, safe='/')}.json")
-        return _composer_license(data, name, version), "packagist"
+        return ("", "") if data is None else (_composer_license(data, name, version), "packagist")
     return "", ""
 
 

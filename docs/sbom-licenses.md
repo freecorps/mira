@@ -89,6 +89,9 @@ GET /api/repos/{owner}/{repo}/sbom?format=cyclonedx|spdx&spec_version=1.5|1.6
 GET /api/sbom?format=cyclonedx|spdx&spec_version=1.5|1.6     # every tracked repository
 ```
 
+`spec_version` is the CycloneDX version; SPDX output is always 2.3, and
+`format=spdx` also takes `spec_version=2.3`.
+
 Both answer a file download (`application/vnd.cyclonedx+json` or
 `application/spdx+json`). They never contact a registry — a page load should
 not be as slow as the slowest registry — so licenses are those the lockfiles

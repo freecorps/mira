@@ -30,6 +30,7 @@ from mira.licenses.expressions import (
 from mira.sbom.inventory import DIRECT, Component, RepoInventory
 
 CYCLONEDX_VERSIONS = ("1.5", "1.6")
+SPDX_VERSIONS = ("2.3",)
 FORMATS = ("cyclonedx", "spdx")
 
 
@@ -112,6 +113,28 @@ def _cdx_component(component: Component, repos: list[str] | None = None) -> dict
     return out
 
 
+def _merged_components(inventories: list[RepoInventory]) -> dict[str, Component]:
+    """One component per purl across ``inventories``.
+
+    A package is development-only when every repository (and manifest) lists
+    it so, and direct when any lists it directly: a runtime dependency of one
+    repository must not be emitted as ``excluded`` because another repository
+    only tests with it.
+    """
+    merged: dict[str, Component] = {}
+    for inv in inventories:
+        for comp in inv.components:
+            seen = merged.get(comp.purl)
+            if seen is None:
+                merged[comp.purl] = comp
+                continue
+            dev = seen.dev and comp.dev
+            scope = DIRECT if DIRECT in (seen.scope, comp.scope) else seen.scope
+            if dev != seen.dev or scope != seen.scope:
+                merged[comp.purl] = replace(seen, dev=dev, scope=scope)
+    return merged
+
+
 def to_cyclonedx(
     inventories: list[RepoInventory],
     *,
@@ -130,6 +153,7 @@ def to_cyclonedx(
     root_ref = f"mira:subject:{subject}"
     root = {"type": "application", "bom-ref": root_ref, "name": subject}
 
+    merged = _merged_components(inventories)
     components: dict[str, dict] = {}
     used_by: dict[str, list[str]] = {}
     dependencies: list[dict] = []
@@ -146,7 +170,7 @@ def to_cyclonedx(
             if inv.name not in used_by[ref]:
                 used_by[ref].append(inv.name)
             if ref not in components:
-                components[ref] = _cdx_component(comp)
+                components[ref] = _cdx_component(merged[ref])
             if comp.scope == DIRECT and ref not in direct:
                 direct.append(ref)
         dependencies.append({"ref": owner_ref, "dependsOn": direct})

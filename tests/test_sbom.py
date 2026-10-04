@@ -281,6 +281,35 @@ def test_cyclonedx_rejects_unknown_spec_version() -> None:
         to_cyclonedx([], spec_version="1.4")
 
 
+def test_org_cyclonedx_shared_component_is_dev_only_if_dev_everywhere() -> None:
+    from mira.sbom.inventory import Component, RepoInventory
+
+    def comp(dev: bool, scope: str) -> Component:
+        return Component("npm", "left-pad", "1.3.0", scope=scope, dev=dev)
+
+    for first, second in (
+        ((True, TRANSITIVE), (False, DIRECT)),
+        ((False, DIRECT), (True, TRANSITIVE)),
+    ):
+        doc = to_cyclonedx(
+            [RepoInventory("o/a", [comp(*first)]), RepoInventory("o/b", [comp(*second)])],
+            name="o",
+        )
+        lib = next(c for c in doc["components"] if c["name"] == "left-pad")
+        assert lib["scope"] == "required"
+        props = lib["properties"]
+        assert {"name": "mira:dependency", "value": DIRECT} in props
+        assert {"name": "mira:dev", "value": "true"} not in props
+        assert [p["value"] for p in props if p["name"] == "mira:repository"] == ["o/a", "o/b"]
+
+    both_dev = to_cyclonedx(
+        [RepoInventory("o/a", [comp(True, DIRECT)]), RepoInventory("o/b", [comp(True, DIRECT)])],
+        name="o",
+    )
+    lib = next(c for c in both_dev["components"] if c["name"] == "left-pad")
+    assert lib["scope"] == "excluded"
+
+
 # ── SPDX ─────────────────────────────────────────────────────────────
 
 _SPDX_ID = re.compile(r"^SPDXRef-[A-Za-z0-9.\-]+$")
@@ -545,6 +574,48 @@ async def test_api_org_sbom(store, api_registry) -> None:
     doc = json.loads(resp.body)
     _check_cyclonedx(doc, "1.6")
     assert any(c["name"] == "acme/api" for c in doc["components"])
+
+
+async def test_api_spdx_takes_its_own_spec_version(store, api_registry) -> None:
+    from mira.dashboard.routers.sbom import get_org_sbom, get_repo_sbom
+
+    resp = await get_repo_sbom("acme", "api", format="spdx", spec_version="2.3")
+    _check_spdx(json.loads(resp.body))
+    _check_spdx(json.loads((await get_org_sbom(format="spdx", spec_version="2.3")).body))
+    with pytest.raises(HTTPException) as exc:
+        await get_repo_sbom("acme", "api", format="cyclonedx", spec_version="2.3")
+    assert exc.value.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        await get_repo_sbom("acme", "api", format="spdx", spec_version="3.0")
+    assert exc.value.status_code == 400
+
+
+async def test_api_org_sbom_skips_a_repo_whose_inventory_fails(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mira.dashboard import api
+    from mira.dashboard.routers import sbom as sbom_router
+
+    class _Two(_Registry):
+        def list_repos(self):
+            return [
+                SimpleNamespace(owner="acme", repo="broken", platform="github"),
+                SimpleNamespace(owner="acme", repo="api", platform="github"),
+            ]
+
+    monkeypatch.setattr(api, "_app_db", _Two())
+    real = sbom_router.build_repo_inventory
+
+    async def flaky(store, label, *args, **kwargs):
+        if label.endswith("broken"):
+            raise sqlite3.OperationalError("no such table: packages")
+        return await real(store, label, *args, **kwargs)
+
+    monkeypatch.setattr(sbom_router, "build_repo_inventory", flaky)
+    doc = json.loads((await sbom_router.get_org_sbom(format="cyclonedx", spec_version="1.6")).body)
+    names = {c["name"] for c in doc["components"]}
+    assert "acme/api" in names
+    assert "acme/broken" not in names
 
 
 def test_api_packages_carry_licenses(store, api_registry) -> None:

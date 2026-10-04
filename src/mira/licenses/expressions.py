@@ -271,6 +271,12 @@ class Node:
             return [self.value]
         return [i for c in self.children for i in c.ids()]
 
+    def exceptions(self) -> list[str]:
+        """The ``WITH`` exceptions named anywhere in the expression."""
+        if self.op == "id":
+            return [self.exception] if self.exception else []
+        return [e for c in self.children for e in c.exceptions()]
+
     def render(self) -> str:
         if self.op == "id":
             return f"{self.value} WITH {self.exception}" if self.exception else self.value
@@ -416,12 +422,15 @@ def normalize(raw: str | None) -> str:
 
 
 def is_spdx_expression(expression: str) -> bool:
-    """Whether every identifier in ``expression`` is a recognised SPDX id or a LicenseRef."""
+    """Whether every identifier in ``expression`` is a recognised SPDX id or a LicenseRef,
+    and every ``WITH`` exception a recognised SPDX exception or an AdditionRef."""
     try:
         node = parse_expression(expression)
     except LicenseParseError:
         return False
-    return all(i in SPDX_IDS or i.startswith("LicenseRef-") for i in node.ids())
+    return all(i in SPDX_IDS or i.startswith("LicenseRef-") for i in node.ids()) and all(
+        e in SPDX_EXCEPTIONS or e.startswith("AdditionRef-") for e in node.exceptions()
+    )
 
 
 def license_ref(text: str) -> str:
