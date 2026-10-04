@@ -17,6 +17,7 @@ from fastapi import BackgroundTasks
 from mira.autofix.commands import FIX_KEYWORDS as _FIX_KEYWORDS
 from mira.autofix.commands import parse_finishing_command
 from mira.config import load_config
+from mira.core.issue_planner import is_plan_command
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
     feedback_ack,
@@ -592,6 +593,32 @@ async def dispatch_github_event(
                 return "processing"
             background_tasks.add_task(handle_comment, payload, app_auth, bot_name)
             return "processing"
+        if "pull_request" not in payload.get("issue", {}) and is_plan_command(comment_body, names):
+            if author_is_filtered(
+                comment_user, cfg.filter.allowed_authors, cfg.filter.blocked_authors
+            ):
+                logger.debug("plan command skipped — author %s filtered", comment_user)
+                return "ignored"
+            background_tasks.add_task(handle_issue_plan, payload, app_auth, bot_name, explicit=True)
+            return "processing"
+
+    # A new issue gets an implementation plan when the planner is on. Checked
+    # here so a repository with it off pays for no token and no task.
+    if event == "issues" and action == "opened":
+        issue = payload.get("issue", {}) or {}
+        sender = payload.get("sender", {}) or {}
+        planner = cfg.issue_planner
+        if not (planner.enabled and planner.auto_on_open) or "pull_request" in issue:
+            return "ignored"
+        login = sender.get("login", "")
+        if _is_bot_user(sender) or _is_bot_user(issue.get("user") or {}):
+            logger.debug("Ignoring issue opened by a bot (%s)", login)
+            return "ignored"
+        if author_is_filtered(login, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
+            logger.debug("issue plan skipped — author %s filtered", login)
+            return "ignored"
+        background_tasks.add_task(handle_issue_plan, payload, app_auth, bot_name, explicit=False)
+        return "processing"
 
     if event == "pull_request_review_comment" and action == "created":
         rc_body = payload.get("comment", {}).get("body", "")
@@ -853,6 +880,40 @@ async def handle_comment(
         )
     except Exception:
         logger.exception("Error handling comment event")
+
+
+async def handle_issue_plan(
+    payload: dict[str, Any],
+    app_auth: GitHubAppAuth,
+    bot_name: str,
+    *,
+    explicit: bool,
+) -> None:
+    """Write or refresh the implementation plan on an issue (see core.issue_planner)."""
+    from mira.core.issue_planner import run_issue_plan
+
+    installation_id: int = payload.get("installation", {}).get("id", 0)
+    try:
+        owner = payload["repository"]["owner"]["login"]
+        repo = payload["repository"]["name"]
+        number = int(payload["issue"]["number"])
+        actor = (payload.get("comment") or {}).get("user", {}).get("login", "") if explicit else ""
+        token = await app_auth.get_installation_token(installation_id)
+        provider = create_provider("github", token)
+        await run_issue_plan(
+            provider,
+            owner,
+            repo,
+            number,
+            platform="github",
+            bot_name=bot_name,
+            bot_identity=await app_auth.get_bot_identity(),
+            explicit=explicit,
+            actor=actor,
+            fetcher=make_fetcher("github", token),
+        )
+    except Exception:
+        logger.exception("Error handling issue plan")
 
 
 async def handle_fix_request(

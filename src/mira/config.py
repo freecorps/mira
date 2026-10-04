@@ -1361,6 +1361,42 @@ class PRSummaryConfig(BaseModel):
     title: PRTitleConfig = Field(default_factory=PRTitleConfig)
 
 
+class IssuePlannerConfig(BaseModel):
+    """An implementation plan posted on new issues. See docs/issue-planner.md.
+
+    Off by default: a comment on every issue a repository receives is a
+    decision a team makes, not one Mira makes for it.
+
+      enabled       — master switch; nothing is planned while it is false
+      auto_on_open  — plan when an issue is opened; ``@mira plan`` on an
+                      issue works either way while ``enabled`` is true
+      labels        — plan an opened issue only when it carries one of these
+                      (empty: every issue); an explicit ``@mira plan`` is not
+                      held to this list
+      ignore_labels — never plan an issue carrying one of these, on open or
+                      on command
+      max_files     — how many likely files the plan lists (1-25)
+    """
+
+    enabled: bool = False
+    auto_on_open: bool = True
+    labels: list[str] = Field(default_factory=list)
+    ignore_labels: list[str] = Field(default_factory=list)
+    max_files: int = 8
+
+    @field_validator("max_files")
+    @classmethod
+    def _bounded_files(cls, v: int) -> int:
+        if not 1 <= v <= 25:
+            raise ValueError(f"issue_planner.max_files must be between 1 and 25, got {v}")
+        return v
+
+    @field_validator("labels", "ignore_labels")
+    @classmethod
+    def _clean_labels(cls, v: list[str]) -> list[str]:
+        return [label.strip() for label in v if label and label.strip()]
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -1375,6 +1411,7 @@ class MiraConfig(BaseModel):
     triage: TriageConfig = Field(default_factory=TriageConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     pr_summary: PRSummaryConfig = Field(default_factory=PRSummaryConfig)
+    issue_planner: IssuePlannerConfig = Field(default_factory=IssuePlannerConfig)
 
     @model_validator(mode="after")
     def _apply_review_profile(self) -> MiraConfig:

@@ -67,6 +67,15 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - `@mira describe` regenerates on demand; respects `@mira ignore` and paused PRs
 - GitHub, GitLab and Forgejo; [configuration and behavior](docs/pr-summary.md)
 
+## Issue planner
+
+- Opt-in implementation plan on new issues (`issue_planner.enabled`), or on demand with `@mira plan` on an issue
+- Summary of the ask, ranked likely files, ordered steps, risks and open questions, suggested tests
+- Files ranked from the repository index (paths, summaries, symbols); path search over the file tree when unindexed; the model can only pick files that exist
+- One comment per issue, found by a hidden marker and edited on re-runs
+- Label allowlist and ignore list, author filters, `@mira ignore` in the issue body; the issue is read as untrusted, bounded input
+- GitHub, GitLab and Forgejo; [configuration and behavior](docs/issue-planner.md)
+
 ## Learning from feedback
 
 - Stable finding provenance for replies, explicit rejects, and supported 👍/👎 reactions

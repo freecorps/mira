@@ -974,6 +974,37 @@ class ForgejoProvider(BaseProvider):
             repo=repo or pr_info.repo,
         )
 
+    async def find_issue_comment(self, issue_ref: PRInfo, marker: str) -> int | None:
+        """The token user's own comment on the issue carrying ``marker``."""
+        me = await self._self_username()
+        try:
+            comments = await self._paginate(
+                f"{self._repo(issue_ref)}/issues/{int(issue_ref.number)}/comments"
+            )
+        except Exception as e:
+            raise ProviderError(f"Failed to list issue comments: {e}") from e
+        for comment in comments:
+            author = (comment.get("user") or {}).get("login") or ""
+            if me and author != me:
+                continue
+            if marker in (comment.get("body") or ""):
+                return int(comment["id"])
+        return None
+
+    async def post_issue_comment(self, issue_ref: PRInfo, body: str) -> None:
+        await self._request(
+            "POST",
+            f"{self._repo(issue_ref)}/issues/{int(issue_ref.number)}/comments",
+            json={"body": body},
+        )
+
+    async def update_issue_comment(self, issue_ref: PRInfo, comment_id: int, body: str) -> None:
+        await self._request(
+            "PATCH",
+            f"{self._repo(issue_ref)}/issues/comments/{int(comment_id)}",
+            json={"body": body},
+        )
+
     async def get_ci_failures(
         self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
     ) -> list[CIJobFailure]:

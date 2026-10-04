@@ -51,6 +51,9 @@ LABELS = (
     # Upstream release notes for a bumped dependency, and what a model made of
     # them: written by the package's maintainers, not by anyone Mira trusts.
     "RELEASE-NOTES",
+    # An issue's title and body, read when Mira writes an implementation plan
+    # for it: written by anyone who can open an issue.
+    "ISSUE",
 )
 
 
