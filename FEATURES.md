@@ -55,6 +55,16 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Deterministic execution on GitHub, GitLab and Forgejo events, independent of AI review settings
 - Admin-only editing and audit trail; [configuration and behavior](docs/automatic-labels.md)
 
+## Generated PR description and title
+
+- Opt-in summary section in the PR description, between `<!-- mira:summary:start -->` / `<!-- mira:summary:end -->`, refreshed on each push; everything outside it is left byte for byte
+- `section` mode appends or refreshes the section; `empty_only` fills only a body with no human text
+- `@mira summary` in the description places the section there
+- Reuses the review's walkthrough on the first review, so the description costs no extra model call
+- Title generated when the title is just `@mira` (or the bot's platform handle), or on the first review with `title.mode: always`; a human-set title is never overwritten
+- `@mira describe` regenerates on demand; respects `@mira ignore` and paused PRs
+- GitHub, GitLab and Forgejo; [configuration and behavior](docs/pr-summary.md)
+
 ## Learning from feedback
 
 - Stable finding provenance for replies, explicit rejects, and supported 👍/👎 reactions

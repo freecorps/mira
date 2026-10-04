@@ -41,6 +41,9 @@ LABELS = (
     "CI",
     "REPLY",
     "COMMENT",
+    # A pull request's own title and description, quoted when Mira writes a
+    # title for it.
+    "PR",
     # Everything the read-only MCP server hands back. Its consumer is another
     # model, reading data that came out of a repository, so the same line has
     # to be drawn there.

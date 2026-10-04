@@ -394,6 +394,22 @@ class GitLabProvider(BaseProvider):
     async def update_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
         await self._request("PUT", f"{self._mr(pr_info)}/notes/{comment_id}", data={"body": body})
 
+    async def update_pr(
+        self,
+        pr_info: PRInfo,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> None:
+        fields: dict[str, str] = {}
+        if title is not None:
+            fields["title"] = title
+        if body is not None:
+            fields["description"] = body
+        if not fields:
+            return
+        await self._request("PUT", self._mr(pr_info), json=fields)
+
     async def get_comment_body(self, pr_info: PRInfo, comment_id: int) -> str:
         """Fetch an MR note's body by id. Best-effort."""
         try:

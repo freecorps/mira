@@ -132,6 +132,21 @@ class BaseProvider(abc.ABC):
     async def update_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
         """Edit an existing comment by its ID."""
 
+    async def update_pr(
+        self,
+        pr_info: PRInfo,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> None:
+        """Set the pull request's title and/or description.
+
+        ``None`` leaves that field alone, so a title-only update cannot clear
+        the body. Callers decide *whether* to write — this only writes. A
+        provider without the capability raises rather than pretending.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot update pull requests")
+
     @abc.abstractmethod
     async def resolve_outdated_review_threads(self, pr_info: PRInfo) -> int:
         """Resolve all unresolved review threads authored by this bot. Returns count resolved."""

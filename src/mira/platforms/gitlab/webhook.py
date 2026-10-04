@@ -134,6 +134,7 @@ async def handle_merge_request(payload: dict[str, Any], auth: PlatformAuth, bot_
             bot_name,
             platform="gitlab",
             pr_title=attrs.get("title", "") or "",
+            bot_identity=await auth.get_bot_identity(),
         )
     except Exception:
         logger.exception("Error handling GitLab merge_request event for %s/%s!%s", owner, repo, iid)
@@ -351,7 +352,16 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
 
         # General MR comment → review / help / Q&A.
         await run_pr_command(
-            provider, owner, repo, iid, mr_url, question, actor, bot_name, platform="gitlab"
+            provider,
+            owner,
+            repo,
+            iid,
+            mr_url,
+            question,
+            actor,
+            bot_name,
+            platform="gitlab",
+            bot_identity=await auth.get_bot_identity(),
         )
     except Exception:
         logger.exception("Error handling GitLab note on %s/%s!%s", owner, repo, iid)

@@ -30,6 +30,7 @@ from mira.core.passes import (
     security_review_pass,
     self_critique,
 )
+from mira.core.pr_summary import strip_summary_section
 from mira.core.priority import rank_files
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
@@ -493,6 +494,13 @@ class ReviewEngine:
         # `report_review_failure`.
         self._status = ReviewStatusReporter(provider, config, dry_run=dry_run)
         self._pr_info: PRInfo | None = None
+        # Read by the PR-summary writer once `review_pr` returns: the whole
+        # pull request's diff, whether this review's walkthrough covered all
+        # of it (an incremental round's covers only the new commits), and
+        # whether there was anything new to review at all.
+        self.last_full_diff = ""
+        self.last_walkthrough_covers_pr = False
+        self.last_review_had_changes = True
 
     def _output_reserve(self) -> int:
         """Context left free for the answer when sizing a review prompt.
@@ -981,11 +989,16 @@ class ReviewEngine:
             thread_task.cancel()
             raise
 
+        self.last_full_diff = full_diff_text
+        self.last_walkthrough_covers_pr = diff_text == full_diff_text and not is_review_rest
+        self.last_review_had_changes = bool(diff_text.strip())
+
         try:
             result = await self._review_diff_internal(
                 diff_text,
                 pr_title=pr_info.title,
-                pr_description=pr_info.description,
+                # Mira's own summary section is not the author's intent.
+                pr_description=strip_summary_section(pr_info.description),
                 on_walkthrough_ready=_on_walkthrough_ready,
                 review_round=review_round,
                 resolved_threads=resolved_thread_dicts or None,
