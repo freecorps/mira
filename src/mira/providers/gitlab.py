@@ -836,6 +836,39 @@ class GitLabProvider(BaseProvider):
             repo=repo or pr_info.repo,
         )
 
+    def _issue_notes(self, issue_ref: PRInfo) -> str:
+        return f"{self._project(issue_ref)}/issues/{int(issue_ref.number)}/notes"
+
+    async def find_issue_comment(self, issue_ref: PRInfo, marker: str) -> int | None:
+        """The token user's own note on the issue carrying ``marker``.
+
+        GitLab keeps issue notes apart from merge-request notes, so this cannot
+        reuse ``find_bot_comment``. A note by anyone else is skipped even when
+        it quotes the marker.
+        """
+        me = await self._self_username()
+        try:
+            notes = await self._paginate(self._issue_notes(issue_ref))
+        except Exception as e:
+            raise ProviderError(f"Failed to list issue notes: {e}") from e
+        for note in notes:
+            if note.get("system"):
+                continue
+            author = (note.get("author") or {}).get("username") or ""
+            if me and author != me:
+                continue
+            if marker in (note.get("body") or ""):
+                return int(note["id"])
+        return None
+
+    async def post_issue_comment(self, issue_ref: PRInfo, body: str) -> None:
+        await self._request("POST", self._issue_notes(issue_ref), data={"body": body})
+
+    async def update_issue_comment(self, issue_ref: PRInfo, comment_id: int, body: str) -> None:
+        await self._request(
+            "PUT", f"{self._issue_notes(issue_ref)}/{int(comment_id)}", data={"body": body}
+        )
+
     async def get_ci_failures(
         self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
     ) -> list[CIJobFailure]:

@@ -371,6 +371,29 @@ class BaseProvider(abc.ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot read issues")
 
+    # ── Issue comments (the issue planner) ──
+    #
+    # ``issue_ref`` is a repository locator in PRInfo form whose ``number`` is
+    # the issue's. On GitHub and Forgejo a pull request is an issue and these
+    # could reuse the pull-request comment calls; GitLab keeps issue notes and
+    # merge-request notes apart, so the interface keeps them apart too.
+
+    async def find_issue_comment(self, issue_ref: PRInfo, marker: str) -> int | None:
+        """The id of a comment *this bot* wrote on the issue containing ``marker``.
+
+        Only the bot's own comments count: an issue is open to anybody, and a
+        human who pastes the marker must not have their comment taken over.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot read issue comments")
+
+    async def post_issue_comment(self, issue_ref: PRInfo, body: str) -> None:
+        """Post a comment on the issue."""
+        raise NotImplementedError(f"{type(self).__name__} cannot comment on issues")
+
+    async def update_issue_comment(self, issue_ref: PRInfo, comment_id: int, body: str) -> None:
+        """Edit a comment on the issue."""
+        raise NotImplementedError(f"{type(self).__name__} cannot edit issue comments")
+
     async def get_ci_failures(
         self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
     ) -> list[CIJobFailure]:

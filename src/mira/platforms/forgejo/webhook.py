@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from mira.config import load_config
+from mira.core.issue_planner import is_plan_command
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
     feedback_ack,
@@ -451,6 +452,38 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
         )
 
 
+async def handle_forgejo_issue_plan(
+    payload: dict[str, Any], auth: PlatformAuth, bot_name: str, *, explicit: bool
+) -> None:
+    """Write or refresh the implementation plan on a Forgejo issue."""
+    from mira.core.issue_planner import run_issue_plan
+
+    try:
+        owner, repo = _split_repo_path(payload.get("repository", {}).get("full_name", ""))
+    except ValueError:
+        return
+    number = int((payload.get("issue") or {}).get("number") or 0)
+    if not number:
+        return
+    actor = (payload.get("sender") or {}).get("login", "") if explicit else ""
+    try:
+        token = await auth.get_token()
+        await run_issue_plan(
+            create_provider("forgejo", token),
+            owner,
+            repo,
+            number,
+            platform="forgejo",
+            bot_name=bot_name,
+            bot_identity=await auth.get_bot_identity(),
+            explicit=explicit,
+            actor=actor,
+            fetcher=make_fetcher("forgejo", token),
+        )
+    except Exception:
+        logger.exception("Error handling Forgejo issue plan for %s/%s#%s", owner, repo, number)
+
+
 async def dispatch_forgejo_event(
     event: str,
     payload: dict[str, Any],
@@ -503,9 +536,36 @@ async def dispatch_forgejo_event(
         background_tasks.add_task(handle_forgejo_push, payload, auth, bot_name)
         return "processing"
 
+    # A new issue gets an implementation plan when the planner is on.
+    if event == "issues":
+        issue = payload.get("issue", {}) or {}
+        if payload.get("action") != "opened" or issue.get("pull_request"):
+            return "ignored"
+        if not (cfg.issue_planner.enabled and cfg.issue_planner.auto_on_open):
+            return "ignored"
+        if author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
+            logger.debug("issue plan skipped — author %s filtered", actor)
+            return "ignored"
+        background_tasks.add_task(
+            handle_forgejo_issue_plan, payload, auth, bot_name, explicit=False
+        )
+        return "processing"
+
     if event == "issue_comment":
         if payload.get("is_pull") is not True:
-            return "ignored"
+            names = mention_names(bot_name, bot_identity)
+            comment_body = payload.get("comment", {}).get("body", "") or ""
+            if payload.get("action", "created") != "created" or not is_plan_command(
+                comment_body, names
+            ):
+                return "ignored"
+            if author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
+                logger.debug("plan command skipped — author %s filtered", actor)
+                return "ignored"
+            background_tasks.add_task(
+                handle_forgejo_issue_plan, payload, auth, bot_name, explicit=True
+            )
+            return "processing"
         names = mention_names(bot_name, bot_identity)
         comment_body = payload.get("comment", {}).get("body", "") or ""
         is_inline_reply = bool(payload.get("comment", {}).get("in_reply_to_id"))

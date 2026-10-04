@@ -1712,6 +1712,53 @@ class GitHubProvider(BaseProvider):
 
         return await asyncio.to_thread(_fetch)
 
+    async def find_issue_comment(self, issue_ref: PRInfo, marker: str) -> int | None:
+        """The bot's own comment carrying ``marker``.
+
+        Mira comments on GitHub as an App, so its comments are authored by a
+        ``Bot`` account. A human's comment that quotes the marker is skipped:
+        editing it would fail, and it is not Mira's to edit anyway.
+        """
+
+        @_retry_transient
+        def _find() -> int | None:
+            gh_repo = self._github.get_repo(f"{issue_ref.owner}/{issue_ref.repo}")
+            issue = gh_repo.get_issue(issue_ref.number)
+            for comment in issue.get_comments():
+                user = getattr(comment, "user", None)
+                if getattr(user, "type", "") != "Bot":
+                    continue
+                if marker in (comment.body or ""):
+                    return int(comment.id)
+            return None
+
+        try:
+            return await asyncio.to_thread(_find)
+        except Exception as e:
+            raise ProviderError(f"Failed to list issue comments: {e}") from e
+
+    async def post_issue_comment(self, issue_ref: PRInfo, body: str) -> None:
+        @_retry_transient
+        def _post() -> None:
+            gh_repo = self._github.get_repo(f"{issue_ref.owner}/{issue_ref.repo}")
+            gh_repo.get_issue(issue_ref.number).create_comment(body)
+
+        try:
+            await asyncio.to_thread(_post)
+        except Exception as e:
+            raise ProviderError(f"Failed to post issue comment: {e}") from e
+
+    async def update_issue_comment(self, issue_ref: PRInfo, comment_id: int, body: str) -> None:
+        @_retry_transient
+        def _update() -> None:
+            gh_repo = self._github.get_repo(f"{issue_ref.owner}/{issue_ref.repo}")
+            gh_repo.get_issue(issue_ref.number).get_comment(comment_id).edit(body)
+
+        try:
+            await asyncio.to_thread(_update)
+        except Exception as e:
+            raise ProviderError(f"Failed to update issue comment: {e}") from e
+
     async def get_ci_failures(
         self, pr_info: PRInfo, *, max_jobs: int = 3, max_log_bytes: int = 16_000
     ) -> list[CIJobFailure]:

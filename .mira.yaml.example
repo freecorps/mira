@@ -245,6 +245,28 @@ pr_summary:
     #                is never overwritten
     mode: "on_mention"
 
+# ── Issue planner ──
+#
+# An implementation plan posted as a comment on new issues: a summary of the
+# ask, the files most likely to change (from the repository index, or from
+# file paths when the repository is not indexed), steps, risks and open
+# questions, and tests to write. One comment per issue, edited in place on a
+# re-run. `@mira plan` on an issue writes or refreshes it on demand. On
+# GitHub the App must be subscribed to "Issues" events. See
+# docs/issue-planner.md.
+issue_planner:
+  # Off by default: a comment on every new issue is a team's decision.
+  enabled: false
+  # Plan when an issue is opened. With false, only `@mira plan` writes one.
+  auto_on_open: true
+  # Plan an opened issue only when it carries one of these labels (empty:
+  # every issue). An explicit `@mira plan` is not held to this list.
+  labels: []
+  # Never plan an issue carrying one of these, on open or on command.
+  ignore_labels: []
+  # How many likely files the plan lists (1-25).
+  max_files: 8
+
 # ── Merge gate (Phase 4) ──
 #
 # A conservative approval decision, kept separate from `review.verdict`. The

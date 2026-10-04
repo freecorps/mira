@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from mira.config import load_config
+from mira.core.issue_planner import is_plan_command
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
     feedback_ack,
@@ -451,6 +452,39 @@ async def handle_gitlab_emoji(payload: dict[str, Any], auth: PlatformAuth) -> No
         logger.exception("Error handling GitLab emoji feedback on %s/%s!%s", owner, repo, iid)
 
 
+async def handle_gitlab_issue_plan(
+    payload: dict[str, Any], auth: PlatformAuth, bot_name: str, *, explicit: bool
+) -> None:
+    """Write or refresh the implementation plan on a GitLab issue."""
+    from mira.core.issue_planner import run_issue_plan
+
+    project = payload.get("project", {})
+    owner, repo = _split_project_path(project.get("path_with_namespace", ""))
+    if explicit:
+        iid = int((payload.get("issue") or {}).get("iid") or 0)
+    else:
+        iid = int((payload.get("object_attributes") or {}).get("iid") or 0)
+    if not owner or not repo or not iid:
+        return
+    actor = (payload.get("user") or {}).get("username", "") if explicit else ""
+    try:
+        token = await auth.get_token()
+        await run_issue_plan(
+            create_provider("gitlab", token),
+            owner,
+            repo,
+            iid,
+            platform="gitlab",
+            bot_name=bot_name,
+            bot_identity=await auth.get_bot_identity(),
+            explicit=explicit,
+            actor=actor,
+            fetcher=make_fetcher("gitlab", token),
+        )
+    except Exception:
+        logger.exception("Error handling GitLab issue plan for %s/%s#%s", owner, repo, iid)
+
+
 async def dispatch_gitlab_event(
     event: str,
     payload: dict[str, Any],
@@ -510,7 +544,34 @@ async def dispatch_gitlab_event(
                     return "ignored"
             background_tasks.add_task(handle_gitlab_note, payload, auth, bot_name)
             return "processing"
+        if attrs.get("noteable_type") == "Issue" and is_plan_command(
+            attrs.get("note") or "", names
+        ):
+            cfg = load_config()
+            if author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
+                logger.debug("plan command skipped — author %s filtered", actor)
+                return "ignored"
+            background_tasks.add_task(
+                handle_gitlab_issue_plan, payload, auth, bot_name, explicit=True
+            )
+            return "processing"
         return "ignored"
+
+    # A new issue gets an implementation plan when the planner is on.
+    if event == "Issue Hook":
+        attrs = payload.get("object_attributes", {}) or {}
+        if attrs.get("action") != "open":
+            return "ignored"
+        cfg = load_config()
+        if not (cfg.issue_planner.enabled and cfg.issue_planner.auto_on_open):
+            return "ignored"
+        if (payload.get("user") or {}).get("bot"):
+            return "ignored"
+        if author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
+            logger.debug("issue plan skipped — author %s filtered", actor)
+            return "ignored"
+        background_tasks.add_task(handle_gitlab_issue_plan, payload, auth, bot_name, explicit=False)
+        return "processing"
 
     if event == "Emoji Hook":
         attrs = payload.get("object_attributes", {}) or {}
