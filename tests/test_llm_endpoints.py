@@ -44,9 +44,9 @@ GO_URL = "https://opencode.ai/zen/go/v1"
 
 GO_USAGE = {
     "usage": {
-        "rolling": {"status": "ok", "percent": 12.5, "resetsAt": "2026-09-20T09:00:00.000Z"},
-        "weekly": {"status": "ok", "percent": 40, "resetsAt": "2026-09-21T00:00:00.000Z"},
-        "monthly": {"status": "rate-limited", "percent": 99.7, "resetsAt": "2026-10-01T00:00:00Z"},
+        "rolling": {"status": "ok", "percent": 12.5, "resetsAt": "2099-09-20T09:00:00.000Z"},
+        "weekly": {"status": "ok", "percent": 40, "resetsAt": "2099-09-21T00:00:00.000Z"},
+        "monthly": {"status": "rate-limited", "percent": 99.7, "resetsAt": "2099-10-01T00:00:00Z"},
     }
 }
 
@@ -735,11 +735,11 @@ class TestGoUsageDocument:
         # whatever percent it read, so the refusal stays attached to *its*
         # reset (October 1st) and not to the 5-hour window's (09:00Z).
         assert snapshot.tertiary.used_percent == 100.0
-        assert snapshot.tertiary.resets_at == 1790812800.0
+        assert snapshot.tertiary.resets_at == 4094496000.0
         assert snapshot.source == "endpoint"
         assert snapshot.limit_reached is True
-        assert snapshot.available(now=1789894801.0) is False  # 5-hour reset passed
-        assert snapshot.available(now=1790812801.0) is True
+        assert snapshot.available(now=4093578001.0) is False  # 5-hour reset passed
+        assert snapshot.available(now=4094496001.0) is True
 
     def test_a_missing_window_is_left_out(self):
         doc = {"usage": {"rolling": {"status": "ok", "percent": 5, "resetsAt": "x"}}}
