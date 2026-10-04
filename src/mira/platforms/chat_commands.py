@@ -78,16 +78,19 @@ def normalize_command(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
-def is_review_request(text: str, names: list[str], first_word: str) -> bool:
+def is_review_request(text: str, names: list[str]) -> bool:
     """Whether a mention asks for a review (`review` or `full review`).
 
     The webhook layers let a review request through the author filter, so a
     blocked author can still ask for a review by hand. A full review is the
-    same request and gets the same treatment.
+    same request and gets the same treatment. The whole command has to match,
+    as it does when ``run_pr_command`` dispatches it: "review please" is a
+    free-form question there, so it must not get past the filter here either.
     """
-    if first_word == "review":
-        return True
-    return normalize_command(strip_mentions(text, names)) in FULL_REVIEW_KEYWORDS
+    from mira.platforms.handlers import _REVIEW_KEYWORDS
+
+    command = normalize_command(strip_mentions(text, names))
+    return command in _REVIEW_KEYWORDS or command in FULL_REVIEW_KEYWORDS
 
 
 def _is_secret_key(name: str) -> bool:
