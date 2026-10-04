@@ -2,6 +2,7 @@ import { ArrowDown, ArrowUp, Info, RefreshCw, Search } from "lucide-react"
 import { type ReactNode, useState } from "react"
 import { useNavigate } from "react-router"
 import { BarGauge } from "@/components/dashboard/bar-gauge"
+import { DoraPanel } from "@/components/dashboard/dora-panel"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
 import {
@@ -367,6 +368,8 @@ export function ContributorsPage() {
           loading={summaryLoading}
         />
       </div>
+
+      {user?.is_admin && <DoraPanel />}
 
       <ReviewersCard />
     </div>

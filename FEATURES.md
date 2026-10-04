@@ -271,6 +271,8 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Threaded PR activity timeline: each review pass with its comments and the human replies nested under them
 - Review page (admin): stale/waiting PRs, reviewer-responsiveness leaderboard, throughput trends, rubber-stamp detection, open-PR status board
 - Contributor analytics: authoring stats, year-long contribution heatmap, and Mira's review-quality signal per contributor
+- Change-frequency hotspots (per repo): treemap heatmap and ranked table scoring each file by churn × complexity (LOC, symbols) × Mira finding density over a 30–365 day window; reviews of PRs touching a top hotspot get a short "scrutinize these" note ([docs/analytics.md](docs/analytics.md))
+- DORA metrics and cycle time on the Reviewers page (admin): deployment frequency (merges to the default branch or releases), lead time for changes, change failure rate and time-to-restore proxies from reverts/hotfixes, plus time to first review, approval and merge — with DORA bands, period and repository selectors, and trends vs the previous period
 - Pending-uninstall review queue
 - Logs page (admin): Mira's own log output captured into the app database, filterable by level, module, trace ID, repo and time window, with copy and plain-text export — every failed review prints a trace ID that pulls up exactly the lines it emitted
 

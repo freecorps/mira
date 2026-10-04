@@ -27,6 +27,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { DependenciesTable } from "@/components/dashboard/dependencies-table"
 import { SbomDownload } from "@/components/dashboard/sbom-download"
+import { HotspotsPanel } from "@/components/dashboard/hotspots-panel"
 import { LabelWorkflowPanel } from "@/components/dashboard/label-workflow"
 import { useAuth } from "@/lib/auth"
 import { api, type ReviewContextModel } from "@/lib/api"
@@ -55,18 +56,15 @@ export function RepoDetailPage() {
 
   const { data, loading, error } = useAsync(
     () => api.getRepo(owner!, repo!),
-    [owner, repo],
+    [owner, repo]
   )
   const { data: packages } = useAsync(
     () => api.getPackages(owner!, repo!),
-    [owner, repo],
+    [owner, repo]
   )
   const { data: vulns } = useAsync(
-    () =>
-      api
-        .getRepoVulnerabilities(owner!, repo!)
-        .catch(() => [] as never),
-    [owner, repo],
+    () => api.getRepoVulnerabilities(owner!, repo!).catch(() => [] as never),
+    [owner, repo]
   )
   const [contextEntries, setContextEntries] = useState<ReviewContextModel[]>([])
   const [contextLoaded, setContextLoaded] = useState(false)
@@ -91,17 +89,17 @@ export function RepoDetailPage() {
         repo,
         editingCtx.id,
         editingCtx.title,
-        editingCtx.content,
+        editingCtx.content
       )
       setContextEntries((prev) =>
-        prev.map((e) => (e.id === updated.id ? updated : e)),
+        prev.map((e) => (e.id === updated.id ? updated : e))
       )
     } else {
       const created = await api.createContext(
         owner,
         repo,
         editingCtx.title,
-        editingCtx.content,
+        editingCtx.content
       )
       setContextEntries((prev) => [...prev, created])
     }
@@ -132,7 +130,7 @@ export function RepoDetailPage() {
           setIndexStatus(
             job.files_done > 0
               ? `Indexing... ${job.files_done} files processed`
-              : "Indexing...",
+              : "Indexing..."
           )
         } else if (job && job.status === "completed") {
           setIndexStatus(`Done — ${job.files_done} files indexed`)
@@ -144,7 +142,9 @@ export function RepoDetailPage() {
           setIndexStatus(`Failed: ${job.error}`)
           setIndexing(false)
         } else if (job && job.status === "cancelled") {
-          setIndexStatus(`Cancelled — ${job.files_done} files indexed before stopping`)
+          setIndexStatus(
+            `Cancelled — ${job.files_done} files indexed before stopping`
+          )
           setIndexing(false)
         }
       } catch {
@@ -163,7 +163,9 @@ export function RepoDetailPage() {
   const triggerIndex = async (full: boolean) => {
     if (!owner || !repo) return
     setIndexing(true)
-    setIndexStatus(full ? "Starting full re-index..." : "Starting index update...")
+    setIndexStatus(
+      full ? "Starting full re-index..." : "Starting index update..."
+    )
     try {
       await api.triggerIndex(owner, repo, full)
     } catch {
@@ -309,10 +311,21 @@ export function RepoDetailPage() {
           <TabsTrigger value="context">Review Context</TabsTrigger>
           <TabsTrigger value="dependencies">Dependencies</TabsTrigger>
           <TabsTrigger value="blast">Blast Radius</TabsTrigger>
-          {user?.is_admin && <TabsTrigger value="labels">Automatic Labels</TabsTrigger>}
+          <TabsTrigger value="hotspots">Hotspots</TabsTrigger>
+          {user?.is_admin && (
+            <TabsTrigger value="labels">Automatic Labels</TabsTrigger>
+          )}
         </TabsList>
 
-        {user?.is_admin && <TabsContent value="labels"><LabelWorkflowPanel key={`${owner}/${repo}`} owner={owner!} repo={repo!} /></TabsContent>}
+        {user?.is_admin && (
+          <TabsContent value="labels">
+            <LabelWorkflowPanel
+              key={`${owner}/${repo}`}
+              owner={owner!}
+              repo={repo!}
+            />
+          </TabsContent>
+        )}
 
         {/* Files */}
         <TabsContent value="files">
@@ -338,14 +351,14 @@ export function RepoDetailPage() {
                       </AvatarFallback>
                     </Avatar>
                     <div className="ml-4 min-w-0 flex-1 space-y-1">
-                      <p className="text-sm font-medium leading-none">
+                      <p className="text-sm leading-none font-medium">
                         {f.path}
                       </p>
                       <p className="text-sm text-muted-foreground">
                         {f.summary}
                       </p>
                     </div>
-                    <div className="ml-4 whitespace-nowrap text-sm text-muted-foreground tabular-nums">
+                    <div className="ml-4 text-sm whitespace-nowrap text-muted-foreground tabular-nums">
                       {f.loc ?? 0} lines
                     </div>
                   </div>
@@ -368,8 +381,8 @@ export function RepoDetailPage() {
                     </Badge>
                   </div>
                   <CardDescription>
-                    Docs, guidelines, and API contracts injected into PR
-                    reviews for this repo
+                    Docs, guidelines, and API contracts injected into PR reviews
+                    for this repo
                   </CardDescription>
                 </div>
                 <Button
@@ -426,10 +439,10 @@ export function RepoDetailPage() {
                         </AvatarFallback>
                       </Avatar>
                       <div className="ml-4 min-w-0 flex-1 space-y-1">
-                        <p className="text-sm font-medium leading-none">
+                        <p className="text-sm leading-none font-medium">
                           {entry.title}
                         </p>
-                        <pre className="whitespace-pre-wrap text-sm text-muted-foreground">
+                        <pre className="text-sm whitespace-pre-wrap text-muted-foreground">
                           {entry.content.slice(0, 200)}
                           {entry.content.length > 200 && "..."}
                         </pre>
@@ -463,8 +476,8 @@ export function RepoDetailPage() {
                 </div>
               ) : !editingCtx ? (
                 <p className="text-sm text-muted-foreground">
-                  No context yet. Add architecture docs or coding guidelines
-                  to improve review quality on this repo.
+                  No context yet. Add architecture docs or coding guidelines to
+                  improve review quality on this repo.
                 </p>
               ) : null}
             </CardContent>
@@ -508,6 +521,11 @@ export function RepoDetailPage() {
             </CardContent>
           </Card>
         </TabsContent>
+
+        {/* Hotspots — change-frequency heatmap + ranked table */}
+        <TabsContent value="hotspots">
+          <HotspotsPanel owner={owner!} repo={repo!} />
+        </TabsContent>
       </Tabs>
     </div>
   )
@@ -516,7 +534,7 @@ export function RepoDetailPage() {
 function BlastRadiusList({ owner, repo }: { owner: string; repo: string }) {
   const { data, loading } = useAsync(
     () => api.getBlastRadius(owner, repo),
-    [owner, repo],
+    [owner, repo]
   )
 
   if (loading) {
@@ -552,7 +570,8 @@ function BlastRadiusList({ owner, repo }: { owner: string; repo: string }) {
                   {entry.repo}
                 </Link>
                 <p className="text-xs text-muted-foreground">
-                  {entry.files.length} reference{entry.files.length !== 1 ? "s" : ""}
+                  {entry.files.length} reference
+                  {entry.files.length !== 1 ? "s" : ""}
                 </p>
               </div>
             )

@@ -9,6 +9,7 @@ import { autofixApi } from "./api/autofix"
 import { checksApi } from "./api/checks"
 import { contributorsApi } from "./api/contributors"
 import { digestsApi } from "./api/digests"
+import { deliveryApi } from "./api/delivery"
 import { gateApi } from "./api/gate"
 import { logsApi } from "./api/logs"
 import { oauthApi } from "./api/oauth"
@@ -28,6 +29,7 @@ import { vulnerabilitiesApi } from "./api/vulnerabilities"
 import { webhooksApi } from "./api/webhooks"
 
 export * from "./api/types"
+export type * from "./api/delivery"
 export type { ApiToken, CreatedApiToken } from "./api/tokens"
 export type {
   DigestArea,
@@ -53,6 +55,7 @@ export const api = {
   ...contributorsApi,
   ...digestsApi,
   ...reviewInsightsApi,
+  ...deliveryApi,
   ...gateApi,
   ...autofixApi,
   ...checksApi,

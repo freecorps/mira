@@ -54,7 +54,8 @@ Most AI reviewers are SaaS: your diffs (and often the full surrounding code) lea
   - **Traceable failures**: Mira's own logs, captured into your database and searchable from the dashboard. A failed review prints a trace ID; pasting it in returns every line that review emitted, so "it broke" stops being a `docker logs` archaeology exercise.
   - **Cost & token telemetry**: actual spend per repo and per model, not estimates, because you control the LLM key.
   - **Review-health page**: stale/waiting PRs, a reviewer-responsiveness leaderboard, throughput trends, and rubber-stamp detection (approvals with no substantive review) — plus per-contributor analytics with a year-long heatmap and Mira's review-quality signal.
-  - **Coming soon, change-frequency heatmaps**: surface the files that bug fixes keep landing on so you can target review attention.
+  - **Change-frequency hotspots**: a per-repo heatmap of the files that keep changing and keep drawing findings, ranked by churn × complexity × finding density — and Mira tells its reviewer to look harder when a PR touches one.
+  - **DORA metrics & cycle time**: deployment frequency, lead time, change failure rate and time to restore, plus time to first review, approval and merge, from the PR data Mira already tracks.
 
 If your engineering team needs answers like *"which of our repos are exposed to this CVE?"* or *"what's the blast radius of changing this function?"*, those questions stop being multi-day investigations and start being one-click dashboard pages.
 
