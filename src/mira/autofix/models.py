@@ -144,6 +144,7 @@ class ReasonCode:
     OUT_OF_SCOPE = "out_of_scope"
     ATTEMPT_LIMIT = "attempt_limit"
     JOB_TIMEOUT = "job_timeout"
+    HEAD_MOVED = "head_moved"
 
     # Refused while validating.
     VALIDATION_FAILED = "validation_failed"
@@ -191,6 +192,7 @@ NON_RETRYABLE_CODES: frozenset[str] = frozenset(
         ReasonCode.FEATURE_DISABLED,
         ReasonCode.NOTHING_TO_TEST,
         ReasonCode.NOTHING_TO_DOCUMENT,
+        ReasonCode.HEAD_MOVED,
         ReasonCode.PATH_PROTECTED,
         ReasonCode.PATH_TRAVERSAL,
         ReasonCode.PATH_OUTSIDE_REPO,
@@ -542,13 +544,14 @@ def branch_name(
     entirely without changing which branch this is.
 
     A finishing touch has no finding, so its identity is the kind of work and
-    the commit it was asked for on: ``<prefix>/pr-7/tests-1a2b3c4``. The commit
+    the commit it was asked for on: ``<prefix>/pr-7/tests-1a2b3c4d5e6f``. The commit
     is part of it because a request after a push is new work on new code, and
     stacking it onto the branch an older request made would mix the two.
     """
     if job_kind and job_kind != "fix":
         kind = sanitize_slug(job_kind, limit=16) or "touch"
-        sha = sanitize_slug(head_sha, limit=7)
+        # Twelve characters, as finding branches use: seven can collide.
+        sha = sanitize_slug(head_sha, limit=12)
         leaf = f"{kind}-{sha}" if sha else kind
         candidate = "/".join(
             part for part in (prefix.strip("/"), f"pr-{int(pr_number)}", leaf) if part

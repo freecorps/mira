@@ -2580,7 +2580,12 @@ class ReviewEngine:
                 timeout=self.config.review.dependency_updates.context_wait_seconds,
             )
             if done and not dependency_updates_task.cancelled():
-                walkthrough.dependency_updates = dependency_updates_task.result()
+                # Read like the prompt path reads it: a lookup that failed costs
+                # the walkthrough its section, never the finished review.
+                try:
+                    walkthrough.dependency_updates = dependency_updates_task.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("Dependency updates left out of the walkthrough: %s", exc)
         _mark("summary")
         # One line per review saying where its time went, so a slow review can
         # be read off the log trail instead of reconstructed from HTTP lines.

@@ -51,8 +51,10 @@ MAX_RELEASES = 15
 
 _USER_AGENT = "mira-code-review (dependency release notes)"
 _GITHUB_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+# `github.com` only as the whole host: at the start, after a scheme's `//`, a
+# `git@`, or `www.` — never as the tail of another name (`evilgithub.com`).
 _GITHUB_URL = re.compile(
-    r"github\.com[/:]+([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/#?].*)?$",
+    r"(?:^|//|@|//www\.)github\.com[/:]+([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/#?].*)?$",
     re.IGNORECASE,
 )
 _CHANGELOG_FILES = ("CHANGELOG.md", "CHANGES.md", "HISTORY.md", "CHANGES.rst", "NEWS.md")
@@ -86,6 +88,20 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return blocked(ip)
 
 
+async def _public_addresses(host: str) -> list[str]:
+    """The addresses ``host`` resolves to, or [] if any of them is not public."""
+    try:
+        return [] if _is_blocked_ip(ipaddress.ip_address(host)) else [host]
+    except ValueError:
+        pass
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    addresses = [str(info[4][0]) for info in infos]
+    if not addresses or any(_is_blocked_ip(ipaddress.ip_address(a)) for a in addresses):
+        return []
+    return addresses
+
+
 async def resolves_public(host: str) -> bool:
     """Whether every address ``host`` resolves to is a public one."""
     now = time.monotonic()
@@ -93,20 +109,47 @@ async def resolves_public(host: str) -> bool:
     if cached and cached[0] > now:
         return cached[1]
     try:
-        try:
-            return not _is_blocked_ip(ipaddress.ip_address(host))
-        except ValueError:
-            pass
-        loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-        public = bool(infos) and not any(
-            _is_blocked_ip(ipaddress.ip_address(info[4][0])) for info in infos
-        )
+        public = bool(await _public_addresses(host))
     except (OSError, ValueError) as exc:
         logger.debug("Dependency updates: could not resolve %s: %s", host, exc)
         public = False
     _HOST_CACHE[host] = (now + CACHE_TTL_SECONDS, public)
     return public
+
+
+class PinnedTransport(httpx.AsyncBaseTransport):
+    """Connect to an address that was checked, not to a second lookup's answer.
+
+    Checking where a host resolves and then letting the HTTP stack resolve it
+    again leaves a window in which DNS can answer differently — a rebinding
+    that turns an allowed host into a private address. Here the address is
+    resolved and checked once per request, the connection goes to that
+    address, and TLS still verifies the certificate against the host name
+    (``sni_hostname``), so pinning the address costs no authentication.
+
+    Requests an environment proxy carries (``HTTPS_PROXY``) are resolved by the
+    proxy and never reach this transport.
+    """
+
+    def __init__(self) -> None:
+        self._inner = httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        try:
+            addresses = await _public_addresses(host)
+        except (OSError, ValueError) as exc:
+            raise httpx.ConnectError(f"could not resolve {host}: {exc}", request=request) from exc
+        if not addresses:
+            raise httpx.ConnectError(f"{host} is not a public address", request=request)
+        # The Host header was set from the original URL when the request was
+        # built, so only the connection target changes.
+        request.url = request.url.copy_with(host=addresses[0])
+        request.extensions = {**request.extensions, "sni_hostname": host}
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 class Budget:

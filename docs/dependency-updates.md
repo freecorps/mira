@@ -80,7 +80,8 @@ lookup still running then goes on for the walkthrough, which grants it the same
 grace once more when the review is done — so the review is never more than that
 late twice over, and usually not at all. The whole lookup,
 summary included, has a wall-clock budget (`timeout_seconds`) and a byte budget
-(`max_bytes`) shared across its requests, each request has its own timeout, and
+(`max_bytes`) shared across its release-note and registry requests (the OSV
+query is separate, small and bounded by its own timeout), each request has its own timeout, and
 at most `max_packages` bumps are looked up. A failure anywhere — a registry
 down, a rate limit, a model error — is logged and costs that bump its notes.
 
@@ -93,13 +94,15 @@ The hosts contacted are exactly `allowed_hosts`:
 
 ```
 pypi.org  registry.npmjs.org  proxy.golang.org  repo.packagist.org
-api.github.com  raw.githubusercontent.com
+api.github.com  raw.githubusercontent.com  api.osv.dev
 ```
 
-plus `api.osv.dev` when `review.osv_scan` is on (as it already is for the
-review-time CVE scan). Requests are HTTPS only, never follow redirects, and are
-refused for a host that resolves to a private, loopback, link-local or reserved
-address — the rule the outbound webhooks use. URLs read from registry metadata
+with `api.osv.dev` asked only when `review.osv_scan` is on and the list names
+it. Requests are HTTPS only, never follow redirects, and are refused for a host
+that resolves to a private, loopback, link-local or reserved address — the rule
+the outbound webhooks use. The connection goes to the address that was checked
+rather than to a second DNS lookup, so a rebinding answer cannot slip in between,
+and TLS still verifies the certificate against the host name. URLs read from registry metadata
 are never requested as given.
 
 `MIRA_DEPENDENCY_UPDATES_HOSTS` overrides the list from the environment
@@ -135,6 +138,7 @@ review:
     max_bytes: 2000000       # downloaded across the whole lookup
     context_wait_seconds: 3  # how long the review prompt waits after preparation
     allowed_hosts: [pypi.org, registry.npmjs.org, proxy.golang.org,
-                    repo.packagist.org, api.github.com, raw.githubusercontent.com]
+                    repo.packagist.org, api.github.com, raw.githubusercontent.com,
+                    api.osv.dev]
     github_token_env: ""     # e.g. MIRA_RELEASE_NOTES_TOKEN
 ```
