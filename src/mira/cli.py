@@ -1433,3 +1433,10 @@ def auth_logout(target: str) -> None:
         raise click.ClickException(f"{provider} has no account {key!r}")
     manager.disconnect(provider, key)
     click.echo(f"Disconnected {provider}{':' + key if key else ' (every account)'}.")
+
+
+# SBOM export and license checks live with the package inventory they read.
+from mira.sbom.cli import licenses_command, sbom_command  # noqa: E402
+
+main.add_command(sbom_command)
+main.add_command(licenses_command)

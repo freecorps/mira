@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mira.llm.base import LLMProviderProtocol
@@ -1666,6 +1666,30 @@ class ReviewEngine:
 
         return _search
 
+    async def _license_findings(self, manifest_files: list, source_fetcher: Any) -> list:
+        """Findings for added dependencies whose license breaks ``licenses``. Never raises.
+
+        Runs only on a pull request (``source_fetcher`` is set only there), so
+        ``mira local review`` keeps contacting nothing but the model. The index
+        store caches registry answers across reviews.
+        """
+        cfg = self.config.licenses
+        pr_info = getattr(self, "_pr_info", None)
+        if not cfg.enabled or not manifest_files or source_fetcher is None or pr_info is None:
+            return []
+        from mira.licenses.review import check_manifest_licenses
+
+        store = None
+        try:
+            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
+        except Exception as exc:  # noqa: BLE001 - the check runs without a cache
+            logger.debug("License cache unavailable: %s", exc)
+        try:
+            return await check_manifest_licenses(manifest_files, source_fetcher, cfg, store=store)
+        finally:
+            if store is not None:
+                store.close()
+
     def _start_dependency_updates(self, files: list) -> asyncio.Task | None:
         """Start the release-notes lookup for this review's bumps, or None.
 
@@ -2580,9 +2604,17 @@ class ReviewEngine:
             else _asyncio.sleep(0, result=[])
         )
 
+        # License policy (mira.licenses): deterministic, no model call. Its
+        # findings join after self-critique, since a policy fact is not a claim
+        # for the critic to grade — and grading it would spend a model call.
+        license_task = _asyncio.create_task(
+            self._license_findings(manifest_files, pr_source_fetcher)
+        )
+
         chunk_results, security_comments, dependency_comments, osv_comments = await _asyncio.gather(
             review_task, security_task, dependency_task, osv_task
         )
+        license_comments = await license_task
         _mark("review")
 
         if chunks and len(chunk_failures) == len(chunks):
@@ -2665,6 +2697,12 @@ class ReviewEngine:
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
         _mark("critique")
+
+        if license_comments:
+            audit.append({"stage": "drafted", "chunk": "licenses", "count": len(license_comments)})
+            if existing_comments:
+                license_comments = drop_already_posted(license_comments, existing_comments)
+            final_comments = [*final_comments, *license_comments]
 
         all_key_issues = _drop_orphan_key_issues(all_key_issues, final_comments)
 

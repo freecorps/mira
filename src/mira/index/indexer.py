@@ -682,6 +682,7 @@ def _store_manifest_file(store: IndexStore, path: str, content: str) -> int:
                 "version": pkg.version,
                 "file_path": pkg.file_path,
                 "is_dev": pkg.is_dev,
+                "license": pkg.license,
             }
             for pkg in packages
         ],

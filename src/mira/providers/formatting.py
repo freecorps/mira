@@ -25,6 +25,7 @@ _CATEGORY_DISPLAY: dict[str, tuple[str, str]] = {
     "style": ("\U0001f3a8", "Style"),
     "clarity": ("\U0001f4dd", "Clarity"),
     "configuration": ("⚙️", "Configuration"),
+    "license": ("\U0001f4dc", "License compliance"),
     "other": ("\U0001f4cc", "Note"),
 }
 

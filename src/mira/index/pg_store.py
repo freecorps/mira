@@ -672,11 +672,24 @@ CREATE TABLE IF NOT EXISTS package_manifests (
     file_path TEXT NOT NULL DEFAULT '',
     is_dev INTEGER NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    license TEXT NOT NULL DEFAULT '',
     UNIQUE(owner, repo, name, kind, file_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pg_pkg_manifest_name
     ON package_manifests(owner, repo, name);
+
+-- Registry licenses (mira.licenses.lookup). Not per repository: the license
+-- of lodash 4.17.21 is the same answer for every repository that uses it.
+CREATE TABLE IF NOT EXISTS package_licenses (
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    license TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    fetched_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, name, version)
+);
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
     id SERIAL PRIMARY KEY,
@@ -873,6 +886,11 @@ def _get_conn(url: str, *, read_only: bool = False) -> Any:
                     "ALTER TABLE autofix_jobs ADD COLUMN IF NOT EXISTS job_kind "
                     "TEXT NOT NULL DEFAULT 'fix'"
                 )
+                # The license a lockfile records, added with the SBOM export.
+                cur.execute(
+                    "ALTER TABLE package_manifests ADD COLUMN IF NOT EXISTS license "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
             _schema_initialized = True
         return _pg_conn
 
@@ -1041,6 +1059,15 @@ def list_packages_org_wide(url: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def list_package_repos(url: str) -> list[tuple[str, str]]:
+    """Every ``(owner key, repo)`` with at least one package row — what an
+    org-wide SBOM covers. The owner key is as stored (``_gitlab/group`` for a
+    repository on another platform)."""
+    with _pg_cursor(url) as cur:
+        cur.execute("SELECT DISTINCT owner, repo FROM package_manifests ORDER BY owner, repo")
+        return [(r[0], r[1]) for r in cur.fetchall()]
 
 
 def search_packages_org_wide(
@@ -3654,16 +3681,17 @@ class PgIndexStore(
                         p["file_path"],
                         1 if p.get("is_dev") else 0,
                         now,
+                        p.get("license") or "",
                     )
                     for p in packages
                 ]
                 cur.executemany(
                     "INSERT INTO package_manifests "
-                    "(owner, repo, name, kind, version, file_path, is_dev, updated_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                    "(owner, repo, name, kind, version, file_path, is_dev, updated_at, license) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "ON CONFLICT (owner, repo, name, kind, file_path) DO UPDATE SET "
                     "version=EXCLUDED.version, is_dev=EXCLUDED.is_dev, "
-                    "updated_at=EXCLUDED.updated_at",
+                    "updated_at=EXCLUDED.updated_at, license=EXCLUDED.license",
                     rows,
                 )
         self._commit()
@@ -3673,7 +3701,7 @@ class PgIndexStore(
         from mira.index.store import PackageManifestRow
 
         rows = self._fetchall(
-            "SELECT id, name, kind, version, file_path, is_dev, updated_at "
+            "SELECT id, name, kind, version, file_path, is_dev, updated_at, license "
             "FROM package_manifests WHERE owner=%s AND repo=%s "
             "ORDER BY LOWER(name)",
             (self._owner, self._repo),
@@ -3687,9 +3715,43 @@ class PgIndexStore(
                 file_path=r[4],
                 is_dev=bool(r[5]),
                 updated_at=r[6],
+                license=r[7] or "",
             )
             for r in rows
         ]
+
+    def get_package_licenses(
+        self, keys: list[tuple[str, str, str]]
+    ) -> dict[tuple[str, str, str], tuple[str, str, float]]:
+        out: dict[tuple[str, str, str], tuple[str, str, float]] = {}
+        unique = list(dict.fromkeys(keys))
+        for start in range(0, len(unique), 200):
+            batch = unique[start : start + 200]
+            placeholders = ", ".join(["(%s, %s, %s)"] * len(batch))
+            rows = self._fetchall(
+                "SELECT kind, name, version, license, source, fetched_at FROM package_licenses "
+                f"WHERE (kind, name, version) IN ({placeholders})",
+                tuple(v for key in batch for v in key),
+            )
+            for r in rows:
+                out[(r[0], r[1], r[2])] = (r[3], r[4], r[5])
+        return out
+
+    def upsert_package_licenses(self, rows: list[tuple[str, str, str, str, str]]) -> None:
+        if not rows:
+            return
+        now = time.time()
+        with self._cursor() as cur:
+            cur.executemany(
+                "INSERT INTO package_licenses "
+                "(kind, name, version, license, source, fetched_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (kind, name, version) DO UPDATE SET "
+                "license=EXCLUDED.license, source=EXCLUDED.source, "
+                "fetched_at=EXCLUDED.fetched_at",
+                [(*r, now) for r in rows],
+            )
+        self._commit()
 
     def clear_manifest_packages_for_missing_files(self, live_paths: set[str]) -> int:
         rows = self._fetchall(
