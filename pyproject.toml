@@ -57,7 +57,7 @@ dev = [
 serve = [
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.52.4",
-    "PyJWT[crypto]>=2.14.0",
+    "PyJWT[crypto]>=2.15.0",
     # Postgres driver — used when DATABASE_URL is set. Optional at runtime
     # (SQLite is the default), but bundled so the Docker image works with
     # either backend out of the box.
