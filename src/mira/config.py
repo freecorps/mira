@@ -1509,6 +1509,7 @@ class LicensesConfig(BaseModel):
                 parse_expression(entry)
             except LicenseParseError as exc:
                 raise ValueError(f"licenses: {entry!r} is not a license expression: {exc}") from exc
+        return value
 
 
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
