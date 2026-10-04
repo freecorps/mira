@@ -54,6 +54,9 @@ LABELS = (
     # An issue's title and body, read when Mira writes an implementation plan
     # for it: written by anyone who can open an issue.
     "ISSUE",
+    # Titles, descriptions and commit messages of what landed on a branch,
+    # quoted to the digest and release-notes calls. Written by contributors.
+    "CHANGES",
 )
 
 

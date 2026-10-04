@@ -481,6 +481,48 @@ class OpenPRRef:
 
 
 @dataclass
+class MergedPullRequest:
+    """A pull request that landed, as digests and release notes read it.
+
+    ``title`` and ``body`` are written by whoever opened the pull request and
+    are untrusted: anything that puts them in front of a model frames them as
+    data first. ``merged_at`` is epoch seconds (0.0 when the platform did not
+    say). ``files`` is bounded by the caller and may be empty when the provider
+    could not list them; an empty list reads as "unknown area", not as "touched
+    nothing".
+    """
+
+    number: int
+    title: str
+    body: str = ""
+    url: str = ""
+    author: str = ""
+    merged_at: float = 0.0
+    merge_commit_sha: str = ""
+    base_branch: str = ""
+    labels: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CommitInfo:
+    """One commit on a branch, for digests and release notes.
+
+    ``parents`` lets a caller walk the first-parent chain and tell a commit
+    pushed straight to the branch from one that arrived inside a merge.
+    ``date`` is the committer date in epoch seconds (0.0 when unknown).
+    """
+
+    sha: str
+    message: str = ""
+    author: str = ""
+    date: float = 0.0
+    url: str = ""
+    parents: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PRFingerprint:
     """A compact signature of a PR's changes, cached per repo.
 

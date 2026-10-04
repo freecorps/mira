@@ -280,6 +280,59 @@ issue_planner:
   # How many likely files the plan lists (1-25).
   max_files: 8
 
+# ── Digests and release notes ──
+#
+# What landed on the default branch, summarised per area of the codebase, on a
+# schedule, and delivered to the outbound webhooks subscribed to `digest.ready`
+# (Settings → Webhooks; Slack, Discord, Teams or generic JSON) and optionally
+# by email. `mira digest` and `mira release-notes` use this section too, and
+# work whether or not the schedule is enabled.
+#
+# NOTE: like the gate, this is deployment configuration read by the server.
+#
+# Full reference: docs/digests.md
+digests:
+  # Off by default: a scheduled digest spends model calls every period.
+  enabled: false
+  schedule: "weekly"      # "weekly" | "daily"
+  day: "monday"           # weekly only
+  hour: 9                 # UTC
+  # "repo": one digest per repository. "org": one per owner, areas prefixed
+  # with the repository name.
+  scope: "repo"
+  # `[platform:]owner/repo`. Empty: every repository registered with Mira.
+  repositories: []
+  # Area name -> path patterns (gate syntax). Files no area claims are grouped
+  # by their first `area_depth` directories.
+  areas: {}
+  #   API: ["src/api/**", "openapi.yaml"]
+  #   Docs: ["docs/**", "*.md"]
+  area_depth: 1
+  # Commits pushed straight to the branch, outside any pull request.
+  include_direct_commits: true
+  # Caps on what is read from the platform and quoted to the model.
+  max_pull_requests: 100
+  max_commits: 200
+  max_files_per_change: 100
+  max_input_chars: 40000
+  # false: list changes per area without any model call.
+  use_llm: true
+  # Do not store or deliver a digest for a period in which nothing landed.
+  skip_empty: true
+  # Plain-text email. The server comes from MIRA_SMTP_HOST / _PORT / _USER /
+  # _PASSWORD / _FROM / _STARTTLS; no host or no recipients means no email.
+  email:
+    recipients: []
+  # How release notes sort pull requests. Labels win over titles; then
+  # conventional-commit titles (`feat:`, `fix(api):`, `feat!:`); the model
+  # sorts whatever is left.
+  release_notes:
+    breaking_labels: ["breaking", "breaking-change", "breaking change", "semver-major"]
+    feature_labels: ["feature", "enhancement", "feat", "semver-minor"]
+    fix_labels: ["bug", "fix", "bugfix", "regression"]
+    dependency_labels: ["dependencies", "deps", "dependency"]
+    exclude_labels: ["skip-changelog", "no-changelog", "ignore-for-release"]
+
 # ── Merge gate (Phase 4) ──
 #
 # A conservative approval decision, kept separate from `review.verdict`. The

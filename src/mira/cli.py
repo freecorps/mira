@@ -549,6 +549,223 @@ def autofix_worker(
         click.echo("Stopped.")
 
 
+def _repo_provider(platform: str, token: str | None):  # type: ignore[no-untyped-def]
+    """A provider for the digest commands, or a usage error naming the fix."""
+    from mira.providers import create_provider
+
+    if not token:
+        raise click.UsageError("--token (or GITHUB_TOKEN / MIRA_GIT_TOKEN) is required")
+    try:
+        return create_provider(platform, token)
+    except (ValueError, MiraError) as err:
+        raise click.UsageError(str(err)) from err
+
+
+def _split_repo(value: str) -> tuple[str, str]:
+    owner, sep, repo = value.strip().strip("/").rpartition("/")
+    if not sep or not owner or not repo:
+        raise click.BadParameter("expected owner/repo", param_hint="--repo")
+    return owner, repo
+
+
+def _parse_day(value: str, flag: str) -> float:
+    from datetime import datetime
+
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError as err:
+        raise click.BadParameter("expected a date like 2026-09-01", param_hint=flag) from err
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+_DIGEST_PLATFORMS = click.Choice(["github", "gitlab", "forgejo"])
+
+
+@main.command("digest")
+@click.option("--repo", "repo_slug", required=True, help="owner/repo (GitLab: group/sub/project)")
+@click.option("--platform", type=_DIGEST_PLATFORMS, default="github", show_default=True)
+@click.option("--days", type=click.IntRange(1, 90), default=7, show_default=True)
+@click.option("--since", default=None, help="Start date (YYYY-MM-DD, UTC). Overrides --days.")
+@click.option("--until", default=None, help="End date (YYYY-MM-DD, UTC). Default: now.")
+@click.option("--branch", default="", help="Branch to read. Default: the default branch.")
+@click.option("--token", envvar="MIRA_GIT_TOKEN", default=None, help="Git platform API token")
+@click.option("--github-token", envvar="GITHUB_TOKEN", default=None, help="Alias for --token")
+@click.option("--no-llm", is_flag=True, help="List changes per area without a model call.")
+@click.option(
+    "--deliver",
+    is_flag=True,
+    help="Also store the digest and send it to the configured webhooks and email.",
+)
+@click.option(
+    "--output", "output_format", type=click.Choice(["markdown", "json"]), default="markdown"
+)
+@click.option("--config", "config_path", default=None, help="Path to .mira.yaml")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+def digest(
+    repo_slug: str,
+    platform: str,
+    days: int,
+    since: str | None,
+    until: str | None,
+    branch: str,
+    token: str | None,
+    github_token: str | None,
+    no_llm: bool,
+    deliver: bool,
+    output_format: str,
+    config_path: str | None,
+    verbose: bool,
+) -> None:
+    """Summarise what landed on a repository's default branch, per area.
+
+    Uses the `digests` section of the configuration (areas, caps), whether or
+    not the scheduled digest is enabled. See docs/digests.md.
+    """
+    import time
+
+    from mira.digests.render import render_markdown
+    from mira.digests.service import DigestTarget, build_digest, index_context
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+    owner, repo = _split_repo(repo_slug)
+    try:
+        config = load_config(config_path)
+    except MiraError as e:
+        raise click.ClickException(str(e)) from e
+    provider = _repo_provider(platform, token or github_token)
+    end = _parse_day(until, "--until") if until else time.time()
+    start = _parse_day(since, "--since") if since else end - days * 86400
+    if start >= end:
+        raise click.UsageError("the start of the period must come before its end")
+
+    llm = None
+    if not no_llm and config.digests.use_llm:
+        from mira.digests.runtime import digest_llm
+
+        llm = digest_llm(config)
+    try:
+        result = asyncio.run(
+            build_digest(
+                [
+                    DigestTarget(
+                        provider=provider,
+                        platform=platform,
+                        owner=owner,
+                        repo=repo,
+                        branch=branch,
+                        context=index_context(platform, owner, repo),
+                    )
+                ],
+                since=start,
+                until=end,
+                cfg=config.digests,
+                llm=llm,
+            )
+        )
+    except MiraError as e:
+        raise click.ClickException(str(e)) from e
+
+    if deliver:
+        try:
+            from mira.dashboard.api import _app_db
+        except ImportError as err:
+            raise click.ClickException(
+                "--deliver needs the server extra: pip install 'mira-reviewer[serve]'"
+            ) from err
+        from mira.digests.service import publish_digest
+
+        digest_id = asyncio.run(publish_digest(result, cfg=config.digests, db=_app_db))
+        click.echo(f"Stored digest {digest_id} and delivered it.", err=True)
+
+    if output_format == "json":
+        click.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo(render_markdown(result), nl=False)
+
+
+@main.command("release-notes")
+@click.option("--repo", "repo_slug", required=True, help="owner/repo (GitLab: group/sub/project)")
+@click.option("--platform", type=_DIGEST_PLATFORMS, default="github", show_default=True)
+@click.option("--from", "from_ref", default="", help="Starting tag, branch or sha (exclusive).")
+@click.option(
+    "--to", "to_ref", default="", help="Ending tag, branch or sha. Default: default branch."
+)
+@click.option("--since", default=None, help="Instead of --from: changes merged since this date.")
+@click.option("--token", envvar="MIRA_GIT_TOKEN", default=None, help="Git platform API token")
+@click.option("--github-token", envvar="GITHUB_TOKEN", default=None, help="Alias for --token")
+@click.option("--no-llm", is_flag=True, help="Sort by labels and titles only; no narrative.")
+@click.option(
+    "--output", "output_format", type=click.Choice(["markdown", "json"]), default="markdown"
+)
+@click.option("--config", "config_path", default=None, help="Path to .mira.yaml")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+def release_notes(
+    repo_slug: str,
+    platform: str,
+    from_ref: str,
+    to_ref: str,
+    since: str | None,
+    token: str | None,
+    github_token: str | None,
+    no_llm: bool,
+    output_format: str,
+    config_path: str | None,
+    verbose: bool,
+) -> None:
+    """Markdown release notes from the pull requests merged between two refs.
+
+    Sections come from labels and conventional-commit titles first; the model
+    sorts what is left and writes a short narrative. See docs/digests.md.
+    """
+    from mira.digests.release_notes import render_markdown
+    from mira.digests.service import build_release_notes_for
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+    if bool(from_ref) == bool(since):
+        raise click.UsageError("give either --from <ref> or --since <date>")
+    owner, repo = _split_repo(repo_slug)
+    try:
+        config = load_config(config_path)
+    except MiraError as e:
+        raise click.ClickException(str(e)) from e
+    provider = _repo_provider(platform, token or github_token)
+    llm = None
+    if not no_llm and config.digests.use_llm:
+        from mira.digests.runtime import digest_llm
+
+        llm = digest_llm(config)
+    try:
+        notes = asyncio.run(
+            build_release_notes_for(
+                provider,
+                platform=platform,
+                owner=owner,
+                repo=repo,
+                cfg=config.digests,
+                from_ref=from_ref,
+                to_ref=to_ref,
+                since=_parse_day(since, "--since") if since else 0.0,
+                llm=llm,
+            )
+        )
+    except (MiraError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
+    if output_format == "json":
+        click.echo(json.dumps(notes.to_dict(), indent=2))
+    else:
+        click.echo(render_markdown(notes), nl=False)
+
+
 @main.group("local")
 def local_group() -> None:
     """Review a change in this checkout, without a pull request.

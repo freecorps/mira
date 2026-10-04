@@ -140,6 +140,23 @@ PROTECTED = [
     ("/api/triage/config", "GET", {}),
     ("/api/triage/config", "PUT", {"body": None}),
     ("/api/triage/config/audit", "GET", {}),
+    # Digests. Generating spends model calls and can post to every webhook;
+    # release notes are generated on request too. Reading stored digests is
+    # deliberately open to every signed-in user, like the activity feed.
+    ("/api/digests/generate", "POST", {"body": None}),
+    (
+        "/api/release-notes",
+        "GET",
+        {
+            "owner": "o",
+            "repo": "r",
+            "platform": "github",
+            "from_ref": "v1",
+            "to_ref": "",
+            "since": "",
+            "llm": False,
+        },
+    ),
 ]
 
 

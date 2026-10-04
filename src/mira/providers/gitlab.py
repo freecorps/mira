@@ -36,15 +36,18 @@ from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     CIJobFailure,
+    CommitInfo,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
+    MergedPullRequest,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
 )
 from mira.platforms import profiles
+from mira.providers._time import epoch_to_iso, iso_to_epoch
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 from mira.triage.capabilities import (
@@ -1138,6 +1141,172 @@ class GitLabProvider(BaseProvider):
         if source is None or target is None:
             return True
         return int(source) != int(target)
+
+    # ── Digests and release notes ──
+
+    async def _get_page(
+        self, client: httpx.AsyncClient, url: str, params: dict[str, Any]
+    ) -> httpx.Response:
+        resp = await client.get(url, headers={"PRIVATE-TOKEN": self._token}, params=params)
+        if resp.status_code != 200:
+            raise ProviderError(f"GitLab GET {url} → {resp.status_code}: {resp.text[:300]}")
+        return resp
+
+    async def list_landed_pull_requests(
+        self,
+        repo: PRInfo,
+        *,
+        since: float,
+        until: float = 0.0,
+        base: str = "",
+        limit: int = 100,
+        max_files: int = 100,
+    ) -> list[MergedPullRequest]:
+        """Merged MRs, filtered on ``merged_at``.
+
+        ``updated_after`` narrows the listing server-side (a merge is an
+        update); the exact window is applied here on ``merged_at``. The commit
+        that landed is the merge commit, else the squash commit, else — for a
+        fast-forward merge — the MR's own head.
+        """
+        url = f"{self._project(repo)}/merge_requests"
+        merged: list[MergedPullRequest] = []
+        max_pages = max(1, min(20, (limit // 50) + 4))
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                for page in range(1, max_pages + 1):
+                    params: dict[str, Any] = {
+                        "state": "merged",
+                        "order_by": "updated_at",
+                        "sort": "desc",
+                        "updated_after": epoch_to_iso(since),
+                        "per_page": 100,
+                        "page": page,
+                    }
+                    if base:
+                        params["target_branch"] = base
+                    items = (await self._get_page(client, url, params)).json() or []
+                    for item in items:
+                        merged_at = iso_to_epoch(str(item.get("merged_at") or ""))
+                        if not merged_at or merged_at < since or (until and merged_at >= until):
+                            continue
+                        merged.append(
+                            MergedPullRequest(
+                                number=int(item.get("iid") or 0),
+                                title=str(item.get("title") or ""),
+                                body=str(item.get("description") or ""),
+                                url=str(item.get("web_url") or ""),
+                                author=str((item.get("author") or {}).get("username") or ""),
+                                merged_at=merged_at,
+                                merge_commit_sha=str(
+                                    item.get("merge_commit_sha")
+                                    or item.get("squash_commit_sha")
+                                    or item.get("sha")
+                                    or ""
+                                ),
+                                base_branch=str(item.get("target_branch") or ""),
+                                labels=[str(lb) for lb in item.get("labels") or [] if lb],
+                            )
+                        )
+                    if len(merged) >= limit or len(items) < 100:
+                        break
+                merged.sort(key=lambda pr: pr.merged_at, reverse=True)
+                merged = merged[:limit]
+
+                sem = asyncio.Semaphore(8)
+
+                async def _files(pr: MergedPullRequest) -> None:
+                    async with sem:
+                        try:
+                            resp = await self._get_page(client, f"{url}/{pr.number}/changes", {})
+                        except Exception as exc:  # noqa: BLE001 - files only enrich
+                            logger.debug("Could not list files of !%s: %s", pr.number, exc)
+                            return
+                    changes = (resp.json() or {}).get("changes") or []
+                    pr.files = [
+                        str(ch.get("new_path") or ch.get("old_path") or "")
+                        for ch in changes[:max_files]
+                    ]
+
+                if max_files > 0:
+                    await asyncio.gather(*[_files(pr) for pr in merged])
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to list merged merge requests: {e}") from e
+        return merged
+
+    @staticmethod
+    def _commit_from(item: dict[str, Any]) -> CommitInfo:
+        return CommitInfo(
+            sha=str(item.get("id") or ""),
+            message=str(item.get("message") or item.get("title") or ""),
+            author=str(item.get("author_name") or ""),
+            date=iso_to_epoch(str(item.get("committed_date") or item.get("created_at") or "")),
+            url=str(item.get("web_url") or ""),
+            parents=[str(p) for p in item.get("parent_ids") or []],
+        )
+
+    async def list_commits(
+        self,
+        repo: PRInfo,
+        *,
+        ref: str,
+        since: float,
+        until: float = 0.0,
+        limit: int = 200,
+    ) -> list[CommitInfo]:
+        url = f"{self._project(repo)}/repository/commits"
+        out: list[CommitInfo] = []
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                page = 1
+                while len(out) < limit:
+                    params: dict[str, Any] = {
+                        "ref_name": ref,
+                        "since": epoch_to_iso(since),
+                        "per_page": 100,
+                        "page": page,
+                    }
+                    if until:
+                        params["until"] = epoch_to_iso(until)
+                    items = (await self._get_page(client, url, params)).json() or []
+                    out.extend(self._commit_from(item) for item in items)
+                    if len(items) < 100:
+                        break
+                    page += 1
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to list commits: {e}") from e
+        return out[:limit]
+
+    async def compare_commits(
+        self, repo: PRInfo, base: str, head: str, *, limit: int = 250
+    ) -> list[CommitInfo]:
+        url = f"{self._project(repo)}/repository/compare"
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await self._get_page(client, url, {"from": base, "to": head})
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to compare {base}...{head}: {e}") from e
+        items = (resp.json() or {}).get("commits") or []
+        return [self._commit_from(item) for item in items[:limit]]
+
+    async def get_commit_files(self, repo: PRInfo, sha: str, *, limit: int = 100) -> list[str]:
+        url = f"{self._project(repo)}/repository/commits/{quote(sha, safe='')}/diff"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await self._get_page(client, url, {"per_page": min(100, max(1, limit))})
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to read commit {sha}: {e}") from e
+        return [
+            str(d.get("new_path") or d.get("old_path") or "") for d in (resp.json() or [])[:limit]
+        ]
 
 
 def _next_link(link_header: str) -> str | None:

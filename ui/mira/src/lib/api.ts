@@ -8,6 +8,7 @@ import { analyticsApi } from "./api/analytics"
 import { autofixApi } from "./api/autofix"
 import { checksApi } from "./api/checks"
 import { contributorsApi } from "./api/contributors"
+import { digestsApi } from "./api/digests"
 import { gateApi } from "./api/gate"
 import { logsApi } from "./api/logs"
 import { oauthApi } from "./api/oauth"
@@ -28,6 +29,12 @@ import { webhooksApi } from "./api/webhooks"
 
 export * from "./api/types"
 export type { ApiToken, CreatedApiToken } from "./api/tokens"
+export type {
+  DigestArea,
+  DigestChange,
+  DigestDetail,
+  DigestListItem,
+} from "./api/digests"
 
 export const api = {
   ...activityApi,
@@ -44,6 +51,7 @@ export const api = {
   ...tokensApi,
   ...webhooksApi,
   ...contributorsApi,
+  ...digestsApi,
   ...reviewInsightsApi,
   ...gateApi,
   ...autofixApi,

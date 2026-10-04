@@ -1509,6 +1509,153 @@ class LicensesConfig(BaseModel):
                 parse_expression(entry)
             except LicenseParseError as exc:
                 raise ValueError(f"licenses: {entry!r} is not a license expression: {exc}") from exc
+
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+class DigestEmailConfig(BaseModel):
+    """Optional plain-text email delivery of each digest.
+
+    The SMTP server is configured from the environment (``MIRA_SMTP_HOST``,
+    ``MIRA_SMTP_PORT``, ``MIRA_SMTP_USER``, ``MIRA_SMTP_PASSWORD``,
+    ``MIRA_SMTP_FROM``, ``MIRA_SMTP_STARTTLS``) so a credential never sits in a
+    file. No recipients, or no ``MIRA_SMTP_HOST``, means no email.
+    """
+
+    recipients: list[str] = Field(default_factory=list)
+
+    @field_validator("recipients")
+    @classmethod
+    def _valid_recipients(cls, v: list[str]) -> list[str]:
+        cleaned = [r.strip() for r in v if r and r.strip()]
+        bad = [r for r in cleaned if "@" not in r or any(c in r for c in "\r\n,;<> ")]
+        if bad:
+            raise ValueError(f"digests.email.recipients: not an email address: {bad}")
+        return cleaned
+
+
+class ReleaseNotesConfig(BaseModel):
+    """How release notes sort pull requests into sections.
+
+    Labels win over titles: a pull request labelled ``bug`` is a fix whatever
+    its title says. Matching is case-insensitive. A pull request neither a
+    label nor a conventional-commit title places goes to the model when one is
+    available, and to *Other* when not.
+    """
+
+    breaking_labels: list[str] = Field(
+        default_factory=lambda: ["breaking", "breaking-change", "breaking change", "semver-major"]
+    )
+    feature_labels: list[str] = Field(
+        default_factory=lambda: ["feature", "enhancement", "feat", "semver-minor"]
+    )
+    fix_labels: list[str] = Field(default_factory=lambda: ["bug", "fix", "bugfix", "regression"])
+    dependency_labels: list[str] = Field(
+        default_factory=lambda: ["dependencies", "deps", "dependency"]
+    )
+    # Pull requests carrying one of these never appear in release notes.
+    exclude_labels: list[str] = Field(
+        default_factory=lambda: ["skip-changelog", "no-changelog", "ignore-for-release"]
+    )
+
+
+class DigestsConfig(BaseModel):
+    """What landed on the default branch, summarised per area. See docs/digests.md.
+
+    Off by default: a scheduled digest spends model calls and posts to the
+    outbound webhooks every period whether or not anybody asked for it.
+    ``mira digest`` and ``mira release-notes`` work regardless of ``enabled`` —
+    it governs only the scheduler inside ``mira serve``.
+
+    Every list is bounded: ``max_pull_requests`` and ``max_commits`` cap what is
+    fetched from the platform, ``max_files_per_change`` caps the paths read per
+    change, and ``max_input_chars`` caps the text quoted to the model. What the
+    caps cut is said in the digest rather than dropped silently.
+    """
+
+    enabled: bool = False
+    # "weekly" runs once a week on `day` at `hour` UTC; "daily" every day at `hour`.
+    schedule: str = "weekly"
+    day: str = "monday"
+    hour: int = Field(default=9, ge=0, le=23)
+    # "repo": one digest per repository. "org": one per owner, with each
+    # repository's areas prefixed by its name.
+    scope: str = "repo"
+    # `[platform:]owner/repo` to include. Empty: every registered repository.
+    repositories: list[str] = Field(default_factory=list)
+    # Area name -> path globs (gate path syntax: `src/api/**`, `*.md`). A change
+    # belongs to every area one of its files matches; files no area claims are
+    # grouped by their first `area_depth` directories.
+    areas: dict[str, list[str]] = Field(default_factory=dict)
+    area_depth: int = Field(default=1, ge=1, le=4)
+    # Commits pushed straight to the branch, outside any pull request.
+    include_direct_commits: bool = True
+    max_pull_requests: int = Field(default=100, ge=1, le=500)
+    max_commits: int = Field(default=200, ge=1, le=1000)
+    max_files_per_change: int = Field(default=100, ge=1, le=300)
+    # Characters of pull request text quoted to the model per digest.
+    max_input_chars: int = Field(default=40_000, ge=2_000, le=200_000)
+    # False: a deterministic list of titles per area and no model call at all.
+    use_llm: bool = True
+    # Do not store or deliver a digest for a period in which nothing landed.
+    skip_empty: bool = True
+    email: DigestEmailConfig = Field(default_factory=DigestEmailConfig)
+    release_notes: ReleaseNotesConfig = Field(default_factory=ReleaseNotesConfig)
+
+    @field_validator("schedule")
+    @classmethod
+    def _valid_schedule(cls, v: str) -> str:
+        allowed = {"daily", "weekly"}
+        if v not in allowed:
+            raise ValueError(f"digests.schedule must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("day")
+    @classmethod
+    def _valid_day(cls, v: str) -> str:
+        day = v.strip().lower()
+        if day not in _WEEKDAYS:
+            raise ValueError(f"digests.day must be a weekday name, got {v!r}")
+        return day
+
+    @field_validator("scope")
+    @classmethod
+    def _valid_scope(cls, v: str) -> str:
+        allowed = {"repo", "org"}
+        if v not in allowed:
+            raise ValueError(f"digests.scope must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("repositories")
+    @classmethod
+    def _valid_repositories(cls, value: list[str]) -> list[str]:
+        from mira.mcp.authz import InvalidRepository, parse_repository
+
+        seen: list[str] = []
+        for entry in value:
+            try:
+                key = parse_repository(entry).key
+            except InvalidRepository as exc:
+                raise ValueError(f"digests.repositories: {exc}") from exc
+            if key not in seen:
+                seen.append(key)
+        return seen
+
+    @field_validator("areas")
+    @classmethod
+    def _valid_areas(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        from mira.gate.paths import PatternError, validate_patterns
+
+        for name, patterns in value.items():
+            if not name.strip():
+                raise ValueError("digests.areas: an area needs a name")
+            if not patterns:
+                raise ValueError(f"digests.areas.{name}: list at least one path pattern")
+            try:
+                validate_patterns(patterns)
+            except PatternError as exc:
+                raise ValueError(f"digests.areas.{name}: {exc}") from exc
         return value
 
 
@@ -1528,6 +1675,7 @@ class MiraConfig(BaseModel):
     pr_summary: PRSummaryConfig = Field(default_factory=PRSummaryConfig)
     issue_planner: IssuePlannerConfig = Field(default_factory=IssuePlannerConfig)
     licenses: LicensesConfig = Field(default_factory=LicensesConfig)
+    digests: DigestsConfig = Field(default_factory=DigestsConfig)
 
     @model_validator(mode="after")
     def _apply_review_profile(self) -> MiraConfig:

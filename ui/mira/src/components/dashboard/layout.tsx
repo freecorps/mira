@@ -13,6 +13,7 @@ import {
   LayoutDashboard,
   LogOut,
   Moon,
+  Newspaper,
   Package,
   ScrollText,
   Settings,
@@ -77,6 +78,7 @@ import { UserAvatar } from "@/components/ui/user-avatar"
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard", end: true },
   { to: "/activity", icon: Activity, label: "Activity" },
+  { to: "/digests", icon: Newspaper, label: "Digests" },
   { to: "/repos", icon: Database, label: "Repositories" },
   { to: "/contributors", icon: Users2, label: "Reviewers", adminOnly: true },
   { to: "/packages", icon: Package, label: "Packages" },
@@ -123,6 +125,7 @@ const settingsSubItems = [
 
 const PAGE_LABELS: Record<string, string> = {
   activity: "Activity",
+  digests: "Digests",
   repos: "Repositories",
   contributors: "Reviewers",
   packages: "Packages",
