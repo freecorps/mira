@@ -16,6 +16,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -25,6 +26,7 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { DependenciesTable } from "@/components/dashboard/dependencies-table"
+import { SbomDownload } from "@/components/dashboard/sbom-download"
 import { LabelWorkflowPanel } from "@/components/dashboard/label-workflow"
 import { useAuth } from "@/lib/auth"
 import { api, type ReviewContextModel } from "@/lib/api"
@@ -478,6 +480,9 @@ export function RepoDetailPage() {
                 Packages declared in package.json, requirements.txt,
                 pyproject.toml, go.mod, composer.json, and Dockerfile.
               </CardDescription>
+              <CardAction>
+                <SbomDownload owner={owner} repo={repo} />
+              </CardAction>
             </CardHeader>
             <CardContent>
               <DependenciesTable

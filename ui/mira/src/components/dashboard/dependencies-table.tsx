@@ -99,6 +99,7 @@ export function DependenciesTable({
       return (
         p.name.toLowerCase().includes(q) ||
         p.version.toLowerCase().includes(q) ||
+        (p.license ?? "").toLowerCase().includes(q) ||
         p.file_path.toLowerCase().includes(q)
       )
     })
@@ -202,13 +203,14 @@ export function DependenciesTable({
               <th className="w-20 px-4 py-2 text-left font-medium">Kind</th>
               <th className="px-4 py-2 text-left font-medium">Package</th>
               <th className="w-40 px-4 py-2 text-left font-medium">Version</th>
+              <th className="px-4 py-2 text-left font-medium">License</th>
               <th className="px-4 py-2 text-left font-medium">Source</th>
             </tr>
           </thead>
           <tbody>
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">
+                <td colSpan={5} className="px-4 py-6 text-center text-muted-foreground">
                   No packages match your filter.
                 </td>
               </tr>
@@ -254,6 +256,9 @@ export function DependenciesTable({
                     </td>
                     <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                       {p.version || "—"}
+                    </td>
+                    <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
+                      {p.license || "—"}
                     </td>
                     <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                       {p.file_path}
