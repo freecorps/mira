@@ -95,9 +95,13 @@ class TestFormatDetection:
         assert nf.detect_format("https://discord.com/api/webhooks/123/tok/slack") == "slack"
         assert nf.detect_format("https://discordapp.com/api/webhooks/123/tok/slack/") == "slack"
 
-    def test_bare_discord_url_stays_generic(self):
-        # Discord's own schema isn't emitted — generic makes the 400 visible.
-        assert nf.detect_format("https://discord.com/api/webhooks/123/tok") == "generic"
+    def test_bare_discord_url_is_discord(self):
+        # Discord's own schema: an embed, with mentions disabled.
+        assert nf.detect_format("https://discord.com/api/webhooks/123/tok") == "discord"
+        assert nf.detect_format("https://discordapp.com/api/webhooks/123/tok/") == "discord"
+
+    def test_other_discord_paths_stay_generic(self):
+        assert nf.detect_format("https://discord.com/channels/1/2") == "generic"
 
     def test_discord_lookalike_host_is_not_slack(self):
         assert nf.detect_format("https://evildiscord.com/api/webhooks/1/t/slack") == "generic"
@@ -301,6 +305,7 @@ class TestAdminEndpoints:
             nf.REVIEW_HIGH_SEVERITY,
             nf.REVIEW_FAILED,
             nf.INDEXING_COMPLETED,
+            nf.DIGEST_READY,
         }
 
     def test_get_by_id_returns_full_url(self, in_memory_db: AppDatabase):

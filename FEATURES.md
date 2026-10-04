@@ -80,6 +80,18 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Label allowlist and ignore list, author filters, `@mira ignore` in the issue body; the issue is read as untrusted, bounded input
 - GitHub, GitLab and Forgejo; [configuration and behavior](docs/issue-planner.md)
 
+## Digests and release notes
+
+- Scheduled digest (weekly or daily, day and hour in UTC) of what landed on each repository's default branch: merged pull requests plus commits pushed outside any pull request (first-parent walk; squash and rebase merges recognised)
+- Changes grouped by area: named areas from path patterns (`digests.areas`), the rest by top-level directory (`area_depth`), with the repository index's directory summaries as context
+- One bounded model call writes the overview and a summary and highlights per area; contributor text is quoted as untrusted data and the output is stripped of links, HTML and mentions; `use_llm: false` lists changes without a model
+- Per-repository or org-wide (`scope: org`) digests, stored in the database and listed on the dashboard's Digests page; admins can generate one on demand
+- Delivered through the outbound webhooks' new `digest.ready` event (Slack, Discord embeds with mentions disabled, Teams, generic JSON) and optionally by SMTP email
+- Exactly-once scheduling per period via a compare-and-set on the stored schedule boundary; caps on pull requests, commits, files and model input, each noted when it cuts something
+- `mira digest` and `mira release-notes` CLI commands, and `GET /api/release-notes`
+- Release notes between two refs (or since a date) in Breaking / Features / Fixes / Dependencies / Other, sorted by labels and conventional-commit titles first; the model only sorts what is left and writes the narrative
+- GitHub, GitLab and Forgejo; [configuration and behavior](docs/digests.md)
+
 ## Learning from feedback
 
 - Stable finding provenance for replies, explicit rejects, and supported 👍/👎 reactions

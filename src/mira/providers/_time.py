@@ -28,3 +28,8 @@ def iso_to_epoch(value: str) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
+
+
+def epoch_to_iso(value: float) -> str:
+    """Epoch seconds → ``2026-08-01T12:00:00Z``, the spelling all three APIs accept."""
+    return datetime.fromtimestamp(float(value or 0.0), tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

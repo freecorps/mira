@@ -299,6 +299,28 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user
     ON api_tokens(user_id);
+
+-- Generated digests and release notes. `repo` is '' for an org-wide digest.
+-- One row per (kind, scope, period): regenerating a period replaces it rather
+-- than listing the same week twice. `data` is the structured digest as JSON,
+-- which the dashboard renders; `markdown` is what was delivered.
+CREATE TABLE IF NOT EXISTS digests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'digest',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL DEFAULT '',
+    period_start REAL NOT NULL DEFAULT 0,
+    period_end REAL NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    markdown TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT 0,
+    UNIQUE (kind, platform, owner, repo, period_start, period_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_digests_created
+    ON digests(created_at);
 """
 
 _PG_SCHEMA = """
@@ -538,6 +560,28 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user
     ON api_tokens(user_id);
+
+-- Generated digests and release notes. `repo` is '' for an org-wide digest.
+-- One row per (kind, scope, period): regenerating a period replaces it rather
+-- than listing the same week twice. `data` is the structured digest as JSON,
+-- which the dashboard renders; `markdown` is what was delivered.
+CREATE TABLE IF NOT EXISTS digests (
+    id SERIAL PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'digest',
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL DEFAULT '',
+    period_start DOUBLE PRECISION NOT NULL DEFAULT 0,
+    period_end DOUBLE PRECISION NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    markdown TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '{}',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    UNIQUE (kind, platform, owner, repo, period_start, period_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_digests_created
+    ON digests(created_at);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -3402,6 +3446,112 @@ class AppDatabase:
             }
             for r in rows
         ]
+
+    # ── Digests and release notes ──
+
+    _DIGEST_COLUMNS = "id, kind, platform, owner, repo, period_start, period_end, title, created_at"
+
+    @staticmethod
+    def _digest_row(row: tuple, *, full: bool = False) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "id": int(row[0]),
+            "kind": str(row[1] or "digest"),
+            "platform": str(row[2] or "github"),
+            "owner": str(row[3] or ""),
+            "repo": str(row[4] or ""),
+            "period_start": float(row[5] or 0.0),
+            "period_end": float(row[6] or 0.0),
+            "title": str(row[7] or ""),
+            "created_at": float(row[8] or 0.0),
+        }
+        if full:
+            out["markdown"] = str(row[9] or "")
+            try:
+                out["data"] = json.loads(row[10] or "{}")
+            except (TypeError, ValueError):
+                out["data"] = {}
+        return out
+
+    def save_digest(
+        self,
+        *,
+        kind: str,
+        platform: str,
+        owner: str,
+        repo: str,
+        period_start: float,
+        period_end: float,
+        title: str,
+        markdown: str,
+        data: dict[str, Any],
+    ) -> int:
+        """Store a digest, replacing an earlier one for the same scope and period.
+
+        Returns the row id.
+        """
+        now = time.time()
+        params = (
+            kind,
+            platform,
+            owner,
+            repo,
+            float(period_start),
+            float(period_end),
+            title,
+            markdown,
+            json.dumps(data),
+            now,
+        )
+        upsert = (
+            "INSERT INTO digests (kind, platform, owner, repo, period_start, period_end, "
+            "title, markdown, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (kind, platform, owner, repo, period_start, period_end) DO UPDATE SET "
+            "title = excluded.title, markdown = excluded.markdown, data = excluded.data, "
+            "created_at = excluded.created_at"
+        )
+        self._exec(upsert, params)
+        rows = self._rows(
+            "SELECT id FROM digests WHERE kind = ? AND platform = ? AND owner = ? AND repo = ? "
+            "AND period_start = ? AND period_end = ?",
+            params[:6],
+        )
+        return int(rows[0][0]) if rows else 0
+
+    def list_digests(
+        self,
+        *,
+        kind: str = "",
+        platform: str = "",
+        owner: str = "",
+        repo: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Digests newest first, without their bodies, and the total matching."""
+        where: list[str] = []
+        params: list[Any] = []
+        for column, value in (("kind", kind), ("platform", platform), ("owner", owner)):
+            if value:
+                where.append(f"{column} = ?")
+                params.append(value)
+        if repo is not None:
+            where.append("repo = ?")
+            params.append(repo)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        total = int(self._rows(f"SELECT COUNT(*) FROM digests{clause}", tuple(params))[0][0])
+        rows = self._rows(
+            f"SELECT {self._DIGEST_COLUMNS} FROM digests{clause} "
+            "ORDER BY period_end DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, int(limit), int(offset)),
+        )
+        return [self._digest_row(r) for r in rows], total
+
+    def get_digest(self, digest_id: int) -> dict[str, Any] | None:
+        rows = self._rows(
+            f"SELECT {self._DIGEST_COLUMNS}, markdown, data FROM digests WHERE id = ?",
+            (int(digest_id),),
+        )
+        return self._digest_row(rows[0], full=True) if rows else None
 
     def close(self) -> None:
         if self._sqlite_conn:

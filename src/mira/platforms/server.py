@@ -136,7 +136,25 @@ def create_app(
             }
         )
 
+        # The digest scheduler. Always started: whether a digest is due is
+        # decided per tick from the configuration, which the dashboard can
+        # change without a restart, and an idle tick is one config load.
+        from mira.digests import runtime as digest_runtime
+
+        digest_runtime.start(
+            {
+                name: auth
+                for name, auth in (
+                    ("github", app_auth),
+                    ("gitlab", gitlab_auth),
+                    ("forgejo", forgejo_auth),
+                )
+                if auth is not None
+            }
+        )
+
         yield
+        await digest_runtime.stop()
         await autofix_runtime.stop()
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()

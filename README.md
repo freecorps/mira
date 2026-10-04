@@ -285,6 +285,14 @@ left untouched. Open a PR titled just `@mira` and Mira gives it a title.
 
 → [Generated PR description and title](docs/pr-summary.md)
 
+Mira can also say **what landed**: a weekly (or daily) digest of the pull
+requests and direct commits merged into each repository's default branch,
+grouped by area and summarised, delivered to Slack, Discord, Teams or email
+through the outbound webhooks. `mira release-notes --from v1.4.0 --to v1.5.0`
+writes categorized release notes from the same data.
+
+→ [Digests and release notes](docs/digests.md)
+
 The **merge gate** is a separate, conservative approval decision — the review
 verdict says whether the code is good, the gate says whether Mira may put its
 name on merging it. It ships off. Turn it on in shadow first, which records the

@@ -42,6 +42,7 @@ type EventOption = { value: string; label: string; description: string }
 
 const FORMAT_LABEL: Record<string, string> = {
   slack: "Slack",
+  discord: "Discord",
   teams: "Teams",
   generic: "Webhook",
 }

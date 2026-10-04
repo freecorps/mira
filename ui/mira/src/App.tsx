@@ -16,6 +16,7 @@ import { TriagePage } from "@/pages/triage"
 import { ContributorDetailPage } from "@/pages/contributor-detail"
 import { ContributorsPage } from "@/pages/contributors"
 import { DashboardPage } from "@/pages/dashboard"
+import { DigestsPage } from "@/pages/digests"
 import { LearnedRulesPage } from "@/pages/learned-rules"
 import { RuleAnalyticsPage } from "@/pages/rule-analytics"
 import { LearningFormPage } from "@/pages/learning-form"
@@ -210,6 +211,7 @@ export function App() {
         >
           <Route index element={<DashboardPage />} />
           <Route path="activity" element={<ActivityPage />} />
+          <Route path="digests" element={<DigestsPage />} />
           <Route path="repos" element={<ReposPage />} />
           <Route path="repos/:owner/:repo" element={<RepoDetailPage />} />
           <Route path="contributors" element={<ContributorsPage />} />

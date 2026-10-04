@@ -41,17 +41,19 @@ from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     CIJobFailure,
+    CommitInfo,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
+    MergedPullRequest,
     PathAuthorship,
     PRInfo,
     ReviewResult,
     UnresolvedThread,
 )
 from mira.platforms import profiles
-from mira.providers._time import iso_to_epoch
+from mira.providers._time import epoch_to_iso, iso_to_epoch
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 from mira.triage.capabilities import (
@@ -1239,6 +1241,186 @@ class ForgejoProvider(BaseProvider):
         if not full_name:
             return True
         return full_name.lower() != f"{pr_info.owner}/{pr_info.repo}".lower()
+
+    # ── Digests and release notes ──
+
+    async def _get_page(
+        self, client: httpx.AsyncClient, url: str, params: dict[str, Any]
+    ) -> httpx.Response:
+        resp = await client.get(
+            url, headers={"Authorization": f"token {self._token}"}, params=params
+        )
+        if resp.status_code != 200:
+            raise ProviderError(f"Forgejo GET {url} → {resp.status_code}: {resp.text[:300]}")
+        return resp
+
+    async def list_landed_pull_requests(
+        self,
+        repo: PRInfo,
+        *,
+        since: float,
+        until: float = 0.0,
+        base: str = "",
+        limit: int = 100,
+        max_files: int = 100,
+    ) -> list[MergedPullRequest]:
+        """Closed pull requests by most recent update, filtered on ``merged``.
+
+        The API has no merged-only filter or date bound, so the walk stops at
+        the first page whose oldest entry was last updated before ``since`` —
+        a merge after ``since`` is an update after it.
+        """
+        url = f"{self._repo(repo)}/pulls"
+        merged: list[MergedPullRequest] = []
+        page_size = 50
+        max_pages = max(1, min(40, (limit // 25) + 6))
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                for page in range(1, max_pages + 1):
+                    params = {
+                        "state": "closed",
+                        "sort": "recentupdate",
+                        "limit": page_size,
+                        "page": page,
+                    }
+                    items = (await self._get_page(client, url, params)).json() or []
+                    for item in items:
+                        if not item.get("merged"):
+                            continue
+                        merged_at = iso_to_epoch(str(item.get("merged_at") or ""))
+                        if not merged_at or merged_at < since or (until and merged_at >= until):
+                            continue
+                        base_ref = str((item.get("base") or {}).get("ref") or "")
+                        if base and base_ref != base:
+                            continue
+                        merged.append(
+                            MergedPullRequest(
+                                number=int(item.get("number") or 0),
+                                title=str(item.get("title") or ""),
+                                body=str(item.get("body") or ""),
+                                url=str(item.get("html_url") or ""),
+                                author=str((item.get("user") or {}).get("login") or ""),
+                                merged_at=merged_at,
+                                merge_commit_sha=str(item.get("merge_commit_sha") or ""),
+                                base_branch=base_ref,
+                                labels=[
+                                    str(lb.get("name") or "")
+                                    for lb in item.get("labels") or []
+                                    if isinstance(lb, dict) and lb.get("name")
+                                ],
+                            )
+                        )
+                    if not items:
+                        break
+                    oldest_update = iso_to_epoch(str(items[-1].get("updated_at") or ""))
+                    if len(merged) >= limit or len(items) < page_size or oldest_update < since:
+                        break
+                merged.sort(key=lambda pr: pr.merged_at, reverse=True)
+                merged = merged[:limit]
+
+                sem = asyncio.Semaphore(8)
+
+                async def _files(pr: MergedPullRequest) -> None:
+                    async with sem:
+                        try:
+                            resp = await self._get_page(
+                                client,
+                                f"{url}/{pr.number}/files",
+                                {"limit": min(100, max_files)},
+                            )
+                        except Exception as exc:  # noqa: BLE001 - files only enrich
+                            logger.debug("Could not list files of #%s: %s", pr.number, exc)
+                            return
+                    pr.files = [
+                        str(f.get("filename") or "") for f in (resp.json() or [])[:max_files]
+                    ]
+
+                if max_files > 0:
+                    await asyncio.gather(*[_files(pr) for pr in merged])
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to list merged pull requests: {e}") from e
+        return merged
+
+    @staticmethod
+    def _commit_from(item: dict[str, Any]) -> CommitInfo:
+        commit = item.get("commit") or {}
+        committer = commit.get("committer") or {}
+        author = (item.get("author") or {}).get("login") or (commit.get("author") or {}).get("name")
+        return CommitInfo(
+            sha=str(item.get("sha") or ""),
+            message=str(commit.get("message") or ""),
+            author=str(author or ""),
+            date=iso_to_epoch(str(committer.get("date") or item.get("created") or "")),
+            url=str(item.get("html_url") or ""),
+            parents=[str(p.get("sha") or "") for p in item.get("parents") or []],
+            files=[str(f.get("filename") or "") for f in item.get("files") or []],
+        )
+
+    async def list_commits(
+        self,
+        repo: PRInfo,
+        *,
+        ref: str,
+        since: float,
+        until: float = 0.0,
+        limit: int = 200,
+    ) -> list[CommitInfo]:
+        url = f"{self._repo(repo)}/commits"
+        out: list[CommitInfo] = []
+        page_size = 50
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                page = 1
+                while len(out) < limit:
+                    params: dict[str, Any] = {
+                        "sha": ref,
+                        "since": epoch_to_iso(since),
+                        "limit": page_size,
+                        "page": page,
+                        "stat": "false",
+                        "verification": "false",
+                        "files": "true",
+                    }
+                    if until:
+                        params["until"] = epoch_to_iso(until)
+                    items = (await self._get_page(client, url, params)).json() or []
+                    out.extend(self._commit_from(item) for item in items)
+                    if len(items) < page_size:
+                        break
+                    page += 1
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to list commits: {e}") from e
+        return out[:limit]
+
+    async def compare_commits(
+        self, repo: PRInfo, base: str, head: str, *, limit: int = 250
+    ) -> list[CommitInfo]:
+        url = f"{self._repo(repo)}/compare/{quote(base, safe='')}...{quote(head, safe='')}"
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await self._get_page(client, url, {})
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to compare {base}...{head}: {e}") from e
+        items = (resp.json() or {}).get("commits") or []
+        return [self._commit_from(item) for item in items[:limit]]
+
+    async def get_commit_files(self, repo: PRInfo, sha: str, *, limit: int = 100) -> list[str]:
+        url = f"{self._repo(repo)}/git/commits/{quote(sha, safe='')}"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await self._get_page(client, url, {"stat": "false", "files": "true"})
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Failed to read commit {sha}: {e}") from e
+        files = (resp.json() or {}).get("files") or []
+        return [str(f.get("filename") or "") for f in files[:limit]]
 
 
 def _next_link(link_header: str) -> str | None:

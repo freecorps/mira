@@ -22,10 +22,12 @@ from mira.gate.models import CIState
 from mira.models import (
     BotThreadRecord,
     CIJobFailure,
+    CommitInfo,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
     IssueInfo,
+    MergedPullRequest,
     PathAuthorship,
     PRInfo,
     ReviewResult,
@@ -40,6 +42,28 @@ from mira.triage.capabilities import (
 
 if TYPE_CHECKING:
     from mira.platforms.fetch import RepoSnapshot
+
+
+def repository_ref(platform: str, owner: str, repo: str, *, url: str = "") -> PRInfo:
+    """A :class:`PRInfo` naming a repository rather than a pull request.
+
+    The provider interface is keyed by ``PRInfo`` because almost everything it
+    does is about a pull request. The repository-level reads below (what landed
+    on a branch, what lies between two tags) need only the owner and the repo,
+    so they take one of these: number 0, no branches, nothing to mistake for a
+    real pull request.
+    """
+    return PRInfo(
+        title="",
+        description="",
+        base_branch="",
+        head_branch="",
+        url=url,
+        number=0,
+        owner=owner,
+        repo=repo,
+        platform=platform,
+    )
 
 
 class BaseProvider(abc.ABC):
@@ -561,3 +585,62 @@ class BaseProvider(abc.ABC):
         that nobody authorized.
         """
         return True
+
+    # ── Digests and release notes ──
+    #
+    # Read-only, all of it, and keyed by a repository reference (see
+    # :func:`repository_ref`) rather than a pull request. The defaults *raise*:
+    # an empty list here would read as "nothing landed this week", which is a
+    # statement about the team rather than about the provider, and a digest
+    # that says it on the strength of a missing method is wrong in public.
+
+    async def list_landed_pull_requests(
+        self,
+        repo: PRInfo,
+        *,
+        since: float,
+        until: float = 0.0,
+        base: str = "",
+        limit: int = 100,
+        max_files: int = 100,
+    ) -> list[MergedPullRequest]:
+        """Pull requests merged in ``[since, until)`` (epoch seconds), newest first.
+
+        ``until`` 0 means "up to now". ``base`` restricts to pull requests that
+        targeted that branch; empty means any. At most ``limit`` are returned,
+        each with at most ``max_files`` changed paths. The list itself must be
+        complete or raise; a pull request whose files could not be listed comes
+        back with ``files=[]``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list merged pull requests")
+
+    async def list_commits(
+        self,
+        repo: PRInfo,
+        *,
+        ref: str,
+        since: float,
+        until: float = 0.0,
+        limit: int = 200,
+    ) -> list[CommitInfo]:
+        """Commits reachable from ``ref`` committed in ``[since, until)``, newest first.
+
+        Files are not required here (most platforms charge a request per commit
+        for them); :meth:`get_commit_files` fills them in for the few a caller
+        needs.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list commits")
+
+    async def compare_commits(
+        self, repo: PRInfo, base: str, head: str, *, limit: int = 250
+    ) -> list[CommitInfo]:
+        """The commits in ``head`` that are not in ``base`` (``base..head``).
+
+        ``base`` and ``head`` are anything the platform resolves: a tag, a
+        branch or a sha. At most ``limit`` are returned, in no promised order.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot compare refs")
+
+    async def get_commit_files(self, repo: PRInfo, sha: str, *, limit: int = 100) -> list[str]:
+        """Paths one commit changed. ``[]`` when the commit touched none."""
+        raise NotImplementedError(f"{type(self).__name__} cannot list a commit's files")

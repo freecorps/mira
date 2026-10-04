@@ -1,4 +1,4 @@
-"""Outbound webhook notifications (Slack / Microsoft Teams / generic JSON).
+"""Outbound webhook notifications (Slack / Discord / Microsoft Teams / generic JSON).
 
 Mira can POST to user-configured endpoints when interesting things happen —
 a PR review finishes, a review errors out, a repo finishes indexing. Webhooks
@@ -15,8 +15,10 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import socket
 import time
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -31,6 +33,7 @@ REVIEW_COMPLETED = "review.completed"
 REVIEW_FAILED = "review.failed"
 REVIEW_HIGH_SEVERITY = "review.high_severity"
 INDEXING_COMPLETED = "indexing.completed"
+DIGEST_READY = "digest.ready"
 
 # Surfaced to the Settings UI so it can render an event picker per webhook.
 AVAILABLE_EVENTS: list[dict[str, str]] = [
@@ -53,6 +56,11 @@ AVAILABLE_EVENTS: list[dict[str, str]] = [
         "value": INDEXING_COMPLETED,
         "label": "Indexing completed",
         "description": "When a repository finishes indexing.",
+    },
+    {
+        "value": DIGEST_READY,
+        "label": "Digest ready",
+        "description": "When a scheduled digest of what landed is ready.",
     },
 ]
 _EVENT_VALUES = {e["value"] for e in AVAILABLE_EVENTS}
@@ -88,16 +96,19 @@ class WebhookConfig(BaseModel):
 
 
 def detect_format(url: str) -> str:
-    """Classify a webhook URL as ``"slack"``, ``"teams"`` or ``"generic"``."""
+    """Classify a webhook URL as ``"slack"``, ``"discord"``, ``"teams"`` or ``"generic"``."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if host == "hooks.slack.com":
         return "slack"
-    # Discord's Slack-compatible variant (…/webhooks/{id}/{token}/slack).
-    # A bare Discord URL expects Discord's own schema, which Mira doesn't
-    # emit — leave it "generic" so the test button surfaces the 400 loudly.
-    if host in ("discord.com", "discordapp.com") and parsed.path.rstrip("/").endswith("/slack"):
-        return "slack"
+    # Discord's Slack-compatible variant (…/webhooks/{id}/{token}/slack) takes
+    # Slack's schema; a bare `/api/webhooks/{id}/{token}` takes Discord's own.
+    if host in ("discord.com", "discordapp.com"):
+        path = parsed.path.rstrip("/")
+        if path.endswith("/slack"):
+            return "slack"
+        if path.startswith("/api/webhooks/"):
+            return "discord"
     # Classic Teams connector (*.webhook.office.com) and the newer Teams
     # Workflows endpoints (Power Automate / Logic Apps, *.logic.azure.com).
     # Match on a leading dot so a look-alike like "evilwebhook.office.com"
@@ -157,8 +168,59 @@ def _message(event: str, data: dict[str, Any]) -> tuple[str, str, str]:
         body = f"*{repo}* is indexed — {files} file(s) ready for cross-repo context."
         return title, body, "2EB67D"
 
+    if event == DIGEST_READY:
+        return _digest_message(data)
+
     # Fallback for unknown events — still deliver something useful.
     return f"Mira: {event}", f"Event `{event}` for {repo or 'Mira'}.", "5B6770"
+
+
+# Slack caps a section's text at 3,000 characters; Discord an embed's
+# description at 4,096. The digest is the one event long enough to reach them.
+_MAX_BODY_CHARS = 2_900
+_MAX_DISCORD_CHARS = 4_000
+
+
+def _esc(text: Any) -> str:
+    """Slack's three escapes. Digest text is contributors' and a model's."""
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _day(value: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(value or 0), tz=UTC).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
+def _digest_message(data: dict[str, Any]) -> tuple[str, str, str]:
+    scope = _esc(data.get("repo", ""))
+    prs = int(data.get("pull_requests") or 0)
+    commits = int(data.get("direct_commits") or 0)
+    title = f"📰 Mira digest for {data.get('repo', '')}"
+    lines = [
+        f"*{scope}* — {prs} pull request(s), {commits} direct commit(s), "
+        f"{_day(data.get('period_start'))} to {_day(data.get('period_end'))}"
+    ]
+    if data.get("overview"):
+        lines.append(_esc(data["overview"]))
+    for area in data.get("areas") or []:
+        summary = _esc(area.get("summary", ""))
+        line = f"• *{_esc(area.get('name', ''))}* ({int(area.get('count') or 0)})"
+        lines.append(f"{line}: {summary}" if summary else line)
+    more = int(data.get("more_areas") or 0)
+    if more:
+        lines.append(f"_…and {more} more area(s) in the dashboard_")
+    body = "\n".join(lines)
+    if len(body) > _MAX_BODY_CHARS:
+        body = body[: _MAX_BODY_CHARS - 1].rstrip() + "…"
+    return title, body, "4A90D9"
+
+
+def _to_discord_markdown(body: str) -> str:
+    """Slack mrkdwn → Discord Markdown: `<url|text>` links, then the escapes."""
+    body = re.sub(r"<(https?://[^|>\s]+)\|([^>]*)>", r"[\2](\1)", body)
+    return body.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
 def render(event: str, data: dict[str, Any], fmt: str) -> dict[str, Any]:
@@ -172,6 +234,16 @@ def render(event: str, data: dict[str, Any], fmt: str) -> dict[str, Any]:
             "blocks": [
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{body}"}}
             ],
+        }
+
+    if fmt == "discord":
+        description = _to_discord_markdown(body)
+        if len(description) > _MAX_DISCORD_CHARS:
+            description = description[: _MAX_DISCORD_CHARS - 1].rstrip() + "…"
+        return {
+            "embeds": [{"title": title[:256], "description": description, "color": int(color, 16)}],
+            # Text quoted from a pull request must never ping anyone.
+            "allowed_mentions": {"parse": []},
         }
 
     if fmt == "teams":
@@ -319,6 +391,29 @@ def sample_data(event: str) -> dict[str, Any]:
     """A representative payload used by the Settings 'Send test' button."""
     if event == INDEXING_COMPLETED:
         return {"repo": "octocat/hello-world", "files_indexed": 128}
+    if event == DIGEST_READY:
+        now = time.time()
+        return {
+            "digest_id": 0,
+            "platform": "github",
+            "repo": "octocat/hello-world",
+            "title": "Mira digest: octocat/hello-world (test delivery)",
+            "period_start": now - 7 * 86400,
+            "period_end": now,
+            "branch": "main",
+            "overview": "Example digest (test delivery): two pull requests landed in the API.",
+            "pull_requests": 2,
+            "direct_commits": 0,
+            "areas": [
+                {
+                    "name": "src/",
+                    "count": 2,
+                    "summary": "Request validation was tightened and a new endpoint added.",
+                    "highlights": [],
+                }
+            ],
+            "more_areas": 0,
+        }
     if event == REVIEW_FAILED:
         return {
             "repo": "octocat/hello-world",
