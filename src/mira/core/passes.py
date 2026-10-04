@@ -118,6 +118,44 @@ def _with_digest(messages: list[dict], digest: str) -> list[dict]:
     return out
 
 
+# One line per helper the agentic loop can offer, in the order offered.
+_TOOL_LINES = {
+    "read_file": "`read_file(path, start_line?, end_line?)` reads a file at this pull request's head.",
+    "grep_repo": (
+        "`grep_repo(pattern, path_glob?, path_only?)` searches the whole repository "
+        "by regex, or its paths."
+    ),
+    "find_usages": (
+        "`find_usages(symbol, path?)` lists the call sites of a function, method or "
+        "class from parsed syntax trees, each with the function it sits in — the "
+        "way to check every caller of a symbol whose signature or behaviour this "
+        "PR changes."
+    ),
+    "find_definition": (
+        "`find_definition(symbol)` shows where a symbol is defined, its signature and "
+        "the start of its body — what a called function accepts, returns or raises."
+    ),
+    "grep_index": (
+        "`grep_index(query)` searches the repository index's file and symbol "
+        "summaries by keywords — *which file handles X?* when you have no name to grep."
+    ),
+}
+
+
+def _tool_guidance(tools: list[dict]) -> str:
+    """The system-prompt paragraph describing the helpers actually offered."""
+    names = [str((t.get("function") or {}).get("name") or "") for t in tools]
+    lines = [f"- {_TOOL_LINES[n]}" for n in names if n in _TOOL_LINES]
+    return (
+        "You have helpers for cross-file checks:\n"
+        + "\n".join(lines)
+        + "\n\nUse them to verify a cross-file claim before filing — *what does the "
+        "caller pass?*, *is this new value handled where it is consumed?*, *does the "
+        "function actually raise X?* — and to confirm a suspicion rather than drop it. "
+        "Don't browse; fetch what you need."
+    )
+
+
 async def agentic_review_loop(
     llm: LLMProvider,
     messages: list[dict],
@@ -126,7 +164,8 @@ async def agentic_review_loop(
 ) -> str:
     """Run an agentic tool-use loop until the LLM submits a review.
 
-    Hands the model `read_file` and `grep_repo` alongside the terminal
+    Hands the model the executor's helpers (`executor.tools`: `read_file`,
+    `grep_repo`, `find_usages`, …) alongside the terminal
     `submit_review` tool. Caps at ``max_hops`` to bound token spend; returns
     the JSON args of the final `submit_review` call (same shape `llm.review`
     returns), or "" when the loop got nowhere — the caller then makes a
@@ -142,19 +181,13 @@ async def agentic_review_loop(
     """
     from mira.llm.agentic_tools import AGENTIC_TOOLS
 
-    tools = [*AGENTIC_TOOLS, SUBMIT_REVIEW_TOOL]
+    offered = getattr(executor, "tools", None)
+    helpers = list(offered) if isinstance(offered, list) and offered else list(AGENTIC_TOOLS)
+    tools = [*helpers, SUBMIT_REVIEW_TOOL]
     convo: list[dict] = [dict(m) for m in messages]
     if convo and convo[0].get("role") == "system":
         convo[0]["content"] = (
-            convo[0]["content"] + "\n\n## Tools\n\n"
-            "You have two helpers for cross-file checks: "
-            "`read_file(path, start_line?, end_line?)` and "
-            "`grep_repo(pattern, path_glob?, path_only?)`, which searches the "
-            "whole repository at this pull request's head. Use them to verify a "
-            "cross-file claim before filing — *what does the caller pass?*, *is "
-            "this new value handled where it is consumed?*, *does the function "
-            "actually raise X?* — and to confirm a suspicion rather than drop it. "
-            "Don't browse; fetch what you need.\n\n"
+            convo[0]["content"] + "\n\n## Tools\n\n" + _tool_guidance(helpers) + "\n\n"
             f"You have at most {max_hops - 1} rounds of lookups before you must "
             "submit. Ask for everything you need in the same turn — several "
             "tool calls in one reply run together — instead of one lookup per "

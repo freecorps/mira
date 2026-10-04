@@ -49,6 +49,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=from=uv,source=/uv,target=/bin/uv \
     uv sync --locked --no-dev --no-install-project --extra serve --extra bedrock
 
+# The code graph's tree-sitter grammars (docs/code-graph.md). The language
+# pack downloads a grammar the first time it is used; fetching them here keeps
+# a review from depending on that download, and a host without egress to
+# GitHub still parses. The downloaded bundle is dropped, the ~7 MB of grammars
+# kept.
+ENV TREE_SITTER_LANGUAGE_PACK_CACHE_DIR=/app/.tree-sitter
+RUN python -c "import tree_sitter_language_pack as p; [p.get_parser(n) for n in ('python', 'javascript', 'typescript', 'tsx', 'go', 'rust', 'java')]" \
+    && rm -rf /app/.tree-sitter/tree-sitter-language-pack/*/bundles
+
 # Layer 2 — the package itself. Small, and the one layer that changes every
 # commit. Installed non-editable so /app/src is not needed at runtime.
 COPY README.md ./

@@ -497,3 +497,245 @@ class TestAgenticLoopKeepsItsWork:
         result = await agentic_review_loop(llm, [{"role": "user", "content": "go"}], _Recorder())
         assert result == ""
         assert llm.review_messages == []
+
+
+# ── Code-graph and index tools ──
+
+_GRAPH_SOURCES = {
+    "src/billing/charge.py": (
+        "class Charger:\n"
+        "    def charge_card(self, card, cents, currency):\n"
+        '        """Charge a card."""\n'
+        "        validate(card)\n"
+        "        return gateway.post(card, cents)\n"
+    ),
+    "src/api/routes.py": (
+        "from billing.charge import Charger\n"
+        "\n"
+        "def checkout(req):\n"
+        "    # charge_card(req) used to live here\n"
+        "    return Charger().charge_card(req.card, req.cents)\n"
+        "\n"
+        "HANDLERS = {'charge': Charger.charge_card}\n"
+    ),
+    "tests/test_charge.py": "def test_it():\n    Charger().charge_card(1, 2, 'usd')\n",
+    "README.md": "charge_card(x)\n",
+}
+
+
+def _graph_executor(**kwargs) -> AgenticToolExecutor:  # type: ignore[no-untyped-def]
+    return AgenticToolExecutor(
+        source_fetcher=_SnapshotFetcher(_GRAPH_SOURCES),
+        repo_tree=list(_GRAPH_SOURCES),
+        **kwargs,
+    )
+
+
+class TestToolOffer:
+    def test_default_offer_has_the_graph_tools_but_not_the_index(self):
+        names = [t["function"]["name"] for t in _graph_executor().tools]
+        assert names == ["read_file", "grep_repo", "find_usages", "find_definition"]
+
+    def test_index_search_adds_grep_index(self):
+        ex = _graph_executor(index_search=lambda q, n: [])
+        assert "grep_index" in [t["function"]["name"] for t in ex.tools]
+
+    def test_graph_tools_can_be_turned_off(self):
+        ex = _graph_executor(graph_tools=False)
+        assert [t["function"]["name"] for t in ex.tools] == ["read_file", "grep_repo"]
+
+    @pytest.mark.asyncio
+    async def test_tools_not_offered_are_not_run(self):
+        ex = _graph_executor(graph_tools=False)
+        assert "unknown tool" in await ex.execute("find_usages", {"symbol": "charge_card"})
+        assert "unknown tool" in await ex.execute("grep_index", {"query": "billing"})
+
+    def test_schemas_require_their_argument(self):
+        from mira.llm.agentic_tools import (
+            FIND_DEFINITION_TOOL,
+            FIND_USAGES_TOOL,
+            GREP_INDEX_TOOL,
+        )
+
+        assert FIND_USAGES_TOOL["function"]["parameters"]["required"] == ["symbol"]
+        assert FIND_DEFINITION_TOOL["function"]["parameters"]["required"] == ["symbol"]
+        assert GREP_INDEX_TOOL["function"]["parameters"]["required"] == ["query"]
+
+
+class TestFindUsages:
+    @pytest.mark.asyncio
+    async def test_lists_calls_with_their_enclosing_function(self):
+        out = await _graph_executor().execute("find_usages", {"symbol": "Charger.charge_card"})
+        assert "Usages of `charge_card`" in out
+        assert "src/api/routes.py:5 in `checkout`: return Charger().charge_card(" in out
+        assert "tests/test_charge.py:2 in `test_it`" in out
+        # Calls in source come before calls in tests.
+        assert out.index("src/api/routes.py:5") < out.index("tests/test_charge.py:2")
+        assert "Defined at: `src/billing/charge.py:2`" in out
+        # A function passed as a value and a comment are mentions, not calls.
+        mentions = out.split("Other mentions", 1)[1]
+        assert "src/api/routes.py:7" in mentions and "src/api/routes.py:4" in mentions
+        # A Markdown file is not parsed for calls.
+        assert "README.md" not in out
+
+    @pytest.mark.asyncio
+    async def test_path_scopes_the_search(self):
+        out = await _graph_executor().execute(
+            "find_usages", {"symbol": "charge_card", "path": "tests/"}
+        )
+        assert "tests/test_charge.py:2" in out
+        assert "src/api/routes.py" not in out
+
+    @pytest.mark.asyncio
+    async def test_a_scope_outside_the_tree_finds_nothing(self):
+        out = await _graph_executor().execute(
+            "find_usages", {"symbol": "charge_card", "path": "../../etc/"}
+        )
+        assert out.startswith("[no usages of `charge_card`")
+
+    @pytest.mark.asyncio
+    async def test_rejects_patterns(self):
+        out = await _graph_executor().execute("find_usages", {"symbol": "charge.*card"})
+        assert "not a symbol name" in out
+        assert "missing `symbol`" in await _graph_executor().execute("find_usages", {})
+
+    @pytest.mark.asyncio
+    async def test_without_a_snapshot_it_greps_by_word(self):
+        ex = AgenticToolExecutor(
+            source_fetcher=_FakeFetcher(dict(_GRAPH_SOURCES)), repo_tree=list(_GRAPH_SOURCES)
+        )
+        out = await ex.execute("find_usages", {"symbol": "charge_card", "path": "src/api"})
+        assert "word-boundary text matches instead" in out
+        assert "src/api/routes.py:5" in out
+
+    @pytest.mark.asyncio
+    async def test_works_without_tree_sitter(self, monkeypatch):  # type: ignore[no-untyped-def]
+        import sys
+
+        from mira.index import code_graph as cg
+
+        monkeypatch.setitem(sys.modules, "tree_sitter_language_pack", None)
+        monkeypatch.setattr(cg, "_ts_state", None)
+        monkeypatch.setattr(cg, "_ts_module", None)
+        out = await _graph_executor().execute("find_usages", {"symbol": "charge_card"})
+        assert "regex parse" in out
+        assert "src/api/routes.py:5 in `checkout`" in out
+
+    @pytest.mark.asyncio
+    async def test_results_are_cached_and_counted(self, monkeypatch):  # type: ignore[no-untyped-def]
+        ex = _graph_executor()
+        first = await ex.execute("find_usages", {"symbol": "charge_card"})
+        used = ex.bytes_used
+
+        async def _boom(*_a, **_k):  # type: ignore[no-untyped-def]
+            raise AssertionError("not cached")
+
+        monkeypatch.setattr(ex, "_find_usages", _boom)
+        assert await ex.execute("find_usages", {"symbol": "charge_card"}) == first
+        assert ex.bytes_used == used * 2
+        assert ex.call_log[-1] == {"tool": "find_usages", "arg": "charge_card"}
+
+    @pytest.mark.asyncio
+    async def test_shares_the_review_graph(self):
+        from mira.index.code_graph import CodeGraph
+
+        graph = CodeGraph()
+        await _graph_executor(code_graph=graph).execute("find_usages", {"symbol": "validate"})
+        assert "src/billing/charge.py" in graph
+
+
+class TestFindDefinition:
+    @pytest.mark.asyncio
+    async def test_shows_signature_and_body(self):
+        out = await _graph_executor().execute("find_definition", {"symbol": "charge_card"})
+        assert "`src/billing/charge.py` lines 2-5 (method `Charger.charge_card`)" in out
+        assert "`def charge_card(self, card, cents, currency)`" in out
+        assert "    4          validate(card)" in out
+
+    @pytest.mark.asyncio
+    async def test_qualified_name_narrows(self):
+        out = await _graph_executor().execute("find_definition", {"symbol": "Other.charge_card"})
+        assert out.startswith("[no definition of `Other.charge_card`")
+
+    @pytest.mark.asyncio
+    async def test_long_bodies_are_excerpted(self):
+        body = "".join(f"    x{i} = {i}\n" for i in range(40))
+        sources = {"m.py": "def long_one():\n" + body}
+        ex = AgenticToolExecutor(source_fetcher=_SnapshotFetcher(sources), repo_tree=list(sources))
+        out = await ex.execute("find_definition", {"symbol": "long_one"})
+        assert "more lines; read_file with start_line=16" in out
+
+    @pytest.mark.asyncio
+    async def test_without_a_snapshot_it_greps_for_a_definition(self):
+        ex = AgenticToolExecutor(
+            source_fetcher=_FakeFetcher(dict(_GRAPH_SOURCES)), repo_tree=list(_GRAPH_SOURCES)
+        )
+        out = await ex.execute("find_definition", {"symbol": "Charger"})
+        assert "definition-keyword text matches" in out
+        assert "src/billing/charge.py:1: class Charger:" in out
+
+
+class TestGrepIndex:
+    @pytest.mark.asyncio
+    async def test_formats_matches(self):
+        from mira.index._store_shared import IndexMatch
+
+        seen: list[tuple[str, int]] = []
+
+        def _search(query: str, limit: int) -> list[IndexMatch]:
+            seen.append((query, limit))
+            return [
+                IndexMatch(
+                    path="src/limits.py",
+                    summary="Token bucket rate limiting.\nMore detail.",
+                    symbols=["TokenBucket"],
+                )
+            ]
+
+        ex = _graph_executor(index_search=_search)
+        out = await ex.execute("grep_index", {"query": "rate limiting"})
+        assert "- `src/limits.py` — Token bucket rate limiting. (symbols: TokenBucket)" in out
+        assert "More detail" not in out
+        await ex.execute("grep_index", {"query": "Rate Limiting"})
+        assert len(seen) == 1  # cached, case-insensitively
+
+    @pytest.mark.asyncio
+    async def test_no_match_and_missing_query(self):
+        ex = _graph_executor(index_search=lambda q, n: [])
+        assert "no indexed files match" in await ex.execute("grep_index", {"query": "zzz"})
+        assert "missing `query`" in await ex.execute("grep_index", {})
+
+    @pytest.mark.asyncio
+    async def test_a_failing_index_is_reported_not_raised(self):
+        def _broken(query: str, limit: int):  # type: ignore[no-untyped-def]
+            raise RuntimeError("db locked")
+
+        out = await _graph_executor(index_search=_broken).execute("grep_index", {"query": "x"})
+        assert "error executing `grep_index`" in out
+
+
+class TestLoopOffersExecutorTools:
+    @pytest.mark.asyncio
+    async def test_system_prompt_describes_only_offered_tools(self):
+        seen: dict = {}
+
+        class _LLM:
+            async def complete_agentic(self, messages, tools):  # type: ignore[no-untyped-def]
+                seen["tools"] = [t["function"]["name"] for t in tools]
+                seen["system"] = messages[0]["content"]
+                return {
+                    "content": "",
+                    "tool_calls": [_call("c1", "submit_review", '{"comments": []}')],
+                }
+
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        await agentic_review_loop(_LLM(), messages, _graph_executor(graph_tools=False))  # type: ignore[arg-type]
+        assert seen["tools"] == ["read_file", "grep_repo", "submit_review"]
+        assert "find_usages" not in seen["system"]
+
+        ex = _graph_executor(index_search=lambda q, n: [])
+        await agentic_review_loop(_LLM(), messages, ex)  # type: ignore[arg-type]
+        assert seen["tools"][-1] == "submit_review"
+        assert {"find_usages", "find_definition", "grep_index"} <= set(seen["tools"])
+        assert "`find_usages(symbol, path?)`" in seen["system"]
+        assert "`grep_index(query)`" in seen["system"]

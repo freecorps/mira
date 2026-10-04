@@ -451,6 +451,34 @@ _PROFILE_REVIEW_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+class CodeGraphConfig(BaseModel):
+    """The AST code graph: callers of changed symbols, and the usage tools.
+
+    Each review part whose diff changes a function's signature, or removes
+    it, gets the call sites the diff does not touch (see
+    ``index/code_graph.py`` and docs/code-graph.md), and the agentic reviewer
+    gets ``find_usages`` / ``find_definition``. Parsed with tree-sitter when
+    the optional ``graph`` extra is installed (the Docker image has it), with
+    the regex extractor otherwise. ``review.code_graph: false`` turns both off.
+    """
+
+    enabled: bool = True
+    # Tokens per review part for the "Callers of changed symbols" block.
+    # 0 keeps the tools and drops the block.
+    callers_tokens: int = Field(default=2_000, ge=0)
+    # Changed symbols looked up per pull request, and callers listed per symbol.
+    max_symbols: int = Field(default=12, ge=1, le=100)
+    max_callers: int = Field(default=8, ge=1, le=100)
+    # Files parsed for call sites (only files that mention a changed name are
+    # parsed at all), the largest file parsed, and the text parsed in total.
+    max_files: int = Field(default=400, ge=1, le=20_000)
+    max_file_kb: int = Field(default=300, ge=1, le=10_240)
+    max_total_mb: int = Field(default=24, ge=1, le=1024)
+    # Wall-clock seconds the caller search may take per review; it runs while
+    # the walkthrough and index reads do, so most of it is not added time.
+    time_budget_seconds: float = Field(default=20.0, gt=0, le=300)
+
+
 class DependencyUpdatesConfig(BaseModel):
     """Upstream release notes for the dependency versions a pull request bumps.
 
@@ -544,6 +572,10 @@ class ReviewConfig(BaseModel):
     # its changed lines sit in (see core/enclosing.py). 0 turns it off and
     # leaves the review with the diff's three lines of context.
     enclosing_context_tokens: int = Field(default=6_000, ge=0)
+    # Callers of the symbols a PR changes or removes, and the reviewer's
+    # find_usages/find_definition tools. `code_graph: false` is shorthand for
+    # `code_graph: {enabled: false}`. See CodeGraphConfig.
+    code_graph: CodeGraphConfig = Field(default_factory=CodeGraphConfig)
     include_summary: bool = True
     focus_only_on_problems: bool = False
     walkthrough: bool = True
@@ -593,8 +625,9 @@ class ReviewConfig(BaseModel):
     # docs/dependency-updates.md.
     dependency_updates: DependencyUpdatesConfig = Field(default_factory=DependencyUpdatesConfig)
 
-    # Give the reviewer LLM tools (`read_file`, `grep_repo`) to fetch
-    # cross-file context on demand. On unindexed repos this closes the
+    # Give the reviewer LLM tools (`read_file`, `grep_repo`; `find_usages` and
+    # `find_definition` with `code_graph` on; `grep_index` on an indexed
+    # repository) to fetch cross-file context on demand. On unindexed repos this closes the
     # Java/Go gaps JIT pre-fetch can't reach; on indexed repos it lets the
     # reviewer trace callers and dispatch points beyond the pre-fetched
     # index context. Disable to force single-shot reviews (cheaper, less
@@ -649,6 +682,14 @@ class ReviewConfig(BaseModel):
         if value not in REVIEW_PROFILES:
             raise ValueError(f"review.profile must be one of {', '.join(REVIEW_PROFILES)}")
         return value
+
+    @field_validator("code_graph", mode="before")
+    @classmethod
+    def _code_graph_shorthand(cls, v: Any) -> Any:
+        # `code_graph: false` / `true` in YAML.
+        if isinstance(v, bool):
+            return {"enabled": v}
+        return v
 
 
 def _apply_preset(model: BaseModel, preset: dict[str, Any]) -> None:

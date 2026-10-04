@@ -49,7 +49,10 @@ Every diff line in the prompt starts with its line number in the file after the
 change, so the model files comments against numbers it reads rather than counts.
 Each part also receives the post-change source of every function or class its
 changed lines sit in (nested functions included, long ones as windows around the
-change), within `enclosing_context_tokens`.
+change), within `enclosing_context_tokens`. When a part changes a function's
+signature or removes it, it also gets the call sites elsewhere in the repository
+that the pull request does not update, within `code_graph.callers_tokens` (see
+[code graph](code-graph.md)).
 
 Oversized files are split by hunks and lines, preserving original coordinates.
 An individual line larger than the window is labelled and split into fragments.

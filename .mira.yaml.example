@@ -133,6 +133,19 @@ review:
   # Tokens per review part for the full source of the functions its changed
   # lines sit in. 0 turns it off.
   enclosing_context_tokens: 6000
+  # Callers of the functions a PR changes the signature of or removes, found
+  # in syntax trees (tree-sitter; regex without the `graph` extra), plus the
+  # reviewer's find_usages/find_definition tools. `code_graph: false` turns
+  # both off. See docs/code-graph.md.
+  code_graph:
+    enabled: true
+    callers_tokens: 2000      # per review part; 0 keeps only the tools
+    max_symbols: 12           # changed symbols looked up per PR
+    max_callers: 8            # call sites listed per symbol
+    max_files: 400            # files parsed (only those naming a changed symbol)
+    max_file_kb: 300
+    max_total_mb: 24
+    time_budget_seconds: 20
   # Confidence a finding the critic grades "plausible" needs to be posted.
   # Set by `profile` unless written here (balanced: 0.7).
   # critique_plausible_min_confidence: 0.7

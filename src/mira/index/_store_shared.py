@@ -7,6 +7,8 @@ they don't touch SQL themselves, so they live in one place.
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -16,6 +18,23 @@ if TYPE_CHECKING:
         ExternalRef,
         FileSummary,
     )
+
+
+_SEARCH_WORD_RE = re.compile(r"[a-z0-9_]+")
+_SEARCH_STOPWORDS = frozenset(
+    ["the", "a", "an", "of", "to", "in", "for", "and", "or", "is", "which", "where", "what"]
+    + ["file", "files", "handles", "handle", "code", "does", "how", "who", "that", "with"]
+)
+
+
+@dataclass
+class IndexMatch:
+    """One indexed file matching an index search."""
+
+    path: str
+    summary: str = ""
+    symbols: list[str] = field(default_factory=list)
+    score: int = 0
 
 
 class _StoreSharedMixin:
@@ -48,6 +67,62 @@ class _StoreSharedMixin:
         for path in paths:
             result.extend(self._load_external_refs(path))  # type: ignore[attr-defined]
         return result
+
+    def search_index(self, query: str, limit: int = 15) -> list[IndexMatch]:
+        """Indexed files that best match ``query``, for "which file handles X?".
+
+        A plain keyword search, not semantic: each word of the query is looked
+        for in file paths, file summaries and symbol names, signatures and
+        descriptions, and a file scores by how many distinct words it matches,
+        then by where (a path or symbol-name hit counts more than a summary
+        hit). The rows come from ``_index_search_rows``, which each backend
+        implements; the ranking is here so both rank alike.
+        """
+        terms = [t for t in dict.fromkeys(_SEARCH_WORD_RE.findall(query.lower())) if len(t) >= 2]
+        terms = [t for t in terms if t not in _SEARCH_STOPWORDS][:8]
+        if not terms:
+            return []
+        file_rows, symbol_rows = self._index_search_rows(terms, 400)  # type: ignore[attr-defined]
+        found: dict[str, IndexMatch] = {}
+        hit_terms: dict[str, set[str]] = {}
+
+        def _entry(path: str) -> IndexMatch:
+            if path not in found:
+                found[path] = IndexMatch(path=path)
+                hit_terms[path] = set()
+            return found[path]
+
+        for path, summary in file_rows:
+            entry = _entry(path)
+            entry.summary = summary or ""
+            lower_path, lower_summary = path.lower(), (summary or "").lower()
+            for term in terms:
+                if term in lower_path:
+                    entry.score += 3
+                    hit_terms[path].add(term)
+                if term in lower_summary:
+                    entry.score += 2
+                    hit_terms[path].add(term)
+        for path, name, signature, description in symbol_rows:
+            entry = _entry(path)
+            lower_name = (name or "").lower()
+            rest = f"{signature or ''} {description or ''}".lower()
+            matched = False
+            for term in terms:
+                if term in lower_name:
+                    entry.score += 3
+                    hit_terms[path].add(term)
+                    matched = True
+                elif term in rest:
+                    entry.score += 1
+                    hit_terms[path].add(term)
+                    matched = True
+            if matched and name and name not in entry.symbols and len(entry.symbols) < 6:
+                entry.symbols.append(name)
+        for path, entry in found.items():
+            entry.score += 10 * len(hit_terms[path])
+        ranked = sorted(found.values(), key=lambda m: (-m.score, m.path))
+        return ranked[: max(1, limit)]
 
     def get_all_review_context_text(self) -> str:
         entries = self.list_review_context()  # type: ignore[attr-defined]
