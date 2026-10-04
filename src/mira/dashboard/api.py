@@ -672,6 +672,8 @@ class PackageModel(BaseModel):
     version: str
     file_path: str
     is_dev: bool = False
+    # SPDX expression from the lockfile or the license cache; "" when unknown.
+    license: str = ""
 
 
 class PackageSearchHit(BaseModel):
@@ -1421,6 +1423,7 @@ import mira.dashboard.routers.providers  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.repos  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401
+import mira.dashboard.routers.sbom  # noqa: E402,F401
 import mira.dashboard.routers.triage  # noqa: E402,F401
 import mira.dashboard.routers.vulnerabilities  # noqa: E402,F401
 

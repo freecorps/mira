@@ -567,3 +567,39 @@ triage:
   # repositories:
   #   acme/infra:
   #     history: false        # CODEOWNERS only here
+
+# License policy for the dependencies a pull request adds or bumps. Off by
+# default; no model is called. Licenses come from the lockfile when it records
+# them (package-lock.json, composer.lock), then Mira's cache, then the package
+# registry. See docs/sbom-licenses.md — and `mira sbom` for SBOM export.
+licenses:
+  enabled: false
+  # SPDX ids or simple expressions. Empty `allow`: anything not denied passes.
+  # A bare GNU family (GPL-3.0) matches both -only and -or-later.
+  allow: []
+  #   - MIT
+  #   - Apache-2.0
+  #   - BSD-3-Clause
+  #   - ISC
+  deny: []
+  #   - GPL-3.0
+  #   - AGPL-3.0
+  # A package whose license cannot be determined is a violation.
+  fail_on_unknown: false
+  # "warning", or "blocker" to make a violation fail the review status the way
+  # any blocker does (see review.status.fail_on).
+  severity: warning
+  ignore_dev: false
+  ignore_packages: []
+  # Ask the registry when neither the lockfile nor the cache knows. Only these
+  # hosts, over HTTPS, no redirects, no private addresses, within one budget.
+  # MIRA_LICENSES_HOSTS="" in the environment keeps an install offline.
+  lookup: true
+  max_lookups: 25
+  timeout_seconds: 10
+  allowed_hosts:
+    - registry.npmjs.org
+    - pypi.org
+    - crates.io
+    - api.deps.dev
+    - repo.packagist.org

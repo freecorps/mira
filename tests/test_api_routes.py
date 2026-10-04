@@ -167,6 +167,9 @@ EXPECTED_ROUTES = {
     ("/api/repos/{owner}/{repo}/rules/{rule_id}", "DELETE"),
     ("/api/repos/{owner}/{repo}/rules/{rule_id}", "PUT"),
     ("/api/repos/{owner}/{repo}/vulnerabilities", "GET"),
+    # SBOM downloads (CycloneDX / SPDX) from the package inventory.
+    ("/api/repos/{owner}/{repo}/sbom", "GET"),
+    ("/api/sbom", "GET"),
     ("/api/rules/global", "GET"),
     ("/api/rules/global", "POST"),
     ("/api/rules/global/{rule_id}", "DELETE"),

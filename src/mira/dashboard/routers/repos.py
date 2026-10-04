@@ -415,19 +415,30 @@ def get_packages(owner: str, repo: str) -> list[PackageModel]:
     actually installed.
     """
     from mira.index.manifests import _is_lockfile_path
+    from mira.licenses.expressions import normalize
+    from mira.licenses.lookup import PackageRef
 
     with _open_store(owner, repo) as store:
         rows = store.list_manifest_packages()
+        # Licenses the registry cache already knows; never a network call here.
+        refs = {r.id: PackageRef(r.kind, r.name, r.version, r.license) for r in rows}
+        try:
+            cached = store.get_package_licenses([ref.key for ref in refs.values()])
+        except Exception:  # noqa: BLE001 - no cache costs the column, not the list
+            cached = {}
 
     # Dedupe by (kind, name), preferring lockfile rows.
     by_key: dict[tuple[str, str], PackageModel] = {}
     for r in rows:
+        ref = refs[r.id]
+        hit = cached.get(ref.key)
         model = PackageModel(
             name=r.name,
             kind=r.kind,
             version=r.version,
             file_path=r.file_path,
             is_dev=r.is_dev,
+            license=normalize(r.license) or (normalize(hit[0]) if hit else ""),
         )
         key = (r.kind, r.name.lower())
         existing = by_key.get(key)

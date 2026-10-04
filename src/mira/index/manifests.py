@@ -31,6 +31,10 @@ class ParsedPackage:
     version: str  # raw constraint as written ("^4.18.0", ">=2.0", "4.18.0", etc.)
     file_path: str
     is_dev: bool = False
+    # The license the manifest or lockfile itself records for this package, as
+    # written ("MIT", "(MIT OR Apache-2.0)"). Empty when the format has none —
+    # most manifests do not, and the license is looked up elsewhere.
+    license: str = ""
 
 
 # ── package.json (npm, yarn, pnpm) ──
@@ -358,9 +362,30 @@ def parse_composer_lock(content: str, file_path: str) -> list[ParsedPackage]:
                     version=version,
                     file_path=file_path,
                     is_dev=is_dev,
+                    # Composer's list holds alternatives: a dual-licensed package.
+                    license=_license_field(entry.get("license"), joiner=" OR "),
                 )
             )
     return out
+
+
+def _license_field(value: object, joiner: str = " AND ") -> str:
+    """A lockfile's license field as one string, whatever shape it took.
+
+    npm writes a string (old packages ``{"type": "MIT"}``); Composer a list.
+    The ``joiner`` says how a list's entries combine.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        kind = value.get("type")
+        return kind.strip() if isinstance(kind, str) else ""
+    if isinstance(value, list):
+        parts = [p for p in (_license_field(v) for v in value) if p]
+        if len(parts) > 1:
+            return joiner.join(f"({p})" if " " in p else p for p in parts)
+        return parts[0] if parts else ""
+    return ""
 
 
 # ── Lockfile parsers ──
@@ -446,6 +471,7 @@ def parse_package_lock_json(content: str, file_path: str) -> list[ParsedPackage]
                     version=version,
                     file_path=file_path,
                     is_dev=is_dev,
+                    license=_license_field(info.get("license")),
                 )
             )
         return out

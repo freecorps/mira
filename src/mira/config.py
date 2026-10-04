@@ -1438,6 +1438,80 @@ class IssuePlannerConfig(BaseModel):
         return [label.strip() for label in v if label and label.strip()]
 
 
+class LicensesConfig(BaseModel):
+    """License policy for the dependencies a pull request adds. See docs/sbom-licenses.md.
+
+    Off by default. When on, every package a changed manifest or lockfile adds
+    or bumps is checked against ``allow`` and ``deny`` (SPDX ids or simple
+    expressions such as ``MIT OR Apache-2.0``), and a package whose license
+    breaks the policy gets an inline finding on the line that added it. No
+    model is called: the license comes from the lockfile when it records one,
+    then from Mira's cache, then — when ``lookup`` is on — from the package
+    registry, over the same guarded HTTP client the dependency release notes
+    use (only ``allowed_hosts``, HTTPS, no redirects, no private addresses, one
+    time and byte budget per review).
+
+    ``severity: blocker`` makes a violation a blocker, which is what
+    ``review.status.fail_on`` and the merge gate read: the review status goes
+    red the same way it does for any other blocker.
+    """
+
+    enabled: bool = False
+    # Licenses that may be used. Empty: anything not denied is allowed.
+    allow: list[str] = Field(default_factory=list)
+    # Licenses that may not be used, whatever `allow` says.
+    deny: list[str] = Field(default_factory=list)
+    # A package whose license cannot be determined is a violation.
+    fail_on_unknown: bool = False
+    # Severity of a violation finding: "warning" or "blocker".
+    severity: str = "warning"
+    # Dev-only dependencies (devDependencies, dev extras) are not checked.
+    ignore_dev: bool = False
+    # Package names never checked, e.g. an internal package with no license.
+    ignore_packages: list[str] = Field(default_factory=list)
+    # Ask the registry (npm, PyPI, crates.io, deps.dev, Packagist) when neither
+    # the lockfile nor the cache knows a package's license.
+    lookup: bool = True
+    # Registry lookups per review; the rest count as unknown.
+    max_lookups: int = Field(default=25, ge=0, le=500)
+    timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    request_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    max_bytes: int = Field(default=5_000_000, ge=10_000, le=50_000_000)
+    # The complete list of hosts contacted. `MIRA_LICENSES_HOSTS` overrides it
+    # from the environment; an empty value keeps an install offline.
+    allowed_hosts: list[str] = Field(
+        default_factory=lambda: [
+            "registry.npmjs.org",
+            "pypi.org",
+            "crates.io",
+            "api.deps.dev",
+            "repo.packagist.org",
+        ]
+    )
+    # Most violations posted inline per review; the last one names the rest.
+    max_comments: int = Field(default=10, ge=1, le=100)
+
+    @field_validator("severity")
+    @classmethod
+    def _valid_severity(cls, v: str) -> str:
+        allowed = {"warning", "blocker"}
+        if v not in allowed:
+            raise ValueError(f"licenses.severity must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def _valid_expressions(cls, value: list[str]) -> list[str]:
+        from mira.licenses.expressions import LicenseParseError, parse_expression
+
+        for entry in value:
+            try:
+                parse_expression(entry)
+            except LicenseParseError as exc:
+                raise ValueError(f"licenses: {entry!r} is not a license expression: {exc}") from exc
+        return value
+
+
 class MiraConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
@@ -1453,6 +1527,7 @@ class MiraConfig(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     pr_summary: PRSummaryConfig = Field(default_factory=PRSummaryConfig)
     issue_planner: IssuePlannerConfig = Field(default_factory=IssuePlannerConfig)
+    licenses: LicensesConfig = Field(default_factory=LicensesConfig)
 
     @model_validator(mode="after")
     def _apply_review_profile(self) -> MiraConfig:

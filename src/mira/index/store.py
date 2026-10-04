@@ -755,10 +755,24 @@ CREATE TABLE IF NOT EXISTS package_manifests (
     file_path TEXT NOT NULL DEFAULT '',
     is_dev INTEGER NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0,
+    license TEXT NOT NULL DEFAULT '',
     UNIQUE(name, kind, file_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pkg_manifest_name ON package_manifests(name);
+
+-- Licenses read from registry metadata (mira.licenses.lookup), so an SBOM or
+-- a license check does not ask npm or PyPI the same question twice. An empty
+-- license is a remembered "the registry had none", kept for less time.
+CREATE TABLE IF NOT EXISTS package_licenses (
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    license TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    fetched_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, name, version)
+);
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -931,6 +945,8 @@ class PackageManifestRow:
     file_path: str
     is_dev: bool = False
     updated_at: float = 0.0
+    # As the lockfile recorded it; "" when the format has no license field.
+    license: str = ""
 
 
 @dataclass
@@ -1048,6 +1064,15 @@ class IndexStore(
         if "job_kind" not in autofix_cols:
             self._conn.execute(
                 "ALTER TABLE autofix_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'fix'"
+            )
+        # package_manifests.license added with the SBOM export: the license a
+        # lockfile records. Rows written before it read as "not recorded".
+        pkg_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(package_manifests)").fetchall()
+        }
+        if "license" not in pkg_cols:
+            self._conn.execute(
+                "ALTER TABLE package_manifests ADD COLUMN license TEXT NOT NULL DEFAULT ''"
             )
         # learned_rules.status added post-schema. Default 'approved' so existing
         # rules keep feeding reviews; new synthesized rules are inserted 'pending'.
@@ -3289,13 +3314,14 @@ class IndexStore(
                     p["file_path"],
                     1 if p.get("is_dev") else 0,
                     now,
+                    p.get("license") or "",
                 )
                 for p in packages
             ]
             self._conn.executemany(
                 "INSERT OR REPLACE INTO package_manifests "
-                "(name, kind, version, file_path, is_dev, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(name, kind, version, file_path, is_dev, updated_at, license) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         self._conn.commit()
@@ -3303,7 +3329,7 @@ class IndexStore(
 
     def list_manifest_packages(self) -> list[PackageManifestRow]:
         rows = self._conn.execute(
-            "SELECT id, name, kind, version, file_path, is_dev, updated_at "
+            "SELECT id, name, kind, version, file_path, is_dev, updated_at, license "
             "FROM package_manifests ORDER BY name COLLATE NOCASE"
         ).fetchall()
         return [
@@ -3315,9 +3341,37 @@ class IndexStore(
                 file_path=r[4],
                 is_dev=bool(r[5]),
                 updated_at=r[6],
+                license=r[7] or "",
             )
             for r in rows
         ]
+
+    def get_package_licenses(
+        self, keys: list[tuple[str, str, str]]
+    ) -> dict[tuple[str, str, str], tuple[str, str, float]]:
+        """Cached registry licenses: ``(kind, name, version)`` → ``(license, source, fetched_at)``."""
+        out: dict[tuple[str, str, str], tuple[str, str, float]] = {}
+        for key in dict.fromkeys(keys):
+            row = self._conn.execute(
+                "SELECT license, source, fetched_at FROM package_licenses "
+                "WHERE kind = ? AND name = ? AND version = ?",
+                key,
+            ).fetchone()
+            if row:
+                out[key] = (row[0], row[1], row[2])
+        return out
+
+    def upsert_package_licenses(self, rows: list[tuple[str, str, str, str, str]]) -> None:
+        """Remember ``(kind, name, version, license, source)`` answers from a registry."""
+        if not rows:
+            return
+        now = time.time()
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO package_licenses "
+            "(kind, name, version, license, source, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [(*r, now) for r in rows],
+        )
+        self._conn.commit()
 
     def clear_manifest_packages_for_missing_files(self, live_paths: set[str]) -> int:
         """Drop entries for manifest files that no longer exist in the repo.
