@@ -84,12 +84,14 @@ def test_new_keywords_do_not_collide_with_existing_ones() -> None:
         ("@mira-bot Full-Review", True),
         ("@mira-bot full explanation of this please", False),
         ("@mira-bot pause", False),
+        # A question that starts with "review" is dispatched as a question,
+        # so it must not get past the author filter as a review request.
+        ("@mira-bot review please, and explain the cache change", False),
+        ("@mira-bot review this pr", True),
     ],
 )
 def test_is_review_request(body: str, expected: bool) -> None:
-    from mira.platforms.mentions import command_after_mention
-
-    assert is_review_request(body, NAMES, command_after_mention(body, NAMES)) is expected
+    assert is_review_request(body, NAMES) is expected
 
 
 def test_help_lists_new_commands_and_keeps_existing_rows() -> None:
