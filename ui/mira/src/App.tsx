@@ -27,6 +27,7 @@ import { PackagesPage } from "@/pages/packages"
 import { RepoDetailPage } from "@/pages/repo-detail"
 import { RelationshipsPage } from "@/pages/relationships"
 import { ReposPage } from "@/pages/repos"
+import { ReviewQualityPage } from "@/pages/review-quality"
 import { SettingsPage } from "@/pages/settings"
 import { SetupPage } from "@/pages/setup"
 import { RulesPage } from "@/pages/rules"
@@ -230,6 +231,7 @@ export function App() {
           <Route path="autofix" element={<AutofixPage />} />
           <Route path="checks" element={<ChecksPage />} />
           <Route path="triage" element={<TriagePage />} />
+          <Route path="review-quality" element={<ReviewQualityPage />} />
           <Route path="vulnerabilities" element={<VulnerabilitiesPage />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="users" element={<UsersPage />} />
