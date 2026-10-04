@@ -26,6 +26,8 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Full-repo code index with per-file summaries
 - Dependency graph and relationships across files
 - Cross-repo relationships and blast-radius analysis
+- AST code graph (tree-sitter: Python, JS/TS/TSX, Go, Rust, Java; regex fallback): when a PR changes a function's signature or removes it, the review gets the call sites the PR does not update, with the function each sits in ([docs](docs/code-graph.md))
+- Reviewer tools beyond `read_file` / `grep_repo`: `find_usages` (call sites from syntax trees), `find_definition` (signature and body), and `grep_index` (keyword search over the index's file and symbol summaries, on indexed repositories)
 - Blast-radius SVG rendering and interactive ReactFlow graph
 - Relationship overrides and custom edges
 - External reference tracking

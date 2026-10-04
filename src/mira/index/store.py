@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 from mira.autofix.persistence import AutofixStoreMixin
 from mira.checks.persistence import ChecksStoreMixin
-from mira.db.sqltext import like_prefix
+from mira.db.sqltext import like_contains, like_prefix
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -1314,6 +1314,33 @@ class IndexStore(
                 break
         visited.discard(path)
         return sorted(visited)
+
+    def _index_search_rows(
+        self, terms: list[str], cap: int
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str]]]:
+        """Files and symbols mentioning any of ``terms``; ranked by `search_index`."""
+        patterns = [like_contains(t) for t in terms]
+        file_where = " OR ".join(
+            "lower(path) LIKE ? ESCAPE '\\' OR lower(summary) LIKE ? ESCAPE '\\'" for _ in terms
+        )
+        file_rows = self._conn.execute(
+            f"SELECT path, summary FROM files WHERE {file_where} LIMIT ?",
+            (*[p for p in patterns for _ in (0, 1)], cap),
+        ).fetchall()
+        symbol_where = " OR ".join(
+            "lower(name) LIKE ? ESCAPE '\\' OR lower(signature) LIKE ? ESCAPE '\\' "
+            "OR lower(description) LIKE ? ESCAPE '\\'"
+            for _ in terms
+        )
+        symbol_rows = self._conn.execute(
+            "SELECT file_path, name, signature, description FROM symbols "
+            f"WHERE {symbol_where} LIMIT ?",
+            (*[p for p in patterns for _ in (0, 1, 2)], cap),
+        ).fetchall()
+        return (
+            [(r[0], r[1] or "") for r in file_rows],
+            [(r[0], r[1] or "", r[2] or "", r[3] or "") for r in symbol_rows],
+        )
 
     def get_inbound_edge_counts(self, paths: list[str]) -> dict[str, int]:
         """Count how many other files reference each path via symbol_refs or imports.

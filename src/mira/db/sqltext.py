@@ -22,3 +22,9 @@ def like_prefix(prefix: str) -> str:
     """
     escaped = prefix.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
     return f"{escaped}%"
+
+
+def like_contains(term: str) -> str:
+    """A LIKE pattern matching the literal ``term`` anywhere, escaped as `like_prefix`."""
+    escaped = term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    return f"%{escaped}%"

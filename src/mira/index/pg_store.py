@@ -15,7 +15,7 @@ from typing import Any
 
 from mira.autofix.persistence import AutofixStoreMixin
 from mira.checks.persistence import ChecksStoreMixin
-from mira.db.sqltext import like_prefix
+from mira.db.sqltext import like_contains, like_prefix
 from mira.feedback.evaluation import RuleEvaluation
 from mira.feedback.models import FeedbackEventV2, LearningCandidate, ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
@@ -1402,6 +1402,34 @@ class PgIndexStore(
                 break
         visited.discard(path)
         return sorted(visited)
+
+    def _index_search_rows(
+        self, terms: list[str], cap: int
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str, str]]]:
+        """Files and symbols mentioning any of ``terms``; ranked by `search_index`."""
+        patterns = [like_contains(t) for t in terms]
+        file_where = " OR ".join(
+            "lower(path) LIKE %s ESCAPE '\\' OR lower(summary) LIKE %s ESCAPE '\\'" for _ in terms
+        )
+        file_rows = self._fetchall(
+            f"SELECT path, summary FROM files WHERE owner=%s AND repo=%s AND ({file_where}) "
+            "LIMIT %s",
+            (self._owner, self._repo, *[p for p in patterns for _ in (0, 1)], cap),
+        )
+        symbol_where = " OR ".join(
+            "lower(name) LIKE %s ESCAPE '\\' OR lower(signature) LIKE %s ESCAPE '\\' "
+            "OR lower(description) LIKE %s ESCAPE '\\'"
+            for _ in terms
+        )
+        symbol_rows = self._fetchall(
+            "SELECT file_path, name, signature, description FROM symbols "
+            f"WHERE owner=%s AND repo=%s AND ({symbol_where}) LIMIT %s",
+            (self._owner, self._repo, *[p for p in patterns for _ in (0, 1, 2)], cap),
+        )
+        return (
+            [(r[0], r[1] or "") for r in file_rows],
+            [(r[0], r[1] or "", r[2] or "", r[3] or "") for r in symbol_rows],
+        )
 
     def get_inbound_edge_counts(self, paths: list[str]) -> dict[str, int]:
         """Count how many other files reference each path via symbol_refs or imports."""

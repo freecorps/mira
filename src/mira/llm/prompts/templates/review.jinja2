@@ -73,7 +73,9 @@ For every new type, variant, value, or behavior the patch introduces that crosse
 2. Confirm the new value has an explicit branch, or that the existing catch-all forwards it correctly.
 3. If it falls through to a silent drop, no-op, or discard (e.g. an unmatched `if`/`switch` that simply returns), report it as a defect.
 
-The dispatch point is frequently **outside the diff**. Use the codebase context provided and the `read_file`/`grep_repo` tools (when available) to read the consuming side before concluding the producing side is correct. Tracing only the emitting code while skipping the consuming routing logic is the single most common source of missed integration bugs.
+The dispatch point is frequently **outside the diff**. Use the codebase context provided and the `read_file`/`grep_repo`/`find_usages` tools (when available) to read the consuming side before concluding the producing side is correct. Tracing only the emitting code while skipping the consuming routing logic is the single most common source of missed integration bugs.
+
+The same holds for a changed signature. When the patch adds, removes, reorders or retypes a parameter, changes a return type, or renames or removes a function, every caller outside the diff must still match. Check them — the "Callers of changed symbols" context lists the ones found, and `find_usages` finds more — and report a caller left passing the old arguments on the changed definition, naming the caller's file and line.
 
 ## Do NOT Suggest
 

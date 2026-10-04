@@ -1,4 +1,9 @@
-"""Tools the reviewer LLM can call during review (`read_file`, `grep_repo`).
+"""Tools the reviewer LLM can call during review.
+
+`read_file` and `grep_repo` read and search the repository at the PR head;
+`find_usages` and `find_definition` answer from the code graph
+(``index/code_graph.py``); `grep_index` searches the repository index's file
+and symbol summaries, when the repository has been indexed.
 
 On unindexed repos the tools cover what JIT pre-fetch can't reach
 (Java/Go import resolution); on indexed repos they let the model trace
@@ -15,9 +20,23 @@ import asyncio
 import fnmatch
 import logging
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
+from mira.index.code_graph import (
+    CodeGraph,
+    graph_searchable,
+    match_path,
+    name_pattern,
+    repo_snapshot,
+    select_candidates,
+)
 from mira.index.context import SourceFetcher
+
+if TYPE_CHECKING:
+    from mira.index._store_shared import IndexMatch
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +122,94 @@ GREP_REPO_TOOL = {
 }
 
 
+FIND_USAGES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "find_usages",
+        "description": (
+            "Find the call sites of a function, method or class across the repository, "
+            "from parsed syntax trees: each hit is `path:line`, the function it sits "
+            "in, and the line. Use it to check that every caller of a symbol whose "
+            "signature or behaviour changed still matches — better than grep_repo for "
+            "this, because comments, strings and same-prefixed names are not calls. "
+            "Calls are matched by name, so `obj.save()` counts for every `save`; "
+            "other mentions (imports, a function passed as a value) are listed after."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": (
+                        "The name to look up, e.g. `authenticate` or `SessionStore.save` "
+                        "(only the last part is matched against calls)."
+                    ),
+                },
+                "path": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Optional directory, file or glob to search in, e.g. `src/api/` "
+                        "or `**/*.ts`. Defaults to the whole repository."
+                    ),
+                },
+            },
+            "required": ["symbol"],
+        },
+    },
+}
+
+
+FIND_DEFINITION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "find_definition",
+        "description": (
+            "Find where a function, method or class is defined: its file, line span, "
+            "signature and the first lines of its body. Use it to check what a called "
+            "function actually accepts, returns or raises without knowing its file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": (
+                        "The name, plain (`parse_config`) or qualified with its class "
+                        "or receiver (`Config.parse`, `Server.Handle`)."
+                    ),
+                },
+            },
+            "required": ["symbol"],
+        },
+    },
+}
+
+
+GREP_INDEX_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "grep_index",
+        "description": (
+            "Search the repository's index — a summary of every file and its "
+            "symbols — by keywords, to answer *which file handles X?* when you "
+            "don't know a name to grep for (e.g. `rate limiting`, `webhook "
+            "signature`). Returns the best-matching files with their summaries "
+            "and matching symbols; read the file to confirm."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A few keywords describing what you are looking for.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
 # Hard caps to keep tool output from blowing up the prompt or the API budget.
 _MAX_FILE_BYTES = 12_000  # ~3k tokens of source; truncate larger files
 _MAX_RANGE_LINES = 300  # one ranged read
@@ -111,6 +218,16 @@ _MAX_GREP_BYTES_PER_HIT = 240
 _MAX_TOTAL_OUTPUT_BYTES = 50_000  # all tool calls in one review combined
 # How long a search waits for the review's archive before searching file by file.
 _GREP_SNAPSHOT_WAIT = 30.0
+# Code-graph lookups: files parsed per call (only those that mention the
+# name), the largest parsed, text parsed per call, and seconds of parsing.
+_GRAPH_MAX_FILES = 300
+_GRAPH_MAX_FILE_BYTES = 300_000
+_GRAPH_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+_GRAPH_TIME_BUDGET = 15.0
+_MAX_DEFINITIONS = 5
+_DEFINITION_EXCERPT_LINES = 15
+_MAX_INDEX_HITS = 12
+_SYMBOL_RE = re.compile(r"^[A-Za-z_$][\w$]*(?:(?:\.|::)[A-Za-z_$][\w$]*)*$")
 
 # Never searched: generated, vendored and binary content.
 _GREP_SKIP_EXTS = (
@@ -192,6 +309,12 @@ class AgenticToolExecutor:
     (already fetched for JIT) so `grep_repo` doesn't keep re-listing the
     repo. The `source_fetcher` already has its own per-path cache, so
     repeated `read_file` calls don't re-hit GitHub.
+
+    `find_usages` / `find_definition` read the code graph (`code_graph`,
+    shared by the review's parts so a file is parsed once per review); with
+    `graph_tools` off they are not offered. `grep_index` is offered only with
+    an `index_search` — a repository that has not been indexed has nothing
+    for it to search.
     """
 
     source_fetcher: SourceFetcher
@@ -199,12 +322,32 @@ class AgenticToolExecutor:
     bytes_used: int = 0
     _content_cache: dict[str, str | None] = field(default_factory=dict)
     call_log: list[dict] = field(default_factory=list)
+    graph_tools: bool = True
+    code_graph: CodeGraph | None = None
+    # (query, limit) -> ranked index matches; blocking, run in a thread.
+    index_search: Callable[[str, int], list[IndexMatch]] | None = None
     _tree_set: set[str] = field(init=False, repr=False)
+    _result_cache: dict[tuple[str, str], str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         # Membership is checked on every read; the tree can be tens of
         # thousands of paths.
         self._tree_set = set(self.repo_tree)
+
+    @property
+    def tools(self) -> list[dict]:
+        """The tool schemas this executor can run, for the agentic loop to offer."""
+        tools = [READ_FILE_TOOL, GREP_REPO_TOOL]
+        if self.graph_tools:
+            tools += [FIND_USAGES_TOOL, FIND_DEFINITION_TOOL]
+        if self.index_search is not None:
+            tools.append(GREP_INDEX_TOOL)
+        return tools
+
+    def _graph(self) -> CodeGraph:
+        if self.code_graph is None:
+            self.code_graph = CodeGraph()
+        return self.code_graph
 
     async def execute(self, name: str, args: dict) -> str:
         """Dispatch a tool call. Returns the tool result as a string.
@@ -214,7 +357,10 @@ class AgenticToolExecutor:
         different path). The string is what gets fed back into the next
         LLM hop as a `tool` message.
         """
-        arg = (args or {}).get("path") or (args or {}).get("pattern") or ""
+        args = args if isinstance(args, dict) else {}
+        arg = next(
+            (str(args[k]) for k in ("symbol", "query", "path", "pattern") if args.get(k)), ""
+        )
         self.call_log.append({"tool": name, "arg": arg})
 
         if self.bytes_used >= _MAX_TOTAL_OUTPUT_BYTES:
@@ -237,6 +383,34 @@ class AgenticToolExecutor:
                 path_glob = (args or {}).get("path_glob") or None
                 path_only = bool((args or {}).get("path_only") or False)
                 result = await self._grep_repo(pattern, path_glob, path_only)
+            elif name in ("find_usages", "find_definition") and self.graph_tools:
+                symbol = str(args.get("symbol") or "").strip()
+                if not symbol:
+                    return "[error: missing `symbol` argument]"
+                if not _SYMBOL_RE.match(symbol):
+                    return (
+                        f"[error: `{symbol[:80]}` is not a symbol name; use grep_repo for patterns]"
+                    )
+                scope = str(args.get("path") or "").strip() or None
+                key = (name, f"{symbol}\0{scope or ''}")
+                cached = self._result_cache.get(key)
+                if cached is None:
+                    if name == "find_usages":
+                        cached = await self._find_usages(symbol, scope)
+                    else:
+                        cached = await self._find_definition(symbol)
+                    self._result_cache[key] = cached
+                result = cached
+            elif name == "grep_index" and self.index_search is not None:
+                query = str(args.get("query") or "").strip()
+                if not query:
+                    return "[error: missing `query` argument]"
+                key = (name, query.lower())
+                cached = self._result_cache.get(key)
+                if cached is None:
+                    cached = await self._grep_index(query)
+                    self._result_cache[key] = cached
+                result = cached
             else:
                 return f"[error: unknown tool `{name}`]"
         except Exception as exc:
@@ -412,5 +586,197 @@ class AgenticToolExecutor:
             prefix += f" showing first {_MAX_GREP_HITS}"
         return prefix + "\n" + "\n".join(hits)
 
+    async def _graph_candidates(
+        self, name: str, scope: str | None, rank: Callable[[str], tuple] | None = None
+    ) -> tuple[list[tuple[str, str]], bool] | None:
+        """Parsed files that mention ``name``, or None without the repository snapshot.
 
-AGENTIC_TOOLS = [READ_FILE_TOOL, GREP_REPO_TOOL]
+        Only paths in the PR head's tree are considered, so a ``scope`` the
+        model made up selects nothing rather than reading outside the tree.
+        """
+        snapshot = await repo_snapshot(self.source_fetcher, _GREP_SNAPSHOT_WAIT)
+        rx = name_pattern([name])
+        if snapshot is None or rx is None:
+            return None
+        pool = [p for p in self.repo_tree if graph_searchable(p) and match_path(p, scope)]
+        if rank is not None:
+            pool.sort(key=rank)
+        candidates, capped = await asyncio.to_thread(
+            select_candidates,
+            snapshot.files,
+            rx,
+            pool,
+            max_files=_GRAPH_MAX_FILES,
+            max_file_bytes=_GRAPH_MAX_FILE_BYTES,
+            max_total_bytes=_GRAPH_MAX_TOTAL_BYTES,
+            presorted=rank is not None,
+        )
+        graph = self._graph()
+        _, timed_out = await asyncio.to_thread(
+            graph.add_files, candidates, time.monotonic() + _GRAPH_TIME_BUDGET
+        )
+        parsed = [(p, c) for p, c in candidates if p in graph]
+        complete = not capped and not timed_out and not getattr(snapshot, "partial", False)
+        return parsed, complete
+
+    async def _text_fallback(self, name: str, scope: str | None, why: str) -> str:
+        glob = None
+        if scope:
+            glob = scope if any(ch in scope for ch in "*?[") else scope.rstrip("/") + "*"
+        found = await self._grep_repo(
+            rf"(?<![\w$]){re.escape(name)}(?![\w$])", glob, path_only=False
+        )
+        return f"[{why}; word-boundary text matches instead — comments and strings count]\n{found}"
+
+    async def _find_usages(self, symbol: str, scope: str | None) -> str:
+        if not self.repo_tree:
+            return "[find_usages unavailable: repo tree not loaded]"
+        name = re.split(r"\.|::", symbol)[-1]
+        found = await self._graph_candidates(name, scope)
+        if found is None:
+            return await self._text_fallback(
+                name,
+                scope,
+                "the code graph needs the repository snapshot, which this review has not got",
+            )
+        candidates, complete = found
+        if not candidates:
+            searched = "the whole repository" if complete else "the files that could be searched"
+            return f"[no usages of `{name}` in {searched}]"
+        graph = self._graph()
+        rx = name_pattern([name])
+        calls: list[str] = []
+        mentions: list[str] = []
+        defined: list[str] = []
+        total_calls = 0
+        for path, _content in candidates:
+            fg = graph.get(path)
+            if fg is None:
+                continue
+            def_lines = {d.start_line for d in fg.definitions if d.name == name}
+            for d in fg.definitions:
+                if d.name == name and len(defined) < 3:
+                    defined.append(f"`{path}:{d.start_line}` `{_cap(d.signature)}`")
+            call_lines: set[int] = set()
+            for ref in fg.references:
+                if ref.name != name:
+                    continue
+                total_calls += 1
+                call_lines.add(ref.line)
+                if len(calls) < _MAX_GREP_HITS:
+                    where = f" in `{ref.enclosing}`" if ref.enclosing else ""
+                    calls.append(f"{path}:{ref.line}{where}: {_cap(ref.text)}")
+            if rx is None or len(mentions) >= _MAX_GREP_HITS // 2:
+                continue
+            for lineno, line in enumerate(fg.lines, start=1):
+                if lineno in call_lines or lineno in def_lines or not rx.search(line):
+                    continue
+                mentions.append(f"{path}:{lineno}: {_cap(line.strip())}")
+                if len(mentions) >= _MAX_GREP_HITS // 2:
+                    break
+        parsed_with = {fg.backend for p, _ in candidates if (fg := graph.get(p)) is not None}
+        how = (
+            "syntax trees"
+            if parsed_with == {"tree-sitter"}
+            else "a regex parse (tree-sitter unavailable)"
+            if parsed_with == {"regex"}
+            else "syntax trees (regex for some files)"
+        )
+        scope_note = (
+            f"all {len(candidates)} files that mention it"
+            if complete
+            else f"{len(candidates)} files that mention it — the search was capped, so an "
+            "absent caller proves nothing; narrow with `path`"
+        )
+        out = [f"Usages of `{name}` from {how}, over {scope_note}:"]
+        if defined:
+            out.append("Defined at: " + "; ".join(defined))
+        if calls:
+            more = f" (showing {len(calls)} of {total_calls})" if total_calls > len(calls) else ""
+            out.append(f"Calls{more}:")
+            out.extend(calls)
+        else:
+            out.append("Calls: none")
+        if mentions:
+            out.append("Other mentions (imports, values, comments):")
+            out.extend(mentions[: max(0, _MAX_GREP_HITS - len(calls)) or 5])
+        return "\n".join(out)
+
+    async def _find_definition(self, symbol: str) -> str:
+        if not self.repo_tree:
+            return "[find_definition unavailable: repo tree not loaded]"
+        name = re.split(r"\.|::", symbol)[-1]
+        lowered = name.lower()
+
+        def _rank(path: str) -> tuple:
+            # A file named after the symbol is the likeliest home; tests last.
+            stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower().replace("_", "")
+            return (lowered.replace("_", "") not in stem, *_grep_order(path))
+
+        found = await self._graph_candidates(name, None, rank=_rank)
+        if found is None:
+            keyword = (
+                r"(?:def|class|function|func|fn|interface|struct|enum|trait|type|record)"
+                rf"\s+(?:\([^)]*\)\s*)?{re.escape(name)}(?![\w$])"
+            )
+            found_text = await self._grep_repo(keyword, None, path_only=False)
+            return (
+                "[the code graph needs the repository snapshot, which this review has not "
+                f"got; definition-keyword text matches instead]\n{found_text}"
+            )
+        candidates, complete = found
+        graph = self._graph()
+        defs = [
+            d
+            for d in graph.definitions_of(symbol.replace("::", "."))
+            if any(d.path == p for p, _ in candidates)
+        ]
+        if not defs:
+            searched = "the whole repository" if complete else "the files that could be searched"
+            return f"[no definition of `{symbol}` found in {searched}]"
+        defs.sort(key=lambda d: (_grep_order(d.path), d.start_line))
+        out = [f"Definitions of `{symbol}` ({len(defs)} found):"]
+        for d in defs[:_MAX_DEFINITIONS]:
+            fg = graph.get(d.path)
+            lines = fg.lines if fg else []
+            last = min(d.end_line, d.start_line + _DEFINITION_EXCERPT_LINES - 1, len(lines))
+            body = "\n".join(f"{n:>5}  {lines[n - 1]}" for n in range(d.start_line, last + 1))
+            if len(body) > _MAX_FILE_BYTES // _MAX_DEFINITIONS:
+                body = body[: _MAX_FILE_BYTES // _MAX_DEFINITIONS] + "…"
+            more = (
+                f"\n... [{d.end_line - last} more lines; read_file with start_line={last + 1}]"
+                if d.end_line > last
+                else ""
+            )
+            out.append(
+                f"\n`{d.path}` lines {d.start_line}-{d.end_line} ({d.kind} "
+                f"`{d.qualified_name}`): `{_cap(d.signature)}`\n```\n{body}{more}\n```"
+            )
+        if len(defs) > _MAX_DEFINITIONS:
+            out.append(f"\n... and {len(defs) - _MAX_DEFINITIONS} more; qualify the name to narrow")
+        return "\n".join(out)
+
+    async def _grep_index(self, query: str) -> str:
+        search = self.index_search
+        if search is None:
+            return "[grep_index unavailable: the repository is not indexed]"
+        matches = await asyncio.to_thread(search, query, _MAX_INDEX_HITS)
+        if not matches:
+            return f"[no indexed files match `{_cap(query)}`; try other words or grep_repo]"
+        out = [f"Indexed files matching `{_cap(query)}` (best first):"]
+        for m in matches:
+            line = f"- `{m.path}`"
+            if m.summary:
+                line += f" — {_cap(m.summary.strip().splitlines()[0] if m.summary.strip() else '')}"
+            if m.symbols:
+                line += f" (symbols: {', '.join(m.symbols)})"
+            out.append(line)
+        return "\n".join(out)
+
+
+def _cap(text: str) -> str:
+    return text if len(text) <= _MAX_GREP_BYTES_PER_HIT else text[:_MAX_GREP_BYTES_PER_HIT] + "…"
+
+
+# The full set, for a caller whose executor does not say what it offers.
+AGENTIC_TOOLS = [READ_FILE_TOOL, GREP_REPO_TOOL, FIND_USAGES_TOOL, FIND_DEFINITION_TOOL]

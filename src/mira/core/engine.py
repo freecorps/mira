@@ -46,6 +46,8 @@ from mira.feedback.models import ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, new_finding_id
 from mira.feedback.retrieval import render_rule
 from mira.gate.policy import resolve_policy
+from mira.index._store_shared import IndexMatch
+from mira.index.code_graph import BlastRadius, CodeGraph, build_blast_radius, render_blast_radius
 from mira.index.context import SnapshotSourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -64,6 +66,7 @@ from mira.models import (
     WALKTHROUGH_MARKER,
     FileChangeStat,
     FileChangeType,
+    FileDiff,
     KeyIssue,
     OverlapFinding,
     PRFingerprint,
@@ -478,6 +481,9 @@ class ReviewEngine:
         # Only the latter drives the user-visible "your repo isn't indexed" nudge.
         self._jit_needed = False
         self._index_was_empty = False
+        # Whether this review saw an index with files in it, which is what
+        # `grep_index` searches. Set while the review context is built.
+        self._index_searchable = False
         self._agentic_source_fetcher: object | None = None
         self._agentic_repo_tree: list[str] = []
         # The review's one reader of the reviewed commit (see
@@ -506,6 +512,9 @@ class ReviewEngine:
         # review in progress, and how it reads manifests when there is no
         # provider to ask — set by local review only when the repository opted in.
         self._dependency_updates_task: asyncio.Task | None = None
+        # Callers of the symbols this review's diff changes (core/code_graph),
+        # looked up alongside the walkthrough; cancelled with the review.
+        self._blast_radius_task: asyncio.Task | None = None
         self.dependency_reader: Callable[[str, str], Awaitable[str | None]] | None = None
 
     def _output_reserve(self) -> int:
@@ -1579,6 +1588,84 @@ class ReviewEngine:
         except Exception as exc:
             logger.warning("Merge gate failed for %s: %s", pr_info.url, exc)
 
+    def _start_blast_radius(
+        self, files: list[FileDiff], source: SnapshotSourceFetcher | None, graph: CodeGraph | None
+    ) -> asyncio.Task | None:
+        """Start looking up the callers of the symbols ``files`` change, or None.
+
+        Runs alongside the walkthrough and the index reads; each part awaits it
+        only when its prompt has room for the result. Never fails: a lookup
+        that cannot finish hands back what it found, or nothing.
+        """
+        config = self.config.review.code_graph
+        if graph is None or source is None or config.callers_tokens <= 0:
+            return None
+        pr_info = getattr(self, "_pr_info", None)
+
+        async def _dependents(paths: list[str]) -> list[str]:
+            # The index's import graph, for a review without the repository
+            # snapshot: the files that import the changed ones are where
+            # their callers are.
+            if pr_info is None:
+                return []
+
+            def _read() -> list[str]:
+                store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
+                try:
+                    return [dep for path in paths for dep in store.get_dependents(path)]
+                finally:
+                    store.close()
+
+            return await asyncio.to_thread(_read)
+
+        async def _run() -> BlastRadius:
+            try:
+                tree = await source.tree()
+            except Exception:  # noqa: BLE001 — candidates come from the snapshot then
+                tree = []
+            lookup = build_blast_radius(
+                files,
+                source,
+                repo_tree=tree or None,
+                dependents=_dependents,
+                graph=graph,
+                max_symbols=config.max_symbols,
+                max_callers=config.max_callers,
+                max_files=config.max_files,
+                max_file_bytes=config.max_file_kb * 1024,
+                max_total_bytes=config.max_total_mb * 1024 * 1024,
+                time_budget=config.time_budget_seconds,
+            )
+            # The budget bounds the parsing; this bounds the reads before it,
+            # so a slow platform API cannot hold every part's prompt.
+            try:
+                return await asyncio.wait_for(lookup, config.time_budget_seconds + 5)
+            except TimeoutError:
+                logger.info("Callers lookup ran out of time; reviewing without it")
+                return BlastRadius(complete=False)
+
+        return asyncio.create_task(_run())
+
+    def _index_search(self) -> Callable[[str, int], list[IndexMatch]] | None:
+        """Search over this repository's index for `grep_index`, or None when it has none.
+
+        `_index_searchable` is set while the review context is built; a
+        repository that has never been indexed has nothing to search, and the
+        tool is then not offered at all.
+        """
+        pr_info = getattr(self, "_pr_info", None)
+        if pr_info is None or not getattr(self, "_index_searchable", False):
+            return None
+
+        def _search(query: str, limit: int) -> list[IndexMatch]:
+            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
+            try:
+                return store.search_index(query, limit)
+            finally:
+                store.close()
+
+        return _search
+
     def _start_dependency_updates(self, files: list) -> asyncio.Task | None:
         """Start the release-notes lookup for this review's bumps, or None.
 
@@ -1697,6 +1784,9 @@ class ReviewEngine:
             pending_updates, self._dependency_updates_task = self._dependency_updates_task, None
             if pending_updates is not None and not pending_updates.done():
                 pending_updates.cancel()
+            pending_radius, self._blast_radius_task = self._blast_radius_task, None
+            if pending_radius is not None and not pending_radius.done():
+                pending_radius.cancel()
             source, self._source = self._source, None
             if source is not None:
                 await source.aclose()
@@ -1731,6 +1821,7 @@ class ReviewEngine:
         # A reused engine must not carry another revision's source/tree cache.
         self._agentic_source_fetcher = None
         self._agentic_repo_tree = []
+        self._index_searchable = False
         import asyncio as _asyncio
 
         # Parse the full diff (not just the priority-selected subset) so the
@@ -1815,6 +1906,13 @@ class ReviewEngine:
         source = self._source
         enclosing_budget = self.config.review.enclosing_context_tokens
 
+        # One code graph per review: the callers lookup below and every
+        # part's find_usages/find_definition share its parsed files.
+        graph_config = self.config.review.code_graph
+        review_graph = CodeGraph() if graph_config.enabled else None
+        self._blast_radius_task = self._start_blast_radius(filtered, source, review_graph)
+        blast_radius_task = self._blast_radius_task
+
         async def _generate_walkthrough() -> WalkthroughResult | None:
             if not self.config.review.walkthrough:
                 return None
@@ -1866,6 +1964,7 @@ class ReviewEngine:
                     index_has_data_for_changed = bool(store.get_summaries(changed_paths))
                     self._jit_needed = not index_has_data_for_changed
                     self._index_was_empty = not bool(store.all_paths())
+                    self._index_searchable = not self._index_was_empty
 
                     # Hoisted: agentic fetcher/tree setup runs whenever a source fetcher exists
                     # (indexed or not), so the reviewer tools are available on indexed repos too.
@@ -2210,10 +2309,25 @@ class ReviewEngine:
                 # Leave the agentic loop room for its tool output, too.
                 tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
                 room = min(enclosing_budget, prompt_limit - _size(messages) - 1000 - tool_room)
+                enclosing = ""
                 if room > 500 and source is not None:
                     enclosing = await build_enclosing_context(chunk.files, source, room * 4)
                     if enclosing:
                         messages = _messages(chunk_history, part, enclosing)
+                # Callers of the symbols this part changes, likewise optional.
+                if blast_radius_task is not None:
+                    room = min(
+                        graph_config.callers_tokens,
+                        prompt_limit - _size(messages) - 1000 - tool_room,
+                    )
+                    if room > 200:
+                        radius = await blast_radius_task
+                        callers = render_blast_radius(
+                            radius, [f.path for f in chunk.files], room * 4
+                        )
+                        if callers:
+                            enclosing += callers
+                            messages = _messages(chunk_history, part, enclosing)
 
                 def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
                     parsed = parse_llm_response(raw)
@@ -2240,6 +2354,9 @@ class ReviewEngine:
                     executor = AgenticToolExecutor(
                         source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
                         repo_tree=list(self._agentic_repo_tree),
+                        graph_tools=review_graph is not None,
+                        code_graph=review_graph,
+                        index_search=self._index_search(),
                     )
                     raw_response = await agentic_review_loop(self.llm, messages, executor)
                     audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})

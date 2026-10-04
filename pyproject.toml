@@ -62,6 +62,16 @@ serve = [
     # (SQLite is the default), but bundled so the Docker image works with
     # either backend out of the box.
     "psycopg[binary]>=3.3.5",
+    # The AST code graph (blast radius, find_usages/find_definition). Bundled
+    # so the Docker image parses real syntax trees; without it Mira falls
+    # back to its regex symbol extractor.
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.20.0",
+]
+# The AST code graph alone, for a CLI install: `pip install mira-reviewer[graph]`.
+graph = [
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.20.0",
 ]
 bedrock = [
     "boto3>=1.43.93",
