@@ -486,9 +486,7 @@ def _gitlab_note(note: str, *, inline: bool) -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize(
-    "note", ["@mira-bot resolve", "@mira-bot full review", "@mira-bot config"]
-)
+@pytest.mark.parametrize("note", ["@mira-bot resolve", "@mira-bot full review", "@mira-bot config"])
 async def test_gitlab_pr_level_commands_reach_run_pr_command(note: str) -> None:
     from mira.platforms.gitlab import webhook as gw
 
