@@ -77,6 +77,58 @@ def parse_fix_command(text: str) -> tuple[str, str] | None:
     return kind, mode
 
 
+# Finishing touches. `generate` is the verb; what follows names the work. The
+# bare aliases (`@mira tests`, `@mira docstrings`) are recognised only when
+# nothing but modifiers follows them, so "@mira tests are failing, why?" stays
+# a question rather than becoming a request to write tests.
+FINISHING_VERB = "generate"
+_FINISHING_TARGETS = {
+    "tests": "tests",
+    "test": "tests",
+    "unit-tests": "tests",
+    "unittests": "tests",
+    "docstrings": "docstrings",
+    "docstring": "docstrings",
+    "docs": "docstrings",
+}
+# Words allowed between the verb and the target: `generate unit tests`,
+# `generate the missing docstrings`.
+_FINISHING_FILLER = frozenset({"unit", "the", "some", "missing", "more"})
+_BARE_FINISHING = {
+    ("tests",): "tests",
+    ("unit", "tests"): "tests",
+    ("unit-tests",): "tests",
+    ("docstrings",): "docstrings",
+}
+
+
+def parse_finishing_command(text: str) -> tuple[str, str] | None:
+    """``(job_kind, mode)`` for a finishing touch, or None if this is not one.
+
+    Like :func:`parse_fix_command`, reads only the words Mira defined. Anything
+    after the target — `generate tests for utils.py please` — is ignored rather
+    than read as a scope: the scope is the pull request's diff, and nothing in
+    a comment narrows or widens it.
+    """
+    words = _WORD.findall((text or "").lower())
+    if not words:
+        return None
+    flags = [_MODE_FLAGS.get(word.strip("-")) for word in words]
+    mode = next((flag for flag in reversed(flags) if flag), "branch_pr")
+
+    if words[0] == FINISHING_VERB:
+        for word, flag in zip(words[1:], flags[1:], strict=True):
+            if flag or word in _FINISHING_FILLER:
+                continue
+            kind = _FINISHING_TARGETS.get(word)
+            return (kind, mode) if kind else None
+        return None
+
+    plain = tuple(word for word, flag in zip(words, flags, strict=True) if not flag)
+    kind = _BARE_FINISHING.get(plain)
+    return (kind, mode) if kind else None
+
+
 def _mode_label(mode: str) -> str:
     return {
         "branch_pr": "a separate branch and a stacked pull request",
@@ -128,6 +180,105 @@ def render_reply(outcome: RequestOutcome, *, actor: str, kind: str) -> str:
         lines.append("There was nothing to fix.")
 
     return "\n".join(lines).strip()
+
+
+def render_finishing_reply(outcome: RequestOutcome, *, actor: str, job_kind: str) -> str:
+    """The comment Mira posts back for a finishing touch. Always says something."""
+    from mira.autofix.finishing import KIND_LABELS
+
+    label = KIND_LABELS.get(job_kind, job_kind)
+    lines = [f"> @{actor} asked Mira to `{label}`.", ""]
+
+    if outcome.accepted:
+        job = outcome.accepted[0]
+        what = (
+            "write tests for the code this pull request changed, touching test files only"
+            if job_kind == "tests"
+            else "add docstrings to the public functions and classes this pull request "
+            "changed, touching documentation only — a patch that changes code is refused"
+        )
+        lines.append(
+            f"Queued (`{job.job_key[:12]}`). Mira will {what}, delivered as "
+            f"{_mode_label(outcome.mode)}. Nothing is written until the patch has been "
+            "generated and validated."
+        )
+        lines.append("")
+        if outcome.scope:
+            lines.append("**In scope:**")
+            lines.append("")
+            lines.extend(f"- {line}" for line in outcome.scope[:20])
+            lines.append("")
+        policy = outcome.policy
+        if policy is not None and not policy.writing:
+            lines.append(
+                "> autofix is in `suggest` mode here: the patch is shown on the dashboard "
+                "and nothing is written to the repository."
+            )
+            lines.append("")
+
+    if outcome.skipped:
+        lines.append(f"**Left out ({len(outcome.skipped)}):**")
+        lines.append("")
+        for path, reason in outcome.skipped[:20]:
+            lines.append(f"- `{path[:120]}` — {reason.message}")
+        if len(outcome.skipped) > 20:
+            lines.append(f"- … and {len(outcome.skipped) - 20} more")
+        lines.append("")
+
+    refusals = [reason for reason in outcome.reasons if reason.kind != "info"]
+    notes = [reason for reason in outcome.reasons if reason.kind == "info"]
+    if refusals:
+        lines.append("**Mira did not start this:**")
+        lines.append("")
+        lines.extend(f"- {reason.message}" for reason in refusals)
+        lines.append("")
+    if notes:
+        lines.extend(f"> {reason.message}" for reason in notes)
+        lines.append("")
+
+    if not outcome.accepted and not refusals:
+        lines.append("There was nothing to do.")
+
+    return "\n".join(lines).strip()
+
+
+async def handle_finishing_command(
+    provider: Any,
+    pr_info: Any,
+    *,
+    actor: str,
+    job_kind: str,
+    mode: str = "branch_pr",
+    config: MiraConfig | None = None,
+    reply: Any = None,
+) -> RequestOutcome:
+    """Accept or refuse ``generate tests`` / ``generate docstrings`` and answer.
+
+    The same shape as :func:`handle_fix_command`, and the same promise: the
+    reply always says what happened, and a reply that cannot be posted never
+    loses a job that was already queued.
+    """
+    from mira.autofix.finishing import FinishingRequest, request_finishing_touch
+
+    config = config or load_config()
+    outcome = await request_finishing_touch(
+        provider,
+        pr_info,
+        FinishingRequest(actor=actor, job_kind=job_kind, mode=mode),
+        config=config,
+    )
+    body = render_finishing_reply(outcome, actor=actor, job_kind=job_kind)
+    try:
+        if reply is not None:
+            await reply(body)
+        else:
+            await provider.post_comment(pr_info, body)
+    except Exception as exc:  # noqa: BLE001 - a silent reply is not a reason to lose the job
+        logger.warning("Could not answer the %s request on %s: %s", job_kind, pr_info.url, exc)
+
+    if outcome.accepted:
+        _nudge_inline_worker(config)
+    return outcome
 
 
 async def handle_fix_command(

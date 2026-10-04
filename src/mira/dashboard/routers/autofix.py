@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 
 from mira.autofix import history
 from mira.autofix.capabilities import for_platform
-from mira.autofix.models import FIX_MODES, JOB_STATES
+from mira.autofix.models import FIX_MODES, JOB_KINDS, JOB_STATES
 from mira.autofix.policy import resolve_policy
 from mira.autofix.worker import cancel_job
 from mira.config import AutofixConfig, load_config
@@ -199,12 +199,16 @@ def _filters(
     request_id_value: str,
     since: float,
     until: float,
+    job_kind: str = "",
 ) -> dict:
     if state and state not in JOB_STATES:
         raise HTTPException(status_code=400, detail=f"state must be one of {sorted(JOB_STATES)}")
     if mode and mode not in FIX_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(FIX_MODES)}")
+    if job_kind and job_kind not in JOB_KINDS:
+        raise HTTPException(status_code=400, detail=f"job_kind must be one of {sorted(JOB_KINDS)}")
     return {
+        "job_kind": job_kind,
         "owner": owner,
         "repo": repo,
         "platform": platform,
@@ -233,6 +237,7 @@ def list_autofix_jobs(
     request_id: str = "",
     since: float = 0.0,
     until: float = 0.0,
+    job_kind: str = "",
     sort: str = "created_at",
     order: str = "desc",
     limit: int = 50,
@@ -258,6 +263,7 @@ def list_autofix_jobs(
                 request_id,
                 since,
                 until,
+                job_kind,
             ),
             limit=limit,
             offset=offset,

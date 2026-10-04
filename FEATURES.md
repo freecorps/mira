@@ -119,7 +119,9 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Bounded CI retry loop driven by the fix's own build, counted on the job row so a restart cannot reset it
 - Optional handoff to an external agent through a one-method adapter, with a zero-dependency built-in
 - Global kill switch that also stops queued work, plus per-repository opt-in and an admin cancel permission
-- Dashboard panel for jobs, patches, validations and failures
+- Finishing touches on the same pipeline: `@mira generate tests` writes tests for the changed code following the repository's own test layout, touching test files only, and `@mira generate docstrings` documents changed public functions and classes, refusing any patch that changes code (checked on the Python syntax tree; comment-lines-only elsewhere)
+- Each finishing touch is off on its own (`autofix.finishing_touches.tests` / `.docstrings`), per repository too, and the job kind is recorded on every job
+- Dashboard panel for jobs, patches, validations and failures, filterable by job kind
 
 ## Pre-merge checks
 

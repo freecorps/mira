@@ -49,6 +49,34 @@ PR_MARKER = "<!-- mira:autofix:{job_key} -->"
 # Trailer on every commit. A human reading `git log` should be able to tell a
 # generated commit from a typed one without opening the pull request.
 COMMIT_TRAILER = "Generated-by: Mira autofix\nMira-Finding: {finding_id}\nMira-Job: {job_key}"
+# A finishing touch has no finding; its trailer names the kind of work instead.
+TASK_TRAILER = "Generated-by: Mira autofix\nMira-Task: {job_kind}\nMira-Job: {job_key}"
+
+# Per kind: the conventional-commit type of the stacked pull request's title,
+# the fallback subject, and the sentence that opens its description.
+_KIND_TEXT = {
+    "fix": (
+        "fix",
+        "Apply Mira's suggested fix",
+        "This change was generated to resolve a finding on {pr}.",
+    ),
+    "tests": (
+        "test",
+        "Add tests for the changed code",
+        "This change adds tests for the code changed in {pr}. Only test files are touched.",
+    ),
+    "docstrings": (
+        "docs",
+        "Document the changed public API",
+        "This change adds docstrings to the public functions and classes changed in "
+        "{pr}. Only comments and docstrings are touched; Mira refuses a patch that "
+        "changes anything else.",
+    ),
+}
+
+
+def _kind_text(job: AutofixJob) -> tuple[str, str, str]:
+    return _KIND_TEXT.get(job.job_kind, _KIND_TEXT["fix"])
 
 
 class PublishRefused(Exception):
@@ -86,10 +114,14 @@ def commit_message(job: AutofixJob, patch: FixPatch) -> str:
     the trailers come from Mira and are the part anything automated should
     read.
     """
-    subject = (redact(patch.summary).strip().splitlines() or ["Apply Mira's suggested fix"])[0]
-    subject = subject[:72] or "Apply Mira's suggested fix"
+    _, fallback, _ = _kind_text(job)
+    subject = (redact(patch.summary).strip().splitlines() or [fallback])[0]
+    subject = subject[:72] or fallback
     body = redact(patch.rationale).strip()
-    trailer = COMMIT_TRAILER.format(finding_id=job.finding_id, job_key=job.job_key)
+    if job.job_kind != "fix":
+        trailer = TASK_TRAILER.format(job_kind=job.job_kind, job_key=job.job_key)
+    else:
+        trailer = COMMIT_TRAILER.format(finding_id=job.finding_id, job_key=job.job_key)
     parts = [subject]
     if body:
         parts.append(body[:2_000])
@@ -105,15 +137,20 @@ def pull_request_body(job: AutofixJob, patch: FixPatch) -> str:
     the originating finding, the model that wrote it, the validation that ran,
     and the fact that a machine wrote it.
     """
+    _, _, opening = _kind_text(job)
+    if job.job_kind != "fix":
+        origin = [f"| Task | `{job.job_kind}` |"]
+    else:
+        origin = [f"| Finding | `{job.finding_id}` |"]
     lines = [
         PR_MARKER.format(job_key=job.job_key),
         "## Mira autofix",
         "",
-        f"This change was generated to resolve a finding on {job.pr_url or 'the pull request'}.",
+        opening.format(pr=job.pr_url or "the pull request"),
         "",
         "| | |",
         "|---|---|",
-        f"| Finding | `{job.finding_id}` |",
+        *origin,
         f"| Title | {redact(job.finding_title)[:200] or '—'} |",
         f"| Requested by | @{job.requested_by} |",
         f"| Model | `{job.model or patch.model or 'unknown'}` |",
@@ -287,6 +324,8 @@ async def _open_stacked_pr(
         finding_id=job.finding_id,
         request_kind=job.request_kind,
         title=job.finding_title,
+        job_kind=job.job_kind,
+        head_sha=job.head_sha,
     )
     # The branch Mira creates is checked; `base` deliberately is not. Opening a
     # pull request *against* a branch does not modify it, and a single-commit
@@ -328,11 +367,14 @@ async def _open_stacked_pr(
             reasons=reasons,
         )
 
-    title = (
-        f"fix: {redact(patch.summary).strip().splitlines()[0][:60]}"
-        if patch.summary
-        else f"fix: address Mira finding on #{job.pr_number}"
-    )
+    kind_prefix, kind_fallback, _ = _kind_text(job)
+    summary_lines = redact(patch.summary).strip().splitlines()
+    if summary_lines:
+        title = f"{kind_prefix}: {summary_lines[0][:60]}"
+    elif job.job_kind != "fix":
+        title = f"{kind_prefix}: {kind_fallback.lower()} in #{job.pr_number}"
+    else:
+        title = f"fix: address Mira finding on #{job.pr_number}"
     try:
         number, url = await provider.create_pull_request(
             pr_info,

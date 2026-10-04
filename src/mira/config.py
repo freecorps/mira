@@ -1045,6 +1045,26 @@ class AutofixHandoffConfig(BaseModel):
     fallback_when_refused: bool = False
 
 
+class AutofixFinishingTouchesConfig(BaseModel):
+    """``@mira generate tests`` and ``@mira generate docstrings``.
+
+    Finishing touches ride on the autofix pipeline — the same queue, the same
+    permission check, the same limits, the same validation and the same
+    delivery — so neither does anything while autofix itself is off. Each is
+    also off on its own until a deployment turns it on: writing tests and
+    documentation is a different request from fixing a finding, and enabling
+    one is not consent to the other.
+    """
+
+    # Write new tests, or extend existing ones, for the source files a pull
+    # request changes. Only test files are ever written.
+    tests: bool = False
+    # Add or complete docstrings for the public functions and classes a pull
+    # request changes. A patch that alters anything but comments and
+    # docstrings is refused.
+    docstrings: bool = False
+
+
 class AutofixRepoPolicy(BaseModel):
     """Per-repository overrides, keyed ``owner/repo`` under ``autofix.repositories``.
 
@@ -1062,6 +1082,9 @@ class AutofixRepoPolicy(BaseModel):
     max_fixes_per_request: int | None = Field(default=None, ge=1)
     protected_paths: list[str] | None = None
     extra_protected_paths: list[str] = Field(default_factory=list)
+    # Replaces the global `finishing_touches` block for this repository when
+    # set; absent inherits it.
+    finishing_touches: AutofixFinishingTouchesConfig | None = None
 
     @field_validator("mode")
     @classmethod
@@ -1174,6 +1197,9 @@ class AutofixConfig(BaseModel):
     # ── Sub-sections ─────────────────────────────────────────────────────
     validation: AutofixValidationConfig = Field(default_factory=AutofixValidationConfig)
     handoff: AutofixHandoffConfig = Field(default_factory=AutofixHandoffConfig)
+    finishing_touches: AutofixFinishingTouchesConfig = Field(
+        default_factory=AutofixFinishingTouchesConfig
+    )
     repositories: dict[str, AutofixRepoPolicy] = Field(default_factory=dict)
 
     @field_validator("mode")

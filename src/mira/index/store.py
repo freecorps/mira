@@ -497,7 +497,10 @@ CREATE TABLE IF NOT EXISTS autofix_jobs (
     cancelled_by TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    -- 'fix' | 'tests' | 'docstrings'. Added after the table shipped; an
+    -- existing database gains it through the `ALTER TABLE` on open.
+    job_kind TEXT NOT NULL DEFAULT 'fix'
 );
 
 -- The claim query's index: state and due-time first, because that is what
@@ -1036,6 +1039,15 @@ class IndexStore(
         if "pr_author" not in feedback_cols:
             self._conn.execute(
                 "ALTER TABLE feedback_events ADD COLUMN pr_author TEXT NOT NULL DEFAULT ''"
+            )
+        # autofix_jobs.job_kind added with the finishing touches. Every row
+        # written before it was a fix, which is exactly what the default says.
+        autofix_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(autofix_jobs)").fetchall()
+        }
+        if "job_kind" not in autofix_cols:
+            self._conn.execute(
+                "ALTER TABLE autofix_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'fix'"
             )
         # learned_rules.status added post-schema. Default 'approved' so existing
         # rules keep feeding reviews; new synthesized rules are inserted 'pending'.

@@ -75,6 +75,11 @@ class EffectivePolicy:
     validation: AutofixValidationConfig = field(default_factory=AutofixValidationConfig)
     handoff: AutofixHandoffConfig = field(default_factory=AutofixHandoffConfig)
 
+    # Finishing touches. Each is off unless turned on, and neither means
+    # anything while `active` is False.
+    finishing_tests: bool = False
+    finishing_docstrings: bool = False
+
     @property
     def active(self) -> bool:
         """Whether autofix responds to a request at all for this repository."""
@@ -88,6 +93,23 @@ class EffectivePolicy:
     @property
     def handoff_enabled(self) -> bool:
         return bool(self.handoff.adapter)
+
+    def allows_job_kind(self, job_kind: str) -> bool:
+        """Whether this repository accepts work of ``job_kind`` at all.
+
+        ``fix`` is governed by ``active`` alone. A finishing touch needs that
+        *and* its own toggle, so turning autofix on is never, by itself,
+        consent to Mira writing tests or documentation.
+        """
+        if not self.active:
+            return False
+        if job_kind == "fix":
+            return True
+        if job_kind == "tests":
+            return self.finishing_tests
+        if job_kind == "docstrings":
+            return self.finishing_docstrings
+        return False
 
     def _payload(self) -> dict[str, Any]:
         """Every resolved field, without the derived version.
@@ -122,6 +144,8 @@ class EffectivePolicy:
             "max_context_bytes": self.max_context_bytes,
             "validation": self.validation.model_dump(),
             "handoff": self.handoff.model_dump(),
+            "finishing_tests": self.finishing_tests,
+            "finishing_docstrings": self.finishing_docstrings,
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -208,6 +232,7 @@ def resolve_policy(config: AutofixConfig, owner: str = "", repo: str = "") -> Ef
     if entry.protected_paths is not None:
         base_protected = list(entry.protected_paths)
     protected = [*base_protected, *config.extra_protected_paths, *entry.extra_protected_paths]
+    finishing = _pick(entry.finishing_touches, config.finishing_touches)
 
     return EffectivePolicy(
         mode=str(mode),
@@ -242,4 +267,6 @@ def resolve_policy(config: AutofixConfig, owner: str = "", repo: str = "") -> Ef
         retry_backoff_seconds=config.retry_backoff_seconds,
         validation=config.validation,
         handoff=config.handoff,
+        finishing_tests=bool(finishing.tests),
+        finishing_docstrings=bool(finishing.docstrings),
     )

@@ -241,7 +241,12 @@ async def handle_forgejo_push(payload: dict[str, Any], auth: PlatformAuth, bot_n
 
 async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """An @-mention in a PR comment: command, pause/resume, or thread reject."""
-    from mira.autofix.commands import handle_fix_command, parse_fix_command
+    from mira.autofix.commands import (
+        handle_finishing_command,
+        handle_fix_command,
+        parse_finishing_command,
+        parse_fix_command,
+    )
     from mira.platforms.handlers import (
         _PAUSE_KEYWORDS,
         _REJECT_KEYWORDS,
@@ -323,6 +328,18 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             )
             if not is_mira_finding and not has_mention(comment_body, names):
                 return
+
+        # The finishing touches write too, so they are routed before the
+        # reject and free-form paths for the same reason `fix` is — and only
+        # when Mira was addressed, so a bare "tests" replied in a thread stays
+        # conversation.
+        finishing = parse_finishing_command(question)
+        if finishing is not None and has_mention(comment_body, names):
+            job_kind, finishing_mode = finishing
+            await handle_finishing_command(
+                provider, pr_info, actor=actor, job_kind=job_kind, mode=finishing_mode
+            )
+            return
 
         # `fix` is handled before the reject and free-form paths: it is the one
         # command that writes, so it must not fall through to the classifier
