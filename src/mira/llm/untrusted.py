@@ -48,6 +48,9 @@ LABELS = (
     # model, reading data that came out of a repository, so the same line has
     # to be drawn there.
     "MCP",
+    # Upstream release notes for a bumped dependency, and what a model made of
+    # them: written by the package's maintainers, not by anyone Mira trusts.
+    "RELEASE-NOTES",
 )
 
 

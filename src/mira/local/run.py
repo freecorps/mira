@@ -22,6 +22,7 @@ different exit codes, and none of them is "no issues found".
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -30,6 +31,7 @@ from typing import Any
 from mira.checks.models import CheckRun
 from mira.config import MiraConfig
 from mira.core.diff_parser import parse_diff
+from mira.dependency_updates.bumps import ManifestReader
 from mira.exceptions import MiraError
 from mira.local.checks import local_pr_info, run_local_checks
 from mira.local.exit_codes import ExitCode
@@ -41,9 +43,11 @@ from mira.local.guard import (
     check_destinations,
     load_repo_config,
     repo_config_path,
+    trusted_config,
 )
 from mira.local.repo import (
     MODE_RANGE,
+    MODE_STAGED,
     MODE_WORKING_TREE,
     ChangedEntry,
     LocalDiff,
@@ -199,6 +203,67 @@ def _annotate_entries(diff: LocalDiff, result: ReviewResult | None) -> None:
     diff.entries = annotated
 
 
+def dependency_updates_allowed(review: LocalReview) -> bool:
+    """Whether this local review may look up dependency release notes.
+
+    A local review promises to contact the model and nothing else, so the
+    lookup — which asks package registries and GitHub about the packages a
+    change bumps — runs only when ``review.dependency_updates.local`` is set,
+    and set in the ``.mira.yaml`` committed at the base as well as in the
+    effective configuration: like the model endpoint, who else hears about a
+    change is not something the change under review gets to decide.
+    """
+    cfg = review.config.review.dependency_updates
+    if not (cfg.enabled and cfg.local):
+        return False
+    try:
+        trusted = trusted_config(review.identity.root, review.diff.base_sha)
+    except Exception as exc:  # noqa: BLE001 - no trusted answer means no
+        logger.debug("Committed configuration unreadable for dependency updates: %s", exc)
+        return False
+    committed = trusted.review.dependency_updates
+    return committed.enabled and committed.local
+
+
+#: Largest manifest read from the working tree for the dependency lookup.
+_MAX_MANIFEST_BYTES = 1_000_000
+
+
+def git_manifest_reader(repo_root: Path, diff: LocalDiff) -> ManifestReader:
+    """Read a manifest at the base or head of a local review, read-only.
+
+    The base is always a commit; the head is a commit for a range, the index
+    for ``--staged`` and the file on disk for the working tree.
+    """
+    root = repo_root.resolve()
+
+    def _read(path: str, side: str) -> str | None:
+        if side == "base" or diff.mode in (MODE_RANGE, MODE_STAGED):
+            if side == "base":
+                if not diff.base_sha:
+                    return None
+                spec = f"{diff.base_sha}:{path}"
+            else:
+                spec = f"{diff.head_sha}:{path}" if diff.mode == MODE_RANGE else f":{path}"
+            result = run_git(root, "show", spec, max_output_bytes=_MAX_MANIFEST_BYTES)
+            return result.stdout if result.ok else None
+        target = (root / path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            return None
+        if target.stat().st_size > _MAX_MANIFEST_BYTES:
+            return None
+        return target.read_text(encoding="utf-8", errors="replace")
+
+    async def read(path: str, side: str) -> str | None:
+        try:
+            return await asyncio.to_thread(_read, path, side)
+        except Exception as exc:  # noqa: BLE001 - a manifest we cannot read is skipped
+            logger.debug("Could not read %s (%s) for dependency updates: %s", path, side, exc)
+            return None
+
+    return read
+
+
 def prepare(
     *,
     path: str | Path,
@@ -326,6 +391,13 @@ async def execute(review: LocalReview, *, run_checks_too: bool = True) -> LocalR
         indexing_llm=indexing_llm,
         security_llm=security_llm,
     )
+
+    if dependency_updates_allowed(review):
+        engine.dependency_reader = git_manifest_reader(review.identity.root, review.diff)
+        review.notes.append(
+            "Dependency release notes were looked up on the package registries and GitHub, "
+            "because review.dependency_updates.local is set in the committed configuration."
+        )
 
     scope = local_pr_info(review.identity, review.diff) if review.identity.known else None
     title = (

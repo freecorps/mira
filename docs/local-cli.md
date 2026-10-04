@@ -27,6 +27,11 @@ destination guard, and the exit codes.
 It does **not** need credentials for GitHub, GitLab or Forgejo, and never
 contacts them. A local review works on a train.
 
+Nor does it look up [dependency release notes](dependency-updates.md) on the
+package registries, unless `review.dependency_updates.local: true` is set in
+the `.mira.yaml` committed at the review's base — a change under review does
+not get to decide who else hears about it.
+
 > The published Docker image does not carry `git`: the server has no checkout
 > to review, and adding it would grow every deployment for a command no
 > deployment runs. Install Mira with `pip` on the machine you develop on.

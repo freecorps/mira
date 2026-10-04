@@ -34,6 +34,8 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 ## Security
 
 - **Vulnerability scanning** via OSV.dev — hourly background poll across every package in every repo. Surfaces critical/high/moderate/low CVEs with advisory links and fix versions.
+- **Dependency bumps reviewed against upstream release notes** — when a PR bumps a package, Mira finds its repository through PyPI, npm, the Go module proxy or Packagist, reads the GitHub releases (or changelog) between the two versions, and has the indexing model extract breaking changes and deprecations. The review model checks the PR's code against them, and the walkthrough lists each bump with links and the OSV advisories it fixes or carries. Release notes are framed as untrusted data, and the lookup is bounded by a time and byte budget so it never holds up a review. See [docs/dependency-updates.md](docs/dependency-updates.md)
+- Outbound posture for the lookup: a fixed host allowlist (`MIRA_DEPENDENCY_UPDATES_HOSTS=""` turns it off), HTTPS only, no redirects, private addresses refused; off in `mira local review` unless the committed `.mira.yaml` opts in
 - **Org-wide package search** — answer "which repos use lodash@4.17.20?" instantly. Built for incident response.
 - Per-repo CVE badges inline with package listings
 - Dashboard "Security alerts" widget showing org-wide open vulnerabilities by severity
@@ -170,6 +172,7 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Documented exit codes for CI, where only `1` is a statement about the code, printable with `--explain-exit-codes`
 - Deterministic, ASCII-safe JSON (`--output json`) with a `schema_version`, sharing its finding shape with `mira review`
 - Needs no forge credentials and contacts no forge — it works offline
+- Dependency release notes are not looked up locally unless the `.mira.yaml` committed at the base sets `review.dependency_updates.local`
 - See [docs/local-cli.md](docs/local-cli.md)
 
 ## Read-only MCP server

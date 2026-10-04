@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from typing import Any
 
 WALKTHROUGH_MARKER = "<!-- mira-walkthrough -->"
 
@@ -200,6 +201,9 @@ class WalkthroughResult:
     effort: WalkthroughEffort | None = None
     confidence_score: WalkthroughConfidenceScore | None = None
     sequence_diagram: str | None = None
+    # `mira.dependency_updates.DependencyUpdate`s, attached once the review is
+    # done; rendered as the "Dependency updates" section.
+    dependency_updates: list[Any] = field(default_factory=list)
 
     def to_markdown(
         self,
@@ -277,6 +281,11 @@ class WalkthroughResult:
                     line += f" Shared: {shown}"
                 parts.append(line)
             parts.append("")
+
+        if self.dependency_updates:
+            from mira.dependency_updates.render import walkthrough_section
+
+            parts.extend(walkthrough_section(self.dependency_updates))
 
         if blast_radius:
             parts.append("")
