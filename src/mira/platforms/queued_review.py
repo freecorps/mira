@@ -203,7 +203,9 @@ async def execute_review_request(
                 "error": str(exc),
             },
         )
-        return RunResult("failed", status_settled=bool(state.get("status_settled")) or not status_on)
+        return RunResult(
+            "failed", status_settled=bool(state.get("status_settled")) or not status_on
+        )
     if not ran:
         return RunResult("busy", status_settled=False)
     return RunResult("reviewed", status_settled=bool(state.get("status_settled")) or not status_on)

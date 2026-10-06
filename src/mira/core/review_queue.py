@@ -334,7 +334,9 @@ class ReviewQueue:
         await self._settle(config, now)
         active = self._db.list_review_requests(REVIEW_REQUEST_ACTIVE)
         queued = [r for r in active if r.state == "queued"]
-        started = self._dispatch(queued, active, now, q.max_concurrent_reviews, q.max_concurrent_per_installation)
+        started = self._dispatch(
+            queued, active, now, q.max_concurrent_reviews, q.max_concurrent_per_installation
+        )
         await self._announce([r for r in queued if r.id not in started], active, config)
         if now - self._last_prune > _PRUNE_EVERY_SECONDS:
             self._last_prune = now

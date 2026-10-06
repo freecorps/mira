@@ -88,9 +88,7 @@ class GitHubReviewPlatform:
         """Open pull requests whose `mira/review` check was left queued or in progress."""
         found: list[ReviewRequest] = []
         repos = [
-            r
-            for r in self._app_db().list_repos()
-            if r.platform == "github" and r.installation_id
+            r for r in self._app_db().list_repos() if r.platform == "github" and r.installation_id
         ][:_ORPHAN_SCAN_REPOS]
         providers: dict[int, Any] = {}
         for record in repos:
