@@ -240,7 +240,10 @@ class SnapshotSourceFetcher:
             logger.info("Snapshot unavailable, reading files one by one: %s", exc)
         finally:
             if isinstance(snapshot, RepoSnapshot) and not self._closed:
-                self._hold(sum(len(text) for text in snapshot.files.values()))
+                self._hold(
+                    snapshot.text_bytes
+                    or sum(len(text.encode("utf-8")) for text in snapshot.files.values())
+                )
             else:
                 self._hold(0)
         return None

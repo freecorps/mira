@@ -279,3 +279,19 @@ class TestSnapshotBudget:
         source = SnapshotSourceFetcher(provider, _pr(), "abc123", budget=budget)
         await source.fetch("a.py")
         assert budget.held == 0
+
+    async def test_the_budget_charges_bytes_not_characters(self):
+        """Non-ASCII source is more bytes than characters; charging characters
+        let concurrent snapshots run past the cap."""
+        budget = SnapshotBudget()
+        text = "é" * 1000
+        provider = self._provider(RepoSnapshot(files={"a.py": text}, paths={"a.py"}))
+        source = SnapshotSourceFetcher(provider, _pr(), "abc123", budget=budget)
+        await source.fetch("a.py")
+        assert budget.held == len(text.encode("utf-8")) == 2000
+        await source.aclose()
+
+    def test_the_archive_reader_records_the_bytes_it_kept(self):
+        blob = _tarball({"a.py": "é".encode() * 10, "b.py": b"bb"})
+        snapshot = _snapshot_from_tarball(blob, 1_048_576, "o/r")
+        assert snapshot is not None and snapshot.text_bytes == 22
