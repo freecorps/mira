@@ -445,6 +445,19 @@ def test_patch_id_ignores_where_a_change_applies_but_not_what_it_does() -> None:
     assert diff_patch_id("") == ""
 
 
+def test_patch_id_keeps_whitespace_that_means_something() -> None:
+    """A re-indent moves a Python line out of its block, and a space inside a
+    string literal is data: neither is the same change."""
+    reindented = _DIFF.replace(
+        "+        return sum(i.price * i.qty", "+    return sum(i.price * i.qty"
+    )
+    spaced = _DIFF.replace("i.price * i.qty", "i.price*i.qty")
+    trailing = _DIFF.replace("for i in self.items)\n+\n", "for i in self.items)   \n+\n")
+    assert diff_patch_id(reindented) != diff_patch_id(_DIFF)
+    assert diff_patch_id(spaced) != diff_patch_id(_DIFF)
+    assert trailing != _DIFF and diff_patch_id(trailing) == diff_patch_id(_DIFF)
+
+
 def _carry_over_setup(db: AppDatabase, diff_now: str) -> tuple[MagicMock, ReviewRequest]:
     db.set_pr_review_verdict(
         PRReviewVerdict(
@@ -571,10 +584,14 @@ async def test_nothing_is_published_with_the_status_off(db: AppDatabase) -> None
         )
     )
     queue = ReviewQueue(db, {"github": platform}, config=lambda: config, clock=clock)
+    platform.publish = AsyncMock(return_value=True)  # type: ignore[method-assign]
     queue.enqueue(_request(1, "a"))
-    queue.enqueue(_request(1, "b"))
     await _tick(queue)
-    assert platform.checks == {}
+    queue.enqueue(_request(1, "b"))
+    clock.now += 60
+    await _drain(queue, db)
+    assert platform.completed == [(1, "b")]
+    platform.publish.assert_not_awaited()
 
 
 # ────────────────────────────────────────────────────── webhook entry points ──
@@ -744,3 +761,34 @@ def test_a_failed_insert_leaves_the_older_request_in_place(db: AppDatabase) -> N
     assert [(r.id, r.state) for r in db.list_review_requests(("queued", "superseded"))] == [
         (first.id, "queued")
     ]
+
+
+async def test_a_failed_queued_status_is_tried_again_later(db: AppDatabase) -> None:
+    class Flaky(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def publish(self, request: ReviewRequest, status: CommitStatus) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                return False
+            return await super().publish(request, status)
+
+    clock = Clock()
+    platform = Flaky()
+    queue = _queue(db, platform, clock, settle_seconds=100.0)
+    queue.enqueue(_request(1, "a"))
+    await _tick(queue)
+    await _tick(queue)
+    assert platform.calls == 1
+    clock.now += 61
+    await _tick(queue)
+    assert platform.checks[(1, "a")] == ("queued", "Queued")
+
+
+def test_claiming_a_request_marks_its_check_in_the_same_write(db: AppDatabase) -> None:
+    row, _, _ = db.enqueue_review_request(_request(1, "a"))
+    assert db.claim_review_request(row.id)
+    claimed = db.get_review_request(row.id)
+    assert (claimed.state, claimed.check_state, claimed.attempts) == ("running", "running", 1)

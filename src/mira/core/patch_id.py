@@ -1,13 +1,17 @@
 """A fingerprint of what a diff changes, independent of where it applies.
 
 Git's ``patch-id`` answers "is this the same patch?" for a commit that was
-rebased: line numbers, hunk offsets, blob ids and whitespace are left out, and
-what is left is the set of lines each file adds and removes. The review queue
+rebased: line numbers, hunk offsets and blob ids are left out, and what is left
+is the set of lines each file adds and removes. The review queue
 asks the same question of a whole pull request — is its diff against the base
 the one Mira already reviewed? — so a restack that only moved the base does not
 pay for the same review again.
 
-Context lines are left out too. A rebase that brings in upstream edits *near*
+Unlike git, whitespace inside a line is kept: in Python an indent is meaning,
+and inside a string literal so is a space. Only trailing whitespace, which no
+rebase changes and no language reads, is dropped.
+
+Context lines are left out. A rebase that brings in upstream edits *near*
 a hunk changes its context without changing what the pull request does, and
 counting those would send most restacked pull requests back to the model.
 """
@@ -38,8 +42,7 @@ def diff_patch_id(diff_text: str) -> str:
             current.append(line.strip())
             continue
         if line.startswith(("+", "-")):
-            body = "".join(line[1:].split())
-            current.append(line[0] + body)
+            current.append(line.rstrip())
     if not any(files.values()):
         return ""
     digest = hashlib.sha256()

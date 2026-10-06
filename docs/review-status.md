@@ -125,7 +125,8 @@ head branch goes after it: the chain is reviewed from its base up.
 **Rebases that change nothing are not reviewed again.** Every finished review
 records its verdict and the *patch id* of the pull request's own diff against
 its base — what each file adds and removes, with line numbers, blob ids,
-context lines and whitespace left out, the way `git patch-id` does. When a
+context lines and trailing whitespace left out, much as `git patch-id` does
+(indentation is kept: in Python it changes what the code does). When a
 `synchronize` arrives and the new head's diff has the same patch id, the push
 only moved the base: the previous verdict is republished on the new head with
 the note *"Rebased without changes; previous review carried over"*, no model is
