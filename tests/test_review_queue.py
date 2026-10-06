@@ -718,3 +718,29 @@ async def test_a_cancelled_review_releases_its_slot_for_the_next_one() -> None:
         await run_pr_review(AsyncMock(), "acme", "slot", 41, "u", False, "mira")
     engine.report_review_failure.assert_not_awaited()
     assert not any(j.repo == "acme/slot" and j.pr_number == 41 for j in tracker.get_active())
+
+
+def test_a_failed_insert_leaves_the_older_request_in_place(db: AppDatabase) -> None:
+    """Superseding happens only once the replacement is stored; otherwise a
+    failed write would leave the pull request with neither request."""
+    first, _, _ = db.enqueue_review_request(_request(7, "first"))
+    real = db._sqlite_conn
+
+    class FailingInsert:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+        def execute(self, sql: str, params: tuple = ()) -> Any:
+            if sql.startswith("INSERT INTO review_requests"):
+                raise RuntimeError("disk full")
+            return real.execute(sql, params)
+
+    db._sqlite_conn = FailingInsert()  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError):
+            db.enqueue_review_request(_request(7, "second"))
+    finally:
+        db._sqlite_conn = real
+    assert [(r.id, r.state) for r in db.list_review_requests(("queued", "superseded"))] == [
+        (first.id, "queued")
+    ]

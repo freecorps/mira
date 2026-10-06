@@ -3141,17 +3141,6 @@ class AppDatabase:
             if same_head and (existing.full_review or not request.full_review):
                 return existing, [], False
 
-        superseded: list[ReviewRequest] = []
-        for existing in same_pr:
-            changed = self._rq_exec(
-                "UPDATE review_requests SET state='superseded', outcome='superseded', "
-                "updated_at=? WHERE id=? AND state IN ('queued', 'running')",
-                (now, existing.id),
-            )
-            if changed:
-                existing.state = "superseded"
-                superseded.append(existing)
-
         waiting = [r for r in active if r.state == "queued" and r.pr_number != request.pr_number]
         batch_id = min((r.batch_id for r in waiting if r.batch_id), default=0)
         available_at = now + settle_seconds
@@ -3216,6 +3205,19 @@ class AppDatabase:
             self._rq_exec(
                 "UPDATE review_requests SET batch_id=? WHERE id=?", (request.id, request.id)
             )
+        # Superseded only once the replacement is safely stored: a failed
+        # insert must not leave the pull request with neither request.
+        superseded: list[ReviewRequest] = []
+        for existing in same_pr:
+            changed = self._rq_exec(
+                "UPDATE review_requests SET state='superseded', outcome='superseded', "
+                "updated_at=? WHERE id=? AND state IN ('queued', 'running')",
+                (now, existing.id),
+            )
+            if changed:
+                existing.state = "superseded"
+                superseded.append(existing)
+
         return request, superseded, True
 
     def claim_review_request(self, request_id: int, *, now: float | None = None) -> bool:

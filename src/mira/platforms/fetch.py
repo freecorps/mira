@@ -115,6 +115,9 @@ class RepoSnapshot:
     # Source files left out only for their size: they exist and could hold a
     # match, so a search over ``files`` has not covered them either.
     oversized: set[str] = field(default_factory=set)
+    # Bytes of text kept in ``files``, as read from the archive: what the
+    # snapshot memory budget charges.
+    text_bytes: int = 0
 
 
 # Never decoded into a snapshot: build output, vendored code and binary
@@ -210,6 +213,7 @@ def _snapshot_from_stream(
                 except UnicodeDecodeError:
                     continue
                 held += len(data)
+                snapshot.text_bytes = held
     except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
         logger.info("Snapshot extract failed for %s: %s", label, exc)
         return None

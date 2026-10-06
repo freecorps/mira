@@ -75,9 +75,12 @@ process, remembers which check it left queued or in progress. On startup:
   (3) is **not started again** — a review that takes the process down with it
   would otherwise do so on every boot — and its check is closed as neutral,
   *"Mira could not finish this review"*;
-- every open pull request whose head carries a `mira/review` check still queued
+- an open pull request whose head carries a `mira/review` check still queued
   or in progress that no row knows about — from before the queue existed, or
   from a lost database — gets a review queued (`review.queue.reconcile_on_boot`).
+  The scan covers up to 200 registered repositories and the 50 most recently
+  updated open pull requests of each; a check beyond that is settled by the
+  next push, `@mira review` or Re-run.
 
 Whatever happens to a request, a check it published is closed by the queue if
 the review did not close it itself. A status that could not be published is
@@ -114,7 +117,8 @@ its newest head.
 
 **Stack-aware.** Requests for one repository that arrive within
 `settle_seconds` (5 s) of each other form one batch, and the batch waits until
-the burst has gone quiet (never more than a minute) before any of it starts.
+the burst has gone quiet before any of it starts — but never longer than six
+times `settle_seconds` (and at least 30 s) after a request's own arrival.
 Within the batch, a pull request whose base branch is another queued request's
 head branch goes after it: the chain is reviewed from its base up.
 

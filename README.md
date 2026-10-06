@@ -293,8 +293,9 @@ On GitHub, the **Re-run** button on the `mira/review` check does the same as
 `@mira review`. Use either when a check looks stuck: there is no need to close
 and reopen the pull request.
 
-Reviews go through a durable queue: every request is written to Mira's
-database before the webhook is answered, at most
+Reviews go through a durable queue: each request is written to Mira's
+database before the webhook is answered (if that write fails, the review runs
+directly instead of being dropped), at most
 `review.queue.max_concurrent_reviews` (default 2) run at once, the rest show a
 **Queued** check, and a restart resumes them. A push that lands while an older
 head is still waiting or being reviewed replaces it (the old check is closed as
