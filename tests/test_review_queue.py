@@ -128,7 +128,11 @@ async def _drain(queue: ReviewQueue, db: AppDatabase, *, rounds: int = 2000) -> 
             for r in db.list_review_requests(("superseded", "failed", "done"))
             if r.check_state in ("queued", "running")
         ]
-        if not queue._tasks and not db.list_review_requests(("queued", "running")) and not unsettled:
+        if (
+            not queue._tasks
+            and not db.list_review_requests(("queued", "running"))
+            and not unsettled
+        ):
             return
     raise AssertionError("the queue never drained")
 
@@ -192,7 +196,7 @@ async def test_a_restacked_chain_of_fifteen_runs_two_at_a_time_from_the_base_up(
     assert len(db.list_review_requests(("queued",))) == 15
     await _tick(queue)
     assert platform.started == []
-    assert {platform.checks[(n, f"new{n}")] [0] for n in numbers} == {"queued"}
+    assert {platform.checks[(n, f"new{n}")][0] for n in numbers} == {"queued"}
     assert {r.batch_id for r in db.list_review_requests(("queued",))} == {
         min(r.id for r in db.list_review_requests(("queued",)))
     }
@@ -279,7 +283,13 @@ async def test_a_restart_in_the_middle_of_the_queue_loses_nothing(db: AppDatabas
     await second._orphan_task
     await _drain(second, db)
 
-    assert sorted(after.completed) == [(10, "h10"), (11, "h11"), (12, "h12"), (13, "h13"), (30, "h30")]
+    assert sorted(after.completed) == [
+        (10, "h10"),
+        (11, "h11"),
+        (12, "h12"),
+        (13, "h13"),
+        (30, "h30"),
+    ]
     assert checks[(20, "h20")] == ("neutral", "Mira could not finish this review")
     assert _pending(checks) == {}
     assert all(state != "failure" for state, _title in checks.values())
@@ -313,7 +323,9 @@ async def test_a_review_whose_head_moved_during_the_restart_is_superseded(
     provider.get_pr_info = AsyncMock(return_value=_pr_info(5, "new"))
     provider.publish_review_status = AsyncMock(return_value="1")
     with patch("mira.platforms.handlers.run_pr_review", AsyncMock(return_value=True)) as review:
-        result = await execute_review_request(provider, row, bot_name=BOT, db=db, config=MiraConfig())
+        result = await execute_review_request(
+            provider, row, bot_name=BOT, db=db, config=MiraConfig()
+        )
     published = provider.publish_review_status.call_args.kwargs
     target = provider.publish_review_status.call_args.args[0]
     assert target.head_sha == "old"
@@ -465,7 +477,9 @@ async def test_a_rebase_that_changes_nothing_carries_the_verdict_over_without_th
         patch("mira.platforms.handlers.run_gate_evaluation", AsyncMock()) as gate,
         patch("mira.platforms.handlers.create_llm") as create_llm,
     ):
-        result = await execute_review_request(provider, row, bot_name=BOT, db=db, config=MiraConfig())
+        result = await execute_review_request(
+            provider, row, bot_name=BOT, db=db, config=MiraConfig()
+        )
 
     assert result == RunResult("carried_over", status_settled=True)
     review.assert_not_awaited()
@@ -486,7 +500,9 @@ async def test_a_rebase_that_changes_nothing_carries_the_verdict_over_without_th
 async def test_a_rebase_that_changes_the_diff_is_reviewed(db: AppDatabase) -> None:
     provider, row = _carry_over_setup(db, _CHANGED)
     with patch("mira.platforms.handlers.run_pr_review", AsyncMock(return_value=True)) as review:
-        result = await execute_review_request(provider, row, bot_name=BOT, db=db, config=MiraConfig())
+        result = await execute_review_request(
+            provider, row, bot_name=BOT, db=db, config=MiraConfig()
+        )
     review.assert_awaited_once()
     assert result.outcome == "reviewed"
 
@@ -589,9 +605,13 @@ async def test_the_re_run_button_on_mira_review_queues_a_review(
         "repository": {"owner": {"login": OWNER}, "name": REPO},
     }
     with patch("mira.platforms.github.webhook.load_config", return_value=MiraConfig()):
-        status = await dispatch_github_event("check_run", payload, _app_auth(), BOT, BackgroundTasks())
+        status = await dispatch_github_event(
+            "check_run", payload, _app_auth(), BOT, BackgroundTasks()
+        )
         other = dict(payload, check_run=dict(payload["check_run"], name="ci/tests"))
-        ignored = await dispatch_github_event("check_run", other, _app_auth(), BOT, BackgroundTasks())
+        ignored = await dispatch_github_event(
+            "check_run", other, _app_auth(), BOT, BackgroundTasks()
+        )
     assert (status, ignored) == ("queued", "ignored")
     (row,) = db.list_review_requests(("queued",))
     assert (row.pr_number, row.head_sha, row.reason) == (9, "abc", "rerun")
