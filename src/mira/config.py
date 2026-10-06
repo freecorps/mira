@@ -537,6 +537,42 @@ class DependencyUpdatesConfig(BaseModel):
     github_token_env: str = ""
 
 
+class ReviewQueueConfig(BaseModel):
+    """How many reviews run at once, and what happens to the rest.
+
+    Every review request is written to the application database before the
+    webhook is answered and run from there by one worker, so a restart loses
+    nothing and a burst of pushes — a restacked chain of fifteen pull
+    requests, all force-pushed in the same second — waits in line instead of
+    starting fifteen reviews in one process. See ``docs/review-status.md``.
+    """
+
+    # Reviews running at once in this process. The excess waits, with a
+    # "Queued" check on the pull request.
+    max_concurrent_reviews: int = Field(default=2, ge=1, le=32)
+    # Per GitHub installation (per repository on the token-based platforms).
+    # 0: only the global limit applies.
+    max_concurrent_per_installation: int = Field(default=0, ge=0, le=32)
+    # How long a new request waits for the rest of its burst. A restack
+    # delivers one webhook per branch over a few seconds; waiting for the last
+    # one is what lets the queue order the chain from its base up.
+    settle_seconds: float = Field(default=5.0, ge=0.0, le=120.0)
+    # Starts a request gets before it is given up on. A review is only started
+    # again after the process died under it, and one that keeps taking the
+    # process down with it must not do so forever.
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    # A push whose own diff (head against base) is the one Mira last reviewed —
+    # a rebase that only moved the base — gets the previous verdict carried
+    # over instead of a new review.
+    carry_over_unchanged_rebase: bool = True
+    # On startup, look for `mira/review` checks left in progress on open pull
+    # requests and resume or settle them.
+    reconcile_on_boot: bool = True
+    # Decoded repository text all running reviews may hold at once, in MB. A
+    # review that would pass it reads files one by one instead.
+    snapshot_memory_mb: int = Field(default=320, ge=0, le=16384)
+
+
 class ReviewConfig(BaseModel):
     # `chill` | `balanced` | `assertive`; see REVIEW_PROFILES above.
     profile: str = "balanced"
@@ -669,6 +705,9 @@ class ReviewConfig(BaseModel):
 
     # The commit status carrying "Mira is reviewing" and then what it found.
     status: ReviewStatusConfig = Field(default_factory=ReviewStatusConfig)
+
+    # The durable review queue: concurrency, bursts and restarts.
+    queue: ReviewQueueConfig = Field(default_factory=ReviewQueueConfig)
 
     # Automatically resolve bot review threads that the LLM verifies as fixed
     # on each review pass. Disable to leave all bot comments open until a human

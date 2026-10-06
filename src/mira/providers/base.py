@@ -30,6 +30,7 @@ from mira.models import (
     HumanReviewComment,
     IssueInfo,
     MergedPullRequest,
+    OpenPRRef,
     PathAuthorship,
     PRInfo,
     ReleaseRef,
@@ -124,8 +125,9 @@ class BaseProvider(abc.ABC):
     ) -> str:
         """Publish "Mira is reviewing" / "Mira finished" as a commit status.
 
-        ``state`` is one of ``pending``, ``success``, ``failure`` or
-        ``neutral``. Idempotent by ``context``: publishing again replaces the
+        ``state`` is one of ``queued``, ``pending``, ``success``, ``failure``
+        or ``neutral``; a platform without a queued state shows ``queued`` as
+        ``pending``. Idempotent by ``context``: publishing again replaces the
         previous entry rather than adding one, so the pending status becomes
         the terminal one instead of sitting next to it forever.
 
@@ -137,6 +139,16 @@ class BaseProvider(abc.ABC):
         misconfiguration and silence is how it stays unfixed.
         """
         return ""
+
+    async def list_unfinished_review_checks(
+        self, owner: str, repo: str, *, context: str, limit: int = 50
+    ) -> list[OpenPRRef]:
+        """Open pull requests whose head carries ``context`` still queued or in progress.
+
+        Read on startup to settle checks a dead process left behind. Empty
+        when the platform has no such thing to look for.
+        """
+        return []
 
     async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
         """Latest review state per reviewer login (e.g. ``{"alice": "CHANGES_REQUESTED"}``).
@@ -244,13 +256,14 @@ class BaseProvider(abc.ABC):
         return []
 
     async def get_repo_snapshot(
-        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int, max_text_bytes: int | None = None
     ) -> RepoSnapshot | None:
         """The whole repository at ``ref`` from one archive download, or None.
 
         None means "read files one at a time": the answer for a provider with
         no archive endpoint, and for a repository whose archive passes
-        ``max_bytes``.
+        ``max_bytes``. ``max_text_bytes`` caps the decoded text kept (None:
+        the default cap), past which the snapshot is partial.
         """
         return None
 

@@ -339,6 +339,7 @@ def _github_provider(existing=None, total=0):
 @pytest.mark.parametrize(
     ("state", "expected"),
     [
+        ("queued", ("queued", None)),
         ("pending", ("in_progress", None)),
         ("success", ("completed", "success")),
         ("failure", ("completed", "failure")),
@@ -385,6 +386,29 @@ async def test_github_opens_a_new_run_rather_than_reopening_a_finished_one() -> 
     )
     assert finished.edit.call_count == 0
     assert repo.create_check_run.call_args.kwargs["status"] == "in_progress"
+
+
+async def test_github_turns_the_queued_run_into_the_running_one() -> None:
+    """The review queue publishes `Queued` first; the review's own pending state
+    must take over that row rather than add a second one beside it."""
+    waiting = MagicMock(id=7, status="queued", started_at=1)
+    provider, repo = _github_provider(existing=waiting)
+    ref = await provider.publish_review_status(
+        _pr(), context=STATUS_CONTEXT, state="pending", title="Reviewing…", summary="s"
+    )
+    assert ref == "7"
+    assert repo.create_check_run.call_count == 0
+    assert waiting.edit.call_args.kwargs["status"] == "in_progress"
+
+
+async def test_github_queues_a_new_run_rather_than_reopening_a_finished_one() -> None:
+    finished = MagicMock(id=7, status="completed", started_at=1)
+    provider, repo = _github_provider(existing=finished)
+    await provider.publish_review_status(
+        _pr(), context=STATUS_CONTEXT, state="queued", title="Queued", summary="s"
+    )
+    assert finished.edit.call_count == 0
+    assert repo.create_check_run.call_args.kwargs["status"] == "queued"
 
 
 async def test_github_picks_the_newest_run_when_there_are_several() -> None:
@@ -434,7 +458,13 @@ class _FakeResp:
 
 @pytest.mark.parametrize(
     ("state", "expected"),
-    [("pending", "pending"), ("success", "success"), ("failure", "failure"), ("neutral", "error")],
+    [
+        ("queued", "pending"),
+        ("pending", "pending"),
+        ("success", "success"),
+        ("failure", "failure"),
+        ("neutral", "error"),
+    ],
 )
 async def test_forgejo_maps_a_failed_review_onto_error_not_success(
     state: str, expected: str

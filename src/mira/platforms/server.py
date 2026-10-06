@@ -39,6 +39,25 @@ def _json_status(status: str) -> Response:
     )
 
 
+def _rss_bytes() -> int:
+    """Resident memory of this process, or 0 where it cannot be read."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import resource
+        import sys
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(peak if sys.platform == "darwin" else peak * 1024)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def create_app(
     app_auth: GitHubAppAuth | None = None,
     webhook_secret: str | None = None,
@@ -136,6 +155,18 @@ def create_app(
             }
         )
 
+        # The review queue's worker. Every GitHub review is persisted before
+        # its webhook is answered and run from here, a bounded number at a
+        # time; starting it also recovers whatever the last process left.
+        from mira.core import review_queue
+        from mira.dashboard.api import _app_db
+        from mira.platforms.github.review_queue import GitHubReviewPlatform
+
+        review_queue.start(
+            _app_db,
+            {"github": GitHubReviewPlatform(app_auth, bot_name)} if app_auth is not None else {},
+        )
+
         # The digest scheduler. Always started: whether a digest is due is
         # decided per tick from the configuration, which the dashboard can
         # change without a restart, and an idle tick is one config load.
@@ -154,6 +185,7 @@ def create_app(
         )
 
         yield
+        await review_queue.stop()
         await digest_runtime.stop()
         await autofix_runtime.stop()
         if backfill_task is not None and not backfill_task.done():
@@ -184,6 +216,18 @@ def create_app(
                     with suppress(Exception):
                         conn.close()
         return {"status": "ok"}
+
+    @app.get("/health/reviews")
+    async def review_health() -> dict[str, Any]:
+        """Reviews running, reviews waiting, and this process's memory."""
+        from mira.core import review_queue
+        from mira.index.context import snapshot_budget
+
+        return {
+            **review_queue.metrics(),
+            "snapshot_bytes_held": snapshot_budget.held,
+            "rss_bytes": _rss_bytes(),
+        }
 
     # `/webhook` is a deprecated alias from before the `/github/webhook` rename.
     @app.post("/github/webhook")

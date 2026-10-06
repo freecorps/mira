@@ -17,7 +17,9 @@ from fastapi import BackgroundTasks
 from mira.autofix.commands import FIX_KEYWORDS as _FIX_KEYWORDS
 from mira.autofix.commands import parse_finishing_command
 from mira.config import load_config
+from mira.core.commit_status import STATUS_CONTEXT as REVIEW_STATUS_CONTEXT
 from mira.core.issue_planner import is_plan_command
+from mira.dashboard.db import ReviewRequest
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
     feedback_ack,
@@ -30,6 +32,7 @@ from mira.models import PRInfo
 from mira.platforms.chat_commands import is_review_request
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.github.auth import GitHubAppAuth
+from mira.platforms.github.review_queue import request_from_pull_request
 from mira.platforms.handlers import (
     _PAUSE_KEYWORDS,
     _REJECT_KEYWORDS,
@@ -571,8 +574,37 @@ async def dispatch_github_event(
         if any(lbl.get("name") == PAUSE_LABEL for lbl in pr_labels):
             logger.info("PR paused via %s label", PAUSE_LABEL)
             return "paused"
+        # Written to the review queue before this webhook is answered, so a
+        # restart cannot lose it; the queue's worker runs it when a slot frees.
+        if _queue_review(
+            request_from_pull_request(payload, payload.get("pull_request") or {}, reason=action)
+        ):
+            _record_pr_contribution(payload, "pr_opened")
+            return "queued"
         background_tasks.add_task(handle_pull_request, payload, app_auth, bot_name)
         return "processing"
+
+    # GitHub's Re-run button on Mira's own check asks for the review again.
+    if event == "check_run" and action == "rerequested":
+        check_run = payload.get("check_run") or {}
+        if str(check_run.get("name") or "") != REVIEW_STATUS_CONTEXT:
+            return "ignored"
+        pull_requests = (check_run.get("pull_requests") or [])[:5]
+        if not pull_requests:
+            return "ignored"
+        queued = False
+        for pull_request in pull_requests:
+            request = request_from_pull_request(
+                payload,
+                pull_request,
+                reason="rerun",
+                head_sha=str(check_run.get("head_sha") or ""),
+            )
+            if _queue_review(request):
+                queued = True
+            else:
+                background_tasks.add_task(handle_review_rerun, request, app_auth, bot_name)
+        return "queued" if queued else "processing"
 
     # The merge gate's inputs move without a new commit: CI finishes, a
     # `do-not-merge` label goes on or comes off, a draft is marked ready. Each
@@ -603,7 +635,10 @@ async def dispatch_github_event(
         if "pull_request" in payload.get("issue", {}) and has_mention(comment_body, names):
             cmd_word = command_after_mention(comment_body, names)
             if is_review_request(comment_body, names):
-                pass  # review / full review bypass the author filter
+                # review / full review bypass the author filter, and go through
+                # the review queue like any other review.
+                if _queue_review(_comment_review_request(payload, comment_body, names)):
+                    return "queued"
             elif author_is_filtered(
                 comment_user, cfg.filter.allowed_authors, cfg.filter.blocked_authors
             ):
@@ -727,6 +762,58 @@ async def dispatch_github_event(
             return "processing"
 
     return "ignored"
+
+
+def _queue_review(request: ReviewRequest) -> bool:
+    """Persist a review request in this process's review queue, if it runs one."""
+    from mira.core import review_queue
+
+    if not request.owner or not request.repo or not request.pr_number:
+        return False
+    return review_queue.submit(request) is not None
+
+
+def _comment_review_request(
+    payload: dict[str, Any], comment_body: str, names: list[str]
+) -> ReviewRequest:
+    """The review an `@mira review` / `@mira full review` comment asks for."""
+    from mira.platforms.chat_commands import FULL_REVIEW_KEYWORDS, normalize_command
+
+    issue = payload.get("issue") or {}
+    request = request_from_pull_request(
+        payload,
+        {"number": issue.get("number"), "title": issue.get("title", "")},
+        reason="command",
+    )
+    request.actor = str((payload.get("comment") or {}).get("user", {}).get("login") or "")
+    request.full_review = (
+        normalize_command(strip_mentions(comment_body, names)) in FULL_REVIEW_KEYWORDS
+    )
+    return request
+
+
+async def handle_review_rerun(
+    request: ReviewRequest,
+    app_auth: GitHubAppAuth,
+    bot_name: str,
+) -> None:
+    """Re-run pressed on `mira/review` with no queue running: review directly."""
+    try:
+        token = await app_auth.get_installation_token(request.installation_id)
+        provider = create_provider("github", token)
+        await run_pr_review(
+            provider,
+            request.owner,
+            request.repo,
+            request.pr_number,
+            request.pr_url,
+            request.is_private,
+            bot_name,
+            pr_title=request.pr_title,
+            bot_identity=await app_auth.get_bot_identity(),
+        )
+    except Exception:
+        logger.exception("Error handling a re-run of %s", request.pr_url)
 
 
 # Pull-request actions that change a gate input without changing the code.

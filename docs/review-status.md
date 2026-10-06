@@ -11,11 +11,14 @@ and narrowest question: *may Mira put its name on merging this?*
 ## The check
 
 ```
+mira/review   ● Queued                        (pending, waiting for a review slot)
 mira/review   ● Reviewing…                    (pending, published at the start)
 mira/review   ✓ No findings                   (green, review finished clean)
 mira/review   ✓ 2 suggestions                 (green, findings are inline)
 mira/review   ✗ 1 blocker, 2 warnings         (red, by default)
 mira/review   ● Mira could not finish this review   (neutral, a Mira failure)
+mira/review   ● Superseded by a newer push    (neutral, an older head nobody needs reviewed)
+mira/review   ✓ No findings (carried over)    (the previous verdict, on a rebase that changed nothing)
 ```
 
 It exists because until the first comment lands, a pull request says nothing
@@ -56,6 +59,115 @@ the gate and reviewer triage run, since those publish their own contexts and a
 crash in one of them is not a review failure. If the review raises, whoever
 caught the exception calls `report_review_failure`, and the pending status
 becomes the neutral one.
+
+That covers a review that *fails*. It does not cover a process that *dies* —
+killed for memory, restarted by a deploy or a watchdog — because then nobody is
+left to catch anything. On GitHub that case is covered by the review queue
+(below): every review is a row in Mira's database, and the row, not the
+process, remembers which check it left queued or in progress. On startup:
+
+- a review that was running is **started again** on the same head, and its
+  check — still "Reviewing…" — is taken over by the new run;
+- if the pull request **moved on** while Mira was down, the old head's check is
+  closed as neutral, *"Review interrupted by a restart; superseded"*, and the
+  new head is reviewed;
+- a review that has already been interrupted `review.queue.max_attempts` times
+  (3) is **not started again** — a review that takes the process down with it
+  would otherwise do so on every boot — and its check is closed as neutral,
+  *"Mira could not finish this review"*;
+- every open pull request whose head carries a `mira/review` check still queued
+  or in progress that no row knows about — from before the queue existed, or
+  from a lost database — gets a review queued (`review.queue.reconcile_on_boot`).
+
+Whatever happens to a request, a check it published is closed by the queue if
+the review did not close it itself. A status that could not be published is
+retried a few times with a growing delay, and given up on with a warning in the
+logs rather than retried for ever.
+
+## The review queue
+
+Each webhook used to start its review on the spot. A restacked chain of
+fifteen pull requests, force-pushed in the same second, started fifteen reviews
+in one process; the process ran out of memory, the webhooks that arrived while
+it restarted were lost, and the checks of the reviews it had been running said
+"Reviewing…" for good. Now, on GitHub:
+
+**Durable.** A review request — repository, pull request, head commit, reason —
+is written to the application database (SQLite or Postgres, the same one the
+dashboard uses) *before* the webhook is answered, and a worker in the same
+process runs it from there. If the write itself fails, the webhook falls back
+to reviewing directly rather than dropping the event.
+
+**Bounded.** At most `max_concurrent_reviews` reviews run at once (default 2),
+and at most `max_concurrent_per_installation` per GitHub installation (0: no
+separate limit). The rest wait, and their pull requests show **Queued**
+straight away, so "waiting its turn" and "not installed here" still look
+different.
+
+**Coalesced.** A new push to a pull request that is still waiting or being
+reviewed replaces the older request: a waiting one is dropped, a running one is
+cancelled, and the older head's check is closed as neutral, *"Superseded by a
+newer push"* — never red, because it says nothing about the change. A
+redelivered webhook, or `opened` racing `synchronize`, is the same request and
+is not queued twice. During a restack each pull request is reviewed once, at
+its newest head.
+
+**Stack-aware.** Requests for one repository that arrive within
+`settle_seconds` (5 s) of each other form one batch, and the batch waits until
+the burst has gone quiet (never more than a minute) before any of it starts.
+Within the batch, a pull request whose base branch is another queued request's
+head branch goes after it: the chain is reviewed from its base up.
+
+**Rebases that change nothing are not reviewed again.** Every finished review
+records its verdict and the *patch id* of the pull request's own diff against
+its base — what each file adds and removes, with line numbers, blob ids,
+context lines and whitespace left out, the way `git patch-id` does. When a
+`synchronize` arrives and the new head's diff has the same patch id, the push
+only moved the base: the previous verdict is republished on the new head with
+the note *"Rebased without changes; previous review carried over"*, no model is
+called, and the merge gate is re-evaluated for the new head. An explicit
+request (`@mira review`, Re-run) is always a real review.
+`carry_over_unchanged_rebase: false` turns this off.
+
+**Memory.** A review keeps up to 150 MB of a repository's decoded source in
+memory for the agentic tools and the code graph, which is fine for one review
+and was most of what five concurrent reviews of one large repository cost.
+`snapshot_memory_mb` (320) caps that text across all running reviews together:
+a review that finds the budget spent reads files one by one through the API,
+as reviews did before snapshots, and a review returns its share when it ends.
+
+```yaml
+review:
+  queue:
+    max_concurrent_reviews: 2
+    max_concurrent_per_installation: 0
+    settle_seconds: 5
+    max_attempts: 3
+    carry_over_unchanged_rebase: true
+    reconcile_on_boot: true
+    snapshot_memory_mb: 320
+```
+
+`GET /health/reviews` answers with `reviews_running`, `reviews_queued`,
+`max_concurrent_reviews`, `snapshot_bytes_held` and `rss_bytes` — enough for a
+liveness probe or a dashboard panel to see a queue backing up before the
+process does.
+
+GitLab and Forgejo still start each review from its webhook; the queue covers
+GitHub, where the stack feature and the incident that prompted it live.
+
+## Asking for the review again
+
+| How | What runs |
+|---|---|
+| `@mira review` | The review again; after a first pass, only what changed since Mira's last review. |
+| `@mira full review` | The whole pull request from scratch, as a first pass would. |
+| **Re-run** on the `mira/review` check (GitHub) | The same as `@mira review`. |
+
+All three go through the queue like a push does, and none of them is carried
+over. Re-run arrives as a `check_run` webhook, which the GitHub App already
+subscribes to for the merge gate. This is the way to unstick a check that looks wrong; closing and
+reopening the pull request is never needed.
 
 ### The name is fixed
 

@@ -253,7 +253,7 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
         return paths
 
     async def get_repo_snapshot(
-        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int, max_text_bytes: int | None = None
     ) -> RepoSnapshot | None:
         """The repository at ``ref`` from one archive download (see ``BaseProvider``)."""
         from mira.platforms.fetch import fetch_snapshot
@@ -263,6 +263,7 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
             {"Authorization": f"token {self._token}"},
             label=f"{pr_info.owner}/{pr_info.repo}@{ref[:12]}",
             max_bytes=max_bytes,
+            max_text_bytes=max_text_bytes,
         )
 
     async def get_file_history(
@@ -686,6 +687,7 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
         if not sha:
             return ""
         forgejo_state = {
+            "queued": "pending",
             "pending": "pending",
             "success": "success",
             "failure": "failure",

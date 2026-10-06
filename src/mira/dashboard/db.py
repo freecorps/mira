@@ -341,6 +341,61 @@ CREATE TABLE IF NOT EXISTS digests (
 
 CREATE INDEX IF NOT EXISTS idx_digests_created
     ON digests(created_at);
+
+-- The durable review queue (mira.core.review_queue). A row is written before
+-- the webhook that asked for the review is answered, so a restart loses no
+-- request; `state` is queued -> running -> done | superseded | failed, and
+-- `check_state` is what this row last published as the `mira/review` check
+-- ('' nothing, 'queued', 'running', 'settled'), which is how a restart finds
+-- the checks it has to finish.
+CREATE TABLE IF NOT EXISTS review_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    installation_id INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    base_ref TEXT NOT NULL DEFAULT '',
+    head_ref TEXT NOT NULL DEFAULT '',
+    pr_title TEXT NOT NULL DEFAULT '',
+    pr_url TEXT NOT NULL DEFAULT '',
+    is_private INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    full_review INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'queued',
+    check_state TEXT NOT NULL DEFAULT '',
+    batch_id INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_requests_state
+    ON review_requests(state);
+CREATE INDEX IF NOT EXISTS idx_review_requests_pr
+    ON review_requests(platform, owner, repo, pr_number);
+
+-- The last verdict published per pull request, with the patch id of the diff
+-- it was decided on: a rebase that leaves the PR's own diff unchanged carries
+-- it over to the new head instead of paying for the same review again.
+CREATE TABLE IF NOT EXISTS pr_review_verdicts (
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL DEFAULT '',
+    patch_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, owner, repo, pr_number)
+);
 """
 
 _PG_SCHEMA = """
@@ -622,6 +677,61 @@ CREATE TABLE IF NOT EXISTS digests (
 
 CREATE INDEX IF NOT EXISTS idx_digests_created
     ON digests(created_at);
+
+-- The durable review queue (mira.core.review_queue). A row is written before
+-- the webhook that asked for the review is answered, so a restart loses no
+-- request; `state` is queued -> running -> done | superseded | failed, and
+-- `check_state` is what this row last published as the `mira/review` check
+-- ('' nothing, 'queued', 'running', 'settled'), which is how a restart finds
+-- the checks it has to finish.
+CREATE TABLE IF NOT EXISTS review_requests (
+    id BIGSERIAL PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    installation_id INTEGER NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    base_ref TEXT NOT NULL DEFAULT '',
+    head_ref TEXT NOT NULL DEFAULT '',
+    pr_title TEXT NOT NULL DEFAULT '',
+    pr_url TEXT NOT NULL DEFAULT '',
+    is_private INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    full_review INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'queued',
+    check_state TEXT NOT NULL DEFAULT '',
+    batch_id INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_requests_state
+    ON review_requests(state);
+CREATE INDEX IF NOT EXISTS idx_review_requests_pr
+    ON review_requests(platform, owner, repo, pr_number);
+
+-- The last verdict published per pull request, with the patch id of the diff
+-- it was decided on: a rebase that leaves the PR's own diff unchanged carries
+-- it over to the new head instead of paying for the same review again.
+CREATE TABLE IF NOT EXISTS pr_review_verdicts (
+    platform TEXT NOT NULL DEFAULT 'github',
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL DEFAULT '',
+    patch_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, owner, repo, pr_number)
+);
 """
 
 # pull_requests columns added for DORA / cycle time, as (name, DDL). Shared by
@@ -688,6 +798,103 @@ class PRReviewProgress:
     def remaining_paths(self) -> list[str]:
         done = set(self.reviewed_paths) | set(self.skipped_paths)
         return [p for p in self.total_paths if p not in done]
+
+
+# A review request's life: waiting, then running, then one of the terminal
+# states. Exported so the queue and the store cannot disagree on the spelling.
+REVIEW_REQUEST_ACTIVE = ("queued", "running")
+REVIEW_REQUEST_TERMINAL = ("done", "superseded", "failed")
+
+_REVIEW_REQUEST_COLUMNS = (
+    "id, platform, owner, repo, pr_number, installation_id, head_sha, base_ref, "
+    "head_ref, pr_title, pr_url, is_private, reason, full_review, actor, state, "
+    "check_state, batch_id, attempts, available_at, created_at, updated_at, "
+    "outcome, error"
+)
+
+
+@dataclass
+class ReviewRequest:
+    """One review asked for and not yet forgotten — a row of the review queue."""
+
+    owner: str
+    repo: str
+    pr_number: int
+    platform: str = "github"
+    installation_id: int = 0
+    head_sha: str = ""
+    base_ref: str = ""
+    head_ref: str = ""
+    pr_title: str = ""
+    pr_url: str = ""
+    is_private: bool = False
+    # opened | synchronize | reopened | command | rerun | recovered
+    reason: str = ""
+    full_review: bool = False
+    actor: str = ""
+    state: str = "queued"
+    check_state: str = ""
+    batch_id: int = 0
+    attempts: int = 0
+    available_at: float = 0.0
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    outcome: str = ""
+    error: str = ""
+    id: int = 0
+
+    @property
+    def repo_key(self) -> tuple[str, str, str]:
+        return (self.platform, self.owner, self.repo)
+
+    @property
+    def pr_key(self) -> tuple[str, str, str, int]:
+        return (self.platform, self.owner, self.repo, self.pr_number)
+
+    @classmethod
+    def from_row(cls, row: tuple) -> ReviewRequest:
+        return cls(
+            id=int(row[0]),
+            platform=str(row[1]),
+            owner=str(row[2]),
+            repo=str(row[3]),
+            pr_number=int(row[4]),
+            installation_id=int(row[5] or 0),
+            head_sha=str(row[6] or ""),
+            base_ref=str(row[7] or ""),
+            head_ref=str(row[8] or ""),
+            pr_title=str(row[9] or ""),
+            pr_url=str(row[10] or ""),
+            is_private=bool(row[11]),
+            reason=str(row[12] or ""),
+            full_review=bool(row[13]),
+            actor=str(row[14] or ""),
+            state=str(row[15]),
+            check_state=str(row[16] or ""),
+            batch_id=int(row[17] or 0),
+            attempts=int(row[18] or 0),
+            available_at=float(row[19] or 0),
+            created_at=float(row[20] or 0),
+            updated_at=float(row[21] or 0),
+            outcome=str(row[22] or ""),
+            error=str(row[23] or ""),
+        )
+
+
+@dataclass
+class PRReviewVerdict:
+    """The last `mira/review` result published on a pull request."""
+
+    owner: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    patch_id: str
+    state: str
+    title: str
+    summary: str
+    platform: str = "github"
+    updated_at: float = 0.0
 
 
 @dataclass
@@ -2851,6 +3058,296 @@ class AppDatabase:
                     "DELETE FROM pr_review_progress WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s",
                     (platform, owner, repo, pr_number),
                 )
+
+    # ── Review queue ──
+
+    def _rq_exec(self, sql: str, params: tuple = ()) -> int:
+        """One write with ``?`` placeholders, committed; returns the row count."""
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(sql, params)
+            self._sqlite_conn.commit()
+            return int(cur.rowcount or 0)
+        with self._pg_cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            count = int(cur.rowcount or 0)
+        self._pg_commit()
+        return count
+
+    def _rq_rows(self, sql: str, params: tuple = ()) -> list[tuple]:
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            return self._sqlite_conn.execute(sql, params).fetchall()
+        with self._pg_cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            return list(cur.fetchall())
+
+    def list_review_requests(
+        self, states: tuple[str, ...] = REVIEW_REQUEST_ACTIVE
+    ) -> list[ReviewRequest]:
+        """Requests in any of ``states``, oldest first."""
+        if not states:
+            return []
+        marks = ", ".join("?" for _ in states)
+        rows = self._rq_rows(
+            f"SELECT {_REVIEW_REQUEST_COLUMNS} FROM review_requests "
+            f"WHERE state IN ({marks}) ORDER BY id",
+            tuple(states),
+        )
+        return [ReviewRequest.from_row(row) for row in rows]
+
+    def get_review_request(self, request_id: int) -> ReviewRequest | None:
+        rows = self._rq_rows(
+            f"SELECT {_REVIEW_REQUEST_COLUMNS} FROM review_requests WHERE id=?",
+            (request_id,),
+        )
+        return ReviewRequest.from_row(rows[0]) if rows else None
+
+    def enqueue_review_request(
+        self,
+        request: ReviewRequest,
+        *,
+        settle_seconds: float = 0.0,
+        max_settle_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> tuple[ReviewRequest, list[ReviewRequest], bool]:
+        """Persist a review request, coalescing it with the PR's earlier ones.
+
+        Returns ``(request, superseded, created)``. A request for a head that
+        is already queued or running is the same request — a redelivered
+        webhook, or `opened` racing `synchronize` — and comes back as the
+        existing row with ``created`` False, unless it asks for more (a full
+        review over an incremental one). Anything else this pull request had
+        waiting or running is marked ``superseded`` and returned, so the
+        caller can settle its check and stop the run.
+
+        Requests for the same repository that arrive within ``settle_seconds``
+        of each other share a ``batch_id``, and the whole batch waits until
+        the burst has gone quiet (never longer than ``max_settle_seconds``
+        from its first request) — a restack arrives one branch at a time, and
+        ordering it needs all of it.
+        """
+        now = time.time() if now is None else now
+        active = [
+            r
+            for r in self.list_review_requests(REVIEW_REQUEST_ACTIVE)
+            if r.repo_key == request.repo_key
+        ]
+        same_pr = [r for r in active if r.pr_number == request.pr_number]
+        for existing in same_pr:
+            # A request that names no head (an `@mira review` comment) asks for
+            # the current one, which is whatever is already waiting or running.
+            same_head = not request.head_sha or existing.head_sha == request.head_sha
+            if same_head and (existing.full_review or not request.full_review):
+                return existing, [], False
+
+        superseded: list[ReviewRequest] = []
+        for existing in same_pr:
+            changed = self._rq_exec(
+                "UPDATE review_requests SET state='superseded', outcome='superseded', "
+                "updated_at=? WHERE id=? AND state IN ('queued', 'running')",
+                (now, existing.id),
+            )
+            if changed:
+                existing.state = "superseded"
+                superseded.append(existing)
+
+        waiting = [r for r in active if r.state == "queued" and r.pr_number != request.pr_number]
+        batch_id = min((r.batch_id for r in waiting if r.batch_id), default=0)
+        available_at = now + settle_seconds
+        if settle_seconds > 0:
+            for other in waiting:
+                held = min(
+                    max(other.available_at, available_at), other.created_at + max_settle_seconds
+                )
+                if held != other.available_at:
+                    self._rq_exec(
+                        "UPDATE review_requests SET available_at=? WHERE id=? AND state='queued'",
+                        (held, other.id),
+                    )
+
+        request.state = "queued"
+        request.attempts = 0
+        request.available_at = available_at
+        request.created_at = now
+        request.updated_at = now
+        values = (
+            request.platform,
+            request.owner,
+            request.repo,
+            request.pr_number,
+            request.installation_id,
+            request.head_sha,
+            request.base_ref,
+            request.head_ref,
+            request.pr_title,
+            request.pr_url,
+            int(request.is_private),
+            request.reason,
+            int(request.full_review),
+            request.actor,
+            request.state,
+            request.check_state,
+            batch_id,
+            request.attempts,
+            request.available_at,
+            request.created_at,
+            request.updated_at,
+        )
+        insert = (
+            "INSERT INTO review_requests (platform, owner, repo, pr_number, "
+            "installation_id, head_sha, base_ref, head_ref, pr_title, pr_url, is_private, "
+            "reason, full_review, actor, state, check_state, batch_id, attempts, "
+            "available_at, created_at, updated_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            cur = self._sqlite_conn.execute(insert, values)
+            self._sqlite_conn.commit()
+            request.id = int(cur.lastrowid or 0)
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(insert.replace("?", "%s") + " RETURNING id", values)
+                request.id = int(cur.fetchone()[0])
+            self._pg_commit()
+        request.batch_id = batch_id or request.id
+        if not batch_id:
+            self._rq_exec(
+                "UPDATE review_requests SET batch_id=? WHERE id=?", (request.id, request.id)
+            )
+        return request, superseded, True
+
+    def claim_review_request(self, request_id: int, *, now: float | None = None) -> bool:
+        """Move a queued request to running. False if it is no longer queued."""
+        now = time.time() if now is None else now
+        return bool(
+            self._rq_exec(
+                "UPDATE review_requests SET state='running', attempts=attempts+1, "
+                "updated_at=? WHERE id=? AND state='queued'",
+                (now, request_id),
+            )
+        )
+
+    def update_review_request(
+        self,
+        request_id: int,
+        *,
+        expected_state: str | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Set some columns of one request; False when ``expected_state`` did not hold."""
+        allowed = {
+            "state",
+            "check_state",
+            "outcome",
+            "error",
+            "head_sha",
+            "available_at",
+            "attempts",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"Not a review request field: {sorted(unknown)}")
+        assignments = [f"{name}=?" for name in fields] + ["updated_at=?"]
+        params: list[Any] = [*fields.values(), time.time()]
+        where = "id=?"
+        params.append(request_id)
+        if expected_state is not None:
+            where += " AND state=?"
+            params.append(expected_state)
+        return bool(
+            self._rq_exec(
+                f"UPDATE review_requests SET {', '.join(assignments)} WHERE {where}",
+                tuple(params),
+            )
+        )
+
+    def requeue_interrupted_review_requests(
+        self, *, max_attempts: int, now: float | None = None
+    ) -> tuple[list[ReviewRequest], list[ReviewRequest]]:
+        """At startup: every `running` row belongs to a process that is gone.
+
+        Returns ``(requeued, exhausted)``. A row that has already been started
+        ``max_attempts`` times is failed instead of started again — a review
+        that takes the process down with it would otherwise do so on every
+        boot, forever.
+        """
+        now = time.time() if now is None else now
+        requeued: list[ReviewRequest] = []
+        exhausted: list[ReviewRequest] = []
+        for row in self.list_review_requests(("running",)):
+            if row.attempts >= max_attempts:
+                self.update_review_request(
+                    row.id,
+                    expected_state="running",
+                    state="failed",
+                    outcome="interrupted",
+                    error=f"interrupted by a restart {row.attempts} times",
+                )
+                row.state = "failed"
+                exhausted.append(row)
+            else:
+                self.update_review_request(
+                    row.id, expected_state="running", state="queued", available_at=now
+                )
+                row.state = "queued"
+                requeued.append(row)
+        return requeued, exhausted
+
+    def prune_review_requests(self, *, older_than_seconds: float = 7 * 86400) -> int:
+        """Forget finished requests past their usefulness for the dashboard."""
+        cutoff = time.time() - older_than_seconds
+        return self._rq_exec(
+            "DELETE FROM review_requests WHERE state IN ('done', 'superseded', 'failed') "
+            "AND check_state IN ('', 'settled') AND updated_at < ?",
+            (cutoff,),
+        )
+
+    def set_pr_review_verdict(self, verdict: PRReviewVerdict) -> None:
+        self._rq_exec(
+            "INSERT INTO pr_review_verdicts (platform, owner, repo, pr_number, head_sha, "
+            "patch_id, state, title, summary, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (platform, owner, repo, pr_number) DO UPDATE SET "
+            "head_sha=excluded.head_sha, patch_id=excluded.patch_id, state=excluded.state, "
+            "title=excluded.title, summary=excluded.summary, updated_at=excluded.updated_at",
+            (
+                verdict.platform,
+                verdict.owner,
+                verdict.repo,
+                verdict.pr_number,
+                verdict.head_sha,
+                verdict.patch_id,
+                verdict.state,
+                verdict.title,
+                verdict.summary,
+                time.time(),
+            ),
+        )
+
+    def get_pr_review_verdict(
+        self, owner: str, repo: str, pr_number: int, platform: str = "github"
+    ) -> PRReviewVerdict | None:
+        rows = self._rq_rows(
+            "SELECT head_sha, patch_id, state, title, summary, updated_at "
+            "FROM pr_review_verdicts WHERE platform=? AND owner=? AND repo=? AND pr_number=?",
+            (platform, owner, repo, pr_number),
+        )
+        if not rows:
+            return None
+        head_sha, patch_id, state, title, summary, updated_at = rows[0]
+        return PRReviewVerdict(
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            platform=platform,
+            head_sha=str(head_sha or ""),
+            patch_id=str(patch_id or ""),
+            state=str(state or ""),
+            title=str(title or ""),
+            summary=str(summary or ""),
+            updated_at=float(updated_at or 0),
+        )
 
     # ── Contributors ──
 
