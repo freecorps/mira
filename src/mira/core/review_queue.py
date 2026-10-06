@@ -64,6 +64,7 @@ _BUSY_RETRY_SECONDS = 30.0
 _SETTLE_ATTEMPTS = 5
 _CONFIG_TTL_SECONDS = 15.0
 _ANNOUNCE_CONCURRENCY = 4
+_ANNOUNCE_RETRY_SECONDS = 60.0
 _PRUNE_EVERY_SECONDS = 3600.0
 
 
@@ -193,7 +194,8 @@ class ReviewQueue:
         self._running: dict[int, ReviewRequest] = {}
         self._superseding: set[int] = set()
         self._settle_failures: dict[int, tuple[int, float]] = {}
-        self._announce_failed: set[int] = set()
+        # Requests whose `Queued` status failed to publish, and when to try again.
+        self._announce_failed: dict[int, float] = {}
         self._wake = asyncio.Event()
         self._stopped = False
         self._last_prune = 0.0
@@ -372,7 +374,6 @@ class ReviewQueue:
             row.state = "running"
             row.attempts += 1
             row.check_state = "running"
-            self._db.update_review_request(row.id, check_state="running")
             self._running[row.id] = row
             self._tasks[row.id] = asyncio.create_task(self._run(row))
             running_prs.add(row.pr_key)
@@ -446,13 +447,15 @@ class ReviewQueue:
         # A restack announces a dozen pull requests at once; a few in flight
         # keeps that to seconds without bursting the platform's rate limit.
         gate = asyncio.Semaphore(_ANNOUNCE_CONCURRENCY)
+        now = self._clock()
 
         async def _one(row: ReviewRequest) -> None:
             async with gate:
                 ok = await self._publish(row, queued_status(running + position.get(row.id, 0)))
             if not ok:
-                self._announce_failed.add(row.id)
+                self._announce_failed[row.id] = now + _ANNOUNCE_RETRY_SECONDS
                 return
+            self._announce_failed.pop(row.id, None)
             # Recorded whatever the row's state is now: it may have been
             # superseded while the status was in flight, and then this is the
             # check the settle pass has to close.
@@ -462,7 +465,7 @@ class ReviewQueue:
             *(
                 _one(row)
                 for row in waiting
-                if not row.check_state and row.id not in self._announce_failed
+                if not row.check_state and self._announce_failed.get(row.id, 0.0) <= now
             )
         )
 

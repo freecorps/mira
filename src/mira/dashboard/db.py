@@ -3221,12 +3221,17 @@ class AppDatabase:
         return request, superseded, True
 
     def claim_review_request(self, request_id: int, *, now: float | None = None) -> bool:
-        """Move a queued request to running. False if it is no longer queued."""
+        """Move a queued request to running. False if it is no longer queued.
+
+        Marks its check as the review's in the same statement: a review that
+        starts publishes "Reviewing…", and a separate write that failed after
+        the claim would leave a running row nobody settles.
+        """
         now = time.time() if now is None else now
         return bool(
             self._rq_exec(
                 "UPDATE review_requests SET state='running', attempts=attempts+1, "
-                "updated_at=? WHERE id=? AND state='queued'",
+                "check_state='running', updated_at=? WHERE id=? AND state='queued'",
                 (now, request_id),
             )
         )
