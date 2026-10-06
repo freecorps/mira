@@ -425,6 +425,24 @@ async def test_github_picks_the_newest_run_when_there_are_several() -> None:
     assert old.edit.call_count == 0
 
 
+async def test_github_finds_a_queued_run_beside_a_finished_one() -> None:
+    """A queued run has no `started_at`. Ordering by it beside a run that has
+    one raised, the lookup fell back to creating, and the queued row was left
+    on the commit with nothing to close it."""
+    from datetime import UTC, datetime
+
+    finished = MagicMock(id=1, status="completed", started_at=datetime(2026, 10, 6, tzinfo=UTC))
+    queued = MagicMock(id=2, status="queued", started_at=None)
+    provider, repo = _github_provider()
+    repo.get_commit.return_value.get_check_runs.return_value = [finished, queued]
+    ref = await provider.publish_review_status(
+        _pr(), context=STATUS_CONTEXT, state="pending", title="Reviewing…", summary="s"
+    )
+    assert ref == "2"
+    assert repo.create_check_run.call_count == 0
+    assert queued.edit.call_args.kwargs["status"] == "in_progress"
+
+
 async def test_github_falls_back_to_creating_when_the_lookup_fails() -> None:
     """A duplicated row is a smaller problem than a lost status."""
     provider, repo = _github_provider()
