@@ -701,10 +701,10 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
             try:
                 runs = list(gh_repo.get_commit(sha).get_check_runs(check_name=context))
                 # Newest first is not a documented ordering, and editing the
-                # wrong one would update a row nobody is looking at.
-                existing = max(
-                    runs, key=lambda run: getattr(run, "started_at", None) or 0, default=None
-                )
+                # wrong one would update a row nobody is looking at. By id, not
+                # `started_at`: a queued run has none, and comparing it with
+                # one that has would raise and duplicate the row.
+                existing = max(runs, key=lambda run: int(getattr(run, "id", 0) or 0), default=None)
             except Exception as exc:  # noqa: BLE001 - lookup is an optimisation
                 logger.debug("Could not look up the %s check run: %s", context, exc)
 
