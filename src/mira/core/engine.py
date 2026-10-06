@@ -48,7 +48,7 @@ from mira.feedback.retrieval import render_rule
 from mira.gate.policy import resolve_policy
 from mira.index._store_shared import IndexMatch
 from mira.index.code_graph import BlastRadius, CodeGraph, build_blast_radius, render_blast_radius
-from mira.index.context import SnapshotSourceFetcher, build_code_context
+from mira.index.context import SnapshotSourceFetcher, build_code_context, snapshot_budget
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
 from mira.llm.prompts.review import (
@@ -573,6 +573,46 @@ class ReviewEngine:
         each of those cases there is no pending status of Mira's left hanging.
         """
         await self._status.failed(self._pr_info, exc)
+
+    @property
+    def status_settled(self) -> bool:
+        """Whether this review's terminal `mira/review` state reached the platform."""
+        return self._status.settled
+
+    def _record_verdict(self, pr_info: PRInfo, full_diff_text: str) -> None:
+        """Remember what was decided, and on which diff, for the review queue.
+
+        A later push whose diff against the base has the same patch id — a
+        rebase that moved nothing — gets this verdict carried over instead of
+        a second review. Never raises: it is bookkeeping after the fact.
+        """
+        status = self._status.last_status
+        if self.dry_run or status is None or not pr_info.head_sha:
+            return
+        # An incremental round with nothing new to read decided nothing about
+        # the pull request; it must not replace the verdict that did.
+        if not self.last_review_had_changes:
+            return
+        try:
+            from mira.core.patch_id import diff_patch_id
+            from mira.dashboard.api import _app_db
+            from mira.dashboard.db import PRReviewVerdict
+
+            _app_db.set_pr_review_verdict(
+                PRReviewVerdict(
+                    owner=pr_info.owner,
+                    repo=pr_info.repo,
+                    pr_number=pr_info.number,
+                    platform=pr_info.platform,
+                    head_sha=pr_info.head_sha,
+                    patch_id=diff_patch_id(full_diff_text),
+                    state=status.state,
+                    title=status.title,
+                    summary=status.summary,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to record the review verdict: %s", exc)
 
     async def _submit_verdict(self, pr_info: PRInfo, result: ReviewResult) -> None:
         """Submit an approve / request-changes review event, when opted in."""
@@ -1291,6 +1331,7 @@ class ReviewEngine:
         # carry their own failures, and a review that finished should not read
         # as still running while something downstream of it works.
         await self._status.finish(pr_info, result)
+        self._record_verdict(pr_info, full_diff_text)
 
         result.thread_decisions = thread_decisions
 
@@ -1926,6 +1967,7 @@ class ReviewEngine:
         # so the archive download overlaps the walkthrough and the index reads.
         review_pr_info = getattr(self, "_pr_info", None)
         if review_pr_info is not None and self.provider is not None:
+            snapshot_budget.capacity = self.config.review.queue.snapshot_memory_mb * 1024 * 1024
             self._source = SnapshotSourceFetcher(
                 self.provider,
                 review_pr_info,

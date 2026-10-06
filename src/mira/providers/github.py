@@ -676,6 +676,7 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
         that the status never went out, rather than pretending it did.
         """
         gh_state = {
+            "queued": ("queued", None),
             "pending": ("in_progress", None),
             "success": ("completed", "success"),
             "failure": ("completed", "failure"),
@@ -710,8 +711,8 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
             # A new review over a finished one gets a new row rather than
             # reopening the old: a completed run keeps its conclusion, so
             # reusing it would show the *previous* review's colour beside
-            # "in progress" until this one lands.
-            reopening = run_status == "in_progress" and (
+            # "queued" or "in progress" until this one lands.
+            reopening = run_status in ("queued", "in_progress") and (
                 str(getattr(existing, "status", "") or "") == "completed"
             )
             if existing is not None and not reopening:
@@ -725,6 +726,47 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
         except Exception as e:
             logger.warning("Could not publish the review status on %s: %s", pr_info.url, e)
             raise ProviderError(f"Failed to publish review status: {e}") from e
+
+    async def list_unfinished_review_checks(
+        self, owner: str, repo: str, *, context: str, limit: int = 50
+    ) -> list[OpenPRRef]:
+        """Open pull requests whose head has ``context`` queued or in progress.
+
+        One call for the pull requests and one per head, so it is bounded by
+        ``limit``, most recently updated first.
+        """
+
+        @_retry_transient
+        def _fetch() -> list[OpenPRRef]:
+            gh_repo = self._github.get_repo(f"{owner}/{repo}")
+            pulls = gh_repo.get_pulls(state="open", sort="updated", direction="desc")
+            out: list[OpenPRRef] = []
+            for pr in itertools.islice(pulls, limit):
+                sha = pr.head.sha if pr.head else ""
+                if not sha:
+                    continue
+                runs = gh_repo.get_commit(sha).get_check_runs(check_name=context)
+                if not any(str(run.status or "") != "completed" for run in runs):
+                    continue
+                out.append(
+                    OpenPRRef(
+                        number=pr.number,
+                        title=pr.title or "",
+                        body="",
+                        head_sha=sha,
+                        author=(pr.user.login if pr.user else ""),
+                        draft=bool(pr.draft),
+                        base_ref=pr.base.ref if pr.base else "",
+                        head_ref=pr.head.ref if pr.head else "",
+                        url=pr.html_url,
+                    )
+                )
+            return out
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            raise ProviderError(f"Failed to list unfinished review checks: {e}") from e
 
     async def get_review_states(self, pr_info: PRInfo) -> dict[str, str]:
         @_retry_transient
@@ -1156,7 +1198,7 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
             return []
 
     async def get_repo_snapshot(
-        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int, max_text_bytes: int | None = None
     ) -> RepoSnapshot | None:
         """The repository at ``ref`` from one tarball download (see ``BaseProvider``)."""
         from mira.platforms.fetch import fetch_snapshot
@@ -1169,6 +1211,7 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
             },
             label=f"{pr_info.owner}/{pr_info.repo}@{ref[:12]}",
             max_bytes=max_bytes,
+            max_text_bytes=max_text_bytes,
         )
 
     async def get_file_content(self, pr_info: PRInfo, path: str, ref: str) -> str:

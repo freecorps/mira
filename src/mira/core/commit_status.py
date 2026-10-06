@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # reads back — see the module docstring.
 STATUS_CONTEXT = "mira/review"
 
+QUEUED = "queued"
 PENDING = "pending"
 SUCCESS = "success"
 FAILURE = "failure"
@@ -103,6 +104,70 @@ def pending_status() -> CommitStatus:
         state=PENDING,
         title="Reviewing…",
         summary="Mira is reviewing this pull request.",
+    )
+
+
+def queued_status(ahead: int = 0) -> CommitStatus:
+    """Waiting for a review slot. Pending, like the review itself."""
+    position = f" {_plural(ahead, 'review')} ahead of it." if ahead else ""
+    return CommitStatus(
+        state=QUEUED,
+        title="Queued",
+        summary=(f"Mira will review this pull request as soon as a review slot is free.{position}"),
+    )
+
+
+def superseded_status(*, restarted: bool = False) -> CommitStatus:
+    """The check of a head that a newer push replaced before it was reviewed.
+
+    Neutral, never red: it says nothing about the change, only that Mira moved
+    on to the newer commit, where the review that counts is published.
+    """
+    if restarted:
+        return CommitStatus(
+            state=NEUTRAL,
+            title="Review interrupted by a restart; superseded",
+            summary=(
+                "Mira restarted while this commit was waiting or being reviewed, and the "
+                "pull request has moved on since. The newer head is reviewed instead."
+            ),
+        )
+    return CommitStatus(
+        state=NEUTRAL,
+        title="Superseded by a newer push",
+        summary=(
+            "A newer commit was pushed before this review finished, so Mira reviews "
+            "that one instead. This says nothing about the change."
+        ),
+    )
+
+
+def interrupted_status(attempts: int) -> CommitStatus:
+    """A review the process kept dying under, given up on. Never red."""
+    return CommitStatus(
+        state=NEUTRAL,
+        title="Mira could not finish this review",
+        summary=(
+            f"The review was interrupted by a restart {_plural(attempts, 'time')} and "
+            "was not started again.\n\n"
+            "This says nothing about the pull request — it is a Mira failure. "
+            "Push again, comment `review`, or press Re-run to retry."
+        ),
+    )
+
+
+CARRIED_OVER_NOTE = "Rebased without changes; previous review carried over"
+
+
+def carried_over_status(state: str, title: str, summary: str, reviewed_sha: str) -> CommitStatus:
+    """The previous verdict, republished on a head whose own diff is the same."""
+    return CommitStatus(
+        state=state,
+        title=f"{title} (carried over)" if title else CARRIED_OVER_NOTE,
+        summary=(
+            f"{CARRIED_OVER_NOTE}: the diff of this pull request against its base is "
+            f"the one Mira reviewed at `{reviewed_sha[:12]}`.\n\n{summary}"
+        ).strip(),
     )
 
 
@@ -197,6 +262,10 @@ class ReviewStatusReporter:
         # finish". The gate, the checks and triage all run after the status is
         # published, and a triage crash is not a review failure.
         self.settled = False
+        # The terminal state the last finished review decided on, published or
+        # not: the review queue records it so a rebase that changes nothing can
+        # carry it over without another review.
+        self.last_status: CommitStatus | None = None
 
     @property
     def active(self) -> bool:
@@ -214,6 +283,7 @@ class ReviewStatusReporter:
         """
         self.published = False
         self.settled = False
+        self.last_status = None
 
     async def _publish(self, pr_info: PRInfo, status: CommitStatus) -> bool:
         """Publish one state. Returns whether the platform was left in it.
@@ -250,12 +320,13 @@ class ReviewStatusReporter:
         await self._publish(pr_info, pending_status())
 
     async def finish(self, pr_info: PRInfo, result: ReviewResult) -> None:
+        self.last_status = finished_status(result, self._config)
         if not self.active:
             return
         # Settled only if the platform took it. A terminal state that failed to
         # publish leaves the pending one on the commit, and the next chance to
         # replace it must not be skipped on the strength of an attempt.
-        self.settled = await self._publish(pr_info, finished_status(result, self._config))
+        self.settled = await self._publish(pr_info, self.last_status)
 
     async def failed(self, pr_info: PRInfo | None, exc: BaseException) -> None:
         """Report a review that stopped early.

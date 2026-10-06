@@ -252,7 +252,7 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
         return [it["path"] for it in items if it.get("type") == "blob"]
 
     async def get_repo_snapshot(
-        self, pr_info: PRInfo, ref: str, *, max_bytes: int
+        self, pr_info: PRInfo, ref: str, *, max_bytes: int, max_text_bytes: int | None = None
     ) -> RepoSnapshot | None:
         """The repository at ``ref`` from one archive download (see ``BaseProvider``)."""
         from mira.platforms.fetch import fetch_snapshot
@@ -262,6 +262,7 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
             {"PRIVATE-TOKEN": self._token},
             label=f"{pr_info.owner}/{pr_info.repo}@{ref[:12]}",
             max_bytes=max_bytes,
+            max_text_bytes=max_text_bytes,
         )
 
     async def get_file_history(

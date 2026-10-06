@@ -264,7 +264,7 @@ async def fetch_snapshot(
     label: str,
     max_bytes: int,
     max_file_size: int = 1_048_576,
-    max_text_bytes: int = _MAX_SNAPSHOT_TEXT_BYTES,
+    max_text_bytes: int | None = None,
     timeout: float = 60.0,
 ) -> RepoSnapshot | None:
     """Download a repository archive and decode it as it arrives, or None.
@@ -275,6 +275,8 @@ async def fetch_snapshot(
     worker ends with it. Decoding stays off the event loop, where it would
     stall every other review and webhook for as long as it took.
     """
+    if max_text_bytes is None:
+        max_text_bytes = _MAX_SNAPSHOT_TEXT_BYTES
     started = time.monotonic()
     chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
     finished = threading.Event()

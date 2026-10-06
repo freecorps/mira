@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -73,6 +74,54 @@ class ProviderSourceFetcher:
 _SNAPSHOT_RETRY_AFTER = 30 * 60.0
 _no_snapshot_until: dict[tuple[str, str, str], float] = {}
 
+# Below this, a snapshot is not worth starting: it would be partial from its
+# first directories and every other read would go to the API anyway.
+_MIN_SNAPSHOT_GRANT = 8 * 1024 * 1024
+
+
+class SnapshotBudget:
+    """Decoded repository text all running reviews may hold, together.
+
+    Each review may keep up to 150 MB of a repository's source in memory, which
+    is the right ceiling for one review and the wrong one for five: five
+    reviews of one large repository — a restacked chain of pull requests, all
+    reviewed at once — held five copies, and that is what took the process
+    down. A review reserves its snapshot's cap from here before downloading,
+    keeps only what the archive actually held once it lands, and returns it
+    when the review ends. A review that finds the budget spent reads files one
+    by one through the API, as every review did before snapshots existed.
+
+    ``capacity`` 0 is no process-wide limit.
+    """
+
+    def __init__(self, capacity: int = 320 * 1024 * 1024) -> None:
+        self.capacity = capacity
+        self._held = 0
+        self._lock = threading.Lock()
+
+    @property
+    def held(self) -> int:
+        return self._held
+
+    def reserve(self, want: int) -> int:
+        """Reserve up to ``want`` bytes. Returns the grant; 0 means none."""
+        with self._lock:
+            if self.capacity <= 0:
+                self._held += want
+                return want
+            grant = min(want, self.capacity - self._held)
+            if grant < min(want, _MIN_SNAPSHOT_GRANT):
+                return 0
+            self._held += grant
+            return grant
+
+    def release(self, amount: int) -> None:
+        with self._lock:
+            self._held = max(self._held - max(amount, 0), 0)
+
+
+snapshot_budget = SnapshotBudget()
+
 
 class SnapshotSourceFetcher:
     """The reviewed commit, read from one archive download, shared by a whole review.
@@ -104,6 +153,7 @@ class SnapshotSourceFetcher:
         max_bytes: int = 250 * 1024 * 1024,
         timeout: float = 120.0,
         read_wait: float = 15.0,
+        budget: SnapshotBudget | None = None,
     ) -> None:
         self._provider = provider
         self._pr_info = pr_info
@@ -121,6 +171,10 @@ class SnapshotSourceFetcher:
         # path: `git archive` leaves out `export-ignore` paths and symlinks.
         self._api_paths: asyncio.Future[set[str] | None] | None = None
         self._closed = False
+        self._budget = budget if budget is not None else snapshot_budget
+        # Bytes of the budget this review holds: the cap while downloading,
+        # what the archive actually held once it has landed.
+        self._reserved = 0
 
     def _repo_key(self) -> tuple[str, str, str]:
         return (
@@ -138,13 +192,31 @@ class SnapshotSourceFetcher:
         self._started_at = time.monotonic()
         self._task = asyncio.create_task(self._load())
 
-    async def _load(self) -> RepoSnapshot | None:
-        from mira.platforms.fetch import RepoSnapshot
+    def _hold(self, amount: int) -> None:
+        """Keep ``amount`` of this review's reservation and hand the rest back."""
+        amount = max(min(amount, self._reserved), 0)
+        self._budget.release(self._reserved - amount)
+        self._reserved = amount
 
+    async def _load(self) -> RepoSnapshot | None:
+        from mira.platforms.fetch import _MAX_SNAPSHOT_TEXT_BYTES, RepoSnapshot
+
+        grant = self._budget.reserve(_MAX_SNAPSHOT_TEXT_BYTES)
+        if not grant:
+            logger.info(
+                "Snapshot of %s/%s skipped: running reviews already hold %d MB of "
+                "repository text; reading files one by one",
+                self._pr_info.owner,
+                self._pr_info.repo,
+                self._budget.held // (1024 * 1024),
+            )
+            return None
+        self._reserved = grant
+        snapshot = None
         try:
             snapshot = await asyncio.wait_for(
                 self._provider.get_repo_snapshot(
-                    self._pr_info, self._ref, max_bytes=self._max_bytes
+                    self._pr_info, self._ref, max_bytes=self._max_bytes, max_text_bytes=grant
                 ),
                 self._timeout,
             )
@@ -166,6 +238,11 @@ class SnapshotSourceFetcher:
             )
         except Exception as exc:  # noqa: BLE001 — a failed snapshot only costs speed
             logger.info("Snapshot unavailable, reading files one by one: %s", exc)
+        finally:
+            if isinstance(snapshot, RepoSnapshot) and not self._closed:
+                self._hold(sum(len(text) for text in snapshot.files.values()))
+            else:
+                self._hold(0)
         return None
 
     async def snapshot(self, max_wait: float | None = None) -> RepoSnapshot | None:
@@ -282,6 +359,7 @@ class SnapshotSourceFetcher:
             # gather hands the download's own cancellation back as a value, so
             # only a cancellation of the caller propagates from here.
             await asyncio.gather(task, return_exceptions=True)
+        self._hold(0)
 
 
 async def build_code_context(

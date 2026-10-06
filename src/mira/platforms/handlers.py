@@ -212,7 +212,10 @@ async def run_pr_review(
     platform: str = "github",
     pr_title: str = "",
     bot_identity: str | None = None,
-) -> None:
+    *,
+    full_review: bool = False,
+    review_state: dict[str, Any] | None = None,
+) -> bool:
     """Platform-neutral review core: review a PR/MR and post the result.
 
     Shared by the GitHub and GitLab webhook handlers — everything here goes
@@ -221,6 +224,12 @@ async def run_pr_review(
 
     ``bot_identity`` is the bot's real platform handle, so a title of
     ``@<identity>`` asks for a generated title as ``@<bot_name>`` does.
+
+    Returns False when another review of this pull request was already
+    running in this process and nothing was done. ``review_state``, when
+    given, receives ``status_settled``: whether the review's terminal
+    `mira/review` state reached the platform, which the review queue reads to
+    know whether a check is still left for it to settle.
     """
     repo_full = f"{owner}/{repo}"
 
@@ -228,7 +237,7 @@ async def run_pr_review(
     # two concurrent webhooks arrive. Returns False if already reviewing.
     if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
         logger.info("Review already in progress for %s, skipping", pr_url)
-        return
+        return False
 
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
@@ -243,6 +252,7 @@ async def run_pr_review(
         bot_name=bot_name,
         indexing_llm=indexing_llm,
         security_llm=security_llm,
+        full_review=full_review,
     )
 
     from mira.dashboard.api import _app_db
@@ -273,6 +283,16 @@ async def run_pr_review(
         # the commit forever, which is the one state that is worse than absent.
         await engine.report_review_failure(exc)
         raise
+    except BaseException:
+        # Cancelled — superseded by a newer push, or shutting down. Release the
+        # slot, or every later review of this pull request in this process is
+        # skipped as "already in progress". The check is the canceller's to
+        # settle; this review never finished, so it has nothing to report.
+        review_tracker.fail(repo_full, number, "interrupted")
+        raise
+    finally:
+        if review_state is not None:
+            review_state["status_settled"] = engine.status_settled is True
 
     # The walkthrough comment already carries the "more accurate after indexing"
     # nudge for unindexed repos, so we don't post a separate note here — that
@@ -315,6 +335,7 @@ async def run_pr_review(
             diff_text=full_diff if isinstance(full_diff, str) and full_diff else None,
             has_new_changes=getattr(engine, "last_review_had_changes", True) is not False,
         )
+    return True
 
 
 async def run_gate_evaluation(
@@ -491,6 +512,9 @@ async def run_pr_command(
             review_tracker.fail(repo_full, number, str(exc))
             await engine.report_review_failure(exc)
             raise
+        except BaseException:
+            review_tracker.fail(repo_full, number, "interrupted")
+            raise
     elif is_review:
         engine = ReviewEngine(
             config=config,
@@ -516,6 +540,9 @@ async def run_pr_command(
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
             await engine.report_review_failure(exc)
+            raise
+        except BaseException:
+            review_tracker.fail(repo_full, number, "interrupted")
             raise
     elif normalized in _DESCRIBE_KEYWORDS:
         await run_pr_describe(

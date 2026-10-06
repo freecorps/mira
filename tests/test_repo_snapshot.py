@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from mira.index.context import SnapshotSourceFetcher
+from mira.index.context import SnapshotBudget, SnapshotSourceFetcher
 from mira.models import PRInfo
 from mira.platforms import fetch as fetch_module
 from mira.platforms.fetch import RepoSnapshot, _snapshot_from_tarball, fetch_snapshot
@@ -229,3 +229,53 @@ class TestSnapshotSourceFetcher:
         await source.aclose()
         assert await source.fetch("a.py") == "from api"
         provider.get_repo_snapshot.assert_not_awaited()
+
+
+class TestSnapshotBudget:
+    """Several reviews at once must not each hold a whole repository."""
+
+    def _provider(self, snapshot: object) -> MagicMock:
+        provider = MagicMock()
+        provider.get_repo_snapshot = AsyncMock(return_value=snapshot)
+        provider.get_file_content = AsyncMock(return_value="from api")
+        provider.get_repo_tree = AsyncMock(return_value=[])
+        return provider
+
+    async def test_a_review_holds_what_its_snapshot_kept_until_it_ends(self):
+        budget = SnapshotBudget(capacity=400 * 1024 * 1024)
+        provider = self._provider(RepoSnapshot(files={"a.py": "x" * 1000}, paths={"a.py"}))
+        source = SnapshotSourceFetcher(provider, _pr(), "abc123", budget=budget)
+        assert await source.fetch("a.py") == "x" * 1000
+        grant = provider.get_repo_snapshot.call_args.kwargs["max_text_bytes"]
+        assert grant == fetch_module._MAX_SNAPSHOT_TEXT_BYTES
+        assert budget.held == 1000
+        await source.aclose()
+        assert budget.held == 0
+
+    async def test_a_spent_budget_reads_files_one_by_one(self):
+        budget = SnapshotBudget(capacity=fetch_module._MAX_SNAPSHOT_TEXT_BYTES)
+        held = budget.reserve(fetch_module._MAX_SNAPSHOT_TEXT_BYTES)
+        provider = self._provider(RepoSnapshot(files={"a.py": "a"}, paths={"a.py"}))
+        source = SnapshotSourceFetcher(provider, _pr(), "abc123", budget=budget)
+        assert await source.fetch("a.py") == "from api"
+        provider.get_repo_snapshot.assert_not_awaited()
+        budget.release(held)
+        assert budget.held == 0
+
+    async def test_what_is_left_of_the_budget_caps_the_next_snapshot(self):
+        budget = SnapshotBudget(capacity=fetch_module._MAX_SNAPSHOT_TEXT_BYTES + 32 * 1024 * 1024)
+        budget.reserve(fetch_module._MAX_SNAPSHOT_TEXT_BYTES)
+        provider = self._provider(None)
+        source = SnapshotSourceFetcher(provider, _pr(), "abc123", budget=budget)
+        await source.fetch("a.py")
+        assert provider.get_repo_snapshot.call_args.kwargs["max_text_bytes"] == 32 * 1024 * 1024
+        # No snapshot: the reservation goes straight back.
+        assert budget.held == fetch_module._MAX_SNAPSHOT_TEXT_BYTES
+
+    async def test_a_failed_download_returns_its_reservation(self):
+        budget = SnapshotBudget()
+        provider = self._provider(None)
+        provider.get_repo_snapshot = AsyncMock(side_effect=RuntimeError("reset"))
+        source = SnapshotSourceFetcher(provider, _pr(), "abc123", budget=budget)
+        await source.fetch("a.py")
+        assert budget.held == 0

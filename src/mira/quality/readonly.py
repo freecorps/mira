@@ -81,6 +81,7 @@ READ_METHODS: frozenset[str] = frozenset(
         "get_blame",
         # Concrete-provider extras that only read.
         "list_open_prs",
+        "list_unfinished_review_checks",
         "get_pr_files",
         "get_review_inline_comments",
     }
