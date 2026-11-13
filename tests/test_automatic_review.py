@@ -12,6 +12,7 @@ from mira.config import MiraConfig
 from mira.core.chunker import chunk_files
 from mira.core.dependencies import discover_dependencies
 from mira.core.engine import ReviewEngine
+from mira.core.review_instructions import is_instructions_file
 from mira.models import FileChangeType, FileDiff, HunkInfo, ReviewChunk
 
 
@@ -541,8 +542,17 @@ async def test_agentic_context_and_dependency_reads_share_revision(monkeypatch, 
     expected = head_sha or "feature"
     assert result.reviewed_files == 1
     assert len(verified) == 1 and expected in verified[0]
-    assert all(call.args[2] == expected for call in provider.get_file_content.call_args_list)
-    assert all(call.args[1] == expected for call in provider.get_repo_tree.call_args_list)
+    # `.mira/REVIEW.md` is read at the base on purpose (see review_instructions);
+    # everything about the code under review is read at the reviewed revision.
+    code_reads = [
+        call
+        for call in provider.get_file_content.call_args_list
+        if not is_instructions_file(call.args[1])
+    ]
+    assert code_reads and all(call.args[2] == expected for call in code_reads)
+    tree_refs = [call.args[1] for call in provider.get_repo_tree.call_args_list]
+    assert all(ref in (expected, "main") for ref in tree_refs)
+    assert expected in tree_refs
 
     # Reuse the engine after the branch advances and context enrichment is off.
     config.review.code_context = False
@@ -550,7 +560,12 @@ async def test_agentic_context_and_dependency_reads_share_revision(monkeypatch, 
     await engine.review_diff(diff(["src/other.tsx"]), repo_scope=scope)
     assert engine._agentic_source_fetcher is None
     assert len(verified) == 1
-    assert provider.get_file_content.call_args.args[2] == "next-sha"
+    code_reads = [
+        call
+        for call in provider.get_file_content.call_args_list
+        if not is_instructions_file(call.args[1])
+    ]
+    assert code_reads[-1].args[2] == "next-sha"
 
 
 async def test_parts_read_their_changed_functions_from_the_snapshot():
@@ -595,5 +610,9 @@ async def test_parts_read_their_changed_functions_from_the_snapshot():
     assert "Changed functions in full" in prompt
     assert "`compute`" in prompt and "   32      return a0" in prompt
     assert "   20 +    a18 = 18" in prompt
-    provider.get_file_content.assert_not_awaited()
+    # Only the review instructions, read at the base, go file by file.
+    assert all(
+        is_instructions_file(call.args[1]) and call.args[2] == "main"
+        for call in provider.get_file_content.call_args_list
+    )
     provider.get_repo_snapshot.assert_awaited_once()

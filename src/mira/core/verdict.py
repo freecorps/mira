@@ -63,9 +63,19 @@ def decide_verdict(
         return None
 
     ceiling = Severity.from_str(cfg.approve_max_severity)
-    blockers = sum(1 for c in result.comments if c.severity == Severity.BLOCKER)
-    warnings = sum(1 for c in result.comments if c.severity == Severity.WARNING)
-    worst = max((c.severity for c in result.comments), default=None)
+    # Every finding, not only the ones posted inline: a warning that lost its
+    # slot to the comment cap is still a warning, and approving over it because
+    # it sits in the walkthrough's "More findings" would make the cap a way to
+    # hide findings from the merge box.
+    findings = result.all_findings
+    blockers = sum(1 for c in findings if c.severity == Severity.BLOCKER)
+    warnings = sum(1 for c in findings if c.severity == Severity.WARNING)
+    worst = max((c.severity for c in findings), default=None)
+    where = (
+        'the inline comments and the walkthrough\'s "More findings"'
+        if result.overflow_comments
+        else "the inline comments"
+    )
 
     if worst is not None and worst > ceiling:
         if cfg.mode != "request_changes":
@@ -82,7 +92,7 @@ def decide_verdict(
             event=REQUEST_CHANGES,
             body=(
                 f"🛑 **Mira requested changes** — found {summary} that should be "
-                f"resolved before merge. Details are in the inline comments.\n\n"
+                f"resolved before merge. Details are in {where}.\n\n"
                 f"Push a fix and Mira will re-check on the next pass; once the "
                 f"findings are verified as addressed this review is superseded "
                 f"automatically."
@@ -150,11 +160,12 @@ def decide_verdict(
         return None
 
     remaining = len(result.comments)
-    detail = (
-        f" {_plural(remaining, 'non-blocking note')} left inline."
-        if remaining
-        else " No issues found."
-    )
+    listed = len(result.overflow_comments)
+    if remaining or listed:
+        detail = f" {_plural(remaining + listed, 'non-blocking note')} left"
+        detail += f" ({remaining} inline, {listed} in the walkthrough)." if listed else " inline."
+    else:
+        detail = " No issues found."
     confidence = f" Merge-readiness confidence: {score}/5." if score is not None else ""
     return Verdict(
         event=APPROVE,

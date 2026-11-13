@@ -330,7 +330,7 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
         posted = 0
         posted_ids = [0] * len(result.comments)
         for index, comment in enumerate(result.comments):
-            body = format_comment_body(comment, bot_name=bot_name)
+            body = format_comment_body(comment, bot_name=bot_name, pr_info=pr_info)
             line = (
                 comment.end_line
                 if comment.end_line and comment.end_line > comment.line

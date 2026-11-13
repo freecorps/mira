@@ -145,6 +145,12 @@ class ReviewComment:
     finding_id: str = ""
     # Provider-populated thread/discussion ID when the post response exposes it.
     platform_thread_id: str = ""
+    # The same problem found at other locations (same category, near-identical
+    # title and body). One posted comment carries the whole group, so a pattern
+    # repeated across five files spends one slot of the comment cap instead of
+    # five; each occurrence is still persisted as its own finding, pointing at
+    # this one.
+    occurrences: list[ReviewComment] = field(default_factory=list)
 
 
 def _format_stats_breakdown(stats: dict[Severity, int]) -> str:
@@ -221,8 +227,19 @@ class WalkthroughResult:
         dashboard_url: str = "",
         overlaps: list[OverlapFinding] | None = None,
         failure_notice: str | None = None,
+        overflow: list[ReviewComment] | None = None,
+        overflow_limit: int = 0,
+        pr_url: str = "",
+        head_sha: str = "",
+        changed_instruction_files: list[str] | None = None,
     ) -> str:
-        """Render as a markdown PR comment."""
+        """Render as a markdown PR comment.
+
+        ``overflow`` is the findings past the comment cap, listed in a
+        collapsible "More findings" section with links built from ``pr_url``
+        and ``head_sha``. ``changed_instruction_files`` are `.mira/REVIEW.md`
+        files the pull request edits, which this review did not apply.
+        """
         parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
         parts.append(self.summary)
 
@@ -328,6 +345,27 @@ class WalkthroughResult:
                 parts.append("")
                 parts.append(f"*{separator.join(stats_parts)}*")
 
+        if overflow and not in_progress:
+            from mira.core.grouping import render_overflow_section
+
+            parts.append("")
+            parts.append(
+                render_overflow_section(
+                    overflow, pr_url=pr_url, sha=head_sha, max_comments=overflow_limit
+                )
+            )
+
+        if changed_instruction_files and not in_progress:
+            shown = ", ".join(f"`{p}`" for p in changed_instruction_files[:5])
+            if len(changed_instruction_files) > 5:
+                shown += f" +{len(changed_instruction_files) - 5} more"
+            parts.append("")
+            parts.append(
+                f"> 📝 **Review instructions changed** — this pull request edits {shown}. "
+                "Mira reviewed it with the version on the base branch; the new "
+                "instructions apply to reviews after it is merged."
+            )
+
         if skipped_paths and not in_progress:
             total = len(total_paths) if total_paths else (reviewed_files + len(skipped_paths))
             shown = min(8, len(skipped_paths))
@@ -416,6 +454,22 @@ class ReviewResult:
     # Severities of findings from earlier rounds whose threads are still open
     # after this pass verified them. An approval has to answer for them too.
     open_prior_severities: list[str] = field(default_factory=list)
+    # Findings past `filter.max_comments`: not posted inline, but listed in the
+    # walkthrough, persisted, and counted by the verdict and the status — a cap
+    # is a noise control on what is posted, never a reason to forget a finding.
+    overflow_comments: list[ReviewComment] = field(default_factory=list)
+    # `.mira/REVIEW.md` files this pull request changes. The review read the
+    # base branch's version; the walkthrough says the new one applies after merge.
+    changed_instruction_files: list[str] = field(default_factory=list)
+
+    @property
+    def all_findings(self) -> list[ReviewComment]:
+        """Every finding of the review, posted inline or listed in the walkthrough.
+
+        What a decision about the pull request (verdict, status, exit code) must
+        count. ``comments`` is only what was posted inline.
+        """
+        return [*self.comments, *self.overflow_comments]
 
 
 @dataclass

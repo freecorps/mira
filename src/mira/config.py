@@ -580,6 +580,31 @@ class ReviewQueueConfig(BaseModel):
     snapshot_memory_mb: int = Field(default=320, ge=0, le=16384)
 
 
+class PathInstructionConfig(BaseModel):
+    """Review instructions for the files one path pattern covers.
+
+    ``path`` uses the merge gate's gitignore-shaped syntax (``convex/**``,
+    ``*.sql``, ``/deploy/*.yaml``; see ``mira.gate.paths``), so a pattern reads
+    the same here as in ``gate.protected_paths`` and ``digests.areas``.
+    """
+
+    path: str
+    instructions: str
+
+    @field_validator("path")
+    @classmethod
+    def _valid_path(cls, value: str) -> str:
+        _validate_path_patterns([value], "review.path_instructions")
+        return value.strip()
+
+    @field_validator("instructions")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("review.path_instructions: instructions must not be empty")
+        return value.strip()
+
+
 class ReviewConfig(BaseModel):
     # `chill` | `balanced` | `assertive`; see REVIEW_PROFILES above.
     profile: str = "balanced"
@@ -664,6 +689,39 @@ class ReviewConfig(BaseModel):
     # dropped 74 findings in a week — 50 graded "plausible" because the code
     # that settled them was in another file.
     critique_model: Literal["review", "indexing"] = "review"
+
+    # Post one comment per root cause: a finding repeated at other locations
+    # (same category, near-identical title and body) is posted once, at its
+    # strongest occurrence, with an "Also at" list of the others, and spends
+    # one slot of `filter.max_comments` instead of one per location. Every
+    # occurrence is still persisted as a finding. Off restores the old
+    # behaviour, which kept the first occurrence and dropped the rest.
+    group_findings: bool = True
+    # Findings at this severity or above are always posted inline; those below
+    # share the `filter.max_comments` slots by severity, then confidence.
+    # `warning` (the default) keeps every warning and blocker inline; `blocker`
+    # lets warnings overflow too. Blockers are never held back by the cap.
+    cap_exempt_severity: Literal["warning", "blocker"] = "warning"
+    # Findings past the cap are never dropped: they are persisted and counted
+    # by the verdict and the `mira/review` status either way. This decides
+    # whether they are also listed in the walkthrough's collapsible "More
+    # findings" section; off keeps the walkthrough to what was posted.
+    list_overflow_findings: bool = True
+
+    # Read `.mira/REVIEW.md` files from the repository: each one applies to the
+    # files under its directory, and is read from the pull request's base, never
+    # its head, so a pull request cannot rewrite the instructions it is
+    # reviewed under. See docs/review-instructions.md.
+    repo_instructions: bool = True
+    # Characters of repository and path instructions a review part receives in
+    # all, the closest files first; whatever is past it is cut, root first.
+    repo_instructions_max_chars: int = Field(default=8_000, ge=0, le=50_000)
+    # Instructions for the files a path pattern covers, kept with the rest of
+    # the deployment's configuration rather than in the repository:
+    #   path_instructions:
+    #     - path: "convex/**"
+    #       instructions: "Every query must use an index; flag `.filter()` scans."
+    path_instructions: list[PathInstructionConfig] = Field(default_factory=list)
 
     # Run a dedicated security review pass in parallel with the main review.
     # Uses the security tier (`llm.security_model`, falling back to the

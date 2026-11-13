@@ -171,7 +171,7 @@ def review(
         click.echo(_format_text(result))
 
     # Exit with non-zero if blockers found
-    if any(c.severity >= Severity.BLOCKER for c in result.comments):
+    if any(c.severity >= Severity.BLOCKER for c in result.all_findings):
         sys.exit(1)
 
 

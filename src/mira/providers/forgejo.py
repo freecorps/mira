@@ -339,7 +339,7 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
             "comments": [
                 {
                     "path": comment.path,
-                    "body": format_comment_body(comment, bot_name=bot_name),
+                    "body": format_comment_body(comment, bot_name=bot_name, pr_info=pr_info),
                     "new_position": comment.line,
                 }
                 for comment in result.comments
@@ -365,7 +365,7 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
                     except ProviderError:
                         logger.warning("Failed to post PR summary comment (fallback)")
                 for comment in result.comments:
-                    body = format_comment_body(comment, bot_name=bot_name)
+                    body = format_comment_body(comment, bot_name=bot_name, pr_info=pr_info)
                     note = f"**`{comment.path}:{comment.line}`**\n\n{body}"
                     try:
                         await self.post_comment(pr_info, note)

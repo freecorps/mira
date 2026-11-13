@@ -11,8 +11,9 @@ from __future__ import annotations
 import html
 import re
 
+from mira.core.grouping import format_also_at
 from mira.feedback.provenance import finding_marker, parse_finding_id
-from mira.models import KeyIssue, ReviewComment, Severity
+from mira.models import KeyIssue, PRInfo, ReviewComment, Severity
 
 _CATEGORY_DISPLAY: dict[str, tuple[str, str]] = {
     "bug": ("\U0001f41b", "Bug"),
@@ -163,8 +164,18 @@ def _close_open_fences(parts: list[str]) -> None:
         parts.append("```")
 
 
-def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") -> str:
-    """Format a review comment body with category badge, severity, and suggestion block."""
+def format_comment_body(
+    comment: ReviewComment,
+    bot_name: str = "miracodeai",
+    pr_info: PRInfo | None = None,
+) -> str:
+    """Format a review comment body with category badge, severity, and suggestion block.
+
+    A grouped finding lists its other occurrences under "Also at", linked to
+    the reviewed commit when ``pr_info`` says where that commit lives. The
+    hidden marker names the posted finding only: the occurrences are persisted
+    pointing at it, so feedback on this thread reaches the whole group.
+    """
     label = _CATEGORY_DISPLAY.get(comment.category, ("\U0001f4cc", "Note"))[1]
     badge = _SEVERITY_BADGE.get(comment.severity, "")
 
@@ -181,6 +192,17 @@ def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") ->
     parts.append(f"**{comment.title}**")
     parts.append("")
     parts.append(comment.body)
+
+    also_at = format_also_at(
+        comment,
+        pr_url=pr_info.url if pr_info else "",
+        sha=pr_info.head_sha if pr_info else "",
+    )
+    if also_at:
+        # A fence the body left open would swallow the list.
+        _close_open_fences(parts)
+        parts.append("")
+        parts.append(also_at)
 
     if comment.suggestion:
         clean_suggestion = html.unescape(comment.suggestion)
