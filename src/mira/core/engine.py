@@ -606,6 +606,9 @@ class ReviewEngine:
         # Never pointed at the head: see mira.core.review_instructions.
         self.instructions_reader: InstructionReader | None = None
         self._instructions_task: asyncio.Task | None = None
+        # The review's sandboxed workspace (mira.verify), when the repository
+        # has verification configured. Built per review, closed when it ends.
+        self._verify: VerifySession | None = None
 
     def _instruction_reader(self) -> InstructionReader | None:
         """Where `.mira/REVIEW.md` is read from for this review: always its base."""
@@ -627,9 +630,6 @@ class ReviewEngine:
         """
         exempt = Severity.from_str(self.config.review.cap_exempt_severity)
         return cap_comments(comments, self.config.filter.max_comments, exempt_severity=exempt)
-        # The review's sandboxed workspace (mira.verify), when the repository
-        # has verification configured. Built per review, closed when it ends.
-        self._verify: VerifySession | None = None
 
     def _output_reserve(self) -> int:
         """Context left free for the answer when sizing a review prompt.
