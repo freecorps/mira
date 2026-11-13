@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Rebuilds `edge` from main by hand (e.g. after Actions was re-enabled).
+  # There is no `before` commit, so every job runs.
+  workflow_dispatch:
 
 # Default-deny token permissions. Each job widens what it actually needs;
 # anything else (a malicious dep in CI, a compromised action) can't push
@@ -258,7 +261,8 @@ jobs:
     needs: [changes, lint, test, ui, docker]
     if: >-
       !cancelled()
-      && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name)
+      && github.ref == 'refs/heads/main'
       && needs.lint.result == 'success'
       && needs.docker.result == 'success'
       && contains(fromJSON('["success", "skipped"]'), needs.test.result)
