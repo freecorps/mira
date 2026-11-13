@@ -312,6 +312,9 @@ class TestJsonOutput:
             "confidence",
             "suggestion",
             "also_at",
+            "source_pass",
+            "votes",
+            "vote_passes",
         }
         assert finding["severity"] == "blocker"
 
