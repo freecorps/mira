@@ -199,6 +199,8 @@ class TestComplete:
             base_url="https://api.deepseek.com/v1",
         )
         provider = LLMProvider(config)
+        # The DeepSeek profile streams; this test is about the request body.
+        provider.profile = {**provider.profile, "stream": False}
         mock_resp = _mock_httpx_response(_make_response_json("ok"))
 
         with patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls:

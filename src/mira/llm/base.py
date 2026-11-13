@@ -219,8 +219,8 @@ def _retry_after_seconds(resp: httpx.Response) -> float | None:
 _TIMEOUT_ATTEMPTS = 2
 
 
-def _make_stop(config: LLMConfig) -> Any:
-    """Stop after ``max_retries`` attempts, or after two timeouts in a row."""
+def _make_stop(config: LLMConfig, timeout_attempts: int = _TIMEOUT_ATTEMPTS) -> Any:
+    """Stop after ``max_retries`` attempts, or after ``timeout_attempts`` timeouts in a row."""
     by_count = stop_after_attempt(config.max_retries)
 
     def _stop(retry_state: Any) -> bool:
@@ -231,7 +231,7 @@ def _make_stop(config: LLMConfig) -> Any:
         timeouts = getattr(retry_state, "mira_timeouts", 0)
         timeouts = timeouts + 1 if isinstance(exc, httpx.TimeoutException) else 0
         retry_state.mira_timeouts = timeouts
-        return by_count(retry_state) or timeouts >= _TIMEOUT_ATTEMPTS
+        return by_count(retry_state) or timeouts >= timeout_attempts
 
     return _stop
 
@@ -321,6 +321,19 @@ _JSON_SCHEMA_REFUSAL_HINTS = (
 # review pass, and rediscovering the same refusal on every pass would spend a
 # request per review on it.
 _NO_JSON_SCHEMA: set[tuple[str, str]] = set()
+
+# The same, for the other refusals a client adapts to: a forced tool_choice,
+# a reasoning level, a custom temperature, a streamed reply. Keyed by
+# (refusal, endpoint) and holding model names. These used to live on the
+# client, so every review pass rediscovered them with a wasted request —
+# over two thousand forced-tool_choice refusals in one week of production.
+_REFUSALS: dict[tuple[str, str], set[str]] = {}
+
+
+def _refusals(kind: str, endpoint: str) -> set[str]:
+    """The process-wide set of models ``endpoint`` has refused ``kind`` for."""
+    return _REFUSALS.setdefault((kind, endpoint), set())
+
 
 # Upper bound for the output budget a truncated re-roll may grow to when the
 # registry does not know the model. Every current model serves at least this
@@ -605,9 +618,12 @@ class OpenAICompatibleProvider:
         self.profile = endpoints.profile_for_config(config)
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
-        self._no_forced_tool_choice: set[str] = set()
-        self._no_reasoning: set[str] = set()
-        self._no_temperature: set[str] = set()
+        endpoint = self._endpoint_key()
+        self._no_forced_tool_choice: set[str] = _refusals("forced_tool_choice", endpoint)
+        self._no_reasoning: set[str] = _refusals("reasoning", endpoint)
+        self._no_temperature: set[str] = _refusals("temperature", endpoint)
+        self._no_stream: set[str] = _refusals("stream", endpoint)
+        self._no_echo_reasoning: set[str] = _refusals("echo_reasoning", endpoint)
         # Output budget per model, once a truncated reply has shown that
         # ``config.max_tokens`` is not enough for it. Kept for the life of
         # the client (one review pass) so every later call to that model
@@ -621,8 +637,11 @@ class OpenAICompatibleProvider:
 
         # Apply retry decorator imperatively so it reads config values
         # (max_retries, retry_min_wait, retry_max_wait) at instance time.
+        # A streamed call times out on silence, not on length: the endpoint
+        # stopped sending. Asking again the same way waits for the same
+        # silence, so the next model in the chain gets the turn instead.
         self._retry = retry(
-            stop=_make_stop(config),
+            stop=_make_stop(config, 1 if self.profile.get("stream") else _TIMEOUT_ATTEMPTS),
             wait=_make_wait(config),
             retry=retry_if_exception(_retriable),
             reraise=True,

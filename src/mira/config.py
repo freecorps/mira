@@ -168,6 +168,12 @@ class LLMConfig(BaseModel):
     # Defaults match the previous hardcoded values to preserve existing behavior.
     max_retries: int = Field(default=3, ge=1)
     request_timeout: int = Field(default=120, ge=1)
+    # Endpoints whose profile streams (`stream: true` in providers.json) are
+    # read as server-sent events. Then the time allowed between two events is
+    # the idle timeout, and a reply that keeps arriving may run up to the
+    # total — instead of being killed at `request_timeout` and asked again.
+    stream_idle_timeout: int = Field(default=90, ge=1)
+    stream_total_timeout: int = Field(default=600, ge=1)
     retry_min_wait: int = Field(default=2, ge=0)
     retry_max_wait: int = Field(default=30, ge=0)
     # Extra attempts spent re-rolling a model that answered a tool call with
@@ -585,6 +591,11 @@ class ReviewConfig(BaseModel):
     agent_max_files: int = Field(default=12, ge=1)
     # Retries per failed part, in addition to provider transport retries.
     chunk_retries: int = Field(default=1, ge=0, le=3)
+    # Wall-clock budget for one review part, lookups and retries included; 0
+    # turns it off. A part past it is left for `review-rest` rather than
+    # holding the whole review: one part chained timeouts into 40 minutes.
+    # The agentic loop is told to submit once 60% of it is gone.
+    part_deadline_seconds: int = Field(default=480, ge=0)
     # Legacy total diff size cap (auto_complete: false). Above this, the diff is *not* truncated arbitrarily —
     # files are ranked by priority and the lowest-priority files are skipped
     # until the diff fits. Skipped files are listed in the walkthrough so the
