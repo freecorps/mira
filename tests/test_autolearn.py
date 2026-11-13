@@ -193,7 +193,7 @@ async def test_a_change_near_the_finding_vetoes_learning(tmp_path, monkeypatch) 
     llm = _llm(_DISAGREE, _PREMISE_WRONG)
     await _reply(provider, pr_info, "This was never a problem.", 458, finding, llm)
 
-    provider.get_compare_diff.assert_awaited_once_with(pr_info, "head123", "head456")
+    provider.get_compare_diff.assert_awaited_with(pr_info, "head123", "head456")
     judge_prompt = llm.complete_with_tools.await_args_list[1].kwargs["messages"][0]["content"]
     assert "if b == 0" in judge_prompt
     store = IndexStore.open("acme", "app")
@@ -416,3 +416,87 @@ def test_reset_skips_a_database_it_cannot_read(tmp_path, monkeypatch) -> None:
     broken.write_bytes(b"not a database")
 
     assert reset_learning_org_wide_sqlite()["rules_archived"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reply_sees_the_file_at_head_around_the_line_it_cites(
+    tmp_path, monkeypatch
+) -> None:
+    """28% of thread replies said the code was not visible; this is that code."""
+    pr_info, finding, provider = _setup(
+        tmp_path, monkeypatch, "00000000-0000-4000-8000-0000000000b1", head_sha="head456"
+    )
+    head_file = "\n".join(f"line {number}" for number in range(1, 301))
+    provider.get_file_content = AsyncMock(return_value=head_file)
+    provider.get_compare_diff = AsyncMock(
+        return_value="--- a/src/other.py\n+++ b/src/other.py\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+    )
+    llm = _llm(
+        {"intent": "fixed", "reply": "Checking."},
+        {"resolved": True, "reply": "Confirmed at line 250."},
+    )
+    with (
+        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.create_llm", return_value=llm),
+        patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()) as purpose,
+    ):
+        await run_thread_reply(
+            provider,
+            pr_info,
+            "Corrigido, está na linha 250 agora.",
+            470,
+            **_kwargs(finding, 470),
+        )
+
+    assert purpose.call_args_list[0].args[0] == "review"
+    provider.get_file_content.assert_awaited_with(pr_info, "src/app.py", "head456")
+    classifier = llm.complete_with_tools.await_args_list[0].kwargs["messages"][0]["content"]
+    recheck = llm.complete_with_tools.await_args_list[1].kwargs["messages"][0]["content"]
+    for prompt in (classifier, recheck):
+        assert "250| line 250" in prompt
+        assert " 10| line 10" in prompt
+        assert "has not changed since the comment" in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_reply_is_read_against_the_thread_so_far(tmp_path, monkeypatch) -> None:
+    pr_info, finding, provider = _setup(
+        tmp_path, monkeypatch, "00000000-0000-4000-8000-0000000000b2"
+    )
+    await _reply(
+        provider,
+        pr_info,
+        "Fixed.",
+        471,
+        finding,
+        _llm(
+            {"intent": "fixed", "reply": "Checking."},
+            {"resolved": False, "reply": "The visible code still divides by b."},
+        ),
+    )
+    llm = _llm(
+        {"intent": "fixed", "reply": "Checking."},
+        {"resolved": True, "reply": "Confirmed."},
+    )
+    await _reply(provider, pr_info, "It's guarded in the caller now.", 472, finding, llm)
+
+    classifier = llm.complete_with_tools.await_args_list[0].kwargs["messages"][0]["content"]
+    assert "Earlier in this thread" in classifier
+    assert "human (@alice): Fixed." in classifier
+    assert "mira: The visible code still divides by b." in classifier
+
+
+def test_only_a_hunk_near_the_line_is_shown() -> None:
+    import asyncio
+
+    from mira.platforms.handlers import _pr_hunk
+
+    provider = AsyncMock()
+    provider.get_pr_diff = AsyncMock(
+        return_value=(
+            "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n"
+            "@@ -1,1 +1,1 @@\n-a\n+b\n"
+        )
+    )
+    assert asyncio.run(_pr_hunk(provider, MagicMock(), "src/app.py", 400)) == ""
+    assert "+b" in asyncio.run(_pr_hunk(provider, MagicMock(), "src/app.py", 5))
