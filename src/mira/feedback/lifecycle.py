@@ -166,8 +166,13 @@ def version_rule(
     validate_rule_scope(scope_type, scope_value)
     # A positive rule was accepted on its own floor (distinct pull requests,
     # see ``approve_candidate``); rewording it in place must not then demand
-    # the per-scope minimum. Widening its scope still does.
-    kept_scope = is_positive_rule(previous) and scope_type == previous.scope_type
+    # the per-scope minimum. Widening its scope still does — and a scope is
+    # its value as much as its type: `path a.py` to `path *.py` is a widening.
+    kept_scope = (
+        is_positive_rule(previous)
+        and scope_type == previous.scope_type
+        and scope_value.strip() == (previous.scope_value or "").strip()
+    )
     if (
         previous.source_signal != "manual"
         and not kept_scope

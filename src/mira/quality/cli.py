@@ -353,7 +353,15 @@ def peer_recall_scan(
     config = _load(config_path)
     provider = _provider("github", token or github_token)
     learn = not no_learn and enabled(config)
-    llm = review_llm(config) if learn else None
+    llm = None
+    if learn:
+        try:
+            llm = review_llm(config)
+        except Exception as exc:  # noqa: BLE001 — collecting needs no model
+            # As the scheduler does: no review model means collect without
+            # learning, not no scan at all.
+            click.echo(f"Warning: review model unavailable, collecting only: {exc}", err=True)
+            learn = False
     outcome = asyncio.run(
         run_repository(provider, owner, repo, config=config, llm=llm, rescan=rescan, learn=learn)
     )
