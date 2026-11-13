@@ -199,7 +199,9 @@ CREATE TABLE IF NOT EXISTS review_findings (
     created_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0,
     presentation TEXT NOT NULL DEFAULT 'inline',
-    primary_finding_id TEXT NOT NULL DEFAULT ''
+    primary_finding_id TEXT NOT NULL DEFAULT '',
+    votes INTEGER NOT NULL DEFAULT 0,
+    vote_passes INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_findings_comment
@@ -1104,6 +1106,13 @@ class IndexStore(
             self._conn.execute(
                 "ALTER TABLE review_findings ADD COLUMN primary_finding_id TEXT NOT NULL DEFAULT ''"
             )
+        # review_findings.votes / vote_passes added with the shuffled voting
+        # passes. Rows written before them came from a single pass: 0/0.
+        for column in ("votes", "vote_passes"):
+            if column not in finding_cols:
+                self._conn.execute(
+                    f"ALTER TABLE review_findings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
         # autofix_jobs.job_kind added with the finishing touches. Every row
         # written before it was a fix, which is exactly what the default says.
         autofix_cols = {
@@ -1981,9 +1990,9 @@ class IndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id) "
+            "presentation, primary_finding_id, votes, vote_passes) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?) "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, "
             "review_id=excluded.review_id, platform_comment_id=excluded.platform_comment_id, "
             "platform_thread_id=excluded.platform_thread_id, state=excluded.state, "
@@ -2018,6 +2027,8 @@ class IndexStore(
                 finding.updated_at,
                 finding.presentation,
                 finding.primary_finding_id,
+                finding.votes,
+                finding.vote_passes,
             ),
         )
         self._conn.commit()
@@ -2086,6 +2097,8 @@ class IndexStore(
             updated_at=row[26],
             presentation=row[27],
             primary_finding_id=row[28],
+            votes=int(row[29] or 0),
+            vote_passes=int(row[30] or 0),
         )
 
     def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
@@ -2094,7 +2107,7 @@ class IndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id "
+            "presentation, primary_finding_id, votes, vote_passes "
             "FROM review_findings WHERE id = ?",
             (finding_id,),
         ).fetchone()
@@ -2130,7 +2143,7 @@ class IndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id "
+            "presentation, primary_finding_id, votes, vote_passes "
             f"FROM review_findings WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC LIMIT 1",
             tuple(params),

@@ -674,6 +674,51 @@ class ReviewConfig(BaseModel):
     # the configured llm.temperature). Mild diversity makes the vote useful.
     ensemble_temperature: float = Field(default=0.3, ge=0.0, le=1.0)
 
+    # Shuffled voting passes (see core/multipass.py and docs/multipass-review.md).
+    # Each review part is read by this many independent agentic passes, side
+    # by side, each with the part's files (and a file's hunks, where they do
+    # not touch) in another seeded order and a slightly higher temperature.
+    # A finding is kept when `pass_vote_threshold` passes report it at
+    # overlapping locations; a blocker reported fewer times is kept only if
+    # self-critique grades it proven. What one pass misses depends on what it
+    # read first, so this is mostly a recall feature. Costs up to `passes`×
+    # the part reviews' tokens; wall clock stays roughly flat. 1 is the old
+    # single-pass review (and `ensemble_runs` only applies then).
+    passes: int = Field(default=3, ge=1, le=5)
+    # Passes that must report a finding for it to be kept, clamped to the
+    # passes that actually landed (one landing keeps all it found).
+    pass_vote_threshold: int = Field(default=2, ge=1, le=5)
+    # Pass 0 keeps `llm.temperature`; the others step up evenly to
+    # `llm.temperature + pass_temperature_spread` (at most 1.0).
+    pass_temperature_spread: float = Field(default=0.3, ge=0.0, le=1.0)
+    # Upper bound on part × pass runs per review. A review with more parts
+    # than this allows gets fewer passes per part (at least one), so a huge
+    # pull request cannot multiply into hundreds of agentic loops.
+    max_pass_runs: int = Field(default=30, ge=1, le=500)
+    # Below this many changed lines (added + removed, reviewed files only)
+    # every part gets one pass and the system pass is skipped: a small change
+    # gains little from a second reading at full price.
+    multipass_min_changed_lines: int = Field(default=30, ge=0)
+    # The same, for follow-up rounds (which review only the new commits'
+    # diff): a fix-up push rarely needs three readings.
+    multipass_min_changed_lines_incremental: int = Field(default=120, ge=0)
+
+    # One extra agentic pass over the whole pull request, asking only what the
+    # change breaks elsewhere: lifecycle and cleanup, state machines,
+    # concurrency, callers and contracts, cross-file invariants (see
+    # core/system_pass.py). Its findings (`source_pass: system`) go through the
+    # same filter, grouping, self-critique and cap as the rest. Skipped below
+    # the changed-line thresholds above.
+    system_pass: bool = True
+    # Wall-clock budget of the system pass; past it the pass is dropped and
+    # the review goes on without it. 0 turns the bound off.
+    system_pass_deadline_seconds: int = Field(default=480, ge=0)
+    # Tokens of the system pass's prompt for the changed-file list, the
+    # callers of changed symbols and the hunks (highest-priority files first;
+    # the rest are listed and read with the tools). Held under the context
+    # window either way.
+    system_pass_tokens: int = Field(default=40_000, ge=2_000)
+
     # Run a second-pass LLM critique on each draft comment before posting.
     # The critic asks "is this analysis actually correct? Cite specific
     # lines that prove it." Comments that fail the critique are dropped.

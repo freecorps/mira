@@ -704,11 +704,15 @@ class QualityStore:
         since: float = 0.0,
         limit: int = 50,
         offset: int = 0,
+        pr_number: int = 0,
     ) -> list[PeerThread]:
         """Peer threads on pull requests closed at or after ``since``, newest first."""
         clause, params = self._scope()
         where = ["pr_closed_at >= ?"]
         values: list[Any] = [float(since)]
+        if pr_number:
+            where.append("pr_number = ?")
+            values.append(int(pr_number))
         if bot:
             where.append("bot = ?")
             values.append(bot)

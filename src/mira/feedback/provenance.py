@@ -26,6 +26,23 @@ def finding_marker(finding_id: str) -> str:
     return f"<!-- mira:finding:{finding_id} -->"
 
 
+def votes_marker(votes: int, passes: int) -> str:
+    """Hidden record of how many shuffled review passes reported a finding.
+
+    The finding row has the numbers too; on the comment they survive a lost
+    or pruned database, and anyone reading the raw thread can see them.
+    """
+    return f"<!-- mira:votes:{int(votes)}/{int(passes)} -->"
+
+
+_VOTES_MARKER_RE = re.compile(r"<!--\s*mira:votes:(\d+)/(\d+)\s*-->")
+
+
+def parse_votes(body: str) -> tuple[int, int] | None:
+    match = _VOTES_MARKER_RE.search(body or "")
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
 def parse_finding_id(body: str) -> str | None:
     match = _FINDING_MARKER_RE.search(body or "")
     return match.group(1).lower() if match else None

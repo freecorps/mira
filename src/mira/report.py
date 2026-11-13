@@ -29,6 +29,11 @@ def comment_dict(comment: ReviewComment) -> dict[str, Any]:
         "body": comment.body,
         "confidence": comment.confidence,
         "suggestion": comment.suggestion,
+        # Which pass found it ("main", "security", "system", …) and, for the
+        # shuffled voting passes, how many of the part's passes reported it.
+        "source_pass": comment.source_pass,
+        "votes": comment.votes,
+        "vote_passes": comment.vote_passes,
         # The same problem at other locations (see mira.core.grouping).
         "also_at": [
             {"path": other.path, "line": other.line, "end_line": other.end_line}

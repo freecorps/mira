@@ -191,6 +191,7 @@ async def agentic_review_loop(
     executor: object,
     max_hops: int = _AGENTIC_MAX_HOPS,
     submit_by: float | None = None,
+    temperature: float | None = None,
 ) -> str:
     """Run an agentic tool-use loop until the LLM submits a review.
 
@@ -208,8 +209,16 @@ async def agentic_review_loop(
     last turn is told to submit, a broken submission is sent back with the
     parse error for one more try, and if the loop still ends without a usable
     review, the forced call here carries a digest of every lookup and note.
+
+    ``temperature``, when set, samples every hop (and the digest review) at
+    it instead of the configured one: the shuffled passes of
+    core/multipass.py differ in temperature as well as in order.
     """
     from mira.llm.agentic_tools import AGENTIC_TOOLS
+
+    # Passed only when set, so a provider (or a test double) that predates
+    # the argument is called exactly as before.
+    sampling: dict = {} if temperature is None else {"temperature": temperature}
 
     offered = getattr(executor, "tools", None)
     helpers = list(offered) if isinstance(offered, list) and offered else list(AGENTIC_TOOLS)
@@ -241,7 +250,7 @@ async def agentic_review_loop(
             len(lookups),
         )
         try:
-            return await review(_with_digest(messages, _lookup_digest(lookups, notes)))
+            return await review(_with_digest(messages, _lookup_digest(lookups, notes)), **sampling)
         except Exception as exc:  # noqa: BLE001 — the caller's plain review still runs
             logger.warning("Review with the lookup digest failed: %s", exc)
             return ""
@@ -256,7 +265,7 @@ async def agentic_review_loop(
         if final_hop and hop > 0:
             convo.append({"role": "user", "content": _FINAL_HOP_NUDGE})
         try:
-            msg = await llm.complete_agentic(convo, tools=tools)
+            msg = await llm.complete_agentic(convo, tools=tools, **sampling)
         except Exception as exc:
             logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
             return await _finish()
@@ -642,6 +651,10 @@ def _critique_keep(
     evidence = verdict.get("evidence")
     if evidence == "proven":
         return True
+    if comment.require_proven:
+        # A blocker too few shuffled passes reported (core/multipass.py): the
+        # vote did not carry it, so only proof does.
+        return False
     if evidence == "plausible":
         return (
             comment.severity >= Severity.WARNING and comment.confidence >= plausible_min_confidence
@@ -758,6 +771,8 @@ async def self_critique(
         verdict_by_idx[idx] = v
         if _critique_keep(v, comments[idx], plausible_min_confidence):
             keep_indices.add(idx)
+            # Proven: the blocker no longer leans on the vote it lost.
+            comments[idx].require_proven = False
 
     for i, c in enumerate(comments):
         if i in keep_indices:

@@ -54,6 +54,8 @@ mira backtest --repo acme/app --prs 812,815 \
 | `--max-prs`, `--max-concurrency`, `--max-cost` | Override the limits below for this run. |
 | `--format markdown\|json`, `--output FILE` | Report format and destination. |
 | `--no-save` | Do not store the run for the dashboard. |
+| `--compare-passes` | A/B from one `--config`: one pass (A) against the shuffled voting passes plus the system pass (B). See [multipass review](multipass-review.md). |
+| `--peer-misses` | Replay the PRs peer recall recorded a missed-and-addressed thread on. |
 
 The token comes from `--token`, `MIRA_GIT_TOKEN` or `GITHUB_TOKEN`, as with
 `mira review`. Models come from the configuration exactly as a live review
@@ -95,6 +97,7 @@ configurations:
 | `revert` | The same, for `Revert …` / `This reverts commit …` | Positive. |
 | `feedback_positive` | Mira's stored findings on that PR with 👍, an agreeing reply or a resolved thread | Positive. |
 | `feedback_negative` | Mira's stored findings with 👎, a disagreeing reply or a dismissal | Negative: a finding there was wrong. |
+| `peer_addressed` | Threads another review bot opened that the author addressed, as recorded by [peer recall](peer-recall.md) (none without a scan) | Positive: the bot found something real there. |
 
 A finding **matches** a signal when it is in the same file and its lines are
 within `line_tolerance` of the signal's. Then:
@@ -118,7 +121,8 @@ and treat absolute numbers as indicative.
 
 Markdown (default) or JSON with: a per-configuration summary (findings, TP,
 FP, unlabelled, both precisions, recall, tokens, cost, mean latency, errors),
-an **A/B comparison** table with B − A deltas when two configurations ran, one
+an **A/B comparison** table with B − A deltas when two configurations ran, a
+**recall by signal kind** table (caught/total per kind and configuration), one
 row per pull request and configuration, every finding with its label and the
 signal kinds it matched, and notes on anything that could not be read (for
 example a provider that cannot search history).
