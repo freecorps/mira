@@ -220,6 +220,16 @@ The following patterns were learned from this team's feedback on previous review
 {% endfor %}
 {% endif %}
 
+{% if learned_checks %}
+## Also Check For (Learned from Missed Issues)
+
+Other reviewers caught defects of these kinds in this repository, the team fixed them, and earlier reviews missed them. When the diff touches code where one of these could apply, also check for it — follow the state, callers or other files it involves if you need to. They tell you where to look, not what to conclude: report one only when the code in front of you actually has the problem, with the same evidence any other finding needs.
+
+{% for rule in learned_checks %}
+- {{ rule }}
+{% endfor %}
+{% endif %}
+
 {% if file_history %}
 ## File History — Why Does This Code Exist?
 

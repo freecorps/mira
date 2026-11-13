@@ -2,6 +2,7 @@ import { ChevronRight, ExternalLink, FlaskConical, Target } from "lucide-react"
 import { Fragment, useState } from "react"
 import { Link } from "react-router"
 
+import { PeerRecallCard } from "@/components/dashboard/peer-recall-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -489,6 +490,7 @@ export function ReviewQualityPage() {
         </p>
       </div>
       <RecallCard />
+      <PeerRecallCard />
       <EscapedBugsCard />
       <BacktestsCard />
     </div>

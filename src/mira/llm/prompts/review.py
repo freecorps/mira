@@ -46,12 +46,17 @@ def build_review_prompt(
     resolved_threads: list[dict] | None = None,
     team_conventions: str = "",
     dependency_updates: str = "",
+    learned_checks: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Build the review prompt messages for the LLM.
 
     ``dependency_updates`` is the rendered block from
     :func:`mira.dependency_updates.review_context` — upstream release notes,
     already inside an untrusted block — placed ahead of the diffs.
+
+    ``learned_checks`` are positive learned rules ("look for …"), rendered
+    apart from ``learned_rules``, which say what the team does not want
+    reported.
 
     Returns a list of message dicts with 'role' and 'content' keys.
     """
@@ -103,6 +108,7 @@ def build_review_prompt(
         existing_comments=cleaned_comments,
         has_code_context=bool(code_context),
         learned_rules=learned_rules,
+        learned_checks=learned_checks,
         custom_rules=custom_rules,
         file_history=history_for_template,
         review_round=review_round,

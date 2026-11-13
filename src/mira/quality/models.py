@@ -308,3 +308,70 @@ class EscapedBug:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# How a peer thread was judged addressed. Anything else means it was not.
+ADDRESSED_REPLY = "reply"
+ADDRESSED_RESOLVED = "resolved"
+ADDRESSED_OUTDATED = "outdated"
+
+# What positive learning did with a missed-and-addressed thread.
+LEARN_PENDING = ""
+LEARN_SKIPPED = "skipped"
+LEARN_COLLECTING = "collecting"
+LEARN_ACTIVE = "active"
+LEARN_ERROR = "error"
+
+
+def peer_thread_id(platform: str, owner: str, repo: str, pr_number: int, thread_id: str) -> str:
+    """Deterministic identity: a re-scan of the same thread updates one row."""
+    raw = "\x1f".join([platform, owner, repo, str(pr_number), thread_id])
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+@dataclass
+class PeerThread:
+    """One review thread another bot opened on a pull request Mira reviewed.
+
+    ``mira_flagged`` is the recall question — did Mira have a finding in the
+    same file within the configured distance — and ``addressed`` says whether
+    the thread pointed at something real: see :mod:`mira.quality.peers` for
+    the (deliberately strict) rule.
+    """
+
+    id: str
+    platform: str
+    owner: str
+    repo: str
+    pr_number: int
+    bot: str
+    path: str
+    line: int
+    thread_id: str = ""
+    url: str = ""
+    pr_url: str = ""
+    pr_state: str = ""
+    pr_closed_at: float = 0.0
+    title: str = ""
+    category: str = "other"
+    body: str = ""
+    original_commit: str = ""
+    head_sha: str = ""
+    addressed: bool = False
+    addressed_reason: str = ""
+    mira_flagged: bool = False
+    mira_flagged_file: bool = False
+    finding_ids: list[str] = field(default_factory=list)
+    learning_state: str = LEARN_PENDING
+    learning_candidate_id: int = 0
+    thread_created_at: float = 0.0
+    collected_at: float = 0.0
+
+    @property
+    def missed_and_addressed(self) -> bool:
+        return self.addressed and not self.mira_flagged
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["missed_and_addressed"] = self.missed_and_addressed
+        return data

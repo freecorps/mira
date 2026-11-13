@@ -306,11 +306,18 @@ def evaluation_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# Actors that stand for Mira itself approving a rule, not a person. The
+# automatic loops (pushback, peer recall) approve as ``mira-auto``; without it
+# here every automatically accepted rule counted as hand-written, and was
+# exempt from the regression suggestions that exist to catch exactly those.
+_MIRA_ACTORS = frozenset({"mira-auto-apply", "mira-auto"})
+
+
 def origin_for_rule(rule: object) -> str:
     """Manual rules stay distinguishable from anything Mira synthesized."""
     signal = str(getattr(rule, "source_signal", "") or "")
     created_by = str(getattr(rule, "created_by", "") or "")
-    if signal == "manual" or (created_by and created_by != "mira-auto-apply"):
+    if signal == "manual" or (created_by and created_by not in _MIRA_ACTORS):
         return "manual"
     return "learned"
 

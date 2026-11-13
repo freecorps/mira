@@ -591,6 +591,56 @@ class BotThreadRecord:
 
 
 @dataclass
+class PeerThreadComment:
+    """One comment in another review bot's thread: the opening one or a reply."""
+
+    author: str
+    body: str
+    created_at: float = 0.0
+
+
+@dataclass
+class PeerReviewThread:
+    """A review thread opened by another review bot, with everything said in it.
+
+    ``line`` is the thread's position at the pull request's head (0 once the
+    code moved past it); ``original_line`` is its position at
+    ``original_commit``, the commit the bot reviewed. ``resolved_by`` is the
+    login that resolved it, when it is resolved.
+    """
+
+    thread_id: str
+    author: str
+    path: str
+    line: int
+    original_line: int
+    body: str
+    url: str = ""
+    is_resolved: bool = False
+    is_outdated: bool = False
+    resolved_by: str = ""
+    original_commit: str = ""
+    created_at: float = 0.0
+    replies: list[PeerThreadComment] = field(default_factory=list)
+
+
+@dataclass
+class PeerReviewSnapshot:
+    """A pull request's final state and the peer-bot threads on it."""
+
+    number: int
+    state: str  # "open" | "closed" | "merged"
+    url: str = ""
+    title: str = ""
+    head_sha: str = ""
+    merged_at: float = 0.0
+    closed_at: float = 0.0
+    # The login the reading token acts as: its replies are Mira's, not evidence.
+    viewer_login: str = ""
+    threads: list[PeerReviewThread] = field(default_factory=list)
+
+
+@dataclass
 class HumanReviewComment:
     """A review comment on a PR authored by a human (not the bot)."""
 

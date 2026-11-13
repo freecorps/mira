@@ -94,16 +94,40 @@ def approve_candidate(
     candidate_id: int,
     actor: str = "",
     config: LearningConfig | None = None,
+    *,
+    min_evidence: int | None = None,
 ) -> Any:
+    """Approve a candidate into an active rule.
+
+    ``min_evidence`` overrides the per-scope minimum. Peer-recall learning
+    uses it: its evidence unit is a distinct pull request where a peer bot's
+    finding was fixed, which is stronger than one disagreeing reply, so it
+    sets its own floor (``peer_recall.min_support``) instead of borrowing the
+    five replies a repository-wide "do not report" rule needs.
+
+    A candidate from a positive synthesiser becomes a positive rule
+    (:data:`~mira.feedback.retrieval.POSITIVE_SIGNAL`) whoever approves it.
+    """
+    from mira.feedback.retrieval import POSITIVE_SIGNAL, is_positive_candidate
+
     candidate = store.get_learning_candidate(candidate_id)
     if candidate is None:
         raise LookupError("Learning candidate not found")
     validate_rule_text(candidate.rule_text)
     validate_rule_scope(candidate.scope_type, candidate.scope_value)
-    required = evidence_required(candidate.scope_type, config)
+    required = (
+        evidence_required(candidate.scope_type, config) if min_evidence is None else min_evidence
+    )
     if candidate.evidence_count < required:
         raise ValueError(
             f"Scope '{candidate.scope_type}' requires at least {required} evidence events"
+        )
+    if is_positive_candidate(candidate):
+        return store.approve_learning_candidate_atomic(
+            candidate_id,
+            actor=actor,
+            min_evidence=required,
+            source_signal=POSITIVE_SIGNAL,
         )
     return store.approve_learning_candidate_atomic(
         candidate_id,
@@ -136,10 +160,18 @@ def version_rule(
     previous = store.get_learned_rule(rule_id)
     if previous is None:
         raise LookupError("Learning not found")
+    from mira.feedback.retrieval import is_positive_rule
+
     validate_rule_text(rule_text)
     validate_rule_scope(scope_type, scope_value)
-    if previous.source_signal != "manual" and previous.evidence_count < evidence_required(
-        scope_type, config
+    # A positive rule was accepted on its own floor (distinct pull requests,
+    # see ``approve_candidate``); rewording it in place must not then demand
+    # the per-scope minimum. Widening its scope still does.
+    kept_scope = is_positive_rule(previous) and scope_type == previous.scope_type
+    if (
+        previous.source_signal != "manual"
+        and not kept_scope
+        and previous.evidence_count < evidence_required(scope_type, config)
     ):
         raise ValueError(
             f"Scope '{scope_type}' requires at least "

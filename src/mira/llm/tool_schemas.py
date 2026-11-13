@@ -362,6 +362,81 @@ SUBMIT_LEARNING_VERDICT_TOOL = {
 }
 
 
+PEER_PATTERN_VERDICTS = ("pattern", "not_generalizable", "not_a_defect")
+
+# The categories a review finding can carry, so a learned check is attributed
+# to the findings it plausibly produced (rule evaluation matches on category).
+FINDING_CATEGORIES = (
+    "bug",
+    "security",
+    "performance",
+    "error-handling",
+    "race-condition",
+    "resource-leak",
+    "maintainability",
+    "clarity",
+    "configuration",
+    "other",
+)
+
+SUBMIT_REVIEW_PATTERN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_review_pattern",
+        "description": (
+            "Turn a defect another reviewer caught, and the change that fixed it, into "
+            "one reusable instruction for what to look for in future reviews."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": list(PEER_PATTERN_VERDICTS),
+                    "description": (
+                        "pattern = a real defect whose kind recurs and can be checked for "
+                        "in other code. not_generalizable = real, but specific to this one "
+                        "change (a typo, a one-off value). not_a_defect = the fix was "
+                        "cosmetic, or the finding was not a problem with the code."
+                    ),
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Only for pattern, otherwise empty. One sentence starting with "
+                        "'Look for', naming the code shape and the failure, transferable to "
+                        "other files: 'Look for status fields set on the success path but "
+                        "never reset when a retry or cancel path exits early.' No file "
+                        "names, PR numbers or quoted identifiers unique to this change."
+                    ),
+                },
+                "same_as": {
+                    "type": "integer",
+                    "description": (
+                        "The id of a listed existing pattern this defect is an instance of, "
+                        "or 0 when none is. Only when the same check would have caught it."
+                    ),
+                },
+                "category": {"type": "string", "enum": list(FINDING_CATEGORIES)},
+                "scope_type": {
+                    "type": "string",
+                    "enum": ["repo", "language"],
+                    "description": (
+                        "language when the pattern is an idiom of the file's language, repo "
+                        "when it is about how this repository is built."
+                    ),
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "0-1 confidence that this generalizes into a useful check.",
+                },
+                "reason": {"type": "string", "description": "One sentence: why."},
+            },
+            "required": ["verdict", "pattern", "same_as", "category", "confidence", "reason"],
+        },
+    },
+}
+
 SUBMIT_WALKTHROUGH_TOOL = {
     "type": "function",
     "function": {

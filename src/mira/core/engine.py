@@ -44,7 +44,7 @@ from mira.feedback.exposure import (
 )
 from mira.feedback.models import ReviewFinding
 from mira.feedback.provenance import finding_fingerprint, new_finding_id
-from mira.feedback.retrieval import render_rule
+from mira.feedback.retrieval import render_rule, split_rules
 from mira.gate.policy import resolve_policy
 from mira.index._store_shared import IndexMatch
 from mira.index.code_graph import BlastRadius, CodeGraph, build_blast_radius, render_blast_radius
@@ -2234,6 +2234,10 @@ class ReviewEngine:
         _mark("prepare")
 
         learned_rules: list[str] = []
+        # "Look for …" rules learned from what peer bots caught and Mira did
+        # not. A separate prompt section, and kept away from the critic: a
+        # preference protects a finding that enforces it, a check must not.
+        learned_checks: list[str] = []
         custom_rules: list[dict[str, str]] = []
         try:
             pr_info = getattr(self, "_pr_info", None)
@@ -2262,7 +2266,9 @@ class ReviewEngine:
                     limit=self.config.learning.max_rules_per_review,
                     auto_rule_ttl_days=self.config.learning.auto_rule_ttl_days,
                 )
-                learned_rules = [render_rule(rule) for rule in rule_rows]
+                preference_rows, check_rows = split_rules(rule_rows)
+                learned_rules = [render_rule(rule) for rule in preference_rows]
+                learned_checks = [render_rule(rule) for rule in check_rows]
                 # Snapshot what was exposed so Phase 3 can record it after the
                 # review is posted. Held on the engine because retrieval and
                 # persistence happen in different methods of the same run.
@@ -2308,6 +2314,7 @@ class ReviewEngine:
             existing_comments=existing_comments,
             code_context=code_context_block,
             learned_rules=learned_rules or None,
+            learned_checks=learned_checks or None,
             custom_rules=custom_rules or None,
             # History is scoped and budgeted per part below, not per entire PR.
             file_history=None,
@@ -2385,6 +2392,7 @@ class ReviewEngine:
                         existing_comments=base_existing or None,
                         code_context=shared + enclosing + group_notes,
                         learned_rules=learned_rules or None,
+                        learned_checks=learned_checks or None,
                         custom_rules=custom_rules or None,
                         file_history=history or None,
                         review_round=review_round,

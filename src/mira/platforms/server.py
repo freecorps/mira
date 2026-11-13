@@ -184,8 +184,16 @@ def create_app(
             }
         )
 
+        # Peer recall: reads the review threads other bots left on pull
+        # requests Mira reviewed, daily by default. Started like the digest
+        # loop, for the same reason; it does nothing without GitHub access.
+        from mira.quality import peer_runtime
+
+        peer_runtime.start({"github": app_auth} if app_auth is not None else {})
+
         yield
         await review_queue.stop()
+        await peer_runtime.stop()
         await digest_runtime.stop()
         await autofix_runtime.stop()
         if backfill_task is not None and not backfill_task.done():
