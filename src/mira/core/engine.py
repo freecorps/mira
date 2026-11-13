@@ -99,6 +99,7 @@ from mira.models import (
     build_review_stats,
 )
 from mira.providers.base import BaseProvider
+from mira.verify.session import VerifySession
 
 logger = logging.getLogger(__name__)
 ReviewPartResult = tuple[list[ReviewComment], list[KeyIssue], str]
@@ -162,6 +163,8 @@ def _build_review_finding(
         primary_finding_id=primary_finding_id,
         votes=comment.votes,
         vote_passes=comment.vote_passes,
+        verification=comment.verification.outcome if comment.verification else "",
+        verification_detail=(comment.verification.reason[:500] if comment.verification else ""),
     )
 
 
@@ -624,6 +627,9 @@ class ReviewEngine:
         """
         exempt = Severity.from_str(self.config.review.cap_exempt_severity)
         return cap_comments(comments, self.config.filter.max_comments, exempt_severity=exempt)
+        # The review's sandboxed workspace (mira.verify), when the repository
+        # has verification configured. Built per review, closed when it ends.
+        self._verify: VerifySession | None = None
 
     def _output_reserve(self) -> int:
         """Context left free for the answer when sizing a review prompt.
@@ -1932,6 +1938,8 @@ class ReviewEngine:
         to.
         """
         self._pr_info = repo_scope
+        # The whole diff is all there is here; verification reads it from this.
+        self.last_full_diff = diff_text
         return await self._review_diff_internal(
             diff_text, pr_title=title, pr_description=description
         )
@@ -1986,6 +1994,9 @@ class ReviewEngine:
             pending_rules, self._instructions_task = self._instructions_task, None
             if pending_rules is not None and not pending_rules.done():
                 pending_rules.cancel()
+            verify_session, self._verify = self._verify, None
+            if verify_session is not None:
+                await verify_session.aclose()
             source, self._source = self._source, None
             if source is not None:
                 await source.aclose()
@@ -2113,6 +2124,15 @@ class ReviewEngine:
             )
             self._source.start()
         source = self._source
+
+        # ── mira.verify: execution-backed review (docs/verify.md) ──────────
+        # The workspace, its setup and its tools get ready alongside everything
+        # below. None unless this repository has verification configured.
+        self._verify = VerifySession.maybe_start(
+            self.config, review_pr_info, source, self.last_full_diff or diff_text
+        )
+        verify_session = self._verify
+        # ── end mira.verify ───────────────────────────────────────────────
         enclosing_budget = self.config.review.enclosing_context_tokens
 
         # One code graph per review: the callers lookup below and every
@@ -2590,6 +2610,11 @@ class ReviewEngine:
                     return sum(self.llm.count_tokens(m["content"]) for m in msgs)
 
                 part = await _part_context(chunk.files)
+                if verify_session is not None:
+                    # Tool output on this part's changed lines; dropped with the
+                    # part context below when the prompt has no room for it.
+                    tool_output = await verify_session.prompt_block([f.path for f in chunk.files])
+                    part = "\n\n".join(p for p in (tool_output, part) if p)
                 messages = _messages(chunk_history, part)
                 prompt_limit = self.config.llm.max_context_tokens - self._output_reserve()
                 if _size(messages) > prompt_limit:
@@ -3117,6 +3142,26 @@ class ReviewEngine:
                 _audit_drop(c, "pass_vote", f"blocker reported by {c.votes} pass(es), not proven")
             )
         _mark("critique")
+
+        # ── mira.verify: reproduction tests, then tool findings ────────────
+        if verify_session is not None:
+            try:
+                final_comments = await verify_session.verify(final_comments, self.llm, audit)
+                reviewed = {f.path for f in filtered}
+                tool_comments = [
+                    c for c in verify_session.tool_findings(final_comments) if c.path in reviewed
+                ]
+                if existing_comments:
+                    tool_comments = drop_already_posted(tool_comments, existing_comments)
+                if tool_comments:
+                    audit.append(
+                        {"stage": "drafted", "chunk": "tools", "count": len(tool_comments)}
+                    )
+                    final_comments = [*final_comments, *tool_comments]
+            except Exception as exc:  # noqa: BLE001 - verification never costs the review
+                logger.warning("Verification failed, keeping the critiqued comments: %s", exc)
+            _mark("verify")
+        # ── end mira.verify ───────────────────────────────────────────────
 
         if license_comments:
             audit.append({"stage": "drafted", "chunk": "licenses", "count": len(license_comments)})

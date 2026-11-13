@@ -228,7 +228,9 @@ CREATE TABLE IF NOT EXISTS review_findings (
     presentation TEXT NOT NULL DEFAULT 'inline',
     primary_finding_id TEXT NOT NULL DEFAULT '',
     votes INTEGER NOT NULL DEFAULT 0,
-    vote_passes INTEGER NOT NULL DEFAULT 0
+    vote_passes INTEGER NOT NULL DEFAULT 0,
+    verification TEXT NOT NULL DEFAULT '',
+    verification_detail TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_pg_review_findings_comment
@@ -945,6 +947,12 @@ def _get_conn(url: str, *, read_only: bool = False) -> Any:
                     "ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS vote_passes "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+                # What a reproduction test said about a finding (mira.verify).
+                for column in ("verification", "verification_detail"):
+                    cur.execute(
+                        f"ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS {column} "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
             _schema_initialized = True
         return _pg_conn
 
@@ -2053,14 +2061,16 @@ class PgIndexStore(
                 "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
                 "confidence, title, body, suggestion, detector, prompt_model, "
                 "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-                "presentation, primary_finding_id, votes, vote_passes) "
+                "presentation, primary_finding_id, votes, vote_passes, verification, verification_detail) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT(id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, "
                 "review_id=EXCLUDED.review_id, platform_comment_id=EXCLUDED.platform_comment_id, "
                 "platform_thread_id=EXCLUDED.platform_thread_id, state=EXCLUDED.state, "
                 "updated_at=EXCLUDED.updated_at, votes=EXCLUDED.votes, "
-                "vote_passes=EXCLUDED.vote_passes",
+                "vote_passes=EXCLUDED.vote_passes, "
+                "verification=EXCLUDED.verification, "
+                "verification_detail=EXCLUDED.verification_detail",
                 (
                     finding.id,
                     finding.fingerprint,
@@ -2093,6 +2103,8 @@ class PgIndexStore(
                     finding.primary_finding_id,
                     finding.votes,
                     finding.vote_passes,
+                    finding.verification,
+                    finding.verification_detail,
                 ),
             )
         self._commit()
@@ -2171,6 +2183,8 @@ class PgIndexStore(
             primary_finding_id=row[28],
             votes=int(row[29] or 0),
             vote_passes=int(row[30] or 0),
+            verification=(row[31] or "") if len(row) > 31 else "",
+            verification_detail=(row[32] or "") if len(row) > 32 else "",
         )
 
     def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
@@ -2179,7 +2193,7 @@ class PgIndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id, votes, vote_passes "
+            "presentation, primary_finding_id, votes, vote_passes, verification, verification_detail "
             "FROM review_findings WHERE owner=%s AND repo=%s AND id=%s",
             (self._owner, self._repo, finding_id),
         )
@@ -2215,7 +2229,7 @@ class PgIndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id, votes, vote_passes "
+            "presentation, primary_finding_id, votes, vote_passes, verification, verification_detail "
             f"FROM review_findings WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC LIMIT 1",
             tuple(params),

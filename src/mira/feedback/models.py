@@ -47,6 +47,11 @@ class ReviewFinding:
     # those that landed (0/0 for a single pass or a pass that does not vote).
     votes: int = 0
     vote_passes: int = 0
+    # What a reproduction test said about the finding before it was posted
+    # (mira.verify): reproduced | not_reproduced | inconclusive, or "" when no
+    # test ran. Kept beside the feedback so precision can be read per outcome.
+    verification: str = ""
+    verification_detail: str = ""
 
 
 @dataclass

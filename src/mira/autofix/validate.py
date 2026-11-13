@@ -50,6 +50,7 @@ import subprocess  # noqa: S404 - argv-only, no shell; see module docstring
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -204,11 +205,27 @@ def materialize(patch: FixPatch, root: Path) -> list[Path]:
     anyway — this function writes to a filesystem, and a filesystem write is
     not the place to rely on a caller having done its job.
     """
+    return materialize_files(patch.files, root)
+
+
+def materialize_files(
+    files: Mapping[str, str], root: Path, *, skip_unsafe: bool = False
+) -> list[Path]:
+    """Write ``{repository-relative path: text}`` under ``root``, refusing to escape it.
+
+    Shared with review verification, which writes a whole repository snapshot
+    rather than a patch: there the paths come from a downloaded archive, so a
+    path that would land outside ``root`` is skipped (``skip_unsafe``) instead
+    of failing the workspace — one hostile entry should cost that entry.
+    """
     written: list[Path] = []
     resolved_root = root.resolve()
-    for path, content in sorted(patch.files.items()):
+    for path, content in sorted(files.items()):
         target = (resolved_root / path).resolve()
-        if not target.is_relative_to(resolved_root):  # pragma: no cover - defence in depth
+        if not target.is_relative_to(resolved_root) or target == resolved_root:
+            if skip_unsafe:
+                logger.debug("Refusing to write %s outside the workspace", path)
+                continue
             raise ValueError(f"refusing to write outside the workspace: {path}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="")
