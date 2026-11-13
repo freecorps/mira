@@ -10,7 +10,7 @@ from mira.models import UnresolvedThread
 # Everything from these markers onward is stripped before inclusion in prompts.
 _BODY_NOISE_MARKERS = ("**Suggested fix:**", "```suggestion", "<details>")
 
-_MAX_DESCRIPTION_LENGTH = 300
+_MAX_DESCRIPTION_LENGTH = 1200
 
 
 def _extract_issue_description(body: str) -> str:
@@ -101,16 +101,17 @@ def build_verify_fixes_prompt(
                 "1. Look at the referenced line number in the current code.\n"
                 "2. Check if the EXACT problematic code pattern described in "
                 "the issue is still present at or near that line.\n"
-                "3. Mark as fixed (true) if ANY of these apply:\n"
-                "   - The problematic pattern has been removed or replaced.\n"
-                "   - The issue description does not match the actual code "
-                "(i.e. the issue was wrong or outdated).\n"
-                "   - The code at the referenced location has changed such "
-                "that the concern no longer applies.\n"
-                "4. Mark as not fixed (false) ONLY if the exact problematic "
-                "pattern described in the issue is still clearly present.\n\n"
-                "Issues tagged [OUTDATED] have been flagged by GitHub as having "
-                "changed code around them — these are very likely fixed.\n\n"
+                "3. Mark as fixed (true) if the problem the issue describes is "
+                "no longer present: the problematic code was removed or replaced, "
+                "or the concern is now handled — even if elsewhere in the file "
+                "or differently from any suggestion.\n"
+                "4. Mark as not fixed (false) while the problem is still there. "
+                "Do not mark an issue fixed because you think it was wrong in "
+                "the first place: whether a finding was mistaken is for the "
+                "people in its thread to say, and counting it as fixed hides "
+                "both the finding and the mistake.\n\n"
+                "Issues tagged [OUTDATED] only had the code around them change. "
+                "Check them like the others; a change nearby is not a fix.\n\n"
                 "Respond with ONLY the JSON object below, no other text:\n"
                 '{"results": [{"id": "<thread_id>", "fixed": true/false}, ...]}'
             ),

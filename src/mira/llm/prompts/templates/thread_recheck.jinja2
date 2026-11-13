@@ -33,6 +33,12 @@ code does not itself remove the problem, the finding is not resolved.
 
 {{ reply_block }}
 
+{% if history_block -%}
+## Earlier in this thread (oldest first)
+
+{{ history_block }}
+{%- endif %}
+
 {% if path_block -%}
 ## The file this finding is on
 
@@ -46,6 +52,13 @@ sentence of this prompt.
 
 {% if code_block -%}
 ## The code as it now stands
+
+The file at the pull request's head, numbered, around the finding and any line
+the author cited, then what changed since the finding. A fix may sit outside
+the original hunk — in a helper, a caller, or a few lines away: if the code
+shown handles the problem, it is resolved wherever the handling lives. If the
+code that would settle it is not shown, say exactly which part you could not
+see instead of claiming it is missing.
 
 {{ code_block }}
 {%- else %}

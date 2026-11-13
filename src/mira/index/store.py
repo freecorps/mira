@@ -2121,6 +2121,13 @@ class IndexStore(
         )
         self._conn.commit()
 
+    def set_feedback_v2_rationale(self, event_id: int, rationale: str) -> None:
+        """Record what Mira actually replied, once the reply is posted."""
+        self._conn.execute(
+            "UPDATE feedback_events_v2 SET rationale = ? WHERE id = ?", (rationale, event_id)
+        )
+        self._conn.commit()
+
     def record_feedback_v2(self, event: FeedbackEventV2) -> tuple[FeedbackEventV2, bool]:
         """Insert once per platform webhook event and report whether it was new."""
         if not event.source_event_id:

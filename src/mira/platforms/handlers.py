@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,74 @@ _PAUSE_KEYWORDS = {"pause"}
 _RESUME_KEYWORDS = {"resume"}
 
 _MAX_THREAD_CODE_CONTEXT = 6000
+# Lines of the file at the head shown around the finding, and around each line
+# the reply points at. A single diff hunk was all a reply used to get, and in
+# 28% of Mira's thread replies that hunk did not reach the code in question —
+# "the visible code stops before X" — so a fix the author pointed at could not
+# be seen and was argued with.
+_THREAD_WINDOW = 60
+_MAX_THREAD_FILE_CONTEXT = 12000
+_MAX_THREAD_CHANGE_CONTEXT = 5000
+_LINE_REFERENCE_RE = re.compile(
+    r"(?:\b(?:line|linha|lines|linhas|L)\s*|:)(\d{1,6})\b", re.IGNORECASE
+)
+
+
+def _numbered_windows(content: str, centres: list[int], radius: int) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    ranges: list[tuple[int, int]] = []
+    for centre in centres:
+        if centre <= 0:
+            continue
+        ranges.append((max(0, centre - 1 - radius), min(len(lines), centre + radius)))
+    if not ranges:
+        ranges = [(0, min(len(lines), 2 * radius))]
+    ranges.sort()
+    merged = [ranges[0]]
+    for lo, hi in ranges[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    width = len(str(len(lines)))
+    return "\n...\n".join(
+        "\n".join(f"{i + 1:>{width}}| {lines[i]}" for i in range(lo, hi)) for lo, hi in merged
+    )
+
+
+def _referenced_lines(text: str, limit: int = 3) -> list[int]:
+    seen: list[int] = []
+    for match in _LINE_REFERENCE_RE.finditer(text or ""):
+        value = int(match.group(1))
+        if value > 0 and value not in seen:
+            seen.append(value)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+async def _pr_hunk(provider: Any, pr_info: Any, path: str, line: int) -> str:
+    if not hasattr(provider, "get_pr_diff"):
+        return ""
+    diff_text = await provider.get_pr_diff(pr_info)
+    if not isinstance(diff_text, str):
+        return ""
+    file = next((item for item in parse_diff(diff_text).files if item.path == path), None)
+    if file is None or not file.hunks:
+        return ""
+
+    def distance(item: Any) -> int:
+        last = item.target_start + max(item.target_length - 1, 0)
+        if item.target_start <= line <= last:
+            return 0
+        return min(abs(line - item.target_start), abs(line - last))
+
+    hunk = min(file.hunks, key=distance)
+    # Only a hunk at or near the line. The first hunk of the file used to be
+    # shown whatever the line, as though it were the code under discussion.
+    return hunk.content[:_MAX_THREAD_CODE_CONTEXT] if distance(hunk) <= 20 else ""
 
 
 async def _thread_code_context(
@@ -81,29 +150,101 @@ async def _thread_code_context(
     pr_info: Any,
     path: str,
     line: int,
+    *,
+    reply: str = "",
+    finding_head_sha: str = "",
 ) -> str:
-    """Fetch only the relevant diff hunk for reply classification/synthesis."""
-    if not path or not hasattr(provider, "get_pr_diff"):
+    """The code a thread reply is about, as the pull request now has it.
+
+    Three parts, each best-effort: the file at the head, numbered, around the
+    finding and around every line the reply cites; what changed in the file
+    since the finding was raised; and the pull request's hunk at the line.
+    """
+    if not path:
         return ""
+    parts: list[str] = []
+    head = getattr(pr_info, "head_sha", "") or getattr(pr_info, "head_branch", "")
     try:
-        diff_text = await provider.get_pr_diff(pr_info)
-        if not isinstance(diff_text, str):
-            return ""
-        file = next((item for item in parse_diff(diff_text).files if item.path == path), None)
-        if file is None or not file.hunks:
-            return ""
-        hunk = next(
-            (
-                item
-                for item in file.hunks
-                if item.target_start <= line <= item.target_start + max(item.target_length - 1, 0)
-            ),
-            file.hunks[0],
-        )
-        return hunk.content[:_MAX_THREAD_CODE_CONTEXT]
+        if head and hasattr(provider, "get_file_content"):
+            content = await provider.get_file_content(pr_info, path, head)
+            if isinstance(content, str) and content:
+                window = _numbered_windows(
+                    content, [line, *_referenced_lines(reply)], _THREAD_WINDOW
+                )
+                parts.append(
+                    f"File at the pull request's head ({head[:12]}), numbered:\n"
+                    + window[:_MAX_THREAD_FILE_CONTEXT]
+                )
+    except Exception as exc:
+        logger.debug("Could not read %s at head for a thread reply: %s", path, exc)
+    try:
+        current = getattr(pr_info, "head_sha", "") or ""
+        if finding_head_sha and current and finding_head_sha != current:
+            compare = await provider.get_compare_diff(pr_info, finding_head_sha, current)
+            if isinstance(compare, str) and compare.strip():
+                changed = next(
+                    (f for f in parse_diff(compare).files if path in {f.path, f.old_path}), None
+                )
+                if changed is not None and changed.hunks:
+                    text = "\n".join(h.content for h in changed.hunks)
+                    parts.append(
+                        f"Changes to this file since the comment ({finding_head_sha[:12]}"
+                        f"..{current[:12]}):\n" + text[:_MAX_THREAD_CHANGE_CONTEXT]
+                    )
+                else:
+                    parts.append("This file has not changed since the comment was made.")
+    except Exception as exc:
+        logger.debug("Could not diff %s since its finding: %s", path, exc)
+    try:
+        hunk = await _pr_hunk(provider, pr_info, path, line)
+        if hunk:
+            parts.append("Pull request diff hunk at the comment's line:\n" + hunk)
     except Exception as exc:
         logger.debug("Could not load thread code context for %s: %s", path, exc)
+    return "\n\n".join(parts)
+
+
+def _lookup_finding(
+    pr_info: Any,
+    *,
+    original_body: str,
+    platform_comment_id: Any,
+    platform_thread_id: str,
+    platform: str,
+) -> Any:
+    """The finding a reply is on, without creating one. None when unknown."""
+    from mira.feedback.provenance import parse_finding_id
+
+    try:
+        store = _open_store(pr_info.owner, pr_info.repo, platform)
+    except Exception:
+        return None
+    try:
+        embedded = parse_finding_id(original_body or "")
+        finding = store.get_review_finding(embedded) if embedded else None
+        if finding is None and platform_comment_id:
+            finding = store.find_review_finding(platform_comment_id=platform_comment_id)
+        if finding is None and platform_thread_id:
+            finding = store.find_review_finding(platform_thread_id=platform_thread_id)
+        return finding
+    except Exception:
+        return None
+    finally:
+        store.close()
+
+
+def _thread_history_text(pr_info: Any, finding: Any, platform: str) -> str:
+    if finding is None:
         return ""
+    try:
+        store = _open_store(pr_info.owner, pr_info.repo, platform)
+        try:
+            events = store.list_feedback_v2(finding_id=finding.id, limit=100)
+        finally:
+            store.close()
+    except Exception:
+        return ""
+    return autolearn.thread_history(events, current_id=-1)
 
 
 def _path_block(path: str) -> str:
@@ -136,6 +277,7 @@ async def _recheck_finding(
     comment_path: str,
     comment_line: int,
     code_context: str,
+    history: str = "",
 ) -> tuple[bool | None, str]:
     """Look at the code again after the author says they fixed something.
 
@@ -150,6 +292,7 @@ async def _recheck_finding(
         finding_block=untrusted.block("FINDING", original_suggestion or "(none)", redactor=redact),
         reply_block=untrusted.block("REPLY", user_reply or "(empty)", redactor=redact),
         code_block=untrusted.block("DIFF", code_context, redactor=redact) if code_context else "",
+        history_block=untrusted.block("COMMENT", history, redactor=redact) if history else "",
         path_block=_path_block(comment_path),
         comment_line=_safe_line(comment_line),
     )
@@ -666,9 +809,27 @@ async def run_thread_reply(
         Acknowledge, leave open.
     """
     config = load_config()
-    llm = create_llm(llm_config_for("indexing", config.llm))
-    code_context = await _thread_code_context(provider, pr_info, comment_path, comment_line)
+    # The review model: a reply decides whether a finding closes and whether
+    # anything is learned from it, which is not a job for the cheap model.
+    llm = create_llm(llm_config_for("review", config.llm))
+    known = _lookup_finding(
+        pr_info,
+        original_body=original_suggestion,
+        platform_comment_id=parent_comment_id,
+        platform_thread_id=thread_id or "",
+        platform=platform,
+    )
+    code_context = await _thread_code_context(
+        provider,
+        pr_info,
+        comment_path,
+        comment_line,
+        reply=human_reply,
+        finding_head_sha=getattr(known, "head_sha", "") or "",
+    )
+    history = _thread_history_text(pr_info, known, platform)
     prompt = _THREAD_REPLY_TEMPLATE.render(
+        history_block=untrusted.block("COMMENT", history, redactor=redact) if history else "",
         reply_block=untrusted.block("REPLY", human_reply or "(empty)", redactor=redact),
         finding_block=(
             untrusted.block("FINDING", original_suggestion, redactor=redact)
@@ -765,7 +926,7 @@ async def run_thread_reply(
                 finding_text=original_suggestion,
                 code_context=code_context,
                 config=config,
-                llm=create_llm(llm_config_for("review", config.llm)),
+                llm=llm,
                 platform=platform,
             )
         except Exception:
@@ -806,6 +967,7 @@ async def run_thread_reply(
             comment_path=comment_path,
             comment_line=comment_line,
             code_context=code_context,
+            history=history,
         )
         if verdict:
             reply_text = verdict
@@ -825,6 +987,18 @@ async def run_thread_reply(
     except Exception as exc:
         logger.warning("Failed to post thread reply: %s", exc)
         return
+    # The event was recorded with the classifier's holding reply; what was
+    # posted is often the recheck's or the judge's. The next reply in this
+    # thread is read against what Mira actually said.
+    if feedback_event is not None and reply_text != (feedback_event.rationale or ""):
+        try:
+            store = _open_store(pr_info.owner, pr_info.repo, platform)
+            try:
+                store.set_feedback_v2_rationale(feedback_event.id, reply_text)
+            finally:
+                store.close()
+        except Exception as exc:
+            logger.debug("Could not record the posted thread reply: %s", exc)
 
     if intent == "disagreement" and close_state != "open":
         if learning_outcome is not None and learning_outcome.verdict == "fixed":
