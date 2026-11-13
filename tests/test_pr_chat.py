@@ -575,6 +575,23 @@ async def test_github_conversation_follows_the_review_thread_root() -> None:
     assert messages[0].is_bot
 
 
+async def test_github_conversation_reads_the_pr_when_the_id_is_an_issue_comment() -> None:
+    from github import GithubException
+
+    from mira.providers.github import GitHubProvider
+
+    issue_comment = MagicMock(id=77, in_reply_to_id=None, body="why?", created_at=None)
+    issue_comment.user = MagicMock(login="alice", type="User")
+    repo = MagicMock()
+    repo.get_pull.return_value.get_review_comment.side_effect = GithubException(404, {}, None)
+    repo.get_issue.return_value.get_comments.return_value = [issue_comment]
+    provider = GitHubProvider.__new__(GitHubProvider)
+    provider._github = MagicMock()
+    provider._github.get_repo.return_value = repo
+    messages = await provider.get_conversation(_pr_info(), comment_id=77)
+    assert [m.body for m in messages] == ["why?"]
+
+
 async def test_question_on_a_finding_thread_is_answered_from_the_repository() -> None:
     from mira.platforms.handlers import run_thread_reply
 
