@@ -6,7 +6,7 @@ import ipaddress
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
@@ -658,6 +658,11 @@ class ReviewConfig(BaseModel):
     # critic saying it could not see enough to be sure, which a small critic
     # says often. Raise it to trade recall for precision.
     critique_plausible_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Which model grades the drafts. The review model by default: the critic
+    # decides what survives, and on the indexing model, reading hunks, it
+    # dropped 74 findings in a week — 50 graded "plausible" because the code
+    # that settled them was in another file.
+    critique_model: Literal["review", "indexing"] = "review"
 
     # Run a dedicated security review pass in parallel with the main review.
     # Uses the security tier (`llm.security_model`, falling back to the

@@ -653,6 +653,7 @@ async def self_critique(
     audit: list[dict] | None = None,
     source_fetcher: object | None = None,
     plausible_min_confidence: float = DEFAULT_PLAUSIBLE_MIN_CONFIDENCE,
+    critic_llm: LLMProvider | None = None,
 ) -> list[ReviewComment]:
     """Grade each draft comment's evidence and drop the unsupported ones.
 
@@ -709,44 +710,27 @@ async def self_critique(
         )
 
     critic_prompt = (
-        "You are grading draft PR comments produced by another reviewer. "
-        "For each comment, grade how well the shown code supports the "
-        "claimed issue:\n\n"
-        "- `proven` — the shown code demonstrates the issue and the "
-        "reasoning is correct.\n"
-        "- `plausible` — consistent with the shown code but depends on "
-        "behaviour or code not shown (cross-file contracts, runtime "
-        "values). Real findings often land here; this is a valid grade, "
-        "not a failure. Read the surrounding code first: when it settles "
-        "the question, the grade is `proven` or `unsupported`, not this.\n"
-        "- `unsupported` — the shown code contradicts the claim, the "
-        "language-semantics reasoning is wrong (e.g. 'decorator only "
-        "registers last route' — stacked decorators register both), or "
-        "it's a style preference dressed up as an issue.\n\n"
-        "Grade the evidence; do NOT construct counter-arguments. A subtle "
-        "issue clearly visible in the code (a predicate with side effects, "
-        "an idiom misuse) is `proven` even if reasonable people might ship "
-        "it anyway.\n\n" + rules_block + "## Draft comments\n\n" + "\n".join(draft_lines)
+        _CRITIC_PREAMBLE + rules_block + "## Draft comments\n\n" + "\n".join(draft_lines)
     )
 
-    critic_llm = indexing_llm or _indexing_llm(llm)
+    critic_llm = critic_llm or indexing_llm or _indexing_llm(llm)
 
     try:
-        raw = await critic_llm.complete_with_tools(
-            messages=[{"role": "user", "content": critic_prompt}],
-            tools=[SUBMIT_CRITIQUE_TOOL],
-            temperature=0.0,
-        )
-        data = loads_lenient(raw) if raw else {}
-        if data is None:
-            data = {}
+        verdicts = await _grade(critic_llm, critic_prompt)
     except Exception as exc:
         logger.warning("Self-critique LLM call failed: %s. Keeping all drafts.", exc)
         return comments
-
-    verdicts = data.get("verdicts") or []
-    if not isinstance(verdicts, list):
+    if verdicts is None:
         return comments
+    verdicts = await _second_look(
+        critic_llm,
+        comments,
+        verdicts,
+        draft_lines,
+        rules_block,
+        source_fetcher,
+        plausible_min_confidence,
+    )
 
     keep_indices: set[int] = set()
     verdict_by_idx: dict[int, dict] = {}
@@ -785,6 +769,148 @@ async def self_critique(
         )
 
     return [c for i, c in enumerate(comments) if i in keep_indices]
+
+
+_CRITIC_PREAMBLE = (
+    "You are grading draft PR comments produced by another reviewer. "
+    "For each comment, grade how well the shown code supports the "
+    "claimed issue:\n\n"
+    "- `proven` — the shown code demonstrates the issue and the "
+    "reasoning is correct.\n"
+    "- `plausible` — consistent with the shown code but depends on "
+    "behaviour or code not shown (cross-file contracts, runtime "
+    "values). Real findings often land here; this is a valid grade, "
+    "not a failure. Read the surrounding code first: when it settles "
+    "the question, the grade is `proven` or `unsupported`, not this. "
+    "When another file would settle it, name it in `settle_with`.\n"
+    "- `unsupported` — the shown code contradicts the claim, the "
+    "language-semantics reasoning is wrong (e.g. 'decorator only "
+    "registers last route' — stacked decorators register both), or "
+    "it's a style preference dressed up as an issue. Code that is "
+    "merely not shown is never grounds for `unsupported`.\n\n"
+    "Grade the evidence; do NOT construct counter-arguments. A subtle "
+    "issue clearly visible in the code (a predicate with side effects, "
+    "an idiom misuse) is `proven` even if reasonable people might ship "
+    "it anyway.\n\n"
+)
+
+# A second look is bounded: it is one more call, made only for the drafts the
+# first grading would drop for want of code it could name.
+_SECOND_LOOK_MAX = 6
+_SECOND_LOOK_RADIUS = 25
+_SECOND_LOOK_MAX_CHARS = 6000
+
+
+async def _grade(critic_llm: LLMProvider, prompt: str) -> list | None:
+    raw = await critic_llm.complete_with_tools(
+        messages=[{"role": "user", "content": prompt}],
+        tools=[SUBMIT_CRITIQUE_TOOL],
+        temperature=0.0,
+    )
+    data = loads_lenient(raw) if raw else {}
+    verdicts = (data or {}).get("verdicts") or []
+    return verdicts if isinstance(verdicts, list) else None
+
+
+async def _settling_code(source_fetcher: object | None, settle_with: object) -> str:
+    """The code a critic asked for: windows around a symbol, or the file's start."""
+    fetch = getattr(source_fetcher, "fetch", None)
+    if fetch is None or not isinstance(settle_with, dict):
+        return ""
+    path = str(settle_with.get("path") or "").strip()
+    symbol = str(settle_with.get("symbol") or "").strip()
+    if not path:
+        return ""
+    try:
+        content = await fetch(path)
+    except Exception:  # noqa: BLE001 — evidence is best-effort
+        return ""
+    if not isinstance(content, str) or not content:
+        return ""
+    lines = content.split("\n")
+    hits = [n for n, line in enumerate(lines, 1) if symbol and symbol in line][:3]
+    windows = (
+        [(max(1, n - _SECOND_LOOK_RADIUS), min(len(lines), n + _SECOND_LOOK_RADIUS)) for n in hits]
+        if hits
+        else [(1, min(len(lines), 4 * _SECOND_LOOK_RADIUS))]
+    )
+    text = "\n...\n".join(
+        "\n".join(f"{n:>5}  {lines[n - 1]}" for n in range(lo, hi + 1)) for lo, hi in windows
+    )
+    return f"{path}:\n{text[:_SECOND_LOOK_MAX_CHARS]}"
+
+
+async def _second_look(
+    critic_llm: LLMProvider,
+    comments: list[ReviewComment],
+    verdicts: list,
+    draft_lines: list[str],
+    rules_block: str,
+    source_fetcher: object | None,
+    plausible_min_confidence: float,
+) -> list:
+    """Grade again, with the code it named, each draft dropped as only plausible."""
+    if getattr(source_fetcher, "fetch", None) is None:
+        return verdicts
+    candidates: list[tuple[int, dict]] = []
+    for verdict in verdicts:
+        if not isinstance(verdict, dict) or verdict.get("evidence") != "plausible":
+            continue
+        try:
+            index = int(verdict.get("index", -1))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < len(comments):
+            continue
+        if _critique_keep(verdict, comments[index], plausible_min_confidence):
+            continue
+        if isinstance(verdict.get("settle_with"), dict):
+            candidates.append((index, verdict))
+    candidates = candidates[:_SECOND_LOOK_MAX]
+    if not candidates:
+        return verdicts
+    codes = await asyncio.gather(
+        *(_settling_code(source_fetcher, verdict["settle_with"]) for _i, verdict in candidates)
+    )
+    entries = [
+        draft_lines[index] + f"    Code the first grading asked for:\n{code}\n"
+        for (index, _verdict), code in zip(candidates, codes, strict=True)
+        if code
+    ]
+    if not entries:
+        return verdicts
+    prompt = (
+        _CRITIC_PREAMBLE + "These drafts were graded `plausible` for want of code in another file. "
+        "That code is now shown: grade each again, keeping its index.\n\n"
+        + rules_block
+        + "## Draft comments\n\n"
+        + "\n".join(entries)
+    )
+    try:
+        second = await _grade(critic_llm, prompt)
+    except Exception as exc:  # noqa: BLE001 — the first grading stands
+        logger.info("Self-critique second look failed: %s", exc)
+        return verdicts
+    asked = {index for (index, _verdict), code in zip(candidates, codes, strict=True) if code}
+    regraded: dict[int, dict] = {}
+    for verdict in second or []:
+        try:
+            index = int(verdict.get("index", -1))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if index in asked:
+            regraded[index] = verdict
+    if regraded:
+        logger.info("Self-critique second look regraded %d draft(s)", len(regraded))
+    merged = []
+    for verdict in verdicts:
+        try:
+            index = int(verdict.get("index", -1))
+        except (TypeError, ValueError, AttributeError):
+            merged.append(verdict)
+            continue
+        merged.append(regraded.get(index, verdict))
+    return merged
 
 
 async def regenerate_summary(

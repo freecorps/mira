@@ -147,6 +147,18 @@ SUBMIT_CRITIQUE_TOOL = {
                                 "type": "string",
                                 "description": "One short sentence explaining the verdict.",
                             },
+                            "settle_with": {
+                                "type": "object",
+                                "description": (
+                                    "For plausible only: the repository file whose code "
+                                    "would settle the question, and the symbol to look at "
+                                    "in it. It is fetched and the comment graded again."
+                                ),
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "symbol": {"type": "string"},
+                                },
+                            },
                         },
                         "required": ["index", "evidence", "reason"],
                     },

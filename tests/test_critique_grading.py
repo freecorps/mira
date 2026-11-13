@@ -186,3 +186,59 @@ class TestEvidenceGradedCritique:
 
         assert kept == []
         assert audit[0]["reason"].startswith("no-verdict:")
+
+
+class _Source:
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+        self.asked: list[str] = []
+
+    async def fetch(self, path: str) -> str:
+        self.asked.append(path)
+        return self.files.get(path, "")
+
+
+@pytest.mark.asyncio
+async def test_a_draft_dropped_for_want_of_another_file_is_graded_again_with_it():
+    """50 of 74 critique drops in a week were `plausible`: the proof was elsewhere."""
+    comments = [_comment(Severity.SUGGESTION, title="stale caller")]
+    critic = AsyncMock()
+    critic.complete_with_tools = AsyncMock(
+        side_effect=[
+            json.dumps(
+                {
+                    "verdicts": [
+                        {
+                            "index": 0,
+                            "evidence": "plausible",
+                            "reason": "depends on the caller",
+                            "settle_with": {"path": "caller.py", "symbol": "run("},
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"verdicts": [{"index": 0, "evidence": "proven", "reason": "shown"}]}),
+        ]
+    )
+    source = _Source({"app.py": "x\n" * 20, "caller.py": "a\nrun(1, 2, 3)\nb\n"})
+
+    kept = await self_critique(AsyncMock(), comments, source_fetcher=source, critic_llm=critic)
+
+    assert [c.title for c in kept] == ["stale caller"]
+    second = critic.complete_with_tools.await_args_list[1].kwargs["messages"][0]["content"]
+    assert "run(1, 2, 3)" in second
+    assert "caller.py" in source.asked
+
+
+@pytest.mark.asyncio
+async def test_a_plausible_draft_naming_no_file_gets_no_second_call():
+    comments = [_comment(Severity.SUGGESTION)]
+    critic = AsyncMock()
+    critic.complete_with_tools = AsyncMock(
+        return_value=json.dumps(
+            {"verdicts": [{"index": 0, "evidence": "plausible", "reason": "runtime value"}]}
+        )
+    )
+    kept = await self_critique(AsyncMock(), comments, source_fetcher=_Source({}), critic_llm=critic)
+    assert kept == []
+    assert critic.complete_with_tools.await_count == 1
