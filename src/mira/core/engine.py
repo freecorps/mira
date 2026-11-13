@@ -2235,6 +2235,7 @@ class ReviewEngine:
                     languages=[file.language for file in filtered if file.language],
                     symbols=sorted(changed_symbols),
                     limit=self.config.learning.max_rules_per_review,
+                    auto_rule_ttl_days=self.config.learning.auto_rule_ttl_days,
                 )
                 learned_rules = [render_rule(rule) for rule in rule_rows]
                 # Snapshot what was exposed so Phase 3 can record it after the

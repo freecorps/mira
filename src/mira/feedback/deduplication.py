@@ -75,7 +75,7 @@ def find_equivalent_candidate(
     best_score = threshold
     for candidate in candidates:
         if (
-            candidate.status in {"rejected", "superseded"}
+            candidate.status in {"rejected", "superseded", "retracted"}
             or candidate.category.casefold() != category.casefold()
         ):
             continue

@@ -1124,6 +1124,42 @@ def mcp_audit(repository: str, limit: int) -> None:
             click.echo(f"    {entry['detail']}")
 
 
+@main.group("learning")
+def learning_group() -> None:
+    """Manage what Mira has learned from review feedback."""
+
+
+@learning_group.command("reset")
+@click.option(
+    "--include-manual",
+    is_flag=True,
+    help="Also archive rules a person wrote by hand. By default those are kept.",
+)
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+def learning_reset(include_manual: bool, yes: bool) -> None:
+    """Start learning from zero.
+
+    Deletes every learning candidate and archives every learned rule (inactive,
+    status `archived`), on the database DATABASE_URL or MIRA_INDEX_DIR points
+    at. Rule history and feedback events are kept.
+    """
+    if not yes:
+        click.confirm("Delete all learning candidates and archive all learned rules?", abort=True)
+    db_url = os.environ.get("DATABASE_URL", "")
+    if db_url.startswith(("postgresql://", "postgres://")):
+        from mira.index.pg_store import reset_learning_org_wide
+
+        totals = reset_learning_org_wide(db_url, include_manual=include_manual)
+    else:
+        from mira.index.store import reset_learning_org_wide_sqlite
+
+        totals = reset_learning_org_wide_sqlite(include_manual=include_manual)
+    click.echo(
+        f"Deleted {totals['candidates_deleted']} candidates; "
+        f"archived {totals['rules_archived']} rules."
+    )
+
+
 @main.group("token")
 def token_group() -> None:
     """Create, list and revoke API tokens, on the host that holds the database.

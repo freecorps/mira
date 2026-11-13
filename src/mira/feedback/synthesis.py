@@ -102,6 +102,7 @@ def synthesize_candidate(
     *,
     proposal: dict[str, Any] | None = None,
     config: LearningConfig | None = None,
+    synthesizer_version: str = SYNTHESIZER_VERSION,
 ) -> tuple[LearningCandidate | None, bool]:
     """Create or enrich a pending candidate from one negative feedback event."""
     config = config or LearningConfig()
@@ -172,7 +173,7 @@ def synthesize_candidate(
         language=language_for_path(finding.path),
         confidence=confidence,
         status="pending",
-        synthesizer_version=SYNTHESIZER_VERSION,
+        synthesizer_version=synthesizer_version,
         evidence_ids_json=json.dumps([event.id]),
         positive_examples_json="[]",
         negative_examples_json=json.dumps([negative_example], sort_keys=True),

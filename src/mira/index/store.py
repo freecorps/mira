@@ -3867,3 +3867,43 @@ def list_learned_rules_org_wide_sqlite(limit: int = 500, status: str | None = No
             continue
     rows.sort(key=lambda r: -(r["updated_at"] or 0.0))
     return rows[:limit]
+
+
+def _reset_learning_sql(include_manual: bool, placeholder: str) -> tuple[str, str]:
+    """The two statements a learning reset runs, for either backend.
+
+    Candidates are deleted: they are proposals, nothing reads them once gone,
+    and a fresh queue is the point. Rules are archived instead, because rule
+    evaluations reference them and their history should stay readable.
+    """
+    manual = "" if include_manual else " AND source_signal != 'manual'"
+    archive = (
+        "UPDATE learned_rules SET active = 0, status = 'archived', "
+        f"origin_candidate_id = NULL, disabled_at = COALESCE(disabled_at, {placeholder}), "
+        f"updated_at = {placeholder} WHERE status != 'archived'{manual}"
+    )
+    return "DELETE FROM learning_candidates", archive
+
+
+def reset_learning_org_wide_sqlite(include_manual: bool = False) -> dict[str, int]:
+    """Start learning from zero across every per-repository SQLite database."""
+    index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
+    delete_sql, archive_sql = _reset_learning_sql(include_manual, "?")
+    totals = {"candidates_deleted": 0, "rules_archived": 0}
+    for _platform, _owner, _repo, db_path in _iter_repo_dbs(index_dir):
+        conn = sqlite3.connect(db_path)
+        try:
+            tables = {
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            now = time.time()
+            if "learned_rules" in tables:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(learned_rules)")}
+                if {"status", "origin_candidate_id", "disabled_at"}.issubset(cols):
+                    totals["rules_archived"] += conn.execute(archive_sql, (now, now)).rowcount
+            if "learning_candidates" in tables:
+                totals["candidates_deleted"] += conn.execute(delete_sql).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    return totals

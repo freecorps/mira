@@ -779,6 +779,18 @@ class LearningConfig(BaseModel):
     # Opt-in only. When disabled, every synthesized candidate requires an
     # explicit approval before it can affect a review.
     learning_auto_apply: bool = False
+    # Thread replies go through the automatic loop in `mira.feedback.autolearn`:
+    # deterministic guards, then an independent judge on the review model, then
+    # automatic acceptance. Off sends disagreements to the pending queue.
+    auto_accept: bool = True
+    # The judge's own confidence that the finding's premise was wrong.
+    auto_accept_min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    # An automatically accepted rule that no new evidence reinforces stops
+    # applying after this many days; reinforcement restarts the clock.
+    auto_rule_ttl_days: int = Field(default=60, ge=1)
+    # Active automatically accepted rules per repository. Past it, the least
+    # recently reinforced one is disabled.
+    max_auto_rules_per_repo: int = Field(default=30, ge=1)
     max_rules_per_review: int = Field(default=10, ge=1, le=50)
     min_evidence_path: int = Field(default=1, ge=1)
     min_evidence_language: int = Field(default=3, ge=1)
