@@ -2801,6 +2801,11 @@ class ReviewEngine:
                     audit=audit,
                     source_fetcher=source,
                     plausible_min_confidence=self.config.review.critique_plausible_min_confidence,
+                    critic_llm=(
+                        self.llm
+                        if self.config.review.critique_model == "review"
+                        else self.indexing_llm
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
