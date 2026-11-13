@@ -66,7 +66,8 @@ def _plural(count: int, word: str) -> str:
 
 def _counts(result: ReviewResult) -> dict[Severity, int]:
     counts: dict[Severity, int] = {}
-    for comment in result.comments:
+    # Overflow included: the status, like the verdict, answers for every finding.
+    for comment in result.all_findings:
         counts[comment.severity] = counts.get(comment.severity, 0) + 1
     return counts
 
@@ -192,7 +193,7 @@ def finished_status(result: ReviewResult, config: MiraConfig) -> CommitStatus:
     counts = _counts(result)
     blockers = counts.get(Severity.BLOCKER, 0)
     ceiling = Severity.from_str(config.review.verdict.approve_max_severity)
-    worst = max((comment.severity for comment in result.comments), default=None)
+    worst = max((comment.severity for comment in result.all_findings), default=None)
 
     failing = False
     if cfg.fail_on == "blocker":
@@ -203,6 +204,13 @@ def finished_status(result: ReviewResult, config: MiraConfig) -> CommitStatus:
     findings = _findings_line(result)
     reviewed = _plural(result.reviewed_files, "file")
     summary = f"Mira reviewed {reviewed} and posted {findings}."
+    if result.overflow_comments:
+        listed = len(result.overflow_comments)
+        summary = (
+            f"Mira reviewed {reviewed} and found {findings}; "
+            f"{_plural(listed, 'finding')} past the comment limit "
+            f"{'is' if listed == 1 else 'are'} listed in the walkthrough."
+        )
     coverage = _coverage_line(result)
     if coverage:
         summary = f"{summary}\n\n{coverage}"
@@ -215,7 +223,7 @@ def finished_status(result: ReviewResult, config: MiraConfig) -> CommitStatus:
         )
     return CommitStatus(
         state=SUCCESS,
-        title="No findings" if not result.comments else findings.capitalize(),
+        title="No findings" if not result.all_findings else findings.capitalize(),
         summary=summary,
     )
 

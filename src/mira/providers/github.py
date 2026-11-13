@@ -581,7 +581,7 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
 
         review_comments: list[dict[str, str | int]] = []
         for comment in result.comments:
-            body = _format_comment_body(comment, bot_name=bot_name)
+            body = _format_comment_body(comment, bot_name=bot_name, pr_info=pr_info)
             rc: dict[str, str | int] = {
                 "path": comment.path,
                 "body": body,

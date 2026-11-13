@@ -29,6 +29,11 @@ def comment_dict(comment: ReviewComment) -> dict[str, Any]:
         "body": comment.body,
         "confidence": comment.confidence,
         "suggestion": comment.suggestion,
+        # The same problem at other locations (see mira.core.grouping).
+        "also_at": [
+            {"path": other.path, "line": other.line, "end_line": other.end_line}
+            for other in comment.occurrences
+        ],
     }
 
 
@@ -67,6 +72,9 @@ def review_result_dict(result: ReviewResult) -> dict[str, Any]:
         "summary": result.summary,
         "walkthrough": walkthrough_dict(result.walkthrough),
         "comments": [comment_dict(comment) for comment in result.comments],
+        # Past `filter.max_comments`: not posted inline on a pull request, but
+        # findings all the same, and counted by every exit code.
+        "overflow": [comment_dict(comment) for comment in result.overflow_comments],
         "reviewed_files": result.reviewed_files,
         "token_usage": result.token_usage,
     }
@@ -100,13 +108,18 @@ def review_result_text(result: ReviewResult) -> str:
         lines.append(result.summary)
         lines.append("")
 
-    if not result.comments:
+    if not result.all_findings:
         lines.append("No issues found.")
         return "\n".join(lines)
 
-    for i, c in enumerate(result.comments, 1):
+    # A terminal has no comment cap to respect: overflow is printed in rank
+    # order after the findings a pull request would have shown inline.
+    for i, c in enumerate(result.all_findings, 1):
         lines.append(f"{i}. [{c.severity.name}] {c.path}:{c.line} — {c.title}")
         lines.append(f"   {c.body}")
+        if c.occurrences:
+            others = ", ".join(f"{o.path}:{o.line}" for o in c.occurrences)
+            lines.append(f"   Also at: {others}")
         if c.suggestion:
             lines.append(f"   Suggestion: {c.suggestion}")
         lines.append("")

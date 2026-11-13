@@ -31,6 +31,7 @@ from typing import Any
 from mira.checks.models import CheckRun
 from mira.config import MiraConfig
 from mira.core.diff_parser import parse_diff
+from mira.core.review_instructions import InstructionReader
 from mira.dependency_updates.bumps import ManifestReader
 from mira.exceptions import MiraError
 from mira.local.checks import local_pr_info, run_local_checks
@@ -89,7 +90,9 @@ class LocalReview:
 
     @property
     def comments(self) -> list:
-        return list(self.result.comments) if self.result else []
+        # Every finding: a local run posts nothing, so the comment cap has
+        # nothing to hold back, and `--fail-on` must see what it overflowed.
+        return list(self.result.all_findings) if self.result else []
 
     def counts(self) -> dict[str, int]:
         tally = {severity.name.lower(): 0 for severity in Severity}
@@ -264,6 +267,39 @@ def git_manifest_reader(repo_root: Path, diff: LocalDiff) -> ManifestReader:
     return read
 
 
+_MAX_INSTRUCTIONS_BYTES = 200_000
+
+
+def git_instructions_reader(repo_root: Path, base_sha: str) -> InstructionReader | None:
+    """Read `.mira/REVIEW.md` as committed at the base of a local review.
+
+    ``git show <base>:<path>`` and never the file on disk, for the reason the
+    destination guard reads ``.mira.yaml`` that way: the working tree is what
+    is being reviewed, and instructions it carries would be the change
+    deciding how it is judged. No base (``--stdin``), no instructions.
+    """
+    if not base_sha:
+        return None
+    root = repo_root.resolve()
+
+    def _read(path: str) -> str | None:
+        result = run_git(
+            root, "show", f"{base_sha}:{path}", max_output_bytes=_MAX_INSTRUCTIONS_BYTES
+        )
+        return result.stdout if result.ok else None
+
+    async def read(path: str) -> str | None:
+        try:
+            return await asyncio.to_thread(_read, path)
+        except Exception as exc:  # noqa: BLE001 - instructions we cannot read are skipped
+            logger.debug("Could not read %s at %s for review instructions: %s", path, base_sha, exc)
+            return None
+
+    # No file list: `ls-tree` is not among the read-only commands this package
+    # runs, so the reviewed files' directories are probed instead.
+    return InstructionReader(read=read)
+
+
 def prepare(
     *,
     path: str | Path,
@@ -398,6 +434,8 @@ async def execute(review: LocalReview, *, run_checks_too: bool = True) -> LocalR
             "Dependency release notes were looked up on the package registries and GitHub, "
             "because review.dependency_updates.local is set in the committed configuration."
         )
+
+    engine.instructions_reader = git_instructions_reader(review.identity.root, review.diff.base_sha)
 
     scope = local_pr_info(review.identity, review.diff) if review.identity.known else None
     title = (

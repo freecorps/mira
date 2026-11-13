@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from mira.config import FilterConfig
+from mira.core.grouping import add_occurrence, cap_comments, is_other_occurrence, prune_group
 from mira.models import ReviewComment, Severity
 
 
@@ -69,15 +70,30 @@ def _is_duplicate(
 def _deduplicate(
     comments: list[ReviewComment],
     title_threshold: float = 0.6,
+    *,
+    group: bool = False,
 ) -> list[ReviewComment]:
-    """Remove duplicate comments using composite similarity."""
+    """Remove duplicate comments using composite similarity.
+
+    With ``group``, a duplicate found at *another* location in the same
+    category is the same problem recurring, not the same comment twice: it is
+    kept as an occurrence of the first one (see ``mira.core.grouping``) rather
+    than dropped. Input order is rank order, so the strongest occurrence is
+    the one that carries the group.
+    """
     if not comments:
         return []
 
     kept: list[ReviewComment] = []
     for comment in comments:
-        if not any(_is_duplicate(comment, existing, title_threshold) for existing in kept):
+        match = next(
+            (existing for existing in kept if _is_duplicate(comment, existing, title_threshold)),
+            None,
+        )
+        if match is None:
             kept.append(comment)
+        elif group and is_other_occurrence(match, comment):
+            add_occurrence(match, comment)
 
     return kept
 
@@ -86,17 +102,27 @@ def filter_noise(
     comments: list[ReviewComment],
     config: FilterConfig,
     review_round: int = 1,
+    *,
+    group_findings: bool = False,
+    apply_cap: bool = True,
 ) -> list[ReviewComment]:
     """Apply the full noise filtering pipeline.
 
     1. Drop below confidence threshold (escalates per ``review_round``)
     2. Drop below minimum severity (escalates per ``review_round``)
     3. Sort by severity (desc) then confidence (desc)
-    4. Deduplicate (first occurrence = highest quality)
+    4. Deduplicate (first occurrence = highest quality); with
+       ``group_findings``, the same problem at another location becomes an
+       occurrence of the first instead of being dropped
     5. Apply the cap **only to suggestions and nitpicks** — every blocker
        and warning that survives the floor gets posted, no matter how
        many. Real bugs deserve to be flagged; the cap is a noise control
        for low-priority findings, not a quality cap on real ones.
+
+    ``apply_cap=False`` skips step 5 and leaves the cap to the caller: the
+    review engine caps after self-critique with :func:`cap_comments`, so the
+    findings past the cap are graded like the rest and kept as overflow
+    instead of being discarded here.
 
     ``review_round`` is the 1-indexed count of bot reviews on this PR.
     Round 1 uses ``config`` defaults; round 2+ raise the floor so the bot
@@ -124,13 +150,14 @@ def filter_noise(
     result = [c for c in comments if c.confidence >= _floor(c)]
     result = [c for c in result if c.severity >= min_severity]
     result.sort(key=lambda c: (c.severity, c.confidence), reverse=True)
-    result = _deduplicate(result)
+    result = _deduplicate(result, group=group_findings)
+    if not apply_cap:
+        return result
 
     # Split: blockers + warnings always post; suggestions + nitpicks share
     # the cap so they can't drown out real findings.
-    urgent = [c for c in result if c.severity >= Severity.WARNING]
-    low_priority = [c for c in result if c.severity < Severity.WARNING]
-    return urgent + low_priority[: config.max_comments]
+    posted, _ = cap_comments(result, config.max_comments, exempt_severity=Severity.WARNING)
+    return posted
 
 
 def drop_already_posted(
@@ -154,10 +181,15 @@ def drop_already_posted(
     if not open_lines:
         return comments
 
+    def _not_posted(c: ReviewComment) -> bool:
+        end = c.end_line or c.line
+        return not any(c.line <= ln <= end for ln in open_lines.get(c.path, []))
+
+    # Per occurrence, not per group: a grouped finding whose first location
+    # already has a thread still has news at the others.
     kept: list[ReviewComment] = []
     for c in comments:
-        end = c.end_line or c.line
-        if any(c.line <= ln <= end for ln in open_lines.get(c.path, [])):
-            continue
-        kept.append(c)
+        survivor = prune_group(c, _not_posted)
+        if survivor is not None:
+            kept.append(survivor)
     return kept

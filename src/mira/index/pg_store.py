@@ -224,7 +224,9 @@ CREATE TABLE IF NOT EXISTS review_findings (
     platform_thread_id TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL DEFAULT 'open',
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    presentation TEXT NOT NULL DEFAULT 'inline',
+    primary_finding_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_pg_review_findings_comment
@@ -920,6 +922,16 @@ def _get_conn(url: str, *, read_only: bool = False) -> Any:
                 # The license a lockfile records, added with the SBOM export.
                 cur.execute(
                     "ALTER TABLE package_manifests ADD COLUMN IF NOT EXISTS license "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+                # Grouped and overflow findings. Rows written before were all
+                # posted as their own inline comment, as the defaults say.
+                cur.execute(
+                    "ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS presentation "
+                    "TEXT NOT NULL DEFAULT 'inline'"
+                )
+                cur.execute(
+                    "ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS primary_finding_id "
                     "TEXT NOT NULL DEFAULT ''"
                 )
             _schema_initialized = True
@@ -2029,9 +2041,10 @@ class PgIndexStore(
                 "(id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
                 "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
                 "confidence, title, body, suggestion, detector, prompt_model, "
-                "platform_comment_id, platform_thread_id, state, created_at, updated_at) "
+                "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
+                "presentation, primary_finding_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT(id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, "
                 "review_id=EXCLUDED.review_id, platform_comment_id=EXCLUDED.platform_comment_id, "
                 "platform_thread_id=EXCLUDED.platform_thread_id, state=EXCLUDED.state, "
@@ -2064,6 +2077,8 @@ class PgIndexStore(
                     finding.state,
                     finding.created_at,
                     finding.updated_at,
+                    finding.presentation,
+                    finding.primary_finding_id,
                 ),
             )
         self._commit()
@@ -2138,6 +2153,8 @@ class PgIndexStore(
             state=row[24],
             created_at=row[25],
             updated_at=row[26],
+            presentation=row[27],
+            primary_finding_id=row[28],
         )
 
     def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
@@ -2145,7 +2162,8 @@ class PgIndexStore(
             "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
-            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
+            "presentation, primary_finding_id "
             "FROM review_findings WHERE owner=%s AND repo=%s AND id=%s",
             (self._owner, self._repo, finding_id),
         )
@@ -2180,7 +2198,8 @@ class PgIndexStore(
             "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
-            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
+            "presentation, primary_finding_id "
             f"FROM review_findings WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC LIMIT 1",
             tuple(params),
@@ -2188,11 +2207,17 @@ class PgIndexStore(
         return self._finding_from_row(row) if row else None
 
     def update_review_finding_state(self, finding_id: str, state: str) -> None:
+        """Set a finding's state, and that of the occurrences grouped under it.
+
+        Same reasoning as the SQLite store: a grouped occurrence shares the
+        fate of the comment that lists it.
+        """
         with self._cursor() as cur:
             cur.execute(
                 "UPDATE review_findings SET state=%s, updated_at=%s "
-                "WHERE owner=%s AND repo=%s AND id=%s",
-                (state, time.time(), self._owner, self._repo, finding_id),
+                "WHERE owner=%s AND repo=%s AND (id=%s OR "
+                "(primary_finding_id=%s AND presentation='grouped'))",
+                (state, time.time(), self._owner, self._repo, finding_id, finding_id),
             )
         self._commit()
 

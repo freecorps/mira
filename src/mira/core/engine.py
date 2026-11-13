@@ -23,6 +23,7 @@ from mira.core.diff_parser import parse_diff
 from mira.core.enclosing import build_enclosing_context
 from mira.core.ensemble import merge_ensemble_runs
 from mira.core.file_filter import filter_files
+from mira.core.grouping import cap_comments, prune_group
 from mira.core.noise_filter import drop_already_posted, filter_noise
 from mira.core.passes import (
     agentic_review_loop,
@@ -33,6 +34,12 @@ from mira.core.passes import (
 )
 from mira.core.pr_summary import strip_summary_section
 from mira.core.priority import rank_files
+from mira.core.review_instructions import (
+    InstructionReader,
+    changed_instruction_files,
+    load_repo_instructions,
+    provider_reader,
+)
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
 from mira.exceptions import MiraError, ResponseParseError
@@ -95,6 +102,8 @@ def _build_review_finding(
     comment: ReviewComment,
     *,
     prompt_model: str,
+    presentation: str = "inline",
+    primary_finding_id: str = "",
 ) -> ReviewFinding:
     finding_id = comment.finding_id or new_finding_id()
     comment.finding_id = finding_id
@@ -138,7 +147,40 @@ def _build_review_finding(
         suggestion=comment.suggestion or "",
         detector=detector,
         prompt_model=prompt_model,
+        presentation=presentation,
+        primary_finding_id=primary_finding_id,
     )
+
+
+def _finding_records(
+    pr_info: PRInfo, result: ReviewResult, *, prompt_model: str
+) -> list[ReviewFinding]:
+    """Every finding of a review as a row: posted, grouped under one, or overflowed.
+
+    The cap and the grouping decide how a finding is shown, never whether it
+    is recorded: analytics, the merge gate and the feedback loop read these
+    rows, and a finding missing from them would be one nobody can learn from.
+    A grouped occurrence points at the finding whose comment lists it.
+    """
+    records: list[ReviewFinding] = []
+    shown = [(c, "inline") for c in result.comments]
+    shown += [(c, "summary") for c in result.overflow_comments]
+    for comment, presentation in shown:
+        primary = _build_review_finding(
+            pr_info, comment, prompt_model=prompt_model, presentation=presentation
+        )
+        records.append(primary)
+        records.extend(
+            _build_review_finding(
+                pr_info,
+                other,
+                prompt_model=prompt_model,
+                presentation="grouped",
+                primary_finding_id=primary.id,
+            )
+            for other in comment.occurrences
+        )
+    return records
 
 
 def _audit_drop(c: ReviewComment, stage: str, reason: str = "") -> dict:
@@ -400,15 +442,23 @@ def _drop_unanchorable_comments(
     A round-2 review of a merge commit can produce findings on mainline code
     that isn't part of the PR's own diff — GitHub rejects those inlines.
     """
-    kept: list[ReviewComment] = []
     dropped: list[ReviewComment] = []
-    for c in comments:
+
+    def _anchorable(c: ReviewComment) -> bool:
         covered = line_map.get(c.path, set())
         anchor = c.end_line if (c.end_line and c.end_line > c.line) else c.line
         if c.line in covered and anchor in covered:
-            kept.append(c)
-        else:
-            dropped.append(c)
+            return True
+        dropped.append(c)
+        return False
+
+    # Occurrences of a grouped finding are held to the same rule: an "Also at"
+    # link to a line the pull request did not change points at nothing it did.
+    kept: list[ReviewComment] = []
+    for c in comments:
+        survivor = prune_group(c, _anchorable)
+        if survivor is not None:
+            kept.append(survivor)
     return kept, dropped
 
 
@@ -535,6 +585,32 @@ class ReviewEngine:
         # looked up alongside the walkthrough; cancelled with the review.
         self._blast_radius_task: asyncio.Task | None = None
         self.dependency_reader: Callable[[str, str], Awaitable[str | None]] | None = None
+        # Reads `.mira/REVIEW.md` at the review's base. The local CLI sets a
+        # git-backed one; a pull request review builds one over its provider.
+        # Never pointed at the head: see mira.core.review_instructions.
+        self.instructions_reader: InstructionReader | None = None
+        self._instructions_task: asyncio.Task | None = None
+
+    def _instruction_reader(self) -> InstructionReader | None:
+        """Where `.mira/REVIEW.md` is read from for this review: always its base."""
+        if self.instructions_reader is not None:
+            return self.instructions_reader
+        pr_info = getattr(self, "_pr_info", None)
+        if pr_info is None or self.provider is None:
+            return None
+        return provider_reader(self.provider, pr_info)
+
+    def _cap(
+        self, comments: list[ReviewComment]
+    ) -> tuple[list[ReviewComment], list[ReviewComment]]:
+        """``(posted, overflow)`` under ``filter.max_comments``.
+
+        Idempotent over its own output, so the review can cap once when the
+        findings are final and again after dropping comments it cannot anchor:
+        a slot freed there goes to the strongest overflowed finding.
+        """
+        exempt = Severity.from_str(self.config.review.cap_exempt_severity)
+        return cap_comments(comments, self.config.filter.max_comments, exempt_severity=exempt)
 
     def _output_reserve(self) -> int:
         """Context left free for the answer when sizing a review prompt.
@@ -1171,9 +1247,11 @@ class ReviewEngine:
         # Inline comments must anchor to lines in the PR's diff vs base, or
         # GitHub 422s them at posting time and the key-issues table ends up
         # naming findings with no inline attached. Drop them here and re-sync.
-        if result.comments:
+        if result.all_findings:
+            # Overflowed findings too: they are listed with links, and a slot an
+            # unanchorable comment frees goes back to the strongest of them.
             kept, unanchorable = _drop_unanchorable_comments(
-                result.comments, _diff_line_map(full_diff_text)
+                result.all_findings, _diff_line_map(full_diff_text)
             )
             if unanchorable:
                 logger.info(
@@ -1181,12 +1259,12 @@ class ReviewEngine:
                     len(unanchorable),
                     ", ".join(f"{c.path}:{c.line}" for c in unanchorable),
                 )
-                result.comments = kept
+                result.comments, result.overflow_comments = self._cap(kept)
                 if result.key_issues:
-                    result.key_issues = _drop_orphan_key_issues(result.key_issues, kept)
+                    result.key_issues = _drop_orphan_key_issues(result.key_issues, result.comments)
 
         if result.walkthrough:
-            _clamp_confidence_to_findings(result.walkthrough, result.comments)
+            _clamp_confidence_to_findings(result.walkthrough, result.all_findings)
             if self.dry_run:
                 logger.info("Dry run: skipping walkthrough comment posting")
             else:
@@ -1258,6 +1336,15 @@ class ReviewEngine:
                         index_was_empty=getattr(self, "_index_was_empty", False),
                         dashboard_url=_os.environ.get("MIRA_DASHBOARD_URL", ""),
                         overlaps=overlaps or None,
+                        overflow=(
+                            result.overflow_comments
+                            if self.config.review.list_overflow_findings
+                            else None
+                        ),
+                        overflow_limit=self.config.filter.max_comments,
+                        pr_url=pr_info.url,
+                        head_sha=pr_info.head_sha,
+                        changed_instruction_files=result.changed_instruction_files or None,
                     )
                     comment_id = placeholder_id
                     if comment_id is None:
@@ -1289,7 +1376,7 @@ class ReviewEngine:
         )
 
         posted_comment_ids: list[int] = []
-        if result.comments:
+        if result.all_findings:
             if self.dry_run:
                 logger.info(
                     "Dry run: would post %d comment(s) on PR %s",
@@ -1300,21 +1387,18 @@ class ReviewEngine:
                 # Persist every finding before the network call. This makes a
                 # posted comment impossible to exist without a durable local
                 # identity and lets the hidden marker survive webhook retries.
+                # Grouped and overflowed findings are persisted too: they are
+                # not posted as comments of their own, but they are findings.
                 finding_store = IndexStore.open(
                     pr_info.owner, pr_info.repo, platform=pr_info.platform
                 )
                 try:
                     prompt_model = self.config.llm.review_model or self.config.llm.model
-                    for comment in result.comments:
-                        finding_store.save_review_finding(
-                            _build_review_finding(
-                                pr_info,
-                                comment,
-                                prompt_model=prompt_model,
-                            )
-                        )
+                    for record in _finding_records(pr_info, result, prompt_model=prompt_model):
+                        finding_store.save_review_finding(record)
                 finally:
                     finding_store.close()
+            if result.comments and not self.dry_run:
                 posted_comment_ids = (
                     await self.provider.post_review(pr_info, result, bot_name=self.bot_name) or []
                 )
@@ -1366,12 +1450,15 @@ class ReviewEngine:
             from mira.models import Severity
 
             store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
-            blocker_count = sum(1 for c in result.comments if c.severity == Severity.BLOCKER)
-            warning_count = sum(1 for c in result.comments if c.severity == Severity.WARNING)
+            # Severity counts are of findings, overflow included; the number
+            # of comments posted stays the number posted.
+            findings = result.all_findings
+            blocker_count = sum(1 for c in findings if c.severity == Severity.BLOCKER)
+            warning_count = sum(1 for c in findings if c.severity == Severity.WARNING)
             suggestion_count = sum(
-                1 for c in result.comments if c.severity in (Severity.SUGGESTION, Severity.NITPICK)
+                1 for c in findings if c.severity in (Severity.SUGGESTION, Severity.NITPICK)
             )
-            categories = ",".join(sorted({c.category for c in result.comments if c.category}))
+            categories = ",".join(sorted({c.category for c in findings if c.category}))
             duration = int((_time.monotonic() - _review_start) * 1000)
             reviewed_paths_json = _json.dumps(result.reviewed_paths or [])
             review_event = store.record_review(
@@ -1415,7 +1502,12 @@ class ReviewEngine:
                 ],
             )
             store.link_review_findings(
-                [comment.finding_id for comment in result.comments if comment.finding_id],
+                [
+                    member.finding_id
+                    for comment in findings
+                    for member in (comment, *comment.occurrences)
+                    if member.finding_id
+                ],
                 review_event.id,
             )
             self._review_event_id = review_event.id
@@ -1884,6 +1976,9 @@ class ReviewEngine:
             pending_radius, self._blast_radius_task = self._blast_radius_task, None
             if pending_radius is not None and not pending_radius.done():
                 pending_radius.cancel()
+            pending_rules, self._instructions_task = self._instructions_task, None
+            if pending_rules is not None and not pending_rules.done():
+                pending_rules.cancel()
             source, self._source = self._source, None
             if source is not None:
                 await source.aclose()
@@ -1958,6 +2053,15 @@ class ReviewEngine:
         all_paths = [f.path for f in filtered]
         selected_paths = [f.path for f in selected]
         skipped_paths_only = [p for p, _reason in skipped]
+
+        # From the whole diff, not the filtered files: an instruction file the
+        # exclusion rules skip is still one this pull request changes.
+        edited_instructions = changed_instruction_files(f.path for f in patch.files)
+        # Read from the base while the rest of the review prepares; awaited
+        # where the prompt is written.
+        self._instructions_task = _asyncio.create_task(
+            load_repo_instructions(self._instruction_reader(), selected_paths, self.config.review)
+        )
 
         if skipped:
             logger.info(
@@ -2306,6 +2410,7 @@ class ReviewEngine:
             resolved_threads = settled_threads or None
         _mark("threads")
         dependency_context = await self._dependency_context(dependency_updates_task)
+        repo_instructions = await self._instructions_task
         overhead_messages = build_review_prompt(
             files=[],
             config=self.config,
@@ -2324,6 +2429,9 @@ class ReviewEngine:
             dependency_updates=dependency_context,
         )
         overhead = sum(self.llm.count_tokens(m["content"]) for m in overhead_messages)
+        if repo_instructions:
+            # A part's instructions are rendered per part, bounded by this.
+            overhead += self.llm.count_tokens(repo_instructions.render(selected_paths))
         if part_context_on:
             # Each part adds its own index context (and, unindexed, JIT context),
             # up to one budget each — held to an eighth of the window, so a small
@@ -2380,6 +2488,8 @@ class ReviewEngine:
                     f.path: file_history[f.path] for f in chunk.files if f.path in file_history
                 }
 
+                part_instructions = repo_instructions.render(f.path for f in chunk.files)
+
                 def _messages(
                     history: dict, part: str = "", enclosing: str = ""
                 ) -> list[dict[str, str]]:
@@ -2399,6 +2509,7 @@ class ReviewEngine:
                         resolved_threads=resolved_threads,
                         team_conventions=team_conventions,
                         dependency_updates=dependency_context,
+                        repo_instructions=part_instructions,
                     )
 
                 def _size(msgs: list[dict[str, str]]) -> int:
@@ -2414,6 +2525,11 @@ class ReviewEngine:
                 if _size(messages) > prompt_limit:
                     # Nor may the part's code context.
                     part = ""
+                    messages = _messages(chunk_history)
+                if _size(messages) > prompt_limit and part_instructions:
+                    # Nor, last of all, the repository's instructions.
+                    logger.warning("Review part %d left out its review instructions", idx + 1)
+                    part_instructions = ""
                     messages = _messages(chunk_history)
                 if _size(messages) > prompt_limit:
                     raise ValueError("Review prompt exceeds the configured context window")
@@ -2768,10 +2884,14 @@ class ReviewEngine:
 
         all_comments = [classify_severity(c) for c in all_comments]
 
+        # The cap waits until after self-critique (see `_cap`): a finding past
+        # it is kept and listed, so it is graded like the ones posted.
         final_comments = filter_noise(
             all_comments,
             self.config.filter,
             review_round=review_round,
+            group_findings=self.config.review.group_findings,
+            apply_cap=False,
         )
         _audit_stage(audit, "noise_filter", all_comments, final_comments)
 
@@ -2803,7 +2923,11 @@ class ReviewEngine:
                     self.llm,
                     final_comments,
                     learned_rules=learned_rules or None,
-                    custom_rules=custom_rules or None,
+                    # The repository's instructions for the reviewed files are
+                    # team preferences too: a finding enforcing one is not a nit.
+                    custom_rules=(
+                        [*custom_rules, *repo_instructions.as_rules(selected_paths)] or None
+                    ),
                     indexing_llm=self.indexing_llm,
                     diff_files=critique_files,
                     audit=audit,
@@ -2825,6 +2949,14 @@ class ReviewEngine:
                 license_comments = drop_already_posted(license_comments, existing_comments)
             final_comments = [*final_comments, *license_comments]
 
+        final_comments, overflow_comments = self._cap(final_comments)
+        if overflow_comments:
+            audit.append({"stage": "overflow", "count": len(overflow_comments)})
+            logger.info(
+                "%d finding(s) past the comment limit, listed in the walkthrough",
+                len(overflow_comments),
+            )
+
         all_key_issues = _drop_orphan_key_issues(all_key_issues, final_comments)
 
         if self.config.review.include_summary:
@@ -2834,7 +2966,9 @@ class ReviewEngine:
             try:
                 summary = await regenerate_summary(
                     self.llm,
-                    final_comments,
+                    # Overflow too: it is listed in the walkthrough, so the
+                    # summary may speak of it without claiming a dropped issue.
+                    [*final_comments, *overflow_comments],
                     all_key_issues,
                     pr_title,
                     pr_description,
@@ -2874,6 +3008,7 @@ class ReviewEngine:
 
         return ReviewResult(
             comments=final_comments,
+            overflow_comments=overflow_comments,
             key_issues=all_key_issues,
             summary=summary,
             reviewed_files=len(filtered) - len(unread_paths),
@@ -2883,4 +3018,5 @@ class ReviewEngine:
             skipped_paths=skipped_paths_only,
             total_paths=all_paths,
             audit=audit,
+            changed_instruction_files=edited_instructions,
         )

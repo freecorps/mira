@@ -36,6 +36,13 @@ class ReviewFinding:
     state: str = "open"
     created_at: float = 0.0
     updated_at: float = 0.0
+    # How the finding reached the pull request: `inline` (its own comment),
+    # `grouped` (listed under "Also at" on another finding's comment) or
+    # `summary` (past the comment cap, listed in the walkthrough).
+    presentation: str = "inline"
+    # For a `grouped` finding, the finding whose comment lists it. Feedback on
+    # that comment carries the primary's marker; this is how it reaches here.
+    primary_finding_id: str = ""
 
 
 @dataclass

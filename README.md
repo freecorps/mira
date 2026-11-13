@@ -278,6 +278,48 @@ failures show as a *neutral* check naming the failure, never red.
 
 → [Review status and approvals](docs/review-status.md)
 
+### How many comments, and what happens to the rest
+
+`filter.max_comments` (5 by default; 3 for `chill`, 10 for `assertive`) bounds
+how many suggestions and nitpicks are posted inline — warnings and blockers are
+always posted. A finding that repeats across files is posted **once**, at its
+strongest occurrence, with an *Also at* list linking the other locations, so a
+pattern repeated five times spends one slot instead of five. Findings past the
+limit are not dropped: they are listed in the walkthrough's collapsible **More
+findings** section, recorded like any other finding, and counted by the verdict
+and the `mira/review` check.
+
+```yaml
+review:
+  group_findings: true           # one comment per root cause, with "Also at"
+  cap_exempt_severity: "warning" # warning | blocker — what the limit never holds back
+  list_overflow_findings: true   # list findings past the limit in the walkthrough
+```
+
+`cap_exempt_severity: blocker` lets warnings share the limit too; blockers are
+never held back.
+
+### Review instructions per directory
+
+A `.mira/REVIEW.md` in any directory carries review instructions for the files
+under it, versioned with the code; `review.path_instructions` does the same by
+path pattern from Mira's own configuration:
+
+```yaml
+review:
+  path_instructions:
+    - path: "convex/**"
+      instructions: "Every query must use an index; flag `.filter()` table scans."
+```
+
+For each file Mira combines the instructions that cover it, closest directory
+first, within `review.repo_instructions_max_chars`. They are read from the pull
+request's **base**, never its head, so a pull request cannot rewrite the
+instructions it is reviewed under — an edited `REVIEW.md` applies after merge,
+and the walkthrough says so. The prompt ranks them below Mira's own rules.
+
+→ [Review instructions](docs/review-instructions.md)
+
 ### Asking for a review again
 
 Comment on the pull request:

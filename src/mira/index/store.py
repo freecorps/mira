@@ -197,7 +197,9 @@ CREATE TABLE IF NOT EXISTS review_findings (
     platform_thread_id TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL DEFAULT 'open',
     created_at REAL NOT NULL DEFAULT 0,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    presentation TEXT NOT NULL DEFAULT 'inline',
+    primary_finding_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_findings_comment
@@ -1088,6 +1090,20 @@ class IndexStore(
             self._conn.execute(
                 "ALTER TABLE feedback_events ADD COLUMN pr_author TEXT NOT NULL DEFAULT ''"
             )
+        # review_findings.presentation / primary_finding_id added with grouped
+        # and overflow findings. Every row written before them was posted as
+        # its own inline comment, which is what the defaults say.
+        finding_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(review_findings)").fetchall()
+        }
+        if "presentation" not in finding_cols:
+            self._conn.execute(
+                "ALTER TABLE review_findings ADD COLUMN presentation TEXT NOT NULL DEFAULT 'inline'"
+            )
+        if "primary_finding_id" not in finding_cols:
+            self._conn.execute(
+                "ALTER TABLE review_findings ADD COLUMN primary_finding_id TEXT NOT NULL DEFAULT ''"
+            )
         # autofix_jobs.job_kind added with the finishing touches. Every row
         # written before it was a fix, which is exactly what the default says.
         autofix_cols = {
@@ -1964,9 +1980,10 @@ class IndexStore(
             "(id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
-            "platform_comment_id, platform_thread_id, state, created_at, updated_at) "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
+            "presentation, primary_finding_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?) "
+            "?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, "
             "review_id=excluded.review_id, platform_comment_id=excluded.platform_comment_id, "
             "platform_thread_id=excluded.platform_thread_id, state=excluded.state, "
@@ -1999,6 +2016,8 @@ class IndexStore(
                 finding.state,
                 finding.created_at,
                 finding.updated_at,
+                finding.presentation,
+                finding.primary_finding_id,
             ),
         )
         self._conn.commit()
@@ -2065,6 +2084,8 @@ class IndexStore(
             state=row[24],
             created_at=row[25],
             updated_at=row[26],
+            presentation=row[27],
+            primary_finding_id=row[28],
         )
 
     def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
@@ -2072,7 +2093,8 @@ class IndexStore(
             "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
-            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
+            "presentation, primary_finding_id "
             "FROM review_findings WHERE id = ?",
             (finding_id,),
         ).fetchone()
@@ -2107,7 +2129,8 @@ class IndexStore(
             "SELECT id, fingerprint, review_id, platform, owner, repo, pr_number, pr_url, "
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
-            "platform_comment_id, platform_thread_id, state, created_at, updated_at "
+            "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
+            "presentation, primary_finding_id "
             f"FROM review_findings WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC LIMIT 1",
             tuple(params),
@@ -2115,9 +2138,16 @@ class IndexStore(
         return self._finding_from_row(row) if row else None
 
     def update_review_finding_state(self, finding_id: str, state: str) -> None:
+        """Set a finding's state, and that of the occurrences grouped under it.
+
+        A grouped occurrence has no thread of its own: the comment listing it
+        is where it gets fixed or dismissed, so it shares that comment's fate.
+        Without this it would stay `open` forever and hold the merge gate.
+        """
         self._conn.execute(
-            "UPDATE review_findings SET state = ?, updated_at = ? WHERE id = ?",
-            (state, time.time(), finding_id),
+            "UPDATE review_findings SET state = ?, updated_at = ? "
+            "WHERE id = ? OR (primary_finding_id = ? AND presentation = 'grouped')",
+            (state, time.time(), finding_id, finding_id),
         )
         self._conn.commit()
 

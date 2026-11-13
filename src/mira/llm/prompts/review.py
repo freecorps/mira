@@ -47,6 +47,7 @@ def build_review_prompt(
     team_conventions: str = "",
     dependency_updates: str = "",
     learned_checks: list[str] | None = None,
+    repo_instructions: str = "",
 ) -> list[dict[str, str]]:
     """Build the review prompt messages for the LLM.
 
@@ -57,6 +58,10 @@ def build_review_prompt(
     ``learned_checks`` are positive learned rules ("look for …"), rendered
     apart from ``learned_rules``, which say what the team does not want
     reported.
+
+    ``repo_instructions`` is this part's block from
+    :meth:`mira.core.review_instructions.RepoInstructions.render`: the
+    `.mira/REVIEW.md` and `review.path_instructions` text covering its files.
 
     Returns a list of message dicts with 'role' and 'content' keys.
     """
@@ -116,6 +121,7 @@ def build_review_prompt(
         team_conventions=team_conventions,
         footguns=footguns,
         has_dependency_updates=bool(dependency_updates),
+        repo_instructions=repo_instructions,
     )
 
     # Build user message with optional code context before diffs

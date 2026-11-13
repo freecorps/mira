@@ -689,6 +689,11 @@ async def self_critique(
             f"    Body:  {(c.body or '').strip()[:1200]}\n"
             f"    Cites: {cited or '(no code citation)'}\n"
         )
+        if c.occurrences:
+            # Grouped: the same problem was drafted at these locations too. The
+            # critic grades the one shown; the rest stand or fall with it.
+            others = ", ".join(f"{o.path}:{o.line}" for o in c.occurrences[:10])
+            entry += f"    Also drafted at: {others}\n"
         hunk = _hunk_evidence(c, diff_files)
         if hunk:
             entry += f"    Diff hunk (new-file line numbers on the left):\n{hunk}\n"
