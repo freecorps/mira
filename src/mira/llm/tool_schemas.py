@@ -276,6 +276,80 @@ SUBMIT_FINDING_RECHECK_TOOL = {
 }
 
 
+LEARNING_VERDICTS = (
+    "premise_wrong",
+    "fixed",
+    "accepted_risk",
+    "out_of_scope",
+    "unclear",
+)
+
+SUBMIT_LEARNING_VERDICT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_learning_verdict",
+        "description": (
+            "Decide what a human's pushback on a review finding actually means, "
+            "and whether it teaches a reusable rule."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": list(LEARNING_VERDICTS),
+                    "description": (
+                        "premise_wrong = the finding was never true of the code it "
+                        "was raised on: the code already handled it at that commit, "
+                        "the pattern is intentional, or the reviewer misread it. "
+                        "fixed = the finding was right and the code was changed, even "
+                        "if differently from the suggestion. accepted_risk = the "
+                        "finding is real but the team accepts it (documented decision, "
+                        "platform limitation, won't fix). out_of_scope = real but "
+                        "deferred to another PR or issue. unclear = the evidence does "
+                        "not settle it."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One sentence: the evidence that decides the verdict.",
+                },
+                "rule": {
+                    "type": "string",
+                    "description": (
+                        "Only for premise_wrong, otherwise empty. One imperative "
+                        "sentence a reviewer can apply to OTHER code: name the code "
+                        "pattern and what makes it safe, not this file or this PR. "
+                        "It must still let a genuine defect of the same kind through."
+                    ),
+                },
+                "scope_type": {
+                    "type": "string",
+                    "enum": ["path", "language", "repo"],
+                    "description": (
+                        "Where the rule holds: path for something specific to this "
+                        "file, language for a language idiom, repo for a convention "
+                        "of this repository."
+                    ),
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "0-1 confidence in the verdict itself.",
+                },
+                "reply": {
+                    "type": "string",
+                    "description": (
+                        "1-2 short sentences to the human, plain text, in the SAME "
+                        "language they wrote in. Say what you concluded and why."
+                    ),
+                },
+            },
+            "required": ["verdict", "reason", "confidence", "reply"],
+        },
+    },
+}
+
+
 SUBMIT_WALKTHROUGH_TOOL = {
     "type": "function",
     "function": {

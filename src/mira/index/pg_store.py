@@ -3922,3 +3922,17 @@ class PgIndexStore(
 
     def close(self) -> None:
         """No-op — connection is shared across all instances."""
+
+
+def reset_learning_org_wide(url: str, include_manual: bool = False) -> dict[str, int]:
+    """Start learning from zero across the whole install (rules first, then candidates)."""
+    from mira.index.store import _reset_learning_sql
+
+    delete_sql, archive_sql = _reset_learning_sql(include_manual, "%s")
+    now = time.time()
+    with _pg_cursor(url) as cur:
+        cur.execute(archive_sql, (now, now))
+        archived = cur.rowcount
+        cur.execute(delete_sql)
+        deleted = cur.rowcount
+    return {"candidates_deleted": deleted, "rules_archived": archived}

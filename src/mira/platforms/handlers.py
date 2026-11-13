@@ -19,6 +19,7 @@ from mira.core.diff_parser import parse_diff
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
 from mira.dashboard.models_config import llm_config_for
+from mira.feedback import autolearn
 from mira.feedback.models import FeedbackEventV2
 from mira.feedback.service import (
     create_learning_candidate_for_feedback,
@@ -740,7 +741,50 @@ async def run_thread_reply(
         return
 
     resolved: bool | None = None
-    if intent == "disagreement":
+    close_state = "dismissed"
+    retraction_note = ""
+    learning_outcome: autolearn.LearningOutcome | None = None
+    if intent != "disagreement" and (
+        autolearn.corrects_false_positive(human_reply) or intent in {"fixed", "agreement"}
+    ):
+        # A reply that takes back an earlier "false positive" — or now agrees
+        # with the finding — undoes whatever was learned from this finding.
+        retracted = _retract_if_previously_rejected(pr_info, finding, platform)
+        if retracted:
+            retraction_note = autolearn._retracted_reply(retracted, human_reply)
+    if intent == "disagreement" and (
+        config.learning.auto_accept or autolearn.corrects_false_positive(human_reply)
+    ):
+        try:
+            learning_outcome = await autolearn.learn_from_pushback(
+                provider,
+                pr_info,
+                finding,
+                feedback_event,
+                human_reply=human_reply,
+                finding_text=original_suggestion,
+                code_context=code_context,
+                config=config,
+                llm=create_llm(llm_config_for("review", config.llm)),
+                platform=platform,
+            )
+        except Exception:
+            logger.exception("Automatic learning failed for %s", pr_info.url)
+            learning_outcome = autolearn.LearningOutcome(
+                action="skipped",
+                reason="automatic learning failed",
+                reply=autolearn._fallback_reply("unclear", human_reply),
+            )
+        logger.info(
+            "Learning from pushback on %s: %s (%s; verdict=%s)",
+            pr_info.url,
+            learning_outcome.action,
+            learning_outcome.reason,
+            learning_outcome.verdict or "-",
+        )
+        reply_text = learning_outcome.reply or reply_text
+        close_state = learning_outcome.finding_state
+    elif intent == "disagreement":
         proposal = data.get("learning")
         candidate, _candidate_created = create_learning_candidate_for_feedback(
             pr_info,
@@ -770,24 +814,45 @@ async def run_thread_reply(
                 "Thanks — I could not re-read the code just now, so I have left "
                 "this thread open rather than closing it on an unverified fix."
             )
-    elif not reply_text:
+    elif not reply_text and not retraction_note:
         logger.warning("Free-form thread reply: empty reply (intent=%s). Recorded only.", intent)
         return
 
+    if retraction_note:
+        reply_text = f"{reply_text}\n\n{retraction_note}" if reply_text else retraction_note
     try:
         await provider.reply_to_review_comment(pr_info, comment_id, reply_text)
     except Exception as exc:
         logger.warning("Failed to post thread reply: %s", exc)
         return
 
-    if intent == "disagreement":
+    if intent == "disagreement" and close_state != "open":
+        if learning_outcome is not None and learning_outcome.verdict == "fixed":
+            # The judge read what changed since the finding and found it fixed;
+            # record that under its own provenance, as the recheck does.
+            record_finding_feedback(
+                pr_info,
+                kind="fixed",
+                source_event_id=f"judge:{source_id}",
+                actor=actor,
+                actor_role=actor_role,
+                raw_text=human_reply,
+                rationale=reply_text,
+                original_body=original_suggestion,
+                platform_comment_id=parent_comment_id,
+                platform_thread_id=thread_id or "",
+                path=comment_path,
+                line=comment_line,
+                thread_state="resolved",
+                platform=platform,
+            )
         await _close_thread(
             provider,
             pr_info,
             finding,
             thread_id=thread_id,
             comment_node_id=comment_node_id,
-            state="dismissed",
+            state=close_state,
             platform=platform,
         )
     elif intent == "fixed" and resolved:
@@ -822,6 +887,25 @@ async def run_thread_reply(
         )
 
     logger.info("Thread reply (%s) on %s: %s", intent, pr_info.url, reply_text[:80])
+
+
+_NEGATIVE_EVENT_KINDS = {"reply_disagree", "dismissed", "thumbs_down"}
+
+
+def _retract_if_previously_rejected(pr_info: Any, finding: Any, platform: str) -> list[int]:
+    """Undo learning from a finding a human earlier pushed back on."""
+    try:
+        store = _open_store(pr_info.owner, pr_info.repo, platform)
+        try:
+            events = store.list_feedback_v2(finding_id=finding.id, limit=100)
+            if not any(event.kind in _NEGATIVE_EVENT_KINDS for event in events):
+                return []
+            return autolearn.retract_learning_for_finding(store, finding.id)
+        finally:
+            store.close()
+    except Exception:
+        logger.exception("Retracting learning for finding %s failed", finding.id)
+        return []
 
 
 async def _close_thread(

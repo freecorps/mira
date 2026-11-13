@@ -21,6 +21,13 @@ from mira.platforms.handlers import run_pr_merged_learning, run_thread_reply
 from mira.providers.formatting import format_comment_body, parse_bot_comment_finding_id
 
 
+def _queue_config() -> MiraConfig:
+    """The pending-queue path these contracts were written for, without auto-accept."""
+    config = MiraConfig()
+    config.learning.auto_accept = False
+    return config
+
+
 def _finding(*, finding_id: str, head_sha: str = "head123") -> ReviewFinding:
     return ReviewFinding(
         id=finding_id,
@@ -268,7 +275,7 @@ async def test_disagreement_reply_records_once_and_uses_safe_ack(tmp_path, monke
     provider.resolve_threads = AsyncMock(return_value=1)
 
     with (
-        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.load_config", return_value=_queue_config()),
         patch("mira.platforms.handlers.create_llm", return_value=llm),
         patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
     ):
@@ -668,7 +675,7 @@ async def test_synthesis_failure_still_acknowledges_and_resolves_thread(
     provider.resolve_threads = AsyncMock(return_value=1)
 
     with (
-        patch("mira.platforms.handlers.load_config", return_value=MiraConfig()),
+        patch("mira.platforms.handlers.load_config", return_value=_queue_config()),
         patch("mira.platforms.handlers.create_llm", return_value=llm),
         patch("mira.platforms.handlers.llm_config_for", return_value=MagicMock()),
         patch(

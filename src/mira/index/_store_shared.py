@@ -139,6 +139,7 @@ class _StoreSharedMixin:
         languages: list[str] | None = None,
         symbols: list[str] | None = None,
         limit: int = 10,
+        auto_rule_ttl_days: int | None = None,
     ) -> list[Any]:
         """The rules retrieval selected for this review, as rule rows.
 
@@ -154,6 +155,7 @@ class _StoreSharedMixin:
             languages=languages or [],
             symbols=symbols or [],
             limit=limit,
+            auto_rule_ttl_days=auto_rule_ttl_days,
         )
 
     def get_learned_rules_text(
