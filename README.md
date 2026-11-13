@@ -449,6 +449,17 @@ live at `/checks` (admin only).
 
 → [Pre-merge check docs](docs/pre-merge-checks.md)
 
+**Execution-backed review** runs the pull request's code instead of only
+reading it. With `review.verify` configured for a repository, the review's
+linters, type checker and related tests run in a sandboxed checkout of the head
+(bubblewrap on Linux, no network after setup, no secrets in it), their output
+on the changed lines goes into the review prompt, and the strongest logic
+findings each get a reproduction test written by the review model: a test that
+fails as described marks the finding **Reproduced**, one that passes downgrades
+it. Off by default, because it executes repository code.
+
+→ [Execution-backed review docs](docs/verify.md)
+
 **Reviewer triage** answers the other question a fresh pull request raises: who
 should look at this. Mira classifies the change from the diff alone — size,
 areas, whether it carries tests or a migration — and ranks who is closest to the

@@ -201,7 +201,9 @@ CREATE TABLE IF NOT EXISTS review_findings (
     presentation TEXT NOT NULL DEFAULT 'inline',
     primary_finding_id TEXT NOT NULL DEFAULT '',
     votes INTEGER NOT NULL DEFAULT 0,
-    vote_passes INTEGER NOT NULL DEFAULT 0
+    vote_passes INTEGER NOT NULL DEFAULT 0,
+    verification TEXT NOT NULL DEFAULT '',
+    verification_detail TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_findings_comment
@@ -1113,6 +1115,16 @@ class IndexStore(
                 self._conn.execute(
                     f"ALTER TABLE review_findings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
                 )
+        # review_findings.verification* added with mira.verify: what a
+        # reproduction test said about the finding. Older rows ran none.
+        finding_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(review_findings)").fetchall()
+        }
+        for column in ("verification", "verification_detail"):
+            if column not in finding_cols:
+                self._conn.execute(
+                    f"ALTER TABLE review_findings ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
         # autofix_jobs.job_kind added with the finishing touches. Every row
         # written before it was a fix, which is exactly what the default says.
         autofix_cols = {
@@ -1990,14 +2002,16 @@ class IndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id, votes, vote_passes) "
+            "presentation, primary_finding_id, votes, vote_passes, verification, verification_detail) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, "
             "review_id=excluded.review_id, platform_comment_id=excluded.platform_comment_id, "
             "platform_thread_id=excluded.platform_thread_id, state=excluded.state, "
             "updated_at=excluded.updated_at, votes=excluded.votes, "
-            "vote_passes=excluded.vote_passes",
+            "vote_passes=excluded.vote_passes, "
+            "verification=excluded.verification, "
+            "verification_detail=excluded.verification_detail",
             (
                 finding.id,
                 finding.fingerprint,
@@ -2030,6 +2044,8 @@ class IndexStore(
                 finding.primary_finding_id,
                 finding.votes,
                 finding.vote_passes,
+                finding.verification,
+                finding.verification_detail,
             ),
         )
         self._conn.commit()
@@ -2100,6 +2116,8 @@ class IndexStore(
             primary_finding_id=row[28],
             votes=int(row[29] or 0),
             vote_passes=int(row[30] or 0),
+            verification=(row[31] or "") if len(row) > 31 else "",
+            verification_detail=(row[32] or "") if len(row) > 32 else "",
         )
 
     def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
@@ -2108,7 +2126,7 @@ class IndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id, votes, vote_passes "
+            "presentation, primary_finding_id, votes, vote_passes, verification, verification_detail "
             "FROM review_findings WHERE id = ?",
             (finding_id,),
         ).fetchone()
@@ -2144,7 +2162,7 @@ class IndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id, votes, vote_passes "
+            "presentation, primary_finding_id, votes, vote_passes, verification, verification_detail "
             f"FROM review_findings WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC LIMIT 1",
             tuple(params),

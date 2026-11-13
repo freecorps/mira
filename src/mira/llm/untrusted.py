@@ -57,6 +57,9 @@ LABELS = (
     # Titles, descriptions and commit messages of what landed on a branch,
     # quoted to the digest and release-notes calls. Written by contributors.
     "CHANGES",
+    # Output of a linter, type checker or test run over the pull request's
+    # head (mira.verify): it quotes the pull request's code back.
+    "TOOL",
 )
 
 

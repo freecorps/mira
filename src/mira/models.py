@@ -161,6 +161,35 @@ class ReviewComment:
     # alone would drop it, so it is kept only if self-critique grades it
     # `proven`. Cleared by the critic when it does; never posted.
     require_proven: bool = False
+    # The critic's evidence grade for a comment it kept (proven / plausible),
+    # "" when no critique ran. Verification reads it: a finding the critic only
+    # found plausible and a test then failed to reproduce is dropped, not kept.
+    critique_grade: str = ""
+    # What running a reproduction test said about this finding (mira.verify),
+    # or None when none was run.
+    verification: FindingVerification | None = None
+
+
+@dataclass
+class FindingVerification:
+    """The outcome of running a reproduction test for one finding.
+
+    ``outcome`` is ``reproduced`` (the test failed with the marker its
+    assertion carries), ``not_reproduced`` (it passed, every run, in a harness
+    that proved it reports failures), or ``inconclusive`` (anything else: it
+    could not be written, built or run, it was flaky, it timed out).
+    """
+
+    outcome: str
+    reason: str = ""
+    test_path: str = ""
+    test_code: str = ""
+    # Redacted tail of the runner's output, for the collapsed block.
+    output: str = ""
+    runner: str = ""
+    duration_seconds: float = 0.0
+    # Severity before a `not_reproduced` downgrade, so the note can say so.
+    original_severity: str = ""
 
 
 def _format_stats_breakdown(stats: dict[Severity, int]) -> str:

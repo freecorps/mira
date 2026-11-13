@@ -357,3 +357,44 @@ def period_findings_sql(
         f"WHERE {where.render()}"
     )
     return sql, tuple(where.params)
+
+
+def verification_outcomes_sql(
+    placeholder: str, filters: dict[str, Any]
+) -> tuple[str, tuple[Any, ...]]:
+    """Feedback outcome mix of findings, grouped by what their reproduction test said.
+
+    The question it answers is whether verification earns its keep: findings
+    marked ``reproduced`` should be accepted more often than findings no test
+    ran for (the ``""`` bucket), and ``not_reproduced`` ones — downgraded, not
+    dropped — less often. Same ``signals`` CTE and outcome expression as every
+    other evaluation query, so a bucket here and a rule's numbers count the same
+    reactions the same way.
+    """
+    where = _Where(placeholder)
+    where.eq("f.owner", filters.get("owner"))
+    where.eq("f.repo", filters.get("repo"))
+    where.eq("f.platform", filters.get("platform"))
+    where.eq("f.category", filters.get("category"))
+    since = filters.get("since")
+    if since:
+        where.add("f.created_at >= ?", float(since))
+    until = filters.get("until")
+    if until:
+        where.add("f.created_at < ?", float(until))
+    outcome = outcome_case_sql()
+    addressed = addressed_case_sql()
+    sql = (
+        f"{signals_cte()} "
+        "SELECT f.verification AS bucket, COUNT(*) AS findings, "
+        f"SUM(CASE WHEN ({outcome}) = 'positive' THEN 1 ELSE 0 END) AS positive, "
+        f"SUM(CASE WHEN ({outcome}) = 'negative' THEN 1 ELSE 0 END) AS negative, "
+        f"SUM(CASE WHEN ({outcome}) = 'neutral' THEN 1 ELSE 0 END) AS neutral, "
+        f"SUM(CASE WHEN ({outcome}) = 'unobserved' THEN 1 ELSE 0 END) AS unobserved, "
+        f"SUM({addressed}) AS addressed "
+        "FROM review_findings f "
+        "LEFT JOIN signals s ON s.finding_id = f.id "
+        f"WHERE {where.render()} "
+        "GROUP BY f.verification ORDER BY f.verification"
+    )
+    return sql, tuple(where.params)

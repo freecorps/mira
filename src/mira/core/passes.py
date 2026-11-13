@@ -773,6 +773,11 @@ async def self_critique(
             keep_indices.add(idx)
             # Proven: the blocker no longer leans on the vote it lost.
             comments[idx].require_proven = False
+            # Kept with its grade: verification treats a plausible finding
+            # whose reproduction passed differently from a proven one.
+            evidence = v.get("evidence")
+            if isinstance(evidence, str):
+                comments[idx].critique_grade = evidence
 
     for i, c in enumerate(comments):
         if i in keep_indices:

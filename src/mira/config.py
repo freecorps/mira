@@ -44,6 +44,15 @@ from mira.triage.config_models import (  # noqa: F401
     TriageWeights,
 )
 
+# Running a pull request's code during its review. Same boundary, same rule:
+# the commands come from deployment configuration, never from the repository.
+from mira.verify.config_models import (  # noqa: F401
+    VerifyCommand,
+    VerifyConfig,
+    VerifyRepoOverride,
+    VerifyTestRunner,
+)
+
 logger = logging.getLogger(__name__)
 
 # `.mira.yaml` is the canonical per-repo override filename. `.mira.yaml`
@@ -829,6 +838,12 @@ class ReviewConfig(BaseModel):
 
     # The durable review queue: concurrency, bursts and restarts.
     queue: ReviewQueueConfig = Field(default_factory=ReviewQueueConfig)
+
+    # Run the pull request's code in a sandboxed workspace: tool output on the
+    # changed lines goes into the review prompt, and the strongest findings are
+    # checked with a reproduction test. Off by default — it executes repository
+    # code. See VerifyConfig and docs/verify.md.
+    verify: VerifyConfig = Field(default_factory=VerifyConfig)
 
     # Automatically resolve bot review threads that the LLM verifies as fixed
     # on each review pass. Disable to leave all bot comments open until a human

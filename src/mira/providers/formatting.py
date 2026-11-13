@@ -164,6 +164,76 @@ def _close_open_fences(parts: list[str]) -> None:
         parts.append("```")
 
 
+def _fence_for(text: str) -> str:
+    """A backtick fence longer than any run of backticks inside ``text``."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+_TEST_LANGUAGES = {
+    ".py": "python",
+    ".js": "javascript",
+    ".jsx": "jsx",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".go": "go",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".php": "php",
+    ".cs": "csharp",
+}
+
+
+def format_verification(comment: ReviewComment) -> str:
+    """The note a reproduction test earned the comment, or "" when it earned none.
+
+    Only the two outcomes that changed something are shown. ``inconclusive``
+    leaves the comment as the reviewer wrote it, and saying "we tried and
+    could not tell" on every such comment would be noise about Mira, not
+    about the code. The test and its output are collapsed: the verdict is
+    the useful line, the evidence is there for whoever doubts it.
+    """
+    verification = comment.verification
+    if verification is None or verification.outcome not in {"reproduced", "not_reproduced"}:
+        return ""
+    if verification.outcome == "reproduced":
+        headline = (
+            "✅ **Reproduced** — Mira ran a test against this pull request's head and it "
+            "failed the way this comment describes."
+        )
+    else:
+        was = verification.original_severity
+        downgrade = f" Downgraded from {was}." if was else ""
+        headline = (
+            "🧪 **Not reproduced** — a test Mira wrote for this claim passed against this "
+            f"pull request's head, so it may not hold as stated.{downgrade}"
+        )
+    if not verification.test_code:
+        return headline
+    suffix = verification.test_path[verification.test_path.rfind(".") :].lower()
+    language = _TEST_LANGUAGES.get(suffix, "")
+    code_fence = _fence_for(verification.test_code)
+    lines = [
+        headline,
+        "",
+        "<details>",
+        f"<summary>Reproduction test ({verification.runner or 'test'}; not committed)</summary>",
+        "",
+        f"{code_fence}{language}",
+        verification.test_code.rstrip(),
+        code_fence,
+    ]
+    if verification.output:
+        output_fence = _fence_for(verification.output)
+        lines += ["", "Output:", "", output_fence, verification.output.rstrip(), output_fence]
+    lines += ["", "</details>"]
+    return "\n".join(lines)
+
+
 def format_comment_body(
     comment: ReviewComment,
     bot_name: str = "miracodeai",
@@ -194,6 +264,11 @@ def format_comment_body(
     parts.append(f"**{comment.title}**")
     parts.append("")
     parts.append(comment.body)
+    verification = format_verification(comment)
+    if verification:
+        _close_open_fences(parts)
+        parts.append("")
+        parts.append(verification)
 
     also_at = format_also_at(
         comment,

@@ -437,3 +437,41 @@ class _StoreSharedMixin:
             addressed=int(row[5] or 0),
         )
         return {"start": start, "end": end, **counts.as_dict()}
+
+    def finding_verification_stats(self, filters: dict[str, Any] | None = None) -> list[dict]:
+        """Acceptance of findings per reproduction outcome (mira.verify).
+
+        One bucket per ``review_findings.verification`` value — ``reproduced``,
+        ``not_reproduced``, ``inconclusive``, and ``unverified`` for findings no
+        test ran for — each with the same outcome counts and rates as a rule's,
+        so "how often is a reproduced finding accepted" reads off
+        ``acceptance_rate`` exactly as it does for a rule.
+        """
+        from mira.feedback.evaluation import RuleOutcomeCounts
+        from mira.feedback.evaluation_sql import verification_outcomes_sql
+
+        sql, params = verification_outcomes_sql(
+            self._analytics_placeholder, self._scoped_filters(filters)
+        )
+        buckets = []
+        for row in self._analytics_fetchall(sql, params):
+            counts = RuleOutcomeCounts(
+                findings=int(row[1] or 0),
+                positive=int(row[2] or 0),
+                negative=int(row[3] or 0),
+                neutral=int(row[4] or 0),
+                unobserved=int(row[5] or 0),
+                addressed=int(row[6] or 0),
+            ).as_dict()
+            for key in (
+                "exposures",
+                "review_exposures",
+                "thumbs_up",
+                "thumbs_down",
+                "reply_agree",
+                "reply_disagree",
+                "repeated_false_positives",
+            ):
+                counts.pop(key, None)
+            buckets.append({"verification": str(row[0] or "") or "unverified", **counts})
+        return buckets
