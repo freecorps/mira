@@ -1340,6 +1340,12 @@ class ReviewEngine:
         # every pass — including the "nothing left to flag" pass, which posts no
         # comments at all and was previously silent. Never fatal: a verdict
         # failure must not discard the review that already landed.
+        from mira.providers.formatting import parse_bot_comment_metadata
+
+        result.open_prior_severities = [
+            parse_bot_comment_metadata(thread.body or "")["severity"]
+            for thread in unresolved_threads
+        ]
         try:
             await self._submit_verdict(pr_info, result)
         except Exception as exc:

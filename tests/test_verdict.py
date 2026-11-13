@@ -258,3 +258,15 @@ def test_valid_config_accepted():
     )
     assert cfg.review.verdict.mode == "request_changes"
     assert cfg.review.verdict.approve_max_severity == "nitpick"
+
+
+def test_an_open_blocker_from_an_earlier_round_blocks_approval():
+    """An incremental pass that finds nothing is not a clean PR."""
+    still_open = _result(open_prior_severities=["blocker", "suggestion"])
+    assert decide_verdict(still_open, _config(), _pr(), "mira") is None
+
+
+def test_open_notes_from_earlier_rounds_do_not_block_approval():
+    notes = _result(open_prior_severities=["suggestion", "nitpick", ""])
+    verdict = decide_verdict(notes, _config(), _pr(), "mira")
+    assert verdict is not None and verdict.event == APPROVE
