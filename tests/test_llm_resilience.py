@@ -259,3 +259,23 @@ async def test_the_loop_keeps_reasoning_and_submits_once_out_of_time() -> None:
     assert assistant["reasoning_content"] == "need the caller"
     # The loop's conversation is one list, so look for the nudge in it.
     assert {"role": "user", "content": _FINAL_HOP_NUDGE} in second
+
+
+def test_a_timeout_behind_the_context_link_is_found() -> None:
+    try:
+        try:
+            raise httpx.ReadTimeout("")
+        except httpx.ReadTimeout:
+            raise LLMError("agentic_failed", model="m", error="x") from ValueError("cause")
+    except LLMError as outer:
+        assert _timed_out(outer)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_name_split_across_deltas_keeps_every_character() -> None:
+    events = [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "e"}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "e"}}]}}]},
+    ]
+    data = await _assemble_stream(_lines(*(f"data: {json.dumps(e)}" for e in events)))
+    assert data["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ee"
