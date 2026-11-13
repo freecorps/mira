@@ -594,8 +594,9 @@ class PathInstructionConfig(BaseModel):
     @field_validator("path")
     @classmethod
     def _valid_path(cls, value: str) -> str:
-        _validate_path_patterns([value], "review.path_instructions")
-        return value.strip()
+        cleaned = value.strip()
+        _validate_path_patterns([cleaned], "review.path_instructions")
+        return cleaned
 
     @field_validator("instructions")
     @classmethod
