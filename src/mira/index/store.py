@@ -1996,7 +1996,8 @@ class IndexStore(
             "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, "
             "review_id=excluded.review_id, platform_comment_id=excluded.platform_comment_id, "
             "platform_thread_id=excluded.platform_thread_id, state=excluded.state, "
-            "updated_at=excluded.updated_at",
+            "updated_at=excluded.updated_at, votes=excluded.votes, "
+            "vote_passes=excluded.vote_passes",
             (
                 finding.id,
                 finding.fingerprint,
