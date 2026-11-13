@@ -52,9 +52,11 @@ def is_other_occurrence(primary: ReviewComment, candidate: ReviewComment) -> boo
 
     The caller has already decided the two read alike; this decides whether
     that likeness is one finding said twice (same place: drop it) or one
-    problem found twice (another place, same category: group it). Different
-    categories at different places are kept apart, because "the same words"
-    is not "the same root cause" when one is a bug and the other a style note.
+    problem found twice (another place, same category: group it). A look-alike
+    in a different category is not grouped, because "the same words" is not
+    "the same root cause" when one is a bug and the other a style note; the
+    duplicate check drops it, as it always has, since it is the same text
+    under another label rather than a second problem.
     """
     return primary.category == candidate.category and not _overlaps(primary, candidate)
 
