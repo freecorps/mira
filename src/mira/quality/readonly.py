@@ -35,6 +35,7 @@ READ_METHODS: frozenset[str] = frozenset(
         "find_bot_comment",
         "get_unresolved_bot_threads",
         "get_all_bot_threads",
+        "get_peer_review_threads",
         "get_thread_id_for_comment",
         "get_human_review_comments",
         "get_file_content",

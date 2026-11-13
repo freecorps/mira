@@ -1,4 +1,4 @@
-"""``mira backtest`` and ``mira escaped-bugs`` — registered on the main CLI group."""
+"""``mira backtest``, ``mira escaped-bugs`` and ``mira peer-recall`` — on the main CLI group."""
 
 from __future__ import annotations
 
@@ -315,6 +315,140 @@ def escaped_bugs_scan(
     )
 
 
+@click.group("peer-recall")
+def peer_recall_group() -> None:
+    """Measure Mira's recall against other review bots, and learn from what it missed."""
+
+
+@peer_recall_group.command("scan")
+@click.option("--repo", "repository", required=True, help="owner/name to read")
+@click.option("--config", "config_path", default=None, help="Path to .mira.yaml")
+@click.option("--token", envvar="MIRA_GIT_TOKEN", default=None, help="GitHub API token")
+@click.option("--github-token", envvar="GITHUB_TOKEN", default=None, help="Alias for --token")
+@click.option("--rescan", is_flag=True, help="Read pull requests already read after closing")
+@click.option(
+    "--no-learn", is_flag=True, help="Only collect; do not synthesise positive rules from misses"
+)
+@click.option("--verbose", is_flag=True)
+def peer_recall_scan(
+    repository: str,
+    config_path: str | None,
+    token: str | None,
+    github_token: str | None,
+    rescan: bool,
+    no_learn: bool,
+    verbose: bool,
+) -> None:
+    """Read peer-bot threads on closed PRs Mira reviewed, record them, learn from misses.
+
+    Only reads from GitHub. With learning on (`peer_recall.positive_learning`)
+    each missed-and-addressed thread costs one review-model call, at most
+    `peer_recall.max_syntheses_per_run` per run.
+    """
+    from mira.quality.peer_learning import enabled
+    from mira.quality.peer_runtime import review_llm, run_repository
+
+    _logging(verbose)
+    owner, repo = _parse_repo(repository)
+    config = _load(config_path)
+    provider = _provider("github", token or github_token)
+    learn = not no_learn and enabled(config)
+    llm = review_llm(config) if learn else None
+    outcome = asyncio.run(
+        run_repository(provider, owner, repo, config=config, llm=llm, rescan=rescan, learn=learn)
+    )
+    if outcome.skipped:
+        click.echo(f"Skipped: {outcome.skipped}")
+        return
+    click.echo(
+        f"Read {outcome.prs_examined} closed PR(s): {outcome.threads} peer thread(s), "
+        f"{outcome.missed_and_addressed} missed by Mira and addressed by the author."
+    )
+    if learn:
+        rules = ", ".join(f"#{rule}" for rule in outcome.rules_activated) or "none"
+        click.echo(f"Synthesised from {outcome.learned} miss(es); rules activated: {rules}.")
+    if outcome.error:
+        click.echo(f"Error: {outcome.error}", err=True)
+
+
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value * 100:.0f}%"
+
+
+@peer_recall_group.command("report")
+@click.option("--repo", "repository", default=None, help="owner/name; default every repository")
+@click.option("--since", default=None, help="PRs closed on or after this date (YYYY-MM-DD)")
+@click.option("--bot", default="", help="Only this peer bot, e.g. cursor[bot]")
+@click.option(
+    "--missed",
+    "show_missed",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Missed-and-addressed threads to list",
+)
+@click.option("--output", "output_format", type=click.Choice(["text", "json"]), default="text")
+def peer_recall_report(
+    repository: str | None, since: str | None, bot: str, show_missed: int, output_format: str
+) -> None:
+    """Print recall vs each peer bot, by repository and by category, from stored rows."""
+    from mira.quality import history
+
+    owner, repo = _parse_repo(repository) if repository else ("", "")
+    since_ts = _parse_since(since)
+    summary = history.peer_recall_summary(owner=owner, repo=repo, bot=bot, since=since_ts)
+    missed = history.list_missed_peer_threads(
+        owner=owner, repo=repo, bot=bot, since=since_ts, limit=max(0, show_missed)
+    )
+    if output_format == "json":
+        click.echo(json.dumps({**summary, "missed": missed}, indent=2, default=str))
+        return
+    totals = summary["totals"]
+    if not totals["threads"]:
+        click.echo("No peer threads recorded. Run `mira peer-recall scan --repo owner/name`.")
+        return
+    click.echo(
+        f"Recall on addressed peer findings: {totals['addressed_flagged']} / "
+        f"{totals['addressed']} ({_pct(totals['recall'])}); "
+        f"overlap on all threads {totals['flagged']} / {totals['threads']} "
+        f"({_pct(totals['overlap'])})."
+    )
+    click.echo("")
+    click.echo(f"{'bot':<30} {'threads':>7} {'addressed':>9} {'missed':>7} {'recall':>7}")
+    for row in summary["bots"]:
+        click.echo(
+            f"{row['bot']:<30} {row['threads']:>7} {row['addressed']:>9} "
+            f"{row['missed_addressed']:>7} {_pct(row['recall']):>7}"
+        )
+    click.echo("")
+    click.echo(f"{'category':<30} {'threads':>7} {'addressed':>9} {'missed':>7} {'recall':>7}")
+    for row in summary["categories"]:
+        click.echo(
+            f"{row['category']:<30} {row['threads']:>7} {row['addressed']:>9} "
+            f"{row['missed_addressed']:>7} {_pct(row['recall']):>7}"
+        )
+    if not owner and len({(r["owner"], r["repo"]) for r in summary["repos"]}) > 1:
+        click.echo("")
+        click.echo(f"{'repository / bot':<50} {'addressed':>9} {'missed':>7} {'recall':>7}")
+        for row in summary["repos"]:
+            name = f"{row['owner']}/{row['repo']} {row['bot']}"
+            click.echo(
+                f"{name:<50} {row['addressed']:>9} {row['missed_addressed']:>7} "
+                f"{_pct(row['recall']):>7}"
+            )
+    if missed:
+        click.echo("")
+        click.echo("Missed and addressed (newest first):")
+        for item in missed:
+            click.echo(
+                f"  {item['owner']}/{item['repo']}#{item['pr_number']} {item['bot']} "
+                f"{item['path']}:{item['line']} [{item['category']}] {item['title'][:80]}"
+            )
+            if item["url"]:
+                click.echo(f"    {item['url']}")
+
+
 def register(main: click.Group) -> None:
     main.add_command(backtest)
     main.add_command(escaped_bugs_group)
+    main.add_command(peer_recall_group)

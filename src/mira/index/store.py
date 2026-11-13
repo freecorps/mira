@@ -2652,7 +2652,12 @@ class IndexStore(
         self._conn.commit()
 
     def approve_learning_candidate_atomic(
-        self, candidate_id: int, *, actor: str, min_evidence: int
+        self,
+        candidate_id: int,
+        *,
+        actor: str,
+        min_evidence: int,
+        source_signal: str = "feedback_v2",
     ) -> LearnedRuleRow:
         """Approve a candidate and create its rule in one write transaction."""
         now = time.time()
@@ -2701,10 +2706,11 @@ class IndexStore(
                 "status, created_by, version, scope_type, scope_value, origin_candidate_id, "
                 "rationale, evidence_count, effective_from, disabled_at, "
                 "supersedes_rule_id, semantic_fingerprint, created_at, updated_at) "
-                "VALUES (?, 'feedback_v2', ?, ?, ?, 1, 'approved', ?, 1, ?, ?, ?, ?, ?, ?, "
+                "VALUES (?, ?, ?, ?, ?, 1, 'approved', ?, 1, ?, ?, ?, ?, ?, ?, "
                 "NULL, NULL, ?, ?, ?)",
                 (
                     candidate.rule_text,
+                    source_signal,
                     candidate.category,
                     candidate.scope_value if candidate.scope_type == "path" else "",
                     candidate.evidence_count,

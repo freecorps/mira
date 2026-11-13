@@ -32,6 +32,7 @@ from mira.models import (
     MergedPullRequest,
     OpenPRRef,
     PathAuthorship,
+    PeerReviewSnapshot,
     PRInfo,
     ReleaseRef,
     ReviewResult,
@@ -250,6 +251,17 @@ class BaseProvider(abc.ABC):
     ) -> list[HumanReviewComment]:
         """Non-bot line-level review comments, for merge-time learning."""
         return []
+
+    async def get_peer_review_threads(
+        self, pr_info: PRInfo, logins: list[str]
+    ) -> PeerReviewSnapshot | None:
+        """The pull request's state and the review threads ``logins`` opened on it.
+
+        ``None`` means the platform cannot answer, and peer recall skips the
+        repository: only GitHub exposes resolution and outdatedness per thread
+        in a form worth comparing against.
+        """
+        return None
 
     async def get_repo_tree(self, pr_info: PRInfo, ref: str) -> list[str]:
         """Every file path in the repo at a ref, for JIT cross-file context."""

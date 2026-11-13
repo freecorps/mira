@@ -10,6 +10,28 @@ from typing import Any
 # retrieval that treats those rules differently, so both sides agree on it.
 AUTO_ACTOR = "mira-auto"
 
+# ``source_signal`` of a rule that asks the reviewer to *look for* something,
+# as opposed to every other learned rule, which says what not to report.
+# Retrieval renders the two into different prompt sections: a "look for" rule
+# under "Team preferences — respect these" would read as a ban on the very
+# thing it asks for.
+POSITIVE_SIGNAL = "positive_pattern"
+
+# Candidates whose rules are positive once approved: missed peer-bot findings
+# (``mira.quality.peer_learning``) and escaped bugs (``mira.quality.escaped``).
+POSITIVE_SYNTHESIZERS = ("peer-recall-", "escaped-bug-")
+
+
+def is_positive_rule(rule: Any) -> bool:
+    """A "look for …" rule: rendered as an extra check, never as a preference."""
+    return str(getattr(rule, "source_signal", "") or "") == POSITIVE_SIGNAL
+
+
+def is_positive_candidate(candidate: Any) -> bool:
+    version = str(getattr(candidate, "synthesizer_version", "") or "")
+    return version.startswith(POSITIVE_SYNTHESIZERS)
+
+
 _SPECIFICITY = {
     "symbol": 0,
     "path": 1,
@@ -98,6 +120,13 @@ def is_expired_auto_rule(rule: Any, ttl_days: int | None, now: float | None = No
     if not last:
         return False
     return (now or time.time()) - last > ttl_days * 86400
+
+
+def split_rules(rules: list[Any]) -> tuple[list[Any], list[Any]]:
+    """``(preferences, checks)``: what not to report, and what to also look for."""
+    preferences = [rule for rule in rules if not is_positive_rule(rule)]
+    checks = [rule for rule in rules if is_positive_rule(rule)]
+    return preferences, checks
 
 
 def render_rule(rule: Any) -> str:

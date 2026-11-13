@@ -44,6 +44,9 @@ from mira.models import (
     MergedPullRequest,
     OpenPRRef,
     PathAuthorship,
+    PeerReviewSnapshot,
+    PeerReviewThread,
+    PeerThreadComment,
     PRInfo,
     ReviewComment,
     ReviewResult,
@@ -182,6 +185,48 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
 }
 """
 
+# Every review thread with its whole conversation, and the pull request's
+# final state, in one paginated query. Pages of 50: peer bots write long
+# bodies (CodeRabbit's run to several kilobytes) and 100 threads of 20
+# comments each can exceed what GitHub returns in one response.
+_PEER_THREADS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  viewer { login }
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      url
+      title
+      state
+      mergedAt
+      closedAt
+      headRefOid
+      reviewThreads(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          resolvedBy { login }
+          comments(first: 20) {
+            nodes {
+              author { login }
+              body
+              url
+              path
+              line
+              originalLine
+              createdAt
+              originalCommit { oid }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 _RESOLVE_THREAD_MUTATION = """
 mutation($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) {
@@ -224,6 +269,39 @@ def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
             "Expected format: https://github.com/owner/repo/pull/123 or owner/repo#123"
         )
     return match.group("owner"), match.group("repo"), int(match.group("number"))
+
+
+def _peer_thread(node: dict[str, Any], wanted: set[str]) -> PeerReviewThread | None:
+    """A thread whose first comment is by one of ``wanted``, or None."""
+    comments = (node.get("comments") or {}).get("nodes") or []
+    if not comments:
+        return None
+    first = comments[0]
+    author = str((first.get("author") or {}).get("login") or "")
+    if _normalize_login(author) not in wanted:
+        return None
+    return PeerReviewThread(
+        thread_id=str(node.get("id") or ""),
+        author=author,
+        path=str(first.get("path") or ""),
+        line=int(first.get("line") or 0),
+        original_line=int(first.get("originalLine") or first.get("line") or 0),
+        body=str(first.get("body") or ""),
+        url=str(first.get("url") or ""),
+        is_resolved=bool(node.get("isResolved")),
+        is_outdated=bool(node.get("isOutdated")),
+        resolved_by=str((node.get("resolvedBy") or {}).get("login") or ""),
+        original_commit=str((first.get("originalCommit") or {}).get("oid") or ""),
+        created_at=iso_to_epoch(str(first.get("createdAt") or "")),
+        replies=[
+            PeerThreadComment(
+                author=str((reply.get("author") or {}).get("login") or ""),
+                body=str(reply.get("body") or ""),
+                created_at=iso_to_epoch(str(reply.get("createdAt") or "")),
+            )
+            for reply in comments[1:]
+        ],
+    )
 
 
 def _file_to_diff(f: dict[str, Any]) -> str:
@@ -1391,6 +1469,52 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
             sum(1 for t in threads if t.is_resolved),
         )
         return threads
+
+    async def get_peer_review_threads(
+        self, pr_info: PRInfo, logins: list[str]
+    ) -> PeerReviewSnapshot | None:
+        """Threads opened by any of ``logins``, with every reply, and the PR's state."""
+        wanted = {_normalize_login(login) for login in logins if login}
+        snapshot: PeerReviewSnapshot | None = None
+        cursor: str | None = None
+        while True:
+            variables: dict[str, Any] = {
+                "owner": pr_info.owner,
+                "repo": pr_info.repo,
+                "number": pr_info.number,
+                "cursor": cursor,
+            }
+            try:
+                data = await self._graphql_request(_PEER_THREADS_QUERY, variables)
+            except ProviderError:
+                raise
+            except Exception as e:
+                raise ProviderError(f"Failed to fetch review threads: {e}") from e
+            pr = (data.get("repository") or {}).get("pullRequest")
+            if not pr:
+                return None
+            if snapshot is None:
+                state = str(pr.get("state") or "").lower()
+                snapshot = PeerReviewSnapshot(
+                    number=int(pr.get("number") or pr_info.number),
+                    state=state if state in {"open", "closed", "merged"} else "open",
+                    url=str(pr.get("url") or ""),
+                    title=str(pr.get("title") or ""),
+                    head_sha=str(pr.get("headRefOid") or ""),
+                    merged_at=iso_to_epoch(str(pr.get("mergedAt") or "")),
+                    closed_at=iso_to_epoch(str(pr.get("closedAt") or "")),
+                    viewer_login=str((data.get("viewer") or {}).get("login") or ""),
+                )
+            connection = pr.get("reviewThreads") or {}
+            for node in connection.get("nodes") or []:
+                thread = _peer_thread(node, wanted)
+                if thread is not None:
+                    snapshot.threads.append(thread)
+            page = connection.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                break
+            cursor = page.get("endCursor")
+        return snapshot
 
     async def get_file_history(
         self,

@@ -119,7 +119,9 @@ Mira is a self-hostable, fully open-source AI code reviewer. Everything below is
 - Escaped-bug tracking (opt-in): reverts and hotfixes detected on merge and push webhooks, linked to the reviewed pull request by reverted sha, blame (GitHub, GitLab) or diff overlap (Forgejo)
 - Real-world recall — escaped bugs Mira had flagged vs ones it missed — per repository via API and the **Review quality** page; `mira escaped-bugs scan` backfills history
 - Missed escapes become pending, path-scoped learning candidates with the escape as a positive example, inactive until approved
-- See [docs/backtest.md](docs/backtest.md) and [docs/escaped-bugs.md](docs/escaped-bugs.md)
+- Peer recall (on by default, GitHub): every review thread Cursor Bugbot, CodeRabbit, CodeAnt and other configured bots open on a closed pull request Mira reviewed is recorded daily with whether Mira had a finding within 15 lines and whether the author addressed it; recall per bot, week, category and repository on the **Review quality** page and `mira peer-recall report`
+- Positive learning: missed-and-addressed peer findings become "Look for …" rules once two pull requests support the same pattern, accepted automatically under the automatic-rule TTL and budget, and shown to the reviewer as an *Also Check For* section
+- See [docs/backtest.md](docs/backtest.md), [docs/escaped-bugs.md](docs/escaped-bugs.md) and [docs/peer-recall.md](docs/peer-recall.md)
 
 ## Merge gate
 

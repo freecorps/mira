@@ -1,4 +1,4 @@
-import { fetchJson } from "./http"
+import { fetchJson, postJson } from "./http"
 
 // Review-quality measurement: escaped bugs (real-world recall) and stored
 // backtest runs. Admin-only on the server; everything here is read-only —
@@ -106,6 +106,73 @@ export interface BacktestRun {
   results?: BacktestResult[]
 }
 
+// Peer recall: review threads other bots opened on pull requests Mira also
+// reviewed. `recall` is over threads the author addressed; `overlap` over all.
+export interface PeerCounts {
+  threads: number
+  flagged: number
+  addressed: number
+  addressed_flagged: number
+  missed_addressed: number
+  overlap: number | null
+  recall: number | null
+}
+
+export interface PeerRepoRun {
+  platform: string
+  owner: string
+  repo: string
+  prs_examined: number
+  threads: number
+  missed_and_addressed: number
+  learned: number
+  rules_activated: number[]
+  error: string
+  skipped: string
+}
+
+export interface PeerRecallSummary {
+  totals: PeerCounts
+  bots: (PeerCounts & { bot: string })[]
+  repos: (PeerCounts & {
+    platform: string
+    owner: string
+    repo: string
+    bot: string
+  })[]
+  categories: (PeerCounts & { category: string })[]
+  weeks: (PeerCounts & { week: string; bot: string })[]
+  learning: Record<string, number>
+  last_run: {
+    started_at: number
+    finished_at: number
+    trigger: string
+    repos: PeerRepoRun[]
+  } | null
+  running: boolean
+  enabled: boolean
+  positive_learning: boolean
+}
+
+export interface PeerThread {
+  id: string
+  platform: string
+  owner: string
+  repo: string
+  pr_number: number
+  pr_url: string
+  pr_closed_at: number
+  bot: string
+  url: string
+  path: string
+  line: number
+  title: string
+  category: string
+  addressed_reason: string
+  learning_state: string
+  learning_candidate_id: number
+}
+
 function seg(value: string) {
   return encodeURIComponent(value)
 }
@@ -116,6 +183,23 @@ export const qualityApi = {
     fetchJson<{ bugs: EscapedBug[] }>(
       `/api/quality/escaped-bugs?limit=${limit}${flagged ? `&flagged=${flagged}` : ""}`
     ).then((page) => page.bugs),
+  getPeerRecall: (bot = "") =>
+    fetchJson<PeerRecallSummary>(
+      `/api/quality/peer-recall/summary${bot ? `?bot=${encodeURIComponent(bot)}` : ""}`
+    ),
+  listMissedPeerThreads: (bot = "", category = "", limit = 100) => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (bot) params.set("bot", bot)
+    if (category) params.set("category", category)
+    return fetchJson<{ threads: PeerThread[] }>(
+      `/api/quality/peer-recall/missed?${params.toString()}`
+    ).then((page) => page.threads)
+  },
+  runPeerRecall: (owner = "", repo = "") =>
+    postJson<{ started: boolean }>("/api/quality/peer-recall/run", {
+      owner,
+      repo,
+    }),
   listBacktests: (limit = 50) =>
     fetchJson<{ runs: BacktestRun[] }>(
       `/api/quality/backtests?limit=${limit}`

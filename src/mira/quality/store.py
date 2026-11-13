@@ -25,6 +25,7 @@ from typing import Any
 from mira.quality.models import (
     BacktestRun,
     EscapedBug,
+    PeerThread,
     PRBacktest,
     Score,
     ScoredFinding,
@@ -119,6 +120,63 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS idx_quality_escaped_bugs_detected
         ON quality_escaped_bugs(detected_at)
     """,
+    # One row per review thread another bot opened on a pull request Mira
+    # reviewed. Assessment columns are rewritten on every re-scan; the
+    # learning columns only by positive learning, so a re-scan never makes a
+    # thread eligible to be learned from twice.
+    """
+    CREATE TABLE IF NOT EXISTS quality_peer_threads (
+        id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL DEFAULT 'github',
+        owner TEXT NOT NULL DEFAULT '',
+        repo TEXT NOT NULL DEFAULT '',
+        pr_number INTEGER NOT NULL DEFAULT 0,
+        pr_url TEXT NOT NULL DEFAULT '',
+        pr_state TEXT NOT NULL DEFAULT '',
+        pr_closed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+        bot TEXT NOT NULL DEFAULT '',
+        thread_id TEXT NOT NULL DEFAULT '',
+        url TEXT NOT NULL DEFAULT '',
+        path TEXT NOT NULL DEFAULT '',
+        line INTEGER NOT NULL DEFAULT 0,
+        title TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL DEFAULT 'other',
+        body TEXT NOT NULL DEFAULT '',
+        original_commit TEXT NOT NULL DEFAULT '',
+        head_sha TEXT NOT NULL DEFAULT '',
+        addressed INTEGER NOT NULL DEFAULT 0,
+        addressed_reason TEXT NOT NULL DEFAULT '',
+        mira_flagged INTEGER NOT NULL DEFAULT 0,
+        mira_flagged_file INTEGER NOT NULL DEFAULT 0,
+        finding_ids_json TEXT NOT NULL DEFAULT '[]',
+        learning_state TEXT NOT NULL DEFAULT '',
+        learning_candidate_id INTEGER NOT NULL DEFAULT 0,
+        thread_created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+        collected_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_quality_peer_threads_closed
+        ON quality_peer_threads(pr_closed_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_quality_peer_threads_pr
+        ON quality_peer_threads(owner, repo, pr_number)
+    """,
+    # Pull requests already read after they closed, threads or not, so a
+    # daily run does not ask GitHub about the same closed pull request again.
+    """
+    CREATE TABLE IF NOT EXISTS quality_peer_scans (
+        id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL DEFAULT 'github',
+        owner TEXT NOT NULL DEFAULT '',
+        repo TEXT NOT NULL DEFAULT '',
+        pr_number INTEGER NOT NULL DEFAULT 0,
+        pr_state TEXT NOT NULL DEFAULT '',
+        threads INTEGER NOT NULL DEFAULT 0,
+        scanned_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    )
+    """,
 )
 
 _RUN_COLUMNS = (
@@ -139,6 +197,34 @@ _BUG_COLUMNS = (
     "detail_json, detected_at"
 )
 
+_PEER_COLUMNS = (
+    "id, platform, owner, repo, pr_number, pr_url, pr_state, pr_closed_at, bot, thread_id, "
+    "url, path, line, title, category, body, original_commit, head_sha, addressed, "
+    "addressed_reason, mira_flagged, mira_flagged_file, finding_ids_json, learning_state, "
+    "learning_candidate_id, thread_created_at, collected_at"
+)
+
+# Rewritten on every re-scan: what the thread and Mira's findings say now.
+_PEER_ASSESSMENT = (
+    "pr_url",
+    "pr_state",
+    "pr_closed_at",
+    "url",
+    "path",
+    "line",
+    "title",
+    "category",
+    "body",
+    "original_commit",
+    "head_sha",
+    "addressed",
+    "addressed_reason",
+    "mira_flagged",
+    "mira_flagged_file",
+    "finding_ids_json",
+    "collected_at",
+)
+
 _FINDING_COLUMNS = (
     "id, path, start_line, end_line, category, severity, title, body, state, confidence"
 )
@@ -156,7 +242,13 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
-_QUALITY_TABLES = ("quality_backtest_runs", "quality_backtest_results", "quality_escaped_bugs")
+_QUALITY_TABLES = (
+    "quality_backtest_runs",
+    "quality_backtest_results",
+    "quality_escaped_bugs",
+    "quality_peer_threads",
+    "quality_peer_scans",
+)
 
 
 class QualityStoreUnavailable(RuntimeError):
@@ -515,6 +607,191 @@ class QualityStore:
         )
         caught = sum(1 for row in rows if int(row[2] or 0))
         return {"caught": caught, "missed": len(rows) - caught, "total": len(rows)}
+
+    # ---------------------------------------------------------- peer recall
+
+    def upsert_peer_thread(self, thread: PeerThread) -> None:
+        """Insert a peer thread, or refresh its assessment; learning state is kept."""
+        self._require_schema()
+        thread.collected_at = thread.collected_at or time.time()
+        updates = ", ".join(f"{column}=excluded.{column}" for column in _PEER_ASSESSMENT)
+        self._exec(
+            "INSERT INTO quality_peer_threads ("
+            + _PEER_COLUMNS
+            + ") VALUES ("
+            + ", ".join("?" * 27)
+            + f") ON CONFLICT(id) DO UPDATE SET {updates}",
+            (
+                thread.id,
+                thread.platform,
+                self._owner() or thread.owner,
+                self._repo() or thread.repo,
+                int(thread.pr_number),
+                thread.pr_url,
+                thread.pr_state,
+                float(thread.pr_closed_at),
+                thread.bot,
+                thread.thread_id,
+                thread.url,
+                thread.path,
+                int(thread.line),
+                thread.title,
+                thread.category,
+                thread.body,
+                thread.original_commit,
+                thread.head_sha,
+                1 if thread.addressed else 0,
+                thread.addressed_reason,
+                1 if thread.mira_flagged else 0,
+                1 if thread.mira_flagged_file else 0,
+                _dumps(thread.finding_ids),
+                thread.learning_state,
+                int(thread.learning_candidate_id),
+                float(thread.thread_created_at),
+                float(thread.collected_at),
+            ),
+        )
+
+    def set_peer_learning(self, thread_id: str, state: str, candidate_id: int = 0) -> None:
+        self._require_schema()
+        clause, params = self._scope()
+        self._exec(
+            "UPDATE quality_peer_threads SET learning_state = ?, learning_candidate_id = ? "
+            f"WHERE id = ?{clause}",
+            (state, int(candidate_id), thread_id, *params),
+        )
+
+    @staticmethod
+    def _peer_from_row(row: tuple) -> PeerThread:
+        return PeerThread(
+            id=str(row[0]),
+            platform=str(row[1] or "github"),
+            owner=str(row[2] or ""),
+            repo=str(row[3] or ""),
+            pr_number=int(row[4] or 0),
+            pr_url=str(row[5] or ""),
+            pr_state=str(row[6] or ""),
+            pr_closed_at=float(row[7] or 0.0),
+            bot=str(row[8] or ""),
+            thread_id=str(row[9] or ""),
+            url=str(row[10] or ""),
+            path=str(row[11] or ""),
+            line=int(row[12] or 0),
+            title=str(row[13] or ""),
+            category=str(row[14] or "other"),
+            body=str(row[15] or ""),
+            original_commit=str(row[16] or ""),
+            head_sha=str(row[17] or ""),
+            addressed=bool(row[18]),
+            addressed_reason=str(row[19] or ""),
+            mira_flagged=bool(row[20]),
+            mira_flagged_file=bool(row[21]),
+            finding_ids=[str(x) for x in _loads(row[22], [])],
+            learning_state=str(row[23] or ""),
+            learning_candidate_id=int(row[24] or 0),
+            thread_created_at=float(row[25] or 0.0),
+            collected_at=float(row[26] or 0.0),
+        )
+
+    def list_peer_threads(
+        self,
+        *,
+        bot: str = "",
+        category: str = "",
+        flagged: bool | None = None,
+        addressed: bool | None = None,
+        learning_state: str | None = None,
+        since: float = 0.0,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[PeerThread]:
+        """Peer threads on pull requests closed at or after ``since``, newest first."""
+        clause, params = self._scope()
+        where = ["pr_closed_at >= ?"]
+        values: list[Any] = [float(since)]
+        if bot:
+            where.append("bot = ?")
+            values.append(bot)
+        if category:
+            where.append("category = ?")
+            values.append(category)
+        if flagged is not None:
+            where.append("mira_flagged = ?")
+            values.append(1 if flagged else 0)
+        if addressed is not None:
+            where.append("addressed = ?")
+            values.append(1 if addressed else 0)
+        if learning_state is not None:
+            where.append("learning_state = ?")
+            values.append(learning_state)
+        rows = self._query(
+            f"SELECT {_PEER_COLUMNS} FROM quality_peer_threads WHERE {' AND '.join(where)}"
+            f"{clause} ORDER BY pr_closed_at DESC, pr_number DESC, id ASC LIMIT ? OFFSET ?",
+            (*values, *params, int(limit), int(offset)),
+        )
+        return [self._peer_from_row(row) for row in rows]
+
+    def get_peer_thread(self, row_id: str) -> PeerThread | None:
+        clause, params = self._scope()
+        rows = self._query(
+            f"SELECT {_PEER_COLUMNS} FROM quality_peer_threads WHERE id = ?{clause}",
+            (row_id, *params),
+        )
+        return self._peer_from_row(rows[0]) if rows else None
+
+    def peer_scanned(self, platform: str, pr_number: int) -> bool:
+        """Whether this pull request was already read after it closed."""
+        clause, params = self._scope()
+        rows = self._query(
+            f"SELECT 1 FROM quality_peer_scans WHERE id = ?{clause}",
+            (self._scan_id(platform, pr_number), *params),
+        )
+        return bool(rows)
+
+    def _scan_id(self, platform: str, pr_number: int) -> str:
+        return f"{platform}:{self._owner()}/{self._repo()}#{int(pr_number)}"
+
+    def record_peer_scan(
+        self,
+        platform: str,
+        pr_number: int,
+        *,
+        pr_state: str,
+        threads: int,
+        owner: str = "",
+        repo: str = "",
+    ) -> None:
+        self._require_schema()
+        self._exec(
+            "INSERT INTO quality_peer_scans (id, platform, owner, repo, pr_number, pr_state, "
+            "threads, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "pr_state=excluded.pr_state, threads=excluded.threads, scanned_at=excluded.scanned_at",
+            (
+                self._scan_id(platform, pr_number),
+                platform,
+                self._owner() or owner,
+                self._repo() or repo,
+                int(pr_number),
+                pr_state,
+                int(threads),
+                time.time(),
+            ),
+        )
+
+    def reviewed_pr_numbers(self, *, since: float, limit: int = 200) -> list[int]:
+        """Pull requests Mira recorded a review of since ``since``, most recent first."""
+        clause, params = self._scope()
+        try:
+            rows = self._query(
+                "SELECT pr_number, MAX(created_at) AS last_review FROM review_events "
+                f"WHERE created_at >= ?{clause} GROUP BY pr_number "
+                "ORDER BY last_review DESC LIMIT ?",
+                (float(since), *params, int(limit)),
+            )
+        except Exception as exc:  # noqa: BLE001 - an older index has no table yet
+            logger.debug("review_events unavailable: %s", exc)
+            return []
+        return [int(row[0]) for row in rows if int(row[0] or 0) > 0]
 
     # ------------------------------------------- reads of review history
 

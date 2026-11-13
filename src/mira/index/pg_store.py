@@ -2755,7 +2755,12 @@ class PgIndexStore(
         self._commit()
 
     def approve_learning_candidate_atomic(
-        self, candidate_id: int, *, actor: str, min_evidence: int
+        self,
+        candidate_id: int,
+        *,
+        actor: str,
+        min_evidence: int,
+        source_signal: str = "feedback_v2",
     ) -> LearnedRuleRow:
         """Approve a candidate and create its rule in one transaction."""
         now = time.time()
@@ -2805,13 +2810,14 @@ class PgIndexStore(
                         "scope_value, origin_candidate_id, rationale, evidence_count, "
                         "effective_from, disabled_at, supersedes_rule_id, "
                         "semantic_fingerprint, created_at, updated_at) "
-                        "VALUES (%s, %s, %s, 'feedback_v2', %s, %s, %s, 1, 'approved', "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, 1, 'approved', "
                         "%s, 1, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, %s, %s) "
                         "ON CONFLICT DO NOTHING RETURNING id",
                         (
                             self._owner,
                             self._repo,
                             candidate.rule_text,
+                            source_signal,
                             candidate.category,
                             candidate.scope_value if candidate.scope_type == "path" else "",
                             candidate.evidence_count,

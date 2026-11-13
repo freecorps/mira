@@ -3,11 +3,12 @@
 Kept in its own module, like the check and triage settings, so ``mira.config``
 only has to import and mount it.
 
-Both features are off unless asked for. A backtest only ever runs when
+Backtests and escaped bugs are off unless asked for. A backtest only ever runs when
 someone invokes ``mira backtest`` — there is nothing automatic to switch on —
 so its section holds limits rather than a switch. Escaped-bug tracking reacts
 to merge and push webhooks, and so it has an ``enabled`` flag that defaults to
-``False``.
+``False``. Peer recall only reads review threads and so runs by default;
+what it may *change* — positive learned rules — sits behind its own flag.
 """
 
 from __future__ import annotations
@@ -85,6 +86,101 @@ class EscapedBugsConfig(BaseModel):
         """Whether this repository is in scope for escaped-bug tracking."""
         if not self.enabled:
             return False
+        if not self.repos:
+            return True
+        wanted = f"{owner}/{repo}".lower()
+        return any(entry.lower() == wanted for entry in self.repos)
+
+
+# Peer review bots this organisation's pull requests carry, by GitHub login.
+# The first three were measured: across pull requests Mira also reviewed, Mira
+# had a finding within 15 lines of 87 of Cursor Bugbot's 490 threads, 38 of
+# CodeRabbit's 215 and 39 of CodeAnt's 223. The others were present in smaller
+# numbers. A login that never comments costs nothing.
+DEFAULT_PEER_BOTS = (
+    "cursor[bot]",
+    "coderabbitai[bot]",
+    "codeant-ai[bot]",
+    "chatgpt-codex-connector[bot]",
+    "qodo-merge-pro[bot]",
+    "graphite-app[bot]",
+)
+
+
+class PeerRecallConfig(BaseModel):
+    """Recall measured against other review bots, and positive rules learned from it.
+
+    Unlike escaped bugs, which wait for something to be reverted, every review
+    thread another bot opened on a pull request Mira reviewed is a labelled
+    example within a day: either Mira had a finding near it or it did not, and
+    either the author fixed it or they did not. On this organisation's history
+    Mira missed 403 of Cursor Bugbot's 490 threads and the author fixed 297 of
+    those, mostly lifecycle, state-machine and cross-file bugs — exactly what
+    a "do not report X" rule can never teach. See docs/peer-recall.md.
+
+    Reading is GitHub-only (review threads come from its GraphQL API); other
+    platforms are skipped. Collecting reads and stores; nothing is posted.
+    """
+
+    # The scheduler inside ``mira serve``. ``mira peer-recall scan`` and the
+    # dashboard's "Run now" work regardless of it.
+    enabled: bool = True
+    # How often the scheduler collects: once a day at ``hour`` UTC.
+    schedule: str = "daily"
+    hour: int = Field(default=4, ge=0, le=23)
+    # Repositories (``owner/repo``) to cover. Empty means every registered one.
+    repos: list[str] = Field(default_factory=list)
+    bots: list[str] = Field(default_factory=lambda: list(DEFAULT_PEER_BOTS))
+    # Pull requests Mira reviewed in this window, closed or merged, are read.
+    # An open pull request is left for a later run: its threads are not settled.
+    lookback_days: int = Field(default=30, ge=1, le=365)
+    # One GraphQL request per pull request (plus one compare per distinct
+    # commit a thread was opened on, only when a resolved or outdated thread
+    # needs checking); a pull request is read once after it closes.
+    max_prs_per_run: int = Field(default=200, ge=1, le=5000)
+    # A Mira finding in the same file within this many lines of a peer thread
+    # counts as having seen the same issue. 15 is what the measurement above
+    # used: line numbers drift between the commits each bot reviewed.
+    match_line_tolerance: int = Field(default=15, ge=0, le=200)
+    # A resolved or outdated thread counts as addressed only when the code
+    # within this many lines of it changed between the thread's commit and the
+    # merged head. Resolving alone is also how people dismiss bot noise.
+    addressed_line_tolerance: int = Field(default=5, ge=0, le=50)
+
+    # Positive learning: missed-and-addressed threads become "look for …"
+    # rules. Accepted automatically (as ``mira-auto``) only once enough
+    # independent misses support one pattern, so ``learning.auto_rule_ttl_days``
+    # and ``learning.max_auto_rules_per_repo`` govern them like any other
+    # automatic rule.
+    positive_learning: bool = True
+    # Distinct pull requests whose misses must support one pattern before it
+    # becomes active. Two threads on one pull request (two bots on one bug)
+    # count once.
+    min_support: int = Field(default=2, ge=1, le=50)
+    # The synthesiser's own confidence that a miss generalises to a pattern.
+    min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Review-model calls per repository per run: one per missed-and-addressed
+    # thread, each bounded to one diff of at most 6,000 characters.
+    max_syntheses_per_run: int = Field(default=20, ge=0, le=500)
+    # Active positive rules per repository, inside the overall automatic-rule
+    # budget, so "look for" rules cannot crowd out what pushback taught.
+    max_positive_rules_per_repo: int = Field(default=10, ge=1, le=100)
+
+    @field_validator("repos", "bots")
+    @classmethod
+    def _strip(cls, values: list[str]) -> list[str]:
+        return [value.strip() for value in values if value and value.strip()]
+
+    @field_validator("schedule")
+    @classmethod
+    def _schedule(cls, value: str) -> str:
+        value = (value or "daily").strip().lower()
+        if value not in {"daily", "weekly"}:
+            raise ValueError("peer_recall.schedule must be 'daily' or 'weekly'")
+        return value
+
+    def covers(self, owner: str, repo: str) -> bool:
+        """Whether this repository is in scope for peer recall."""
         if not self.repos:
             return True
         wanted = f"{owner}/{repo}".lower()
