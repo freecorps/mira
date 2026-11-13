@@ -43,6 +43,10 @@ class ReviewFinding:
     # For a `grouped` finding, the finding whose comment lists it. Feedback on
     # that comment carries the primary's marker; this is how it reaches here.
     primary_finding_id: str = ""
+    # Shuffled multi-pass review: passes that reported the finding, out of
+    # those that landed (0/0 for a single pass or a pass that does not vote).
+    votes: int = 0
+    vote_passes: int = 0
 
 
 @dataclass

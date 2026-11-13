@@ -164,6 +164,34 @@ def build_security_review_prompt(
     ]
 
 
+def build_system_review_prompt(
+    file_paths: list[str],
+    sections: list[str],
+    pr_title: str = "",
+    pr_description: str = "",
+    learned_checks: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """The whole-PR "what does this break elsewhere" prompt (see core/system_pass.py).
+
+    ``sections`` is the user message, already budgeted by the caller: the
+    changed-file summary, the callers of changed symbols and the hunks that
+    fit. ``file_paths`` is every reviewed path, hunks shown or not, since a
+    finding may land on any of them.
+    """
+    env = _get_template_env()
+    template = env.get_template("system_review.jinja2")
+    system_content = template.render(
+        pr_title=pr_title,
+        pr_description=pr_description,
+        file_paths=file_paths,
+        learned_checks=learned_checks,
+    )
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": "\n\n".join(s for s in sections if s)},
+    ]
+
+
 def build_dependency_review_prompt(
     files: list[FileDiff],
     existing_packages: list[str] | None = None,

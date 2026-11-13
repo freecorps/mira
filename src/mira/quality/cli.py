@@ -110,6 +110,18 @@ def _logging(verbose: bool) -> None:
 )
 @click.option("--output", "output_path", default=None, help="Write the report to this file")
 @click.option("--no-save", is_flag=True, help="Do not store the run for the dashboard")
+@click.option(
+    "--compare-passes",
+    is_flag=True,
+    help="A/B the single-pass review (A) against shuffled voting passes plus the "
+    "whole-PR system pass (B), both from --config",
+)
+@click.option(
+    "--peer-misses",
+    is_flag=True,
+    help="Replay the PRs where peer-recall recorded a thread another bot opened, the "
+    "author addressed and Mira missed (needs a prior `mira peer-recall scan`)",
+)
 @click.option("--verbose", is_flag=True)
 def backtest(
     repository: str,
@@ -129,6 +141,8 @@ def backtest(
     output_format: str,
     output_path: str | None,
     no_save: bool,
+    compare_passes: bool,
+    peer_misses: bool,
     verbose: bool,
 ) -> None:
     """Replay Mira over merged pull requests without posting anything.
@@ -137,6 +151,12 @@ def backtest(
     PR's findings are scored against later human review comments, fix/revert
     commits on the same lines and recorded feedback. With --config-b, both
     configurations review every PR and the report compares them.
+
+    --compare-passes builds that A/B pair from one configuration: one pass
+    against `review.passes` shuffled voting passes plus the system pass.
+    --peer-misses picks the pull requests to replay from the peer-recall
+    scan's missed-and-addressed threads, which are then scored as ground
+    truth (docs/multipass-review.md).
     """
     from mira.quality.backtest import BacktestRunner, Variant
     from mira.quality.report import render_json, render_markdown, render_plan
@@ -148,7 +168,15 @@ def backtest(
 
     config_a = _load(config_path)
     variants = [Variant("A", config_path or "default", config_a)]
-    if config_b_path:
+    if compare_passes:
+        if config_b_path:
+            raise click.UsageError(
+                "--compare-passes builds configuration B itself; drop --config-b"
+            )
+        from mira.quality.multipass_eval import pass_variants
+
+        variants = [Variant(*v) for v in pass_variants(config_a, config_path or "default")]
+    elif config_b_path:
         variants.append(Variant("B", config_b_path, _load(config_b_path)))
 
     limits = config_a.backtest.model_copy()
@@ -169,12 +197,24 @@ def backtest(
 
         from mira.quality.store import open_quality_store
 
+        # --peer-misses reads its PRs (and their ground truth) from the store
+        # even when results are not saved to it.
         store_cm = (
             open_quality_store(owner, repo, resolved_platform)
-            if limits.store_results
+            if limits.store_results or peer_misses
             else nullcontext(None)
         )
         with store_cm as quality_store:
+            selected = numbers
+            if peer_misses:
+                from mira.quality.multipass_eval import peer_miss_prs
+
+                selected = numbers or peer_miss_prs(quality_store, since=since_ts, limit=limit)
+                if not selected:
+                    raise click.ClickException(
+                        "No missed-and-addressed peer threads recorded; run "
+                        "`mira peer-recall scan` first."
+                    )
             runner = BacktestRunner(
                 provider,
                 variants,
@@ -186,7 +226,7 @@ def backtest(
                 quality_store=quality_store,
             )
             plan = await runner.plan(
-                numbers=numbers or None, since=since_ts, limit=len(numbers) or limit
+                numbers=selected or None, since=since_ts, limit=len(selected) or limit
             )
             click.echo(render_plan(plan, variants, limits.max_estimated_cost_usd), err=True)
             if not plan.prs:

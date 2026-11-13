@@ -17,6 +17,10 @@ SIGNAL_FIX_COMMIT = "fix_commit"
 SIGNAL_REVERT = "revert"
 SIGNAL_FEEDBACK_POSITIVE = "feedback_positive"
 SIGNAL_FEEDBACK_NEGATIVE = "feedback_negative"
+# A thread another review bot opened that the author then addressed (see
+# mira.quality.peers): what the peer-recall numbers count as a miss when Mira
+# had nothing there.
+SIGNAL_PEER_ADDRESSED = "peer_addressed"
 
 LABEL_TP = "tp"
 LABEL_FP = "fp"

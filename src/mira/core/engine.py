@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -24,6 +24,16 @@ from mira.core.enclosing import build_enclosing_context
 from mira.core.ensemble import merge_ensemble_runs
 from mira.core.file_filter import filter_files
 from mira.core.grouping import cap_comments, prune_group
+from mira.core.multipass import (
+    drop_unproven,
+    pass_seed,
+    pass_temperature,
+    passes_per_part,
+    run_passes,
+    shuffle_files,
+    vote,
+    vote_audit,
+)
 from mira.core.noise_filter import drop_already_posted, filter_noise
 from mira.core.passes import (
     agentic_review_loop,
@@ -40,6 +50,7 @@ from mira.core.review_instructions import (
     load_repo_instructions,
     provider_reader,
 )
+from mira.core.system_pass import system_review_pass
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
 from mira.exceptions import MiraError, ResponseParseError
@@ -149,6 +160,8 @@ def _build_review_finding(
         prompt_model=prompt_model,
         presentation=presentation,
         primary_finding_id=primary_finding_id,
+        votes=comment.votes,
+        vote_passes=comment.vote_passes,
     )
 
 
@@ -2466,10 +2479,74 @@ class ReviewEngine:
         chunk_failures: list[Exception] = []
         unread_paths: set[str] = set()
 
+        # Shuffled voting passes and the whole-PR system pass, both skipped on
+        # a change too small to gain from them (see core/multipass.py).
+        changed_lines = sum(f.added_lines + f.deleted_lines for f in filtered)
+        min_lines = (
+            self.config.review.multipass_min_changed_lines_incremental
+            if review_round > 1
+            else self.config.review.multipass_min_changed_lines
+        )
+        part_passes = passes_per_part(
+            self.config.review.passes,
+            len(chunks),
+            self.config.review.max_pass_runs,
+            changed_lines,
+            min_lines,
+        )
+        run_system_pass = self.config.review.system_pass and changed_lines >= min_lines
+        audit.append(
+            {
+                "stage": "multipass_plan",
+                "passes": part_passes,
+                "configured_passes": self.config.review.passes,
+                "changed_lines": changed_lines,
+                "min_changed_lines": min_lines,
+                "system_pass": run_system_pass,
+            }
+        )
+
+        async def _voted_passes(
+            idx: int,
+            one_pass: Callable[
+                [int], Coroutine[Any, Any, tuple[list[ReviewComment], list[KeyIssue], str]]
+            ],
+            deadline_at: float | None,
+        ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+            """A part's passes side by side, merged by vote.
+
+            Passes still running shortly before the part's deadline are left
+            out of the vote rather than taking the whole part down with them.
+            """
+            budget = self.config.review.part_deadline_seconds
+            # The last tenth of the budget is left to the vote: a pass that
+            # lands after it would only race the hard deadline for the part.
+            soft = deadline_at - budget * 0.1 if deadline_at is not None and budget else None
+            run = await run_passes(one_pass, part_passes, soft_deadline=soft)
+            runs = [o.result[0] for o in run.landed if o.result is not None]
+            threshold = self.config.review.pass_vote_threshold
+            voted = vote(runs, threshold)
+            drafted = sum(len(r) for r in runs)
+            audit.append(vote_audit(idx, run, threshold, voted, drafted))
+            logger.info(
+                "Review part %d: %d of %d pass(es) landed, %d finding(s) -> %d kept by vote "
+                "(%d single-vote blocker(s) left to the critic)",
+                idx + 1,
+                len(runs),
+                part_passes,
+                drafted,
+                len(voted.kept),
+                voted.single_vote_blockers,
+            )
+            first = run.landed[0].result
+            assert first is not None
+            return voted.kept, first[1], first[2]
+
         async def _review_chunk(
             idx: int,
             chunk: ReviewChunk,
             group_notes: str = "",
+            deadline_at: float | None = None,
         ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
             async with semaphore:
                 logger.info(
@@ -2485,11 +2562,14 @@ class ReviewEngine:
                 part_instructions = repo_instructions.render(f.path for f in chunk.files)
 
                 def _messages(
-                    history: dict, part: str = "", enclosing: str = ""
+                    history: dict,
+                    part: str = "",
+                    enclosing: str = "",
+                    files: list | None = None,
                 ) -> list[dict[str, str]]:
                     shared = "\n\n".join(p for p in (code_context_block, part) if p)
                     return build_review_prompt(
-                        files=chunk.files,
+                        files=chunk.files if files is None else files,
                         config=self.config,
                         pr_title=pr_title,
                         pr_description=pr_description,
@@ -2567,31 +2647,70 @@ class ReviewEngine:
                         parsed.summary or "",
                     )
 
-                raw_response = ""
                 use_agentic = (
                     self.config.review.agentic_tools and self._agentic_source_fetcher is not None
                 )
-                if use_agentic:
-                    from mira.llm.agentic_tools import AgenticToolExecutor
+                chunk_key = "\n".join(f.path for f in chunk.files)
 
-                    executor = AgenticToolExecutor(
-                        source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
-                        repo_tree=list(self._agentic_repo_tree),
-                        graph_tools=review_graph is not None,
-                        code_graph=review_graph,
-                        index_search=self._index_search(),
+                async def _one_pass(
+                    pass_idx: int,
+                ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+                    """One reading of the part; pass 0 is the original order."""
+                    started = time.monotonic()
+                    pass_messages = messages
+                    if pass_idx:
+                        order = shuffle_files(chunk.files, pass_seed(chunk_key, pass_idx))
+                        pass_messages = _messages(chunk_history, part, enclosing, files=order)
+                    temperature = pass_temperature(
+                        self.config.llm.temperature,
+                        self.config.review.pass_temperature_spread,
+                        pass_idx,
+                        part_passes,
                     )
-                    budget = self.config.review.part_deadline_seconds
-                    raw_response = await agentic_review_loop(
-                        self.llm,
-                        messages,
-                        executor,
-                        submit_by=time.monotonic() + budget * 0.6 if budget else None,
-                    )
-                    audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
-                if not raw_response:
-                    raw_response = await self.llm.review(messages)
-                comments, key_issues, summary_text = _parse(raw_response)
+                    raw_response = ""
+                    if use_agentic:
+                        from mira.llm.agentic_tools import AgenticToolExecutor
+
+                        executor = AgenticToolExecutor(
+                            source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                            repo_tree=list(self._agentic_repo_tree),
+                            graph_tools=review_graph is not None,
+                            code_graph=review_graph,
+                            index_search=self._index_search(),
+                        )
+                        budget = self.config.review.part_deadline_seconds
+                        raw_response = await agentic_review_loop(
+                            self.llm,
+                            pass_messages,
+                            executor,
+                            submit_by=time.monotonic() + budget * 0.6 if budget else None,
+                            temperature=temperature,
+                        )
+                        entry: dict = {"stage": "agentic", "chunk": idx, "calls": executor.call_log}
+                        if part_passes > 1:
+                            entry["pass"] = pass_idx
+                        audit.append(entry)
+                    if not raw_response:
+                        raw_response = await (
+                            self.llm.review(pass_messages)
+                            if temperature is None
+                            else self.llm.review(pass_messages, temperature=temperature)
+                        )
+                    parsed = _parse(raw_response)
+                    if part_passes > 1:
+                        logger.info(
+                            "Review part %d pass %d/%d: %d finding(s) in %.1fs",
+                            idx + 1,
+                            pass_idx + 1,
+                            part_passes,
+                            len(parsed[0]),
+                            time.monotonic() - started,
+                        )
+                    return parsed
+
+                if part_passes > 1:
+                    return await _voted_passes(idx, _one_pass, deadline_at)
+                comments, key_issues, summary_text = await _one_pass(0)
 
                 # Ensemble: fire the extra runs in parallel and keep
                 # majority-vote findings. The agentic loop (if any) only
@@ -2660,7 +2779,8 @@ class ReviewEngine:
             budget = self.config.review.part_deadline_seconds
             for attempt in range(self.config.review.chunk_retries + 1):
                 try:
-                    review = _review_chunk(idx, chunk, context)
+                    deadline_at = time.monotonic() + budget if budget else None
+                    review = _review_chunk(idx, chunk, context, deadline_at)
                     return await (asyncio.wait_for(review, budget) if budget else review)
                 except Exception as exc:
                     if isinstance(exc, TimeoutError) and not str(exc):
@@ -2762,7 +2882,57 @@ class ReviewEngine:
                 results.extend(item for group in wave for item in group)
             return [result for _, result in sorted(results, key=lambda item: item[0])]
 
+        async def _system_pass() -> list[ReviewComment]:
+            """The whole-PR pass (core/system_pass.py); never fails the review."""
+            prompt_limit = self.config.llm.max_context_tokens - self._output_reserve()
+            tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
+            # The system prompt and learned checks take a few thousand tokens.
+            budget = min(self.config.review.system_pass_tokens, prompt_limit - tool_room - 6000)
+            reviewed = {f.path for f in filtered}
+
+            async def _callers(char_budget: int) -> str:
+                if blast_radius_task is None:
+                    return ""
+                return render_blast_radius(await blast_radius_task, reviewed, char_budget)
+
+            def _parse(raw: str) -> list[ReviewComment]:
+                return convert_to_review_comments(
+                    parse_llm_response(raw), reviewed, diff_files=filtered
+                )
+
+            make_executor = None
+            if self.config.review.agentic_tools and self._agentic_source_fetcher is not None:
+                from mira.llm.agentic_tools import AgenticToolExecutor
+
+                def make_executor() -> AgenticToolExecutor:
+                    return AgenticToolExecutor(
+                        source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                        repo_tree=list(self._agentic_repo_tree),
+                        graph_tools=review_graph is not None,
+                        code_graph=review_graph,
+                        index_search=self._index_search(),
+                    )
+
+            return await system_review_pass(
+                llm=self.llm,
+                files=filtered,
+                count_tokens=self.llm.count_tokens,
+                token_budget=max(2000, budget),
+                parse=_parse,
+                callers=_callers,
+                pr_title=pr_title,
+                pr_description=pr_description,
+                learned_checks=learned_checks or None,
+                make_executor=make_executor,
+                agentic_loop=agentic_review_loop,
+                deadline_seconds=self.config.review.system_pass_deadline_seconds,
+                audit=audit,
+            )
+
         review_task = _asyncio.create_task(_run_review_groups())
+        system_task = _asyncio.create_task(
+            _system_pass() if run_system_pass else _asyncio.sleep(0, result=[])
+        )
         security_task = _asyncio.create_task(
             security_review_pass(
                 self.llm,
@@ -2825,7 +2995,7 @@ class ReviewEngine:
             self._license_findings(manifest_files, pr_source_fetcher)
         )
 
-        passes = (review_task, security_task, dependency_task, osv_task, license_task)
+        passes = (review_task, security_task, dependency_task, osv_task, license_task, system_task)
         try:
             (
                 chunk_results,
@@ -2833,6 +3003,7 @@ class ReviewEngine:
                 dependency_comments,
                 osv_comments,
                 license_comments,
+                system_comments,
             ) = await _asyncio.gather(*passes)
         except BaseException:
             # gather leaves the other passes running when one fails; they read
@@ -2875,6 +3046,9 @@ class ReviewEngine:
         all_comments.extend(dependency_comments)
         audit.append({"stage": "drafted", "chunk": "osv", "count": len(osv_comments)})
         all_comments.extend(osv_comments)
+        if run_system_pass:
+            audit.append({"stage": "drafted", "chunk": "system", "count": len(system_comments)})
+            all_comments.extend(system_comments)
 
         all_comments = [classify_severity(c) for c in all_comments]
 
@@ -2935,6 +3109,13 @@ class ReviewEngine:
                 )
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
+        # A blocker too few passes voted for stands only on a `proven` grade;
+        # one the critic did not prove (or never graded) goes here.
+        final_comments, unproven = drop_unproven(final_comments)
+        for c in unproven:
+            audit.append(
+                _audit_drop(c, "pass_vote", f"blocker reported by {c.votes} pass(es), not proven")
+            )
         _mark("critique")
 
         if license_comments:

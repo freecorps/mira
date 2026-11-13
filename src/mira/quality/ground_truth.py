@@ -28,6 +28,7 @@ from mira.quality.models import (
     SIGNAL_FEEDBACK_POSITIVE,
     SIGNAL_FIX_COMMIT,
     SIGNAL_HUMAN_COMMENT,
+    SIGNAL_PEER_ADDRESSED,
     SIGNAL_REVERT,
     Signal,
 )
@@ -228,6 +229,30 @@ def feedback_signals(quality_store: Any, pr_number: int) -> list[Signal]:
     return out
 
 
+def peer_signals(quality_store: Any, pr_number: int) -> list[Signal]:
+    """Signals from peer review bots' threads the author addressed on this PR.
+
+    Recorded by the peer-recall scan (docs/peer-recall.md); without one there
+    are none. They are what a recall comparison against the other bots needs:
+    a replay that lands a finding on one has closed a miss.
+    """
+    if quality_store is None or not hasattr(quality_store, "list_peer_threads"):
+        return []
+    threads = quality_store.list_peer_threads(pr_number=int(pr_number), addressed=True, limit=500)
+    return [
+        Signal(
+            kind=SIGNAL_PEER_ADDRESSED,
+            path=t.path,
+            start=int(t.line),
+            end=int(t.line),
+            ref=t.bot,
+            detail=(t.title or "")[:200],
+        )
+        for t in threads
+        if t.path and t.line
+    ]
+
+
 def dedupe(signals: list[Signal]) -> list[Signal]:
     seen: set[tuple[str, str, int, int, bool]] = set()
     out = []
@@ -274,4 +299,8 @@ async def collect_signals(
         signals.extend(feedback_signals(quality_store, pr_info.number))
     except Exception as exc:  # noqa: BLE001
         notes.append(f"stored feedback unavailable: {exc}")
+    try:
+        signals.extend(peer_signals(quality_store, pr_info.number))
+    except Exception as exc:  # noqa: BLE001
+        notes.append(f"peer review threads unavailable: {exc}")
     return dedupe(signals), notes

@@ -226,7 +226,9 @@ CREATE TABLE IF NOT EXISTS review_findings (
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     presentation TEXT NOT NULL DEFAULT 'inline',
-    primary_finding_id TEXT NOT NULL DEFAULT ''
+    primary_finding_id TEXT NOT NULL DEFAULT '',
+    votes INTEGER NOT NULL DEFAULT 0,
+    vote_passes INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_pg_review_findings_comment
@@ -933,6 +935,15 @@ def _get_conn(url: str, *, read_only: bool = False) -> Any:
                 cur.execute(
                     "ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS primary_finding_id "
                     "TEXT NOT NULL DEFAULT ''"
+                )
+                # Vote counts of the shuffled passes; older rows were one pass.
+                cur.execute(
+                    "ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS votes "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                cur.execute(
+                    "ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS vote_passes "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
             _schema_initialized = True
         return _pg_conn
@@ -2042,9 +2053,9 @@ class PgIndexStore(
                 "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
                 "confidence, title, body, suggestion, detector, prompt_model, "
                 "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-                "presentation, primary_finding_id) "
+                "presentation, primary_finding_id, votes, vote_passes) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT(id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, "
                 "review_id=EXCLUDED.review_id, platform_comment_id=EXCLUDED.platform_comment_id, "
                 "platform_thread_id=EXCLUDED.platform_thread_id, state=EXCLUDED.state, "
@@ -2079,6 +2090,8 @@ class PgIndexStore(
                     finding.updated_at,
                     finding.presentation,
                     finding.primary_finding_id,
+                    finding.votes,
+                    finding.vote_passes,
                 ),
             )
         self._commit()
@@ -2155,6 +2168,8 @@ class PgIndexStore(
             updated_at=row[26],
             presentation=row[27],
             primary_finding_id=row[28],
+            votes=int(row[29] or 0),
+            vote_passes=int(row[30] or 0),
         )
 
     def get_review_finding(self, finding_id: str) -> ReviewFinding | None:
@@ -2163,7 +2178,7 @@ class PgIndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id "
+            "presentation, primary_finding_id, votes, vote_passes "
             "FROM review_findings WHERE owner=%s AND repo=%s AND id=%s",
             (self._owner, self._repo, finding_id),
         )
@@ -2199,7 +2214,7 @@ class PgIndexStore(
             "base_sha, head_sha, path, start_line, end_line, symbol, category, severity, "
             "confidence, title, body, suggestion, detector, prompt_model, "
             "platform_comment_id, platform_thread_id, state, created_at, updated_at, "
-            "presentation, primary_finding_id "
+            "presentation, primary_finding_id, votes, vote_passes "
             f"FROM review_findings WHERE {' AND '.join(clauses)} "
             "ORDER BY created_at DESC LIMIT 1",
             tuple(params),

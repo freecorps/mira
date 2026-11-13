@@ -130,6 +130,11 @@ def estimate_review_cost(diff_chars: int, config: Any) -> float:
     capped = min(int(diff_chars), int(getattr(review, "max_diff_size", diff_chars) or diff_chars))
     diff_tokens = capped / _CHARS_PER_TOKEN
     passes = 2 + (1 if getattr(review, "walkthrough", True) else 0)
+    # Shuffled voting passes read every part again; the system pass reads the
+    # whole diff once more (core/multipass.py, core/system_pass.py). Counted
+    # in full: the estimate is meant to be pessimistic.
+    passes += max(0, int(getattr(review, "passes", 1) or 1) - 1)
+    passes += 1 if getattr(review, "system_pass", False) else 0
     input_tokens = diff_tokens * passes + _PROMPT_OVERHEAD_TOKENS
     output_tokens = _OUTPUT_TOKENS_PER_REVIEW
     model = getattr(config.llm, "review_model", "") or config.llm.model

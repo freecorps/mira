@@ -192,6 +192,8 @@ async def test_52_files_complete_in_automatic_waves_with_bounded_concurrency():
     config.review.max_concurrent_chunks = 2
     config.review.max_diff_size = 20
     config.review.max_file_size = 10
+    # Counts the parts' review calls; the whole-PR system pass is one more.
+    config.review.system_pass = False
     model = llm()
     active = peak = 0
 

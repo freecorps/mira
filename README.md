@@ -299,6 +299,26 @@ review:
 `cap_exempt_severity: blocker` lets warnings share the limit too; blockers are
 never held back.
 
+### Several readings, and one of the whole change
+
+Each review part is read by three agentic passes side by side, each with the
+files (and hunks) in another seeded order and a slightly higher temperature; a
+finding is kept when two passes report it, and a blocker only one pass saw is
+kept only if self-critique grades it proven. One more pass reads the whole pull
+request and asks what the change breaks elsewhere — cleanup and lifecycle,
+state transitions, races, callers of changed contracts. Both are skipped on
+small changes, and roughly triple the tokens of the part reviews above that.
+
+```yaml
+review:
+  passes: 3                 # 1 = a single reading per part
+  pass_vote_threshold: 2
+  system_pass: true
+  multipass_min_changed_lines: 30
+```
+
+→ [Voting passes and the system pass](docs/multipass-review.md)
+
 ### Review instructions per directory
 
 A `.mira/REVIEW.md` in any directory carries review instructions for the files

@@ -12,7 +12,7 @@ import html
 import re
 
 from mira.core.grouping import format_also_at
-from mira.feedback.provenance import finding_marker, parse_finding_id
+from mira.feedback.provenance import finding_marker, parse_finding_id, votes_marker
 from mira.models import KeyIssue, PRInfo, ReviewComment, Severity
 
 _CATEGORY_DISPLAY: dict[str, tuple[str, str]] = {
@@ -185,6 +185,8 @@ def format_comment_body(
     parts = []
     if comment.finding_id:
         parts.append(finding_marker(comment.finding_id))
+    if comment.vote_passes > 1:
+        parts.append(votes_marker(comment.votes, comment.vote_passes))
     parts.append(f"**{label}**" + ("  " if badge else ""))
     if badge:
         parts.append(badge)

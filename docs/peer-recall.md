@@ -214,6 +214,16 @@ peer_recall:
 Add any other bot by its exact GitHub login; `[bot]` and case are ignored when
 matching. A login that never comments costs nothing.
 
+## Measuring a change against the misses
+
+The recorded threads are ground truth for [backtests](backtest.md) too, as
+`peer_addressed` signals: `mira backtest --repo owner/name --peer-misses`
+replays the pull requests with a missed-and-addressed thread, and the report's
+*Recall by signal kind* table says how many of those threads each
+configuration's findings landed on. With `--compare-passes` it compares the
+single-pass review with the [shuffled voting passes and the system
+pass](multipass-review.md).
+
 ## Storage
 
 Two tables in each repository's store, created on open on SQLite and on

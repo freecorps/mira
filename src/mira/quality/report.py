@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from mira.quality.models import BacktestRun, VariantSummary
+from mira.quality.multipass_eval import render_recall_by_kind
 
 
 def _pct(value: float | None) -> str:
@@ -53,9 +54,10 @@ def render_markdown(run: BacktestRun) -> str:
         f"{_usd(run.estimated_cost_usd)}, spent {_usd(run.total_cost_usd)}",
         "",
         "Dry run: nothing was posted. Findings are scored against human review comments, "
-        "later fix/revert commits on the same lines, and feedback recorded on Mira's own "
-        "findings. *Strict* precision counts findings with no evidence either way as misses; "
-        "*labelled* precision only counts findings the evidence spoke about.",
+        "later fix/revert commits on the same lines, feedback recorded on Mira's own "
+        "findings and other review bots' threads the author addressed. *Strict* precision "
+        "counts findings with no evidence either way as misses; *labelled* precision only "
+        "counts findings the evidence spoke about.",
         "",
         "## Summary",
         "",
@@ -89,6 +91,10 @@ def render_markdown(run: BacktestRun) -> str:
             f"| Mean latency | {a.mean_latency_ms / 1000:.1f}s | {b.mean_latency_ms / 1000:.1f}s "
             f"| {(b.mean_latency_ms - a.mean_latency_ms) / 1000:+.1f}s |",
         ]
+
+    by_kind = render_recall_by_kind(run.results, int(run.params.get("line_tolerance", 3) or 3))
+    if by_kind:
+        lines += ["", by_kind]
 
     lines += [
         "",

@@ -151,6 +151,16 @@ class ReviewComment:
     # five; each occurrence is still persisted as its own finding, pointing at
     # this one.
     occurrences: list[ReviewComment] = field(default_factory=list)
+    # Shuffled multi-pass review (core/multipass.py): how many of the part's
+    # passes reported this finding, out of how many landed. 0/0 when the part
+    # ran one pass. Persisted with the finding so acceptance can be read per
+    # vote count when tuning `review.pass_vote_threshold`.
+    votes: int = 0
+    vote_passes: int = 0
+    # Set on a blocker that fewer passes than the threshold reported: the vote
+    # alone would drop it, so it is kept only if self-critique grades it
+    # `proven`. Cleared by the critic when it does; never posted.
+    require_proven: bool = False
 
 
 def _format_stats_breakdown(stats: dict[Severity, int]) -> str:
