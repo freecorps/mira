@@ -59,8 +59,11 @@ _FIX_VERBS_ES = r"corregir|arreglar|arregla|arreglarlo|arreglalo|aplicar"
 _IMPERATIVE_RE = re.compile(
     r"^(?:(?:please|pls|ok|okay|por\s+favor|então|entao|beleza),?\s+)?"
     r"(?:(?:fix|patch)\s+(?:this|that|it|the|these|those|them|all|everything|my|our|its)\b"
-    r"|(?:corrige|corrija|corrigir|conserta|conserte|consertar|arruma|arrume|arrumar|"
-    r"arregla|arreglar)\b)",
+    # Every verb form the request lists hold, minus "resolver": "resolve" opens
+    # the existing resolve command, and as an opening it is not a code change.
+    r"|(?:corrige|corrija|corrijam|corrigir|conserta|conserte|consertar|arruma|arrume|"
+    r"arrumar|ajusta|ajuste|ajustar|aplica|aplique|aplicar|fixa|fixar|"
+    r"corregir|arregla|arreglar|arreglalo|arréglalo)\b)",
     re.IGNORECASE,
 )
 _REQUEST_RE = re.compile(
