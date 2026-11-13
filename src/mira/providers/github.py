@@ -1703,6 +1703,10 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
                 return []
             gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             kept: deque[ConversationMessage] = deque(maxlen=limit)
+            if not comment_id and thread_id:
+                # A review thread is found from one of its comments; a thread
+                # id alone would otherwise read as "the PR conversation".
+                return []
             if not comment_id:
                 for comment in gh_repo.get_issue(pr_info.number).get_comments():
                     kept.append(_message(comment))
