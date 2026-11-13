@@ -38,6 +38,7 @@ from mira.models import (
     BotThreadRecord,
     CIJobFailure,
     CommitInfo,
+    ConversationMessage,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
@@ -529,6 +530,56 @@ class GitLabProvider(GitLabDeliveryMixin, BaseProvider):
                 if str(note.get("id")) == str(comment_node_id):
                     return str(disc["id"])
         return None
+
+    async def get_conversation(
+        self,
+        pr_info: PRInfo,
+        *,
+        comment_id: str | int = "",
+        thread_id: str = "",
+        limit: int = 50,
+    ) -> list[ConversationMessage]:
+        """The merge request's notes, or one discussion's, oldest first.
+
+        System notes ("added 1 commit", label changes) are not conversation
+        and are left out, and so are diff notes from the merge request's own
+        conversation: those belong to their discussions. Best-effort.
+        """
+        if limit <= 0:
+            return []
+        try:
+            me = await self._self_username()
+            if comment_id and not thread_id:
+                thread_id = await self.get_thread_id_for_comment(str(comment_id), pr_info) or ""
+                if not thread_id:
+                    return []
+            if thread_id:
+                resp = await self._request("GET", f"{self._mr(pr_info)}/discussions/{thread_id}")
+                notes = resp.json().get("notes", []) or []
+            else:
+                notes = await self._paginate(
+                    f"{self._mr(pr_info)}/notes?sort=asc&order_by=created_at"
+                )
+                notes = [n for n in notes if not (n.get("type") == "DiffNote" or n.get("position"))]
+        except Exception as exc:  # noqa: BLE001 — chat answers without memory
+            logger.debug("Could not read the conversation on %s: %s", pr_info.url, exc)
+            return []
+        out: list[ConversationMessage] = []
+        for note in notes:
+            if note.get("system"):
+                continue
+            author = (note.get("author") or {}).get("username", "") or ""
+            out.append(
+                ConversationMessage(
+                    author=author,
+                    body=note.get("body") or "",
+                    is_bot=bool(me) and author == me,
+                    comment_id=str(note.get("id", "")),
+                    created_at=str(note.get("created_at") or ""),
+                )
+            )
+        out.sort(key=lambda m: m.created_at)
+        return out[-limit:]
 
     async def get_human_review_comments(
         self, pr_info: PRInfo, bot_login: str

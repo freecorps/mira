@@ -1814,15 +1814,9 @@ class ReviewEngine:
         pr_info = getattr(self, "_pr_info", None)
         if pr_info is None or not getattr(self, "_index_searchable", False):
             return None
+        from mira.llm.agentic_tools import index_search_for
 
-        def _search(query: str, limit: int) -> list[IndexMatch]:
-            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
-            try:
-                return store.search_index(query, limit)
-            finally:
-                store.close()
-
-        return _search
+        return index_search_for(pr_info.owner, pr_info.repo, pr_info.platform)
 
     async def _license_findings(self, manifest_files: list, source_fetcher: Any) -> list:
         """Findings for added dependencies whose license breaks ``licenses``. Never raises.

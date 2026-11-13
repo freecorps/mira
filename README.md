@@ -330,6 +330,7 @@ Comment on the pull request:
 | `@mira full review` | Review the whole pull request from scratch — after a force-push or a rebase. |
 | `@mira review-rest` | Cover the files a previous review left unread. |
 | `@mira help` | List every command. |
+| `@mira <question>` | Ask anything about the pull request, in any language. Mira reads the repository at the head and the conversation so far, and cites the `path:line` it checked. → [Chat](docs/chat.md) |
 
 On GitHub, the **Re-run** button on the `mira/review` check does the same as
 `@mira review`. Use either when a check looks stuck: there is no need to close

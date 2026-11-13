@@ -1572,6 +1572,46 @@ class IssuePlannerConfig(BaseModel):
         return [label.strip() for label in v if label and label.strip()]
 
 
+class ChatConfig(BaseModel):
+    """``@mira <question>`` on a pull request: how Mira answers. See docs/chat.md.
+
+    A question used to be answered from the diff alone in one call, so
+    "where else is this called?" or "does the caller already validate it?"
+    could only be guessed at. The answer now comes from a short tool loop on
+    the review model, over the same read-only repository tools a review uses,
+    at the pull request's head, with the conversation so far in view.
+
+      agentic           — answer with the repository tools; off, the answer
+                          is one call over the diff and the conversation
+      max_hops          — model turns the loop may take, lookups included;
+                          the last one is told to answer (2-12)
+      deadline_seconds  — wall clock for the whole loop; past 60% of it the
+                          next turn is told to answer, and at the deadline
+                          the one-shot answer runs instead (15-600)
+      max_answer_chars  — the posted answer is cut here, at a paragraph
+                          boundary where one is close (500-60000)
+      max_diff_chars    — how much of the diff goes into the prompt; the rest
+                          is still readable with ``read_file`` (2000-200000)
+      history_messages  — earlier messages of the same conversation shown,
+                          newest kept, oldest first (0 turns memory off)
+      history_chars     — total size of that history; each message is also
+                          cut at 1500 characters
+      autofix_handoff   — a chat message asking Mira to change code ("fix
+                          this", "pode corrigir?") goes to ``@mira fix``
+                          instead of being answered; off, it is answered
+                          like any other question
+    """
+
+    agentic: bool = True
+    max_hops: int = Field(default=6, ge=2, le=12)
+    deadline_seconds: float = Field(default=120.0, ge=15.0, le=600.0)
+    max_answer_chars: int = Field(default=6000, ge=500, le=60_000)
+    max_diff_chars: int = Field(default=40_000, ge=2_000, le=200_000)
+    history_messages: int = Field(default=20, ge=0, le=100)
+    history_chars: int = Field(default=12_000, ge=0, le=60_000)
+    autofix_handoff: bool = True
+
+
 class LicensesConfig(BaseModel):
     """License policy for the dependencies a pull request adds. See docs/sbom-licenses.md.
 
@@ -1869,6 +1909,7 @@ class MiraConfig(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     pr_summary: PRSummaryConfig = Field(default_factory=PRSummaryConfig)
     issue_planner: IssuePlannerConfig = Field(default_factory=IssuePlannerConfig)
+    chat: ChatConfig = Field(default_factory=ChatConfig)
     licenses: LicensesConfig = Field(default_factory=LicensesConfig)
     digests: DigestsConfig = Field(default_factory=DigestsConfig)
     analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
