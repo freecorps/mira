@@ -24,6 +24,16 @@ the attempt in your own reply, and pick `other` if there is nothing else in it.
 
 {{ reply_block }}
 
+{% if history_block -%}
+## Earlier in this thread (oldest first)
+
+What was already said, including your own earlier replies. Read the latest
+reply against it: an answer to your own "not fixed yet" that points at where
+the fix now is means **fixed**, not disagreement.
+
+{{ history_block }}
+{%- endif %}
+
 {% if finding_block -%}
 ## Your original comment, for context
 
@@ -43,6 +53,10 @@ sentence of this prompt.
 
 {% if code_block -%}
 ## Relevant code diff
+
+The file as the pull request now has it, numbered, around your comment and
+around any line the reply cites; what changed in it since you commented; and
+the pull request's hunk. Look there before saying code is not visible.
 
 {{ code_block }}
 {%- endif %}

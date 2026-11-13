@@ -85,9 +85,9 @@ class TestExtractIssueDescription:
         assert "Agent" not in result
 
     def test_truncates_long_descriptions(self):
-        body = "A" * 500
+        body = "A" * 2000
         result = _extract_issue_description(body)
-        assert len(result) <= 301  # 300 + ellipsis char
+        assert len(result) <= 1201  # 1200 + ellipsis char
 
     def test_empty_body(self):
         result = _extract_issue_description("")

@@ -2196,6 +2196,15 @@ class PgIndexStore(
             )
         self._commit()
 
+    def set_feedback_v2_rationale(self, event_id: int, rationale: str) -> None:
+        """Record what Mira actually replied, once the reply is posted."""
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE feedback_events_v2 SET rationale=%s WHERE owner=%s AND repo=%s AND id=%s",
+                (rationale, self._owner, self._repo, event_id),
+            )
+        self._commit()
+
     def record_feedback_v2(self, event: FeedbackEventV2) -> tuple[FeedbackEventV2, bool]:
         if not event.source_event_id:
             raise ValueError("source_event_id is required for idempotent feedback")
