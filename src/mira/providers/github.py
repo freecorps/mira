@@ -1707,12 +1707,23 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
                 # A review thread is found from one of its comments; a thread
                 # id alone would otherwise read as "the PR conversation".
                 return []
-            if not comment_id:
+
+            def _issue_comments() -> list[ConversationMessage]:
                 for comment in gh_repo.get_issue(pr_info.number).get_comments():
                     kept.append(_message(comment))
                 return list(kept)
+
+            if not comment_id:
+                return _issue_comments()
             pr = gh_repo.get_pull(pr_info.number)
-            anchor = pr.get_review_comment(int(comment_id))
+            try:
+                anchor = pr.get_review_comment(int(comment_id))
+            except GithubException as exc:
+                # Not a review comment: an id from the PR conversation names
+                # an issue comment, and that conversation is the history.
+                if getattr(exc, "status", None) != 404:
+                    raise
+                return _issue_comments()
             root = getattr(anchor, "in_reply_to_id", None) or anchor.id
             for comment in pr.get_review_comments():
                 if comment.id == root or getattr(comment, "in_reply_to_id", None) == root:
