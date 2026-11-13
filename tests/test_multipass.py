@@ -341,6 +341,16 @@ def test_system_input_lists_every_file_and_fits_hunks_to_the_budget():
     assert "`def f1():`" in shaped.summary
 
 
+def test_system_input_cuts_the_callers_to_the_budget():
+    tokens = lambda text: (len(text) + 3) // 4  # noqa: E731
+    callers = "\n".join(f"- caller {n} in src/x{n}.py" for n in range(400))
+    shaped = build_system_input(
+        [file("src/small.py", starts=(1,))], tokens, token_budget=300, callers=callers
+    )
+    assert tokens(shaped.summary) + tokens(shaped.callers) <= 300
+    assert "callers cut to fit" in shaped.callers
+
+
 async def test_system_pass_failure_costs_only_its_findings():
     model = MagicMock()
     model.review = AsyncMock(side_effect=RuntimeError("boom"))

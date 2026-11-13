@@ -2059,7 +2059,8 @@ class PgIndexStore(
                 "ON CONFLICT(id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, "
                 "review_id=EXCLUDED.review_id, platform_comment_id=EXCLUDED.platform_comment_id, "
                 "platform_thread_id=EXCLUDED.platform_thread_id, state=EXCLUDED.state, "
-                "updated_at=EXCLUDED.updated_at",
+                "updated_at=EXCLUDED.updated_at, votes=EXCLUDED.votes, "
+                "vote_passes=EXCLUDED.vote_passes",
                 (
                     finding.id,
                     finding.fingerprint,

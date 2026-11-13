@@ -76,6 +76,22 @@ def _summary_line(f: FileDiff, shown: bool) -> str:
     return line
 
 
+def _fit(text: str, budget: int, count_tokens: Callable[[str], int]) -> str:
+    """``text`` cut at a line boundary to fit ``budget`` tokens, saying so."""
+    if not text or count_tokens(text) <= budget:
+        return text
+    note = "\n… (callers cut to fit the budget; find_usages has the rest)"
+    lines = text.split("\n")
+    lo, hi = 0, len(lines)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if count_tokens("\n".join(lines[:mid]) + note) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return "\n".join(lines[:lo]) + note if lo else ""
+
+
 def build_system_input(
     files: list[FileDiff],
     count_tokens: Callable[[str], int],
@@ -94,9 +110,11 @@ def build_system_input(
     used = 0
     shown: list[FileDiff] = []
     hunks: list[str] = []
-    # The summary and the callers come out of the same budget, estimated with
-    # every file marked shown (the longer form is the shorter by a few words).
-    head = "\n".join(_summary_line(f, True) for f in ranked)
+    # The summary and the callers come out of the same budget, estimated in
+    # its longest form — every file marked "hunks not shown" — so the summary
+    # written at the end can only be shorter than what was reserved for it.
+    head = "## Changed files\n\n" + "\n".join(_summary_line(f, False) for f in ranked)
+    callers = _fit(callers, max(0, token_budget - count_tokens(head)), count_tokens)
     used += count_tokens(head) + count_tokens(callers)
     for f in ranked:
         block = build_file_context_string(f)
