@@ -1511,9 +1511,10 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
                 if thread is not None:
                     snapshot.threads.append(thread)
             page = connection.get("pageInfo") or {}
-            if not page.get("hasNextPage"):
-                break
             cursor = page.get("endCursor")
+            # A next page with no cursor would request this page again forever.
+            if not page.get("hasNextPage") or not cursor:
+                break
         return snapshot
 
     async def get_file_history(

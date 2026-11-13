@@ -235,13 +235,20 @@ async def peer_recall_run(body: PeerRecallRun, request: Request) -> dict:
     if peer_runtime.is_running() or (_peer_task is not None and not _peer_task.done()):
         raise HTTPException(status_code=409, detail="A peer-recall run is already in progress")
     only = (_safe(body.owner, "owner"), _safe(body.repo, "repo")) if body.owner else None
-    _peer_task = asyncio.create_task(
-        peer_runtime.run_all(
-            load_config(),
-            db=_app_db,
-            provider_for=provider_factory(auths_from_env()),
-            trigger="manual",
-            only=only,
-        )
-    )
+
+    async def _run() -> None:
+        # Fire-and-forget: a failure outside run_all's per-repository guard
+        # would otherwise surface only as an unretrieved-exception warning.
+        try:
+            await peer_runtime.run_all(
+                load_config(),
+                db=_app_db,
+                provider_for=provider_factory(auths_from_env()),
+                trigger="manual",
+                only=only,
+            )
+        except Exception:
+            logger.exception("Manual peer-recall run failed")
+
+    _peer_task = asyncio.create_task(_run())
     return {"started": True}

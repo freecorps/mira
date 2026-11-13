@@ -737,6 +737,16 @@ def test_rewording_a_positive_rule_keeps_its_own_evidence_floor() -> None:
             scope_type="org",
             scope_value="acme",
         )
+    # …and so does moving it within the same scope type.
+    with pytest.raises(ValueError):
+        version_rule(
+            store,
+            1,
+            rule_text="Look for thing.",
+            category="bug",
+            scope_type="repo",
+            scope_value="acme/other",
+        )
     # A negative rule with the same evidence cannot be reworded at repo scope.
     negative = _rule("feedback_v2", "Do not flag x.")
     store.get_learned_rule = lambda _id: negative
