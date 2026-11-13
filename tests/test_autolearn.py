@@ -398,3 +398,21 @@ async def test_reset_starts_learning_from_zero(tmp_path, monkeypatch) -> None:
         _llm(_DISAGREE, _PREMISE_WRONG),
     )
     assert "Learned rule #" in provider.reply_to_review_comment.await_args.args[2]
+
+
+def test_reset_skips_a_database_it_cannot_read(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    store = IndexStore.open("acme", "app")
+    store.create_learned_rule(
+        rule_text="learned",
+        category="bug",
+        source_signal="feedback_v2",
+        status="approved",
+        scope_type="repo",
+        scope_value="acme/app",
+    )
+    store.close()
+    broken = tmp_path / "acme" / "broken.db"
+    broken.write_bytes(b"not a database")
+
+    assert reset_learning_org_wide_sqlite()["rules_archived"] == 1

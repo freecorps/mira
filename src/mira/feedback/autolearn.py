@@ -172,7 +172,7 @@ def thread_history(events: list[FeedbackEventV2], current_id: int, limit: int = 
     lines: list[str] = []
     for event in earlier:
         lines.append(f"human (@{event.actor or 'unknown'}): {event.raw_text.strip()[:1200]}")
-        if event.rationale and not event.source_event_id.startswith("recheck:"):
+        if event.rationale and not (event.source_event_id or "").startswith("recheck:"):
             lines.append(f"mira: {event.rationale.strip()[:800]}")
     return "\n".join(lines)
 

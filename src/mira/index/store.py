@@ -3890,20 +3890,36 @@ def reset_learning_org_wide_sqlite(include_manual: bool = False) -> dict[str, in
     index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
     delete_sql, archive_sql = _reset_learning_sql(include_manual, "?")
     totals = {"candidates_deleted": 0, "rules_archived": 0}
+    rule_columns = {"status", "origin_candidate_id", "disabled_at"}
+    if not include_manual:
+        rule_columns.add("source_signal")
     for _platform, _owner, _repo, db_path in _iter_repo_dbs(index_dir):
-        conn = sqlite3.connect(db_path)
+        # One unreadable or pre-governance database must not stop the rest:
+        # a reset that stops halfway leaves some repositories learning from
+        # the old rules and the others from none.
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error as exc:
+            logger.warning("Learning reset skipped %s: %s", db_path, exc)
+            continue
         try:
             tables = {
                 row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
             now = time.time()
+            archived = deleted = 0
             if "learned_rules" in tables:
                 cols = {row[1] for row in conn.execute("PRAGMA table_info(learned_rules)")}
-                if {"status", "origin_candidate_id", "disabled_at"}.issubset(cols):
-                    totals["rules_archived"] += conn.execute(archive_sql, (now, now)).rowcount
+                if rule_columns.issubset(cols):
+                    archived = conn.execute(archive_sql, (now, now)).rowcount
             if "learning_candidates" in tables:
-                totals["candidates_deleted"] += conn.execute(delete_sql).rowcount
+                deleted = conn.execute(delete_sql).rowcount
             conn.commit()
+            totals["rules_archived"] += archived
+            totals["candidates_deleted"] += deleted
+        except sqlite3.Error as exc:
+            conn.rollback()
+            logger.warning("Learning reset skipped %s: %s", db_path, exc)
         finally:
             conn.close()
     return totals
