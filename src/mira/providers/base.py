@@ -25,6 +25,7 @@ from mira.models import (
     CIJobFailure,
     CommitChurn,
     CommitInfo,
+    ConversationMessage,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
@@ -337,6 +338,24 @@ class BaseProvider(abc.ABC):
     async def get_discussion_root_body(self, pr_info: PRInfo, discussion_id: str) -> str:
         """The first comment of a thread/discussion (best-effort, "" on failure)."""
         return ""
+
+    async def get_conversation(
+        self,
+        pr_info: PRInfo,
+        *,
+        comment_id: str | int = "",
+        thread_id: str = "",
+        limit: int = 50,
+    ) -> list[ConversationMessage]:
+        """The messages of one conversation on a pull request, oldest first.
+
+        With neither ``comment_id`` nor ``thread_id``, the pull request's own
+        conversation (its top-level comments). With one of them, the review
+        thread that comment or discussion belongs to. At most ``limit``
+        messages, the newest kept. Best-effort: a provider that cannot read
+        the conversation returns ``[]`` and the chat answers without memory.
+        """
+        return []
 
     # ── Merge gate (Phase 4) ──
     #

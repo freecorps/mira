@@ -44,6 +44,7 @@ READ_METHODS: frozenset[str] = frozenset(
         "get_file_history",
         "get_comment_body",
         "get_discussion_root_body",
+        "get_conversation",
         "get_label_change_stats",
         "gate_capabilities",
         "get_ci_state",

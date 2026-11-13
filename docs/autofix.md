@@ -98,6 +98,13 @@ the reason when policy does not allow it:
 
 Leading dashes are optional: `fix on-branch` works too.
 
+The same request in words reaches the same path: "can you fix it?" or "pode
+corrigir?" in a reply to one of Mira's review comments is `@mira fix` on that
+finding, and "fix all of them" / "corrige tudo" on the pull request is
+`@mira fix all`. Only the requester's own words count, the checks below apply
+unchanged, and `chat.autofix_handoff: false` turns this off. See
+[chat](chat.md#asking-mira-to-change-code).
+
 The reply always says what happened — accepted, refused, or partly both. A
 request that produces silence is worse than one that is turned down, because
 nobody can tell it apart from a broken webhook.

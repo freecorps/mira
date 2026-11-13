@@ -42,6 +42,7 @@ from mira.models import (
     BotThreadRecord,
     CIJobFailure,
     CommitInfo,
+    ConversationMessage,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
@@ -428,6 +429,43 @@ class ForgejoProvider(ForgejoDeliveryMixin, BaseProvider):
             return (resp.json().get("body") or "")[:1500]
         except Exception:
             return ""
+
+    async def get_conversation(
+        self,
+        pr_info: PRInfo,
+        *,
+        comment_id: str | int = "",
+        thread_id: str = "",
+        limit: int = 50,
+    ) -> list[ConversationMessage]:
+        """The pull request's comments, oldest first.
+
+        Review threads come back empty: Forgejo has no threaded replies, and
+        Mira's answer to a review comment is already posted on the pull
+        request's own conversation, which is what this reads. Best-effort.
+        """
+        if comment_id or thread_id or limit <= 0:
+            return []
+        try:
+            me = await self._self_username()
+            comments = await self._paginate(
+                f"{self._repo(pr_info)}/issues/{pr_info.number}/comments"
+            )
+        except Exception as exc:  # noqa: BLE001 — chat answers without memory
+            logger.debug("Could not read the conversation on %s: %s", pr_info.url, exc)
+            return []
+        out = [
+            ConversationMessage(
+                author=(c.get("user") or {}).get("login", "") or "",
+                body=c.get("body") or "",
+                is_bot=bool(me) and (c.get("user") or {}).get("login", "") == me,
+                comment_id=str(c.get("id", "")),
+                created_at=str(c.get("created_at") or ""),
+            )
+            for c in comments
+        ]
+        out.sort(key=lambda m: m.created_at)
+        return out[-limit:]
 
     async def reply_to_review_comment(self, pr_info: PRInfo, comment_id: int, body: str) -> None:
         """Reply to a review comment — Forgejo doesn't support threaded replies."""

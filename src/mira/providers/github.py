@@ -37,6 +37,7 @@ from mira.models import (
     BotThreadRecord,
     CIJobFailure,
     CommitInfo,
+    ConversationMessage,
     FileChangeStat,
     FileHistoryEntry,
     HumanReviewComment,
@@ -1668,6 +1669,57 @@ class GitHubProvider(GitHubDeliveryMixin, BaseProvider):
                 *[_fetch_one(client, p) for p in paths], return_exceptions=False
             )
         return {path: entries for path, entries in results if entries}
+
+    async def get_conversation(
+        self,
+        pr_info: PRInfo,
+        *,
+        comment_id: str | int = "",
+        thread_id: str = "",
+        limit: int = 50,
+    ) -> list[ConversationMessage]:
+        """The pull request's comments, or one review thread's, oldest first.
+
+        A review thread on GitHub is its root comment plus every reply, and a
+        reply's ``in_reply_to_id`` always names the root, so the thread is
+        found from any comment in it. Best-effort: ``[]`` on any failure.
+        """
+        from collections import deque
+
+        def _message(comment: Any) -> ConversationMessage:
+            user = comment.user
+            login = (user.login if user else "") or ""
+            created = getattr(comment, "created_at", None)
+            return ConversationMessage(
+                author=login,
+                body=comment.body or "",
+                is_bot=bool(user and (user.type or "") == "Bot") or login.endswith("[bot]"),
+                comment_id=str(comment.id),
+                created_at=epoch_to_iso(created.timestamp()) if created else "",
+            )
+
+        def _fetch() -> list[ConversationMessage]:
+            if limit <= 0:
+                return []
+            gh_repo = self._github.get_repo(f"{pr_info.owner}/{pr_info.repo}")
+            kept: deque[ConversationMessage] = deque(maxlen=limit)
+            if not comment_id:
+                for comment in gh_repo.get_issue(pr_info.number).get_comments():
+                    kept.append(_message(comment))
+                return list(kept)
+            pr = gh_repo.get_pull(pr_info.number)
+            anchor = pr.get_review_comment(int(comment_id))
+            root = getattr(anchor, "in_reply_to_id", None) or anchor.id
+            for comment in pr.get_review_comments():
+                if comment.id == root or getattr(comment, "in_reply_to_id", None) == root:
+                    kept.append(_message(comment))
+            return list(kept)
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as exc:  # noqa: BLE001 — chat answers without memory
+            logger.debug("Could not read the conversation on %s: %s", pr_info.url, exc)
+            return []
 
     async def get_human_review_comments(
         self, pr_info: PRInfo, bot_login: str

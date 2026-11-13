@@ -301,6 +301,27 @@ def _grep_files(
     return hits, scanned
 
 
+def index_search_for(
+    owner: str, repo: str, platform: str = "github"
+) -> Callable[[str, int], list[IndexMatch]]:
+    """A blocking search over a repository's index, for ``grep_index``.
+
+    Opens the store per call: the executor runs it in a thread, and a store
+    handle is not something to share across threads.
+    """
+
+    def _search(query: str, limit: int) -> list[IndexMatch]:
+        from mira.index.store import IndexStore
+
+        store = IndexStore.open(owner, repo, platform=platform)
+        try:
+            return store.search_index(query, limit)
+        finally:
+            store.close()
+
+    return _search
+
+
 @dataclass
 class AgenticToolExecutor:
     """Per-review tool dispatcher with caching and an output-size budget.

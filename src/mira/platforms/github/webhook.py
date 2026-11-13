@@ -1022,6 +1022,7 @@ async def handle_comment(
             bot_name,
             pr_title=payload["issue"].get("title", ""),
             bot_identity=await app_auth.get_bot_identity(),
+            comment_id=str(payload["comment"].get("id", "") or ""),
         )
     except Exception:
         logger.exception("Error handling comment event")

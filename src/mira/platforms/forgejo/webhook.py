@@ -494,6 +494,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             bot_name,
             platform="forgejo",
             bot_identity=await auth.get_bot_identity(),
+            comment_id=str(comment.get("id", "") or ""),
         )
     except Exception:
         logger.exception(

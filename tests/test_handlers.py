@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mira.config import MiraConfig
 from mira.models import PRInfo, ReviewComment, ReviewResult, Severity
 from mira.platforms.github.webhook import (
     handle_comment,
@@ -286,7 +287,11 @@ async def test_handle_comment_question(
     mock_pr_info: PRInfo,
 ) -> None:
     """A question triggers conversational reply via llm.complete(json_mode=False)."""
-    mock_config.return_value = MagicMock()
+    # With `chat.agentic` off a question is one call over the diff; the tool
+    # loop is covered in tests/test_pr_chat.py.
+    config = MiraConfig()
+    config.chat.agentic = False
+    mock_config.return_value = config
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="Because of the nested loop.")
     mock_llm_cls.return_value = mock_llm
@@ -318,7 +323,11 @@ async def test_handle_comment_formats_reply_with_attribution(
     mock_pr_info: PRInfo,
 ) -> None:
     """Reply includes '> @user asked:' attribution prefix."""
-    mock_config.return_value = MagicMock()
+    # With `chat.agentic` off a question is one call over the diff; the tool
+    # loop is covered in tests/test_pr_chat.py.
+    config = MiraConfig()
+    config.chat.agentic = False
+    mock_config.return_value = config
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value="It's an O(n^2) loop.")
     mock_llm_cls.return_value = mock_llm

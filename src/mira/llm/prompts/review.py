@@ -243,24 +243,76 @@ def build_walkthrough_prompt(
     ]
 
 
+def _clip_diff(diff_text: str, max_chars: int) -> str:
+    """The diff cut at a file boundary near ``max_chars``, saying what was cut."""
+    if len(diff_text) <= max_chars:
+        return diff_text
+    head = diff_text[:max_chars]
+    cut = head.rfind("\ndiff --git ")
+    if cut > max_chars // 2:
+        head = head[:cut]
+    left = diff_text[len(head) :].count("diff --git ")
+    return (
+        head.rstrip()
+        + f"\n\n[diff cut here for length: {left} more file(s) not shown — read them at the "
+        "head with `read_file` when tools are available]"
+    )
+
+
 def build_conversation_prompt(
     question: str,
     diff_text: str,
     pr_title: str = "",
     pr_description: str = "",
+    *,
+    history: str = "",
+    focus: str = "",
+    bot_name: str = "mira",
+    tools: bool = False,
+    max_diff_chars: int = 40_000,
 ) -> list[dict[str, str]]:
-    """Build prompt messages for a conversational reply about a PR."""
+    """Prompt messages for answering a question asked on a pull request.
+
+    The system message holds only Mira's own instructions. Everything that
+    came from the pull request — title, description, diff, the conversation
+    so far, the question — goes in the user message inside untrusted blocks,
+    redacted: the title and description used to be written into the system
+    message as prose, where a description saying "ignore the above" sat in
+    the most trusted place in the prompt.
+
+    ``history`` is the earlier conversation, already rendered oldest first;
+    ``focus`` is the code a review-thread question was asked on. ``tools``
+    says whether the answer comes from the tool loop, which changes what the
+    model is told it can check.
+    """
+    from mira.autofix.redact import redact
+    from mira.llm import untrusted
+
     env = _get_template_env()
     template = env.get_template("conversation.jinja2")
+    system_content = template.render(tools=tools, bot_name=bot_name or "mira")
 
-    system_content = template.render(
-        pr_title=pr_title,
-        pr_description=pr_description,
+    parts: list[str] = []
+    if pr_title or pr_description:
+        pr_text = f"Title: {pr_title}" + (f"\n\n{pr_description}" if pr_description else "")
+        parts.append("## Pull request\n\n" + untrusted.block("PR", pr_text, redactor=redact))
+    if history:
+        parts.append(
+            "## Earlier in this conversation (oldest first)\n\n"
+            + untrusted.block("COMMENT", history, redactor=redact)
+        )
+    if focus:
+        parts.append(
+            "## The code this question was asked on\n\n"
+            + untrusted.block("FILE", focus, redactor=redact)
+        )
+    parts.append(
+        "## Diff\n\n"
+        + untrusted.block("DIFF", _clip_diff(diff_text or "", max_diff_chars), redactor=redact)
     )
-
-    user_content = f"## Diff\n\n```diff\n{diff_text}\n```\n\n## Question\n\n{question}"
+    parts.append("## Question\n\n" + untrusted.block("REPLY", question or "", redactor=redact))
 
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": "\n\n".join(parts)},
     ]

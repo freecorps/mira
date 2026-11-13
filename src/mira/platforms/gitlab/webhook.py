@@ -379,6 +379,7 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
             bot_name,
             platform="gitlab",
             bot_identity=await auth.get_bot_identity(),
+            comment_id=str(attrs.get("id", "") or ""),
         )
     except Exception:
         logger.exception("Error handling GitLab note on %s/%s!%s", owner, repo, iid)

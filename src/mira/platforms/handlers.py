@@ -32,7 +32,6 @@ from mira.feedback.service import (
 from mira.feedback.synthesis import synthesize_candidate
 from mira.index.store import IndexStore
 from mira.llm import create_llm, untrusted
-from mira.llm.prompts.review import build_conversation_prompt
 from mira.llm.tool_schemas import SUBMIT_FINDING_RECHECK_TOOL, SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.platforms.chat_commands import CONFIG_KEYWORDS as _CONFIG_KEYWORDS
@@ -44,6 +43,12 @@ from mira.platforms.chat_commands import (
     run_resolve_command,
 )
 from mira.platforms.mentions import mention_names
+from mira.platforms.pr_chat import (
+    answer_in_thread,
+    handoff_to_autofix,
+    run_pr_chat,
+    wants_code_change,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -335,11 +340,12 @@ def _help_message(bot_name: str) -> str:
         f"| `@{bot_name} generate tests` | Have Mira write tests for the code this PR changed, following the repo's existing test layout, on its own branch and stacked PR. Touches test files only. Aliases: `generate unit tests`, `tests`. Disabled unless autofix and `autofix.finishing_touches.tests` are on. |\n"
         f"| `@{bot_name} generate docstrings` | Have Mira add docstrings to the public functions and classes this PR changed, on its own branch and stacked PR. A patch that changes anything but documentation is refused. Alias: `docstrings`. Disabled unless autofix and `autofix.finishing_touches.docstrings` are on. |\n"
         f"| `@{bot_name} help` | Show this message. Aliases: `?`, `commands`. |\n"
-        f"| `@{bot_name} <anything else>` | Ask a free-form question about the PR. Mira will reply inline using the PR diff as context. |\n\n"
+        f'| `@{bot_name} <anything else>` | Ask a question about the PR, in any language. Mira reads the repository at the PR\'s head (files, callers, definitions) and the conversation so far before answering, and cites the `path:line` it checked. Asking it to change code ("fix this", "pode corrigir?") goes to autofix, as `fix` does. |\n\n'
         f"On an inline review comment Mira posted, reply with `@{bot_name} reject` "
         f"(aliases: `dismiss`, `resolve`, `ignore`) to mark the thread resolved and "
         f"record the suggestion as a false positive, or `@{bot_name} fix` to have Mira "
-        f"write the change on its own branch. Direct replies do not require a mention.\n\n"
+        f"write the change on its own branch. Direct replies do not require a mention, "
+        f"and a question there is answered from the repository too.\n\n"
         f"To skip a PR entirely, include `@{bot_name} ignore` in the PR body.\n\n"
         f"Full docs: https://docs.miracode.ai/commands"
     )
@@ -582,12 +588,16 @@ async def run_pr_command(
     platform: str = "github",
     pr_title: str = "",
     bot_identity: str | None = None,
+    comment_id: str | int = "",
 ) -> None:
     """Platform-neutral handler for an @-mention command on a PR/MR.
 
     Dispatches help / review / full review / review-rest / resolve / config /
     free-form Q&A through the provider
     and engine. Shared by the GitHub and GitLab comment handlers.
+
+    ``comment_id`` is the comment that carried the mention; the chat keeps it
+    out of the conversation history it reads back.
     """
     repo_full = f"{owner}/{repo}"
     config = load_config()
@@ -693,17 +703,20 @@ async def run_pr_command(
             provider, owner, repo, number, pr_url, actor, bot_name, platform, bot_identity
         )
     else:
+        # A question, or a change request in words ("pode corrigir?"): see
+        # platforms/pr_chat.py for which, and how each is answered.
         pr_info = await provider.get_pr_info(pr_url)
-        diff_text = await provider.get_pr_diff(pr_info)
-        messages = build_conversation_prompt(
-            question=question,
-            diff_text=diff_text,
-            pr_title=pr_info.title,
-            pr_description=pr_info.description,
+        await run_pr_chat(
+            provider,
+            pr_info,
+            question,
+            actor=actor,
+            bot_name=bot_name,
+            config=config,
+            llm=llm,
+            bot_identity=bot_identity,
+            comment_id=comment_id,
         )
-        response = await llm.complete(messages, json_mode=False)
-        await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
-        logger.info("Replied to comment on %s", pr_url)
 
 
 async def run_pr_describe(
@@ -819,6 +832,28 @@ async def run_thread_reply(
         platform_thread_id=thread_id or "",
         platform=platform,
     )
+    # "Pode corrigir?" on a finding is `@mira fix` on that finding, in other
+    # words. Handed over before anything is classified or recorded: it is a
+    # request, not feedback on whether the finding was right. Always this
+    # finding: "para todos os casos" in a thread is about the finding's scope,
+    # and `@mira fix all` is there for the batch.
+    if known is not None and config.chat.autofix_handoff and wants_code_change(human_reply):
+
+        async def _reply(body: str) -> None:
+            await provider.reply_to_review_comment(pr_info, comment_id, body)
+
+        await handoff_to_autofix(
+            provider,
+            pr_info,
+            actor=actor,
+            kind="single",
+            bot_name=bot_name,
+            config=config,
+            original_body=original_suggestion,
+            finding_id=str(getattr(known, "id", "") or ""),
+            reply=_reply,
+        )
+        return
     code_context = await _thread_code_context(
         provider,
         pr_info,
@@ -895,6 +930,24 @@ async def run_thread_reply(
         if not explicit_mention:
             logger.debug("Ignoring thread reply without Mira finding provenance")
             return
+        # A mention in somebody else's thread is a question to Mira about
+        # that code: answered from the repository, with the thread as memory.
+        reply_text = (
+            await answer_in_thread(
+                provider,
+                pr_info,
+                human_reply,
+                llm=llm,
+                config=config,
+                bot_name=bot_name,
+                comment_id=comment_id,
+                thread_id=thread_id or "",
+                path=comment_path,
+                line=_safe_line(comment_line),
+                code_context=code_context,
+            )
+            or reply_text
+        )
         if not reply_text:
             logger.warning("Mentioned thread reply was recorded but produced no answer")
             return
@@ -976,6 +1029,29 @@ async def run_thread_reply(
                 "Thanks — I could not re-read the code just now, so I have left "
                 "this thread open rather than closing it on an unverified fix."
             )
+    elif intent == "question":
+        # The classifier's reply saw only the code around the comment; the
+        # chat can read the rest of the repository before answering.
+        reply_text = (
+            await answer_in_thread(
+                provider,
+                pr_info,
+                human_reply,
+                llm=llm,
+                config=config,
+                bot_name=bot_name,
+                comment_id=comment_id,
+                thread_id=thread_id or "",
+                path=comment_path,
+                line=_safe_line(comment_line),
+                code_context=code_context,
+                finding_text=original_suggestion,
+            )
+            or reply_text
+        )
+        if not reply_text and not retraction_note:
+            logger.warning("Free-form thread reply: empty answer to a question. Recorded only.")
+            return
     elif not reply_text and not retraction_note:
         logger.warning("Free-form thread reply: empty reply (intent=%s). Recorded only.", intent)
         return

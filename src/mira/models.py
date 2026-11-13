@@ -695,6 +695,21 @@ class PeerReviewSnapshot:
 
 
 @dataclass
+class ConversationMessage:
+    """One message of a pull request conversation, for chat memory.
+
+    ``is_bot`` is what the platform says about the author's account; whether
+    the bot is Mira is decided by the caller, which knows Mira's names.
+    """
+
+    author: str
+    body: str
+    is_bot: bool = False
+    comment_id: str = ""
+    created_at: str = ""
+
+
+@dataclass
 class HumanReviewComment:
     """A review comment on a PR authored by a human (not the bot)."""
 

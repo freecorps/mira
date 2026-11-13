@@ -157,6 +157,34 @@ def _tool_guidance(tools: list[dict]) -> str:
     )
 
 
+def assistant_turn(msg: dict, content: str, tool_calls: list) -> dict:
+    """The assistant message to send back with the next hop of a tool loop.
+
+    Shared by the review loop and the chat loop (``core/chat.py``), because
+    what has to be echoed is a property of the provider, not of the loop.
+    """
+    assistant: dict = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls,
+    }
+    # A Responses-protocol provider hands back its raw output items too;
+    # they go back with the next turn so the model keeps its reasoning
+    # and the endpoint sees the call ids it issued.
+    raw_items = msg.get("items")
+    if isinstance(raw_items, list) and raw_items:
+        assistant["items"] = raw_items
+    # A Chat Completions model's reasoning rides along the same way. The
+    # provider sends it back only where the endpoint wants it (DeepSeek's
+    # thinking mode does: without it each hop reasons from scratch over a
+    # longer conversation, which is where the later hops' time went).
+    for key in ("reasoning_content", "reasoning"):
+        value = msg.get(key)
+        if isinstance(value, str) and value.strip():
+            assistant[key] = value
+    return assistant
+
+
 async def agentic_review_loop(
     llm: LLMProvider,
     messages: list[dict],
@@ -275,26 +303,7 @@ async def agentic_review_loop(
         if content.strip():
             notes.append(content.strip())
 
-        assistant: dict = {
-            "role": "assistant",
-            "content": content,
-            "tool_calls": tool_calls,
-        }
-        # A Responses-protocol provider hands back its raw output items too;
-        # they go back with the next turn so the model keeps its reasoning
-        # and the endpoint sees the call ids it issued.
-        raw_items = msg.get("items")
-        if isinstance(raw_items, list) and raw_items:
-            assistant["items"] = raw_items
-        # A Chat Completions model's reasoning rides along the same way. The
-        # provider sends it back only where the endpoint wants it (DeepSeek's
-        # thinking mode does: without it each hop reasons from scratch over a
-        # longer conversation, which is where the later hops' time went).
-        for key in ("reasoning_content", "reasoning"):
-            value = msg.get(key)
-            if isinstance(value, str) and value.strip():
-                assistant[key] = value
-        convo.append(assistant)
+        convo.append(assistant_turn(msg, content, tool_calls))
 
         for call in tool_calls:
             fn = call.get("function") or {}
