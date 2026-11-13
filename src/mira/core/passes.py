@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from mira.config import load_config
 from mira.core.context import number_hunk_lines
@@ -161,6 +162,7 @@ async def agentic_review_loop(
     messages: list[dict],
     executor: object,
     max_hops: int = _AGENTIC_MAX_HOPS,
+    submit_by: float | None = None,
 ) -> str:
     """Run an agentic tool-use loop until the LLM submits a review.
 
@@ -217,7 +219,12 @@ async def agentic_review_loop(
             return ""
 
     for hop in range(max_hops):
-        final_hop = hop == max_hops - 1
+        # Past ``submit_by`` (a time.monotonic() value) the next turn is the
+        # last: what the lookups found gets submitted instead of more lookups.
+        out_of_time = submit_by is not None and hop > 0 and time.monotonic() >= submit_by
+        if out_of_time:
+            logger.info("Agentic loop out of time at hop %d; asking for the review", hop + 1)
+        final_hop = hop == max_hops - 1 or out_of_time
         if final_hop and hop > 0:
             convo.append({"role": "user", "content": _FINAL_HOP_NUDGE})
         try:
@@ -279,6 +286,14 @@ async def agentic_review_loop(
         raw_items = msg.get("items")
         if isinstance(raw_items, list) and raw_items:
             assistant["items"] = raw_items
+        # A Chat Completions model's reasoning rides along the same way. The
+        # provider sends it back only where the endpoint wants it (DeepSeek's
+        # thinking mode does: without it each hop reasons from scratch over a
+        # longer conversation, which is where the later hops' time went).
+        for key in ("reasoning_content", "reasoning"):
+            value = msg.get(key)
+            if isinstance(value, str) and value.strip():
+                assistant[key] = value
         convo.append(assistant)
 
         for call in tool_calls:

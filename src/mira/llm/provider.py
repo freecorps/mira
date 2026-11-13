@@ -8,8 +8,10 @@ other OpenAI-compatible endpoint works off the portable default, no entry needed
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import httpx
 
@@ -46,6 +48,54 @@ class LLMProvider(OpenAICompatibleProvider):
     def _chat_url(self) -> str:
         return f"{self.config.base_url.rstrip('/')}/chat/completions"
 
+    def _streams(self, body: dict) -> bool:
+        return bool(self.profile.get("stream")) and body.get("model") not in self._no_stream
+
+    def _timeout(self) -> httpx.Timeout | int:
+        """Per-read limits. Streaming turns the read limit into an idle limit."""
+        if self.profile.get("stream"):
+            return httpx.Timeout(
+                float(self.config.request_timeout),
+                read=float(self.config.stream_idle_timeout),
+            )
+        return self.config.request_timeout
+
+    async def _post(self, client: Any, body: dict) -> Any:
+        """POST a chat request, streamed where the endpoint's profile says so.
+
+        A streamed reply is assembled into the same payload a plain one has,
+        so every caller reads both alike. An endpoint that answers the
+        streamed request with a 400 about streaming is asked again plainly,
+        and that model is not streamed again in this process.
+        """
+        if not self._streams(body):
+            return await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+        resp = await _stream_chat(
+            client,
+            self._chat_url(),
+            self._build_headers(),
+            body,
+            total=float(self.config.stream_total_timeout),
+        )
+        if resp.status_code == 400 and "stream" in resp.text.lower():
+            logger.info("Model %s rejected a streamed request; asking plainly", body.get("model"))
+            self._no_stream.add(str(body.get("model")))
+            return await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+        return resp
+
+    def _wire_messages(self, model: str, messages: list) -> list:
+        """The loop's messages as this endpoint takes them.
+
+        The agentic loop keeps each assistant turn's reasoning. DeepSeek's
+        thinking mode needs it back on every later request of the loop, or it
+        reasons from scratch each hop over a growing conversation; endpoints
+        whose profile does not say so get the turns without it.
+        """
+        echo = bool(self.profile.get("echo_reasoning")) and model not in self._no_echo_reasoning
+        if echo:
+            return messages
+        return [_without_reasoning(message) for message in messages]
+
     async def _call_llm(
         self,
         model: str,
@@ -65,14 +115,10 @@ class LLMProvider(OpenAICompatibleProvider):
             body["response_format"] = {"type": "json_object"}
         self._apply_reasoning(body)
 
-        async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(
-                self._chat_url(),
-                headers=self._build_headers(),
-                json=body,
-            )
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -122,12 +168,8 @@ class LLMProvider(OpenAICompatibleProvider):
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
-        async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(
-                self._chat_url(),
-                headers=self._build_headers(),
-                json=body,
-            )
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and body["tool_choice"] != "auto"
@@ -137,7 +179,7 @@ class LLMProvider(OpenAICompatibleProvider):
                 logger.info("Model %s rejected forced tool_choice; retrying with auto", api_model)
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and _asked_for_reasoning(body)
@@ -149,9 +191,9 @@ class LLMProvider(OpenAICompatibleProvider):
                 self._no_reasoning.add(api_model)
                 _drop_reasoning(body)
                 self._temperature(body, temperature)
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -217,8 +259,8 @@ class LLMProvider(OpenAICompatibleProvider):
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
-        async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and _asked_for_reasoning(body)
@@ -228,9 +270,9 @@ class LLMProvider(OpenAICompatibleProvider):
                 self._no_reasoning.add(api_model)
                 _drop_reasoning(body)
                 self._temperature(body, temperature)
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -259,9 +301,10 @@ class LLMProvider(OpenAICompatibleProvider):
         """
         if not tools:
             raise LLMError("no_tools")
+        api_model = _strip_model_prefix(model, self.profile)
         body: dict = {
-            "model": _strip_model_prefix(model, self.profile),
-            "messages": messages,
+            "model": api_model,
+            "messages": self._wire_messages(api_model, messages),
             "tools": tools,
             "tool_choice": "auto",
         }
@@ -269,14 +312,17 @@ class LLMProvider(OpenAICompatibleProvider):
         self._temperature(body, temperature)
         self._apply_reasoning(body)
 
-        async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-            resp = await client.post(
-                self._chat_url(),
-                headers=self._build_headers(),
-                json=body,
-            )
+        async with httpx.AsyncClient(timeout=self._timeout()) as client:
+            resp = await self._post(client, body)
+            if resp.status_code == 400 and "reasoning_content" in resp.text:
+                logger.info(
+                    "Model %s refused reasoning sent back in a tool loop; dropping it", api_model
+                )
+                self._no_echo_reasoning.add(api_model)
+                body["messages"] = self._wire_messages(api_model, messages)
+                resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
-                resp = await client.post(self._chat_url(), headers=self._build_headers(), json=body)
+                resp = await self._post(client, body)
             self._handle_error(resp)
             data = resp.json()
 
@@ -291,3 +337,115 @@ class LLMProvider(OpenAICompatibleProvider):
                 _empty_reply_detail(_finish_reason(data), reasoning=_carries_reasoning(message)),
             )
         return message
+
+
+_REASONING_KEYS = ("reasoning_content", "reasoning")
+
+
+def _without_reasoning(message: Any) -> Any:
+    if not isinstance(message, dict) or not any(key in message for key in _REASONING_KEYS):
+        return message
+    return {key: value for key, value in message.items() if key not in _REASONING_KEYS}
+
+
+class _StreamedResponse:
+    """A streamed chat reply, assembled, with the part of httpx.Response callers use."""
+
+    status_code = 200
+
+    def __init__(self, data: dict, headers: Any) -> None:
+        self._data = data
+        self.headers = headers
+
+    @property
+    def text(self) -> str:
+        return json.dumps(self._data)
+
+    def json(self) -> dict:
+        return self._data
+
+
+async def _stream_chat(client: Any, url: str, headers: dict, body: dict, *, total: float) -> Any:
+    """POST ``body`` with ``stream: true`` and assemble the events into one payload.
+
+    The client's read timeout bounds the silence between two events; ``total``
+    bounds the whole reply. Either running out raises an httpx timeout, which
+    the retry policy already treats as one. A reply that is not an event
+    stream (an error, or an endpoint that ignored ``stream``) is returned as
+    the response it is.
+    """
+    streamed = {**body, "stream": True, "stream_options": {"include_usage": True}}
+    try:
+        async with asyncio.timeout(total):
+            async with client.stream("POST", url, headers=headers, json=streamed) as resp:
+                content_type = resp.headers.get("content-type", "")
+                if resp.status_code != 200 or "text/event-stream" not in content_type:
+                    await resp.aread()
+                    return resp
+                return _StreamedResponse(await _assemble_stream(resp.aiter_lines()), resp.headers)
+    except TimeoutError as exc:
+        raise httpx.ReadTimeout(f"streamed reply ran past {total:.0f}s") from exc
+
+
+async def _assemble_stream(lines: Any) -> dict:
+    """Chat-completions events folded back into a non-streamed payload."""
+    content: list[str] = []
+    reasoning: list[str] = []
+    reasoning_key = "reasoning_content"
+    calls: dict[int, dict] = {}
+    finish_reason = None
+    usage = None
+    async for line in lines:
+        if not line or not line.startswith("data:"):
+            continue  # blank separators and ": keep-alive" comments
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("error"):
+            raise LLMError("api_error", status=200, body=json.dumps(chunk["error"])[:2000])
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                content.append(delta["content"])
+            for key in _REASONING_KEYS:
+                if isinstance(delta.get(key), str):
+                    reasoning.append(delta[key])
+                    reasoning_key = key
+            for position, call in enumerate(delta.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                index = call.get("index")
+                index = index if isinstance(index, int) else position
+                slot = calls.setdefault(
+                    index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                )
+                if call.get("id"):
+                    slot["id"] = call["id"]
+                function = call.get("function") or {}
+                name = function.get("name")
+                if isinstance(name, str) and name and not slot["function"]["name"].endswith(name):
+                    slot["function"]["name"] += name
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    slot["function"]["arguments"] += arguments
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+    message: dict = {"role": "assistant", "content": "".join(content) or None}
+    if reasoning:
+        message[reasoning_key] = "".join(reasoning)
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    data: dict = {"choices": [{"index": 0, "message": message, "finish_reason": finish_reason}]}
+    if usage is not None:
+        data["usage"] = usage
+    return data

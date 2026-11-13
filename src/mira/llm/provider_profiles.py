@@ -51,6 +51,12 @@ DEFAULT_PROFILE: dict = {
     # endpoints, which have nothing to meter.
     "usage_url": "",
     "usage_format": "",
+    # Read replies as server-sent events, so a slow reply that is still
+    # arriving is not mistaken for a stalled one (see LLMConfig.stream_*).
+    "stream": False,
+    # Send an assistant turn's reasoning back with the next request of a tool
+    # loop. DeepSeek's thinking mode requires it; other APIs may refuse it.
+    "echo_reasoning": False,
 }
 
 

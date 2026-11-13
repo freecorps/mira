@@ -528,7 +528,7 @@ async def test_agentic_context_and_dependency_reads_share_revision(monkeypatch, 
     monkeypatch.setattr(module, "build_code_context", AsyncMock(return_value=""))
     verified = []
 
-    async def agentic_read(model, messages, executor):
+    async def agentic_read(model, messages, executor, **_kwargs):
         verified.append(await executor.execute("read_file", {"path": "src/verify.ts"}))
         return '{"comments": []}'
 

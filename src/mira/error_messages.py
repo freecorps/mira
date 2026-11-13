@@ -160,4 +160,18 @@ def get_error_message(code: str, **kwargs: object) -> tuple[str, str]:
         KeyError: If the error code is not in the catalog.
     """
     entry = LLM_ERROR_MESSAGES[code]
+    kwargs = {key: _describe(value) for key, value in kwargs.items()}
     return entry.full.format(**kwargs), entry.safe.format(**kwargs)
+
+
+def _describe(value: object) -> object:
+    """An exception as text that is never empty.
+
+    ``str(httpx.ReadTimeout())`` is ``""``, so a timeout used to be logged as
+    "LLM agentic call failed with deepseek-v4.1-flash: " — 110 times in one
+    week, with nothing to say it was a timeout.
+    """
+    if isinstance(value, BaseException):
+        text = str(value).strip()
+        return text or type(value).__name__
+    return value

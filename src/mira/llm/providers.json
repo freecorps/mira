@@ -15,7 +15,9 @@
     "models_dev": "This endpoint's provider id on models.dev, whose per-model reasoning_options say which levels each model takes. The picker offers those levels and a requested one is snapped to the nearest the model has. Empty for an endpoint the catalogue does not list.",
     "session_header": "Optional header carrying a stable per-conversation id (one per client instance, so one per review pass), for endpoints that route and cache by it.",
     "usage_url": "Optional GET endpoint reporting the key's allowance. Its document is read by the parser named in usage_format.",
-    "usage_format": "Which parser reads usage_url's document (see mira.llm.key_providers). Currently: 'opencode-go'."
+    "usage_format": "Which parser reads usage_url's document (see mira.llm.key_providers). Currently: 'opencode-go'.",
+    "stream": "true to read Chat Completions replies as server-sent events, so a reply still arriving is judged by llm.stream_idle_timeout rather than killed at llm.request_timeout. Off for an endpoint not known to stream tool calls.",
+    "echo_reasoning": "true to send an assistant turn's reasoning_content back with the next request of a tool loop, which DeepSeek's thinking mode requires. A 400 naming the field turns it off for that model."
   },
 
   "openrouter": {
@@ -45,6 +47,8 @@
     "api_key_env": "OPENCODE_API_KEY",
     "api_style": "chat",
     "model_prefix": "strip",
+    "stream": true,
+    "echo_reasoning": true,
     "extra_headers": {
       "x-opencode-client": "mira"
     },
@@ -64,6 +68,7 @@
     "api_key_env": "OPENCODE_API_KEY",
     "api_style": "chat",
     "model_prefix": "strip",
+    "stream": true,
     "extra_headers": {
       "x-opencode-client": "mira"
     },
@@ -91,7 +96,9 @@
     "base_url": "https://api.deepseek.com/v1",
     "api_key_env": "DEEPSEEK_API_KEY",
     "api_style": "chat",
-    "model_prefix": "strip"
+    "model_prefix": "strip",
+    "stream": true,
+    "echo_reasoning": true
   },
 
   "groq": {

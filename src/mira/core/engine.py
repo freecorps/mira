@@ -450,6 +450,20 @@ def filter_blast_radius_for_visibility(
     return [d for d in dependents if dependent_private(d["repo"]) is False]
 
 
+def _timed_out(exc: BaseException) -> bool:
+    """Whether a failure was, somewhere down its cause chain, a timeout."""
+    import httpx
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (TimeoutError, httpx.TimeoutException)):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class ReviewEngine:
     """Orchestrates the full PR review pipeline."""
 
@@ -2438,7 +2452,13 @@ class ReviewEngine:
                         code_graph=review_graph,
                         index_search=self._index_search(),
                     )
-                    raw_response = await agentic_review_loop(self.llm, messages, executor)
+                    budget = self.config.review.part_deadline_seconds
+                    raw_response = await agentic_review_loop(
+                        self.llm,
+                        messages,
+                        executor,
+                        submit_by=time.monotonic() + budget * 0.6 if budget else None,
+                    )
                     audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
                 if not raw_response:
                     raw_response = await self.llm.review(messages)
@@ -2502,12 +2522,21 @@ class ReviewEngine:
             return value[:lo]
 
         async def _run_part(idx: int, chunk: ReviewChunk, context: str) -> ReviewPartResult:
-            """One part, with its retries; a part that never lands costs its files."""
+            """One part, with its retries; a part that never lands costs its files.
+
+            A part is bounded by ``part_deadline_seconds``, and a part that
+            failed by timing out is not reviewed again from scratch: the
+            model that just took minutes to not answer will take them again.
+            """
+            budget = self.config.review.part_deadline_seconds
             for attempt in range(self.config.review.chunk_retries + 1):
                 try:
-                    return await _review_chunk(idx, chunk, context)
+                    review = _review_chunk(idx, chunk, context)
+                    return await (asyncio.wait_for(review, budget) if budget else review)
                 except Exception as exc:
-                    if attempt < self.config.review.chunk_retries:
+                    if isinstance(exc, TimeoutError) and not str(exc):
+                        exc = TimeoutError(f"review part ran past its {budget}s deadline")
+                    if attempt < self.config.review.chunk_retries and not _timed_out(exc):
                         logger.warning("Retrying review part %d: %s", idx + 1, exc)
                         audit.append({"stage": "chunk_retry", "chunk": idx, "attempt": attempt + 1})
                         continue
