@@ -455,12 +455,17 @@ def _timed_out(exc: BaseException) -> bool:
     import httpx
 
     seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
+    pending: list[BaseException] = [exc]
+    # Both links: ``raise ... from err`` inside a handler sets a cause and a
+    # context, and the timeout can sit behind either.
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
         if isinstance(current, (TimeoutError, httpx.TimeoutException)):
             return True
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
+        pending.extend(link for link in (current.__cause__, current.__context__) if link)
     return False
 
 

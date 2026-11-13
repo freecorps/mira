@@ -314,7 +314,7 @@ class LLMProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             resp = await self._post(client, body)
-            if resp.status_code == 400 and "reasoning_content" in resp.text:
+            if resp.status_code == 400 and "reasoning_content" in resp.text.lower():
                 logger.info(
                     "Model %s refused reasoning sent back in a tool loop; dropping it", api_model
                 )
@@ -433,7 +433,8 @@ async def _assemble_stream(lines: Any) -> dict:
                     slot["id"] = call["id"]
                 function = call.get("function") or {}
                 name = function.get("name")
-                if isinstance(name, str) and name and not slot["function"]["name"].endswith(name):
+                # Deltas concatenate, the name's as much as the arguments'.
+                if isinstance(name, str) and name:
                     slot["function"]["name"] += name
                 arguments = function.get("arguments")
                 if isinstance(arguments, str):
