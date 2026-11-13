@@ -175,6 +175,16 @@ class TestIsolation:
         assert str(venv) in roots
         assert "/opt/python" in roots
 
+    def test_a_workspace_venv_cannot_name_host_directories(self, tmp_path: Path) -> None:
+        """A pyvenv.cfg the PR wrote must not bind /root readable."""
+        venv = tmp_path / "repo" / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text("home = /root/.ssh/bin\n")
+        (venv / "bin" / "pytest").write_text("#!/bin/sh\n")
+        roots = toolchain_roots(str(venv / "bin" / "pytest"), untrusted_root=tmp_path)
+        assert not any(root.startswith("/root") for root in roots)
+        assert not any(root.startswith(str(tmp_path)) for root in roots)
+
 
 # ── Workspace ───────────────────────────────────────────────────────────
 

@@ -209,7 +209,7 @@ class Workspace:
             )
         read_only = tuple(
             root
-            for root in toolchain_roots(executable)
+            for root in toolchain_roots(executable, untrusted_root=self.root)
             if not Path(root).resolve().is_relative_to(self.root)
         )
         wrapped = self.isolation.wrap(

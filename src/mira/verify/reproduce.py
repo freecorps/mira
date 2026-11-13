@@ -499,12 +499,22 @@ async def verify_one(
         finally:
             workspace.remove(attempt.test_path)
 
-    answer, output, _ = await asyncio.to_thread(_run)
+    try:
+        answer, output, _ = await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001 — a run that could not happen is no evidence
+        logger.info("Reproduction for %s:%d could not be run: %s", comment.path, comment.line, exc)
+        return _result("inconclusive", "the reproduction test could not be run")
     extra = {"test_code": code, "output": output}
     if answer == "reproduced":
         return _result("reproduced", reason or "the test failed as the finding describes", **extra)
     if answer == "passed":
-        trust = await harness(attempt.test_path)
+        try:
+            trust = await harness(attempt.test_path)
+        except Exception as exc:  # noqa: BLE001 — an unchecked harness is not a trusted one
+            logger.info("Harness check for %s failed: %s", attempt.test_path, exc)
+            return _result(
+                "inconclusive", "the test passed, but the harness could not be checked", **extra
+            )
         if not trust.trusted:
             return _result("inconclusive", f"the test passed, but {trust.reason}", **extra)
         return _result("not_reproduced", reason or "the test passed", **extra)
