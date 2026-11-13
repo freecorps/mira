@@ -79,12 +79,23 @@ def rlimit_preexec(memory_mb: int, cpu_seconds: int) -> Any:
     limit_bytes = max(64, int(memory_mb)) * 1024 * 1024
     cpu = max(1, int(cpu_seconds))
 
+    limits = (
+        (resource.RLIMIT_AS, limit_bytes),
+        (resource.RLIMIT_CPU, cpu),
+        (resource.RLIMIT_NPROC, 256),
+        (resource.RLIMIT_FSIZE, 256 * 1024 * 1024),
+        (resource.RLIMIT_CORE, 0),
+    )
+
     def _apply() -> None:  # pragma: no cover - runs in the forked child
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024, 256 * 1024 * 1024))
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # Each limit on its own: macOS refuses RLIMIT_AS outright, and one
+        # limit the kernel does not implement used to abort the whole
+        # `preexec_fn` — so no command ran there at all, bounded or not. A
+        # limit the platform refuses is a limit it does not have; the others
+        # still apply, and the process group below still does.
+        for which, value in limits:
+            with contextlib.suppress(ValueError, OSError):
+                resource.setrlimit(which, (value, value))
         os.setsid()
 
     return _apply
