@@ -95,6 +95,22 @@ def decide_verdict(
     if result.skipped_reason:
         return None
 
+    open_prior = [
+        severity
+        for severity in (Severity.from_str(raw) for raw in result.open_prior_severities if raw)
+        if severity > ceiling
+    ]
+    if open_prior:
+        # This pass only looked at what changed since the last one. A blocker
+        # from an earlier round that is still open is still a blocker: an
+        # incremental pass that found nothing in one file used to approve over
+        # it.
+        logger.info(
+            "Skipping approval — %s from earlier rounds still open",
+            _plural(len(open_prior), "finding"),
+        )
+        return None
+
     if cfg.require_all_files_reviewed and result.skipped_paths:
         # Failed parts or legacy selection limits left some files incomplete.
         # Approving a PR Mira only half-read is the worst failure mode here.
