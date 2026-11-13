@@ -186,14 +186,41 @@ def _seatbelt_profile(*, root: Path, network: bool, readable: tuple[str, ...]) -
     return "".join(rules)
 
 
-def toolchain_roots(executable: str) -> tuple[str, ...]:
+# Interpreters a workspace executable may be a script or a venv for. They are
+# looked up on Mira's own PATH, outside the workspace, so their location is
+# the host's word rather than the pull request's.
+_HOST_INTERPRETERS = ("python3", "python", "node")
+
+
+def _inside(path: str | Path, root: Path) -> bool:
+    try:
+        return Path(os.path.realpath(path)).is_relative_to(os.path.realpath(root))
+    except (OSError, ValueError):
+        return False
+
+
+def toolchain_roots(executable: str, untrusted_root: Path | None = None) -> tuple[str, ...]:
     """Directories a binary needs to read to run: its venv, and the interpreter's prefix.
 
     A console script in a virtualenv (``.venv/bin/pytest``) is a shebang for
     the venv's python, which is a symlink to an interpreter elsewhere whose
     standard library sits under its own prefix. Each of those has to be
     readable inside the sandbox, and nothing next to them does.
+
+    ``untrusted_root`` is the workspace. Anything under it was written by the
+    pull request's setup, so an executable there says nothing trustworthy
+    about where its interpreter lives: a ``pyvenv.cfg`` whose ``home`` names
+    ``/root``, or a symlink into the host's home, would otherwise be bound
+    readable and undo the isolation. For such an executable the roots are
+    those of the host's own interpreters instead.
     """
+    if untrusted_root is not None and _inside(executable, untrusted_root):
+        host_roots: list[str] = []
+        for name in _HOST_INTERPRETERS:
+            found = shutil.which(name)
+            if found and not _inside(found, untrusted_root):
+                host_roots.extend(toolchain_roots(found, untrusted_root))
+        return tuple(dict.fromkeys(host_roots))
     roots: list[str] = []
     path = Path(executable)
     candidates = [path, Path(os.path.realpath(path))]
