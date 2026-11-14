@@ -559,6 +559,8 @@ function CostsSection() {
     [days]
   )
   const rows: CostRow[] = data?.rows ?? []
+  // Every call unpriced: the total is unknown, not $0.
+  const totalUnpriced = !!data && data.total.unpriced_calls === data.total.calls
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -682,13 +684,18 @@ function CostsSection() {
                       {formatTokens(data.total.completion_tokens)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {formatUsd(data.total.cost_usd)}
+                      {totalUnpriced ? "—" : formatUsd(data.total.cost_usd)}
+                      {!totalUnpriced && data.total.unpriced_calls > 0 && (
+                        <div className="text-muted-foreground">
+                          {data.total.unpriced_calls} unpriced
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell className="text-right">
-                      {data.total.credits.toFixed(3)}
+                      {totalUnpriced ? "—" : data.total.credits.toFixed(3)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {formatUsd(data.total.projected_month_usd)}
+                      {totalUnpriced ? "—" : formatUsd(data.total.projected_month_usd)}
                     </TableCell>
                   </TableRow>
                 )}

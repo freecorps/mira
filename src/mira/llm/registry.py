@@ -127,7 +127,7 @@ def get(model_id: str, endpoint: str | None = None) -> dict | None:
     to it (``<id>@<endpoint>``) wins; otherwise the plain entry is returned —
     which may be pinned to another endpoint, and says so in its own
     ``endpoint`` field — and an id that exists only scoped is found under its
-    single scope. Limits the endpoint's live catalogue reported overlay what
+    scope (the first by name when it has several). Limits the endpoint's live catalogue reported overlay what
     the entry says (or stand alone when there is no entry).
     """
     models = _load()
@@ -137,11 +137,17 @@ def get(model_id: str, endpoint: str | None = None) -> dict | None:
             return {**scoped, "endpoint": endpoint}
     entry = models.get(model_id)
     if entry is None:
-        for key, info in models.items():
-            bare, scope = split_key(key)
-            if scope and bare == model_id:
-                entry = {**info, "endpoint": scope}
-                break
+        # An id served only by scoped entries, asked for without (or with
+        # another) endpoint: the first scope by name, not by models.json order.
+        scoped = sorted(
+            (scope, key)
+            for key in models
+            for bare, scope in [split_key(key)]
+            if scope and bare == model_id
+        )
+        if scoped:
+            scope, key = scoped[0]
+            entry = {**models[key], "endpoint": scope}
     live = _live_limits.get((endpoint, model_id)) if endpoint else None
     if live:
         return {**(entry or {"label": model_id}), **live}
@@ -220,14 +226,17 @@ def max_output_tokens(model_id: str, default: int = 4096, endpoint: str | None =
     return int(info.get("max_output_tokens", default))
 
 
-def pricing(model_id: str) -> tuple[float, float]:
+def pricing(model_id: str, endpoint: str | None = None) -> tuple[float, float]:
     """Return ``(input_cost_per_1m, output_cost_per_1m)`` USD for the model.
+
+    ``endpoint`` picks the entry scoped to it when the id has one, so an id
+    two subscriptions serve at different rates is priced at the right one.
 
     Falls back to Sonnet pricing for unknown models — and for any cost field a
     (possibly user-supplied) entry omits — so cost estimates aren't silently
     zero and a partial custom entry can't crash registry load.
     """
-    info = get(model_id) or {}
+    info = get(model_id, endpoint) or {}
     return (
         float(info.get("input_cost_per_1m", 3.00)),
         float(info.get("output_cost_per_1m", 15.00)),

@@ -66,7 +66,9 @@ def estimate_cost() -> CostEstimate:
     from mira.dashboard.models_config import (
         estimate_indexing_cost,
         get_indexing_model,
+        llm_config_for,
     )
+    from mira.llm import endpoints
 
     config = load_config()
     model = get_indexing_model(config.llm, _api._app_db.get_setting("indexing_model"))
@@ -76,7 +78,11 @@ def estimate_cost() -> CostEstimate:
         r.file_count_estimate for r in _api._app_db.list_repos() if r.status == "pending"
     )
 
-    est = estimate_indexing_cost(total_files, model)
+    try:
+        endpoint = endpoints.profile_for_config(llm_config_for("indexing", config.llm)).get("name")
+    except Exception:  # an unresolvable endpoint prices at the plain entry
+        endpoint = None
+    est = estimate_indexing_cost(total_files, model, endpoint or None)
     return CostEstimate(
         estimated_usd=est["estimated_usd"],
         input_tokens=est["input_tokens"],
