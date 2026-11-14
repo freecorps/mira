@@ -33,6 +33,14 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { toast } from "@/components/ui/sonner"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import { api } from "@/lib/api"
 import type {
   OAuthAccount,
@@ -42,6 +50,7 @@ import type {
   UsageWindow,
 } from "@/lib/api/oauth"
 import type {
+  CostRow,
   EndpointPreset,
   ProviderEndpoint,
   ProvidersResponse,
@@ -406,15 +415,51 @@ function EndpointCard({
               </div>
             ) : (
               <p className="text-xs text-muted-foreground">
-                {endpoint.key_configured
-                  ? "No usage recorded yet — press Refresh usage to ask the provider now."
-                  : "Add a key to see this subscription's allowance."}
+                {endpoint.usage_estimated
+                  ? endpoint.plan
+                    ? "Nothing recorded for this plan yet."
+                    : "This provider has no usage API. Pick the plan this key is on (Edit) and Mira estimates its windows from the tokens it spends here."
+                  : endpoint.key_configured
+                    ? "No usage recorded yet — press Refresh usage to ask the provider now."
+                    : "Add a key to see this subscription's allowance."}
               </p>
             )}
-            {usage && usage.fetched_at > 0 && (
-              <p className="text-[0.7rem] text-muted-foreground">
-                As of {agoLabel(usage.fetched_at)} · from the usage endpoint
-              </p>
+            {usage?.source === "estimate" && usage.estimate ? (
+              <div className="space-y-1">
+                <p className="flex items-center gap-1.5 text-xs">
+                  <Badge variant="outline">estimated by Mira</Badge>
+                  <span className="text-muted-foreground">
+                    {usage.plan && <>{usage.plan} plan · </>}
+                    {usage.estimate.windows
+                      .map(
+                        (w) =>
+                          `${w.name}: ${w.credits_spent.toFixed(2)} of ${w.credits_allowed} credits${w.rolling ? " (rolling)" : ""}`
+                      )
+                      .join(" · ")}
+                  </span>
+                </p>
+                {usage.estimate.left_as.length > 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    Left in the tightest window ≈{" "}
+                    {usage.estimate.left_as
+                      .map((m) => `$${m.usd.toFixed(2)} of ${m.label}`)
+                      .join(" or ")}
+                  </p>
+                )}
+                <p className="text-[0.7rem] text-muted-foreground">
+                  {usage.estimate.note}
+                  {usage.estimate.scale !== 1 && (
+                    <> Calibrated ×{usage.estimate.scale}.</>
+                  )}
+                </p>
+              </div>
+            ) : (
+              usage &&
+              usage.fetched_at > 0 && (
+                <p className="text-[0.7rem] text-muted-foreground">
+                  As of {agoLabel(usage.fetched_at)} · from the usage endpoint
+                </p>
+              )
             )}
           </div>
         )}
@@ -444,11 +489,19 @@ function EndpointCard({
             <Button
               size="sm"
               variant="ghost"
-              disabled={working || !endpoint.key_configured}
-              title="Ask the provider where this key's allowance stands"
+              disabled={
+                working ||
+                (!endpoint.usage_estimated && !endpoint.key_configured)
+              }
+              title={
+                endpoint.usage_estimated
+                  ? "Work the estimate out again from the usage ledger"
+                  : "Ask the provider where this key's allowance stands"
+              }
               onClick={onRefresh}
             >
-              <Gauge className="mr-1 h-3 w-3" /> Refresh usage
+              <Gauge className="mr-1 h-3 w-3" />{" "}
+              {endpoint.usage_estimated ? "Recalculate" : "Refresh usage"}
             </Button>
           )}
           {endpoint.editable && (
@@ -480,6 +533,182 @@ function EndpointCard({
         )}
       </CardContent>
     </Card>
+  )
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
+function formatUsd(n: number): string {
+  if (n === 0) return "$0"
+  if (n < 0.01) return `$${n.toFixed(4)}`
+  return `$${n.toFixed(2)}`
+}
+
+const COST_PERIODS = [7, 30] as const
+
+// What each endpoint and model cost over the last week or month, from the
+// usage ledger. Every figure is Mira's estimate from the registry's prices.
+function CostsSection() {
+  const [days, setDays] = useState<(typeof COST_PERIODS)[number]>(7)
+  const { data, loading, error } = useAsync(
+    () => api.getUsageCosts(days),
+    [days]
+  )
+  const rows: CostRow[] = data?.rows ?? []
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">
+            Usage and cost
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Every model call Mira made, per endpoint and model: input, the part
+            served from the provider&apos;s prompt cache, output, and what it is
+            estimated to have cost — in USD and in plan credits.
+          </p>
+        </div>
+        <div className="flex gap-1">
+          {COST_PERIODS.map((d) => (
+            <Button
+              key={d}
+              size="sm"
+              variant={d === days ? "default" : "outline"}
+              onClick={() => setDays(d)}
+            >
+              {d} days
+            </Button>
+          ))}
+        </div>
+      </div>
+      {loading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+        </div>
+      ) : error ? (
+        <p className="flex items-center gap-2 text-sm text-destructive">
+          <TriangleAlert className="size-4" /> Could not load the cost view:{" "}
+          {error}
+        </p>
+      ) : rows.length === 0 ? (
+        <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+          No model calls recorded in the last {days} days.
+        </p>
+      ) : (
+        <Card>
+          <CardContent className="space-y-2 pt-4">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Endpoint · model</TableHead>
+                  <TableHead className="text-right">Calls</TableHead>
+                  <TableHead className="text-right">Input</TableHead>
+                  <TableHead className="text-right">Cached</TableHead>
+                  <TableHead className="text-right">Output</TableHead>
+                  <TableHead className="text-right">Est. USD</TableHead>
+                  <TableHead className="text-right">Est. credits</TableHead>
+                  <TableHead className="text-right">
+                    Month at this pace
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((r) => (
+                  <TableRow key={`${r.endpoint}:${r.model}`}>
+                    <TableCell>
+                      <div className="font-medium">{r.model_label}</div>
+                      <div className="text-muted-foreground">
+                        {r.endpoint_label}
+                        {Object.keys(r.purposes).length > 0 && (
+                          <> · {Object.keys(r.purposes).join(", ")}</>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right">{r.calls}</TableCell>
+                    <TableCell className="text-right">
+                      {formatTokens(r.prompt_tokens)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatTokens(r.cached_tokens)}
+                      <div className="text-muted-foreground">
+                        {(r.cache_hit_rate * 100).toFixed(0)}% hit
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatTokens(r.completion_tokens)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {r.unpriced_calls === r.calls
+                        ? "—"
+                        : formatUsd(r.cost_usd)}
+                      {r.unpriced_calls > 0 && r.unpriced_calls < r.calls && (
+                        <div className="text-muted-foreground">
+                          {r.unpriced_calls} unpriced
+                        </div>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {r.unpriced_calls === r.calls
+                        ? "—"
+                        : r.credits.toFixed(3)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {r.unpriced_calls === r.calls
+                        ? "—"
+                        : formatUsd(r.projected_month_usd)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {data && rows.length > 1 && (
+                  <TableRow className="font-medium">
+                    <TableCell>Total</TableCell>
+                    <TableCell className="text-right">
+                      {data.total.calls}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatTokens(data.total.prompt_tokens)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatTokens(data.total.cached_tokens)}
+                      <div className="text-muted-foreground">
+                        {(data.total.cache_hit_rate * 100).toFixed(0)}% hit
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatTokens(data.total.completion_tokens)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatUsd(data.total.cost_usd)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {data.total.credits.toFixed(3)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatUsd(data.total.projected_month_usd)}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+            <p className="text-[0.7rem] text-muted-foreground">
+              {data?.note} A model with no price in the registry shows “—”.
+              {data && data.ledger.dropped + data.ledger.write_errors > 0 && (
+                <>
+                  {" "}
+                  Some calls could not be recorded (
+                  {data.ledger.dropped + data.ledger.write_errors} rows or
+                  batches lost), so the figures are low.
+                </>
+              )}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+    </div>
   )
 }
 
@@ -891,6 +1120,8 @@ export function ConnectionsPage() {
           ))
         )}
       </div>
+
+      <CostsSection />
 
       <EndpointDialog
         open={dialogOpen}

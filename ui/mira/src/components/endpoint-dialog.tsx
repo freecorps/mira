@@ -32,6 +32,8 @@ const PROTOCOLS = [
 
 // Stands in for the empty preset id inside the Select, which rejects one.
 const CUSTOM = "__custom__"
+// The same, for "no plan".
+const NO_PLAN = "__none__"
 
 function Field({
   label,
@@ -127,16 +129,24 @@ function EndpointForm({
   const [apiKeyEnv, setApiKeyEnv] = useState(editing?.key_variable ?? "")
   // Sends api_key: "" — the only way to take a stored key back out.
   const [clearKey, setClearKey] = useState(false)
+  // For a subscription with no usage API: the plan, when it started, and
+  // the factor that lines Mira's estimate up with the provider's console.
+  const [plan, setPlan] = useState(editing?.plan ?? "")
+  const [planStarted, setPlanStarted] = useState(editing?.plan_started ?? "")
+  const [costScale, setCostScale] = useState(String(editing?.cost_scale ?? 1))
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [tested, setTested] = useState<EndpointTest | null>(null)
   const [error, setError] = useState("")
 
   const chosen = presets.find((p) => p.id === preset)
+  const plans = chosen?.plans ?? []
 
   const pickPreset = (id: string) => {
     setPreset(id)
     setTested(null)
+    // A plan belongs to the preset it was picked from.
+    if (id !== preset) setPlan("")
     const found = presets.find((p) => p.id === id)
     if (!found) return
     // Prefill what the preset knows, leaving anything already typed alone:
@@ -183,6 +193,13 @@ function EndpointForm({
         preset,
         api_style: apiStyle,
         api_key_env: apiKeyEnv,
+        ...(plans.length > 0
+          ? {
+              plan,
+              plan_started: planStarted,
+              cost_scale: Number(costScale) || 1,
+            }
+          : {}),
         // A typed key replaces the stored one and "" removes it. Absent —
         // neither typed nor cleared — leaves it alone, which is what an
         // edit that only touches the name has to do.
@@ -338,6 +355,57 @@ function EndpointForm({
             </SelectContent>
           </Select>
         </Field>
+
+        {plans.length > 0 && (
+          <>
+            <Field
+              label="Plan"
+              hint="This provider has no usage API, so Mira estimates the plan's windows from the tokens it spends here. Pick the plan the key is on."
+            >
+              <Select
+                value={plan || NO_PLAN}
+                onValueChange={(v) => setPlan(v === NO_PLAN ? "" : v)}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="No plan" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_PLAN}>No plan (no meter)</SelectItem>
+                  {plans.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field
+                label="Subscription started"
+                hint="The 7-day window starts on this day. Leave empty for a rolling 7 days."
+              >
+                <Input
+                  type="date"
+                  value={planStarted}
+                  onChange={(e) => setPlanStarted(e.target.value)}
+                />
+              </Field>
+              <Field
+                label="Calibration"
+                hint="Compare with the provider's console: 1.25 if it reads 25% more than Mira."
+              >
+                <Input
+                  type="number"
+                  step="0.05"
+                  min="0.05"
+                  max="100"
+                  value={costScale}
+                  onChange={(e) => setCostScale(e.target.value)}
+                />
+              </Field>
+            </div>
+          </>
+        )}
 
         {tested && (
           <p
