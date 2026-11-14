@@ -757,3 +757,30 @@ def test_llm_config_for_tags_the_purpose():
     )
     assert config.usage_purpose == "indexing"
     assert all(f.usage_purpose == "indexing" for f in config.fallbacks)
+
+
+def test_an_id_only_scoped_on_several_endpoints_resolves_by_scope_name(monkeypatch) -> None:
+    from mira.llm import registry
+
+    models = {
+        "solo@zeta": {"label": "Z", "input_cost_per_1m": 9.0, "output_cost_per_1m": 9.0},
+        "solo@alpha": {"label": "A", "input_cost_per_1m": 1.0, "output_cost_per_1m": 2.0},
+    }
+    monkeypatch.setattr(registry, "_load", lambda: models)
+    assert registry.get("solo")["endpoint"] == "alpha"
+    assert registry.pricing("solo") == (1.0, 2.0)
+    assert registry.pricing("solo", "zeta") == (9.0, 9.0)
+
+
+def test_indexing_estimate_prices_at_the_endpoint_scoped_rate(monkeypatch) -> None:
+    from mira.dashboard.models_config import estimate_indexing_cost
+    from mira.llm import registry
+
+    models = {
+        "m": {"label": "M", "input_cost_per_1m": 10.0, "output_cost_per_1m": 10.0},
+        "m@cheap": {"label": "M", "input_cost_per_1m": 1.0, "output_cost_per_1m": 1.0},
+    }
+    monkeypatch.setattr(registry, "_load", lambda: models)
+    plain = estimate_indexing_cost(1000, "m")["estimated_usd"]
+    cheap = estimate_indexing_cost(1000, "m", "cheap")["estimated_usd"]
+    assert cheap < plain

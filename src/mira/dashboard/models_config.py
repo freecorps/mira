@@ -17,10 +17,6 @@ from mira.oauth.base import LLMBinding
 
 logger = logging.getLogger(__name__)
 
-MODEL_PRICING: dict[str, tuple[float, float]] = {
-    model_id: registry.pricing(model_id) for model_id, _info in registry.entries()
-}
-
 # Thinking-mode options for the review model. "off" disables extended thinking
 # (today's behavior); low/medium/high map to OpenRouter's unified
 # ``reasoning.effort``. Single source for the dashboard dropdown and validation.
@@ -514,7 +510,7 @@ def describe_call(config: LLMConfig) -> dict:
     }
 
 
-def estimate_indexing_cost(file_count: int, model: str) -> dict:
+def estimate_indexing_cost(file_count: int, model: str, endpoint: str | None = None) -> dict:
     """Estimate cost of indexing N files with the given model.
 
     Based on actual indexer behavior:
@@ -526,7 +522,8 @@ def estimate_indexing_cost(file_count: int, model: str) -> dict:
     if file_count == 0:
         return {"estimated_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
 
-    input_price, output_price = MODEL_PRICING.get(model, (3.00, 15.00))
+    # Priced per endpoint: one id can be served at two rates (``<id>@<endpoint>``).
+    input_price, output_price = registry.pricing(model, endpoint)
 
     # File summarization batches
     batches = (file_count + 4) // 5  # ceil div
