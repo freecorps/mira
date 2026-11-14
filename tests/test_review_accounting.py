@@ -21,11 +21,22 @@ def test_usage_counts_every_model_the_review_called():
     engine = ReviewEngine(
         config=MiraConfig(), llm=review, indexing_llm=indexing, security_llm=security
     )
-    assert engine._usage() == {
+    usage = engine._usage()
+    assert {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")} == {
         "prompt_tokens": 1200,
         "completion_tokens": 30,
         "total_tokens": 1230,
     }
+
+
+def test_usage_sums_cached_tokens_and_cost():
+    review, indexing = _client(1000), _client(200)
+    review.usage = {**review.usage, "cached_tokens": 600, "cost_usd": 0.012}
+    indexing.usage = {**indexing.usage, "cached_tokens": 100, "cost_usd": 0.001}
+    engine = ReviewEngine(config=MiraConfig(), llm=review, indexing_llm=indexing)
+    usage = engine._usage()
+    assert usage["cached_tokens"] == 700
+    assert abs(usage["cost_usd"] - 0.013) < 1e-9
 
 
 def test_a_client_serving_two_purposes_is_counted_once():

@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 
 _INDEX_DIR = os.environ.get("MIRA_INDEX_DIR", "/data/indexes")
 
+# review_events columns added for per-review cost, as (name, SQLite DDL). The
+# Postgres store migrates the same names (see pg_store), so the two cannot drift.
+REVIEW_COST_COLUMNS = (
+    ("prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("cached_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("cost_usd", "REAL NOT NULL DEFAULT 0"),
+)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
@@ -99,6 +108,13 @@ CREATE TABLE IF NOT EXISTS review_events (
     categories TEXT NOT NULL DEFAULT '',
     author_avatar_url TEXT NOT NULL DEFAULT '',
     reviewed_paths TEXT NOT NULL DEFAULT '',
+    -- Per-review totals of every model the review called: the input, the part
+    -- of it served from the prompt cache, the output, and the estimated cost.
+    -- `tokens_used` stays the plain prompt + completion total it always was.
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL DEFAULT 0
 );
 
@@ -890,6 +906,13 @@ class ReviewEvent:
     created_at: float = 0.0
     author_avatar_url: str = ""
     reviewed_paths: str = ""  # JSON array of filenames reviewed this pass
+    # What the review's model calls spent, beyond the plain total above: the
+    # prompt (cached part included), its cached part, the output, and the
+    # estimated cost in USD. Zero on rows recorded before they were tracked.
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 @dataclass
@@ -1087,6 +1110,9 @@ class IndexStore(
                 self._conn.execute(
                     f"ALTER TABLE review_events ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
                 )
+        for col, ddl in REVIEW_COST_COLUMNS:
+            if col not in re_cols:
+                self._conn.execute(f"ALTER TABLE review_events ADD COLUMN {col} {ddl}")
         feedback_cols = {
             r[1] for r in self._conn.execute("PRAGMA table_info(feedback_events)").fetchall()
         }
@@ -1526,14 +1552,19 @@ class IndexStore(
         author: str = "",
         author_avatar_url: str = "",
         reviewed_paths: str = "",
+        prompt_tokens: int = 0,
+        cached_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_usd: float = 0.0,
     ) -> ReviewEvent:
         now = created_at if created_at is not None else time.time()
         self._conn.execute(
             "INSERT INTO review_events "
             "(pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, author_avatar_url, reviewed_paths, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "categories, author_avatar_url, reviewed_paths, prompt_tokens, cached_tokens, "
+            "completion_tokens, cost_usd, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pr_number,
                 pr_title,
@@ -1550,6 +1581,10 @@ class IndexStore(
                 categories,
                 author_avatar_url,
                 reviewed_paths,
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                cost_usd,
                 now,
             ),
         )
@@ -1573,13 +1608,18 @@ class IndexStore(
             created_at=now,
             author_avatar_url=author_avatar_url,
             reviewed_paths=reviewed_paths,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=cost_usd,
         )
 
     def list_review_events(self, limit: int = 100) -> list[ReviewEvent]:
         rows = self._conn.execute(
             "SELECT id, pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, created_at, author_avatar_url, reviewed_paths "
+            "categories, created_at, author_avatar_url, reviewed_paths, "
+            "prompt_tokens, cached_tokens, completion_tokens, cost_usd "
             "FROM review_events ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -1602,6 +1642,10 @@ class IndexStore(
                 created_at=r[14],
                 author_avatar_url=r[15],
                 reviewed_paths=r[16],
+                prompt_tokens=r[17],
+                cached_tokens=r[18],
+                completion_tokens=r[19],
+                cost_usd=r[20],
             )
             for r in rows
         ]
@@ -1610,7 +1654,8 @@ class IndexStore(
         rows = self._conn.execute(
             "SELECT id, pr_number, pr_title, pr_url, author, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, created_at, author_avatar_url, reviewed_paths "
+            "categories, created_at, author_avatar_url, reviewed_paths, "
+            "prompt_tokens, cached_tokens, completion_tokens, cost_usd "
             "FROM review_events WHERE pr_number = ? ORDER BY created_at DESC",
             (pr_number,),
         ).fetchall()
@@ -1633,6 +1678,10 @@ class IndexStore(
                 created_at=r[14],
                 author_avatar_url=r[15],
                 reviewed_paths=r[16],
+                prompt_tokens=r[17],
+                cached_tokens=r[18],
+                completion_tokens=r[19],
+                cost_usd=r[20],
             )
             for r in rows
         ]
@@ -1818,7 +1867,8 @@ class IndexStore(
             "SELECT COUNT(*), COALESCE(SUM(comments_posted),0), COALESCE(SUM(blockers),0), "
             "COALESCE(SUM(warnings),0), COALESCE(SUM(suggestions),0), "
             "COALESCE(SUM(files_reviewed),0), COALESCE(SUM(lines_changed),0), "
-            "COALESCE(SUM(tokens_used),0), COALESCE(AVG(duration_ms),0) "
+            "COALESCE(SUM(tokens_used),0), COALESCE(AVG(duration_ms),0), "
+            "COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cost_usd),0) "
             f"FROM review_events{where}",
             params,
         ).fetchone()
@@ -1847,6 +1897,8 @@ class IndexStore(
             "total_lines_changed": row[6],
             "total_tokens": row[7],
             "avg_duration_ms": int(row[8]),
+            "total_cached_tokens": int(row[9] or 0),
+            "total_cost_usd": float(row[10] or 0.0),
             "categories": cat_counts,
         }
 

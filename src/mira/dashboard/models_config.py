@@ -18,7 +18,7 @@ from mira.oauth.base import LLMBinding
 logger = logging.getLogger(__name__)
 
 MODEL_PRICING: dict[str, tuple[float, float]] = {
-    model_id: registry.pricing(model_id) for model_id in registry.all_models()
+    model_id: registry.pricing(model_id) for model_id, _info in registry.entries()
 }
 
 # Thinking-mode options for the review model. "off" disables extended thinking
@@ -805,14 +805,17 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
         config_model = base.review_model
         thinking_mode = get_review_thinking_mode(base, db_thinking)
     else:
-        return bind_model(
-            base,
-            base.model,
-            model_is_explicit=_model_is_explicit(base, None),
-            default=default,
-            api_style=resolved_style,
-            api_endpoint=db_endpoint,
-            purpose=purpose,
+        return _for_purpose(
+            bind_model(
+                base,
+                base.model,
+                model_is_explicit=_model_is_explicit(base, None),
+                default=default,
+                api_style=resolved_style,
+                api_endpoint=db_endpoint,
+                purpose=purpose,
+            ),
+            purpose,
         )
 
     source = "dashboard setting" if db_model else ("mira.yaml" if config_model else "default")
@@ -841,15 +844,34 @@ def llm_config_for(purpose: str, base: LLMConfig) -> LLMConfig:
             config.endpoint,
             config.base_url,
         )
-    return _with_fallbacks(
-        config,
+    return _for_purpose(
+        _with_fallbacks(
+            config,
+            purpose,
+            base,
+            db_fallbacks,
+            default=default,
+            thinking_mode=thinking_mode,
+            api_style=resolved_style,
+            api_endpoint=db_endpoint,
+        ),
         purpose,
-        base,
-        db_fallbacks,
-        default=default,
-        thinking_mode=thinking_mode,
-        api_style=resolved_style,
-        api_endpoint=db_endpoint,
+    )
+
+
+def _for_purpose(config: LLMConfig, purpose: str) -> LLMConfig:
+    """Tag a resolved config, and its fallback chain, with what its calls are for.
+
+    The usage ledger records it beside every call, so the cost view can say
+    how much of the bill was reviewing and how much indexing.
+    """
+    return config.model_copy(
+        update={
+            "usage_purpose": purpose,
+            "fallbacks": [
+                f.model_copy(update={"usage_purpose": purpose}) for f in config.fallbacks
+            ],
+        }
     )
 
 

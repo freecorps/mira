@@ -202,6 +202,21 @@ class LLMConfig(BaseModel):
     # served through tool calling instead. Set false to go straight to tool
     # calling, as before.
     json_schema_mode: bool = True
+    # The subscription plan behind the endpoint this file names, for a
+    # provider with no usage API (OpenDesign Cloud: go, plus, pro or max).
+    # Mira then estimates the plan's windows from the tokens it recorded
+    # spending; an endpoint added in the dashboard carries its own.
+    plan: str = ""
+    # The day the subscription started (YYYY-MM-DD), which is where a
+    # plan's 7-day windows begin. Empty means a rolling 7 days.
+    plan_started: str = ""
+    # Scales the estimated plan credits after comparing them with the
+    # provider's own console: 1.25 if the console reads 25% more than Mira.
+    cost_scale: float = Field(default=1.0, gt=0)
+    # What the calls made with this config are for ("review", "indexing",
+    # "security"), as the usage ledger records them. Set by
+    # `llm_config_for`; nothing in a config file needs to set it.
+    usage_purpose: str = ""
 
     @field_validator("base_url")
     @classmethod

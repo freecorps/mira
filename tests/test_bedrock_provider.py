@@ -575,11 +575,35 @@ class TestUsage:
         await provider.complete([{"role": "user", "content": "a"}], json_mode=False)
         await provider.complete([{"role": "user", "content": "b"}], json_mode=False)
 
-        assert provider.usage == {
+        usage = provider.usage
+        assert {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")} == {
             "prompt_tokens": 300,
             "completion_tokens": 130,
             "total_tokens": 430,
         }
+        assert usage["cached_tokens"] == 0
+
+    @pytest.mark.asyncio
+    @patch("boto3.Session")
+    async def test_cache_reads_count_as_input(self, mock_session_cls):
+        """Converse reports cache reads apart from inputTokens; both are input."""
+        from mira.llm.bedrock import BedrockProvider
+
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = [
+            _mock_converse_response(
+                "r1", {"inputTokens": 100, "outputTokens": 50, "cacheReadInputTokens": 900}
+            ),
+        ]
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_session_cls.return_value = mock_session
+
+        provider = BedrockProvider(_bedrock_config())
+        await provider.complete([{"role": "user", "content": "a"}], json_mode=False)
+
+        assert provider.usage["prompt_tokens"] == 1000
+        assert provider.usage["cached_tokens"] == 900
 
 
 class TestBedrockToolChoiceFallback:

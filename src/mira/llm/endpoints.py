@@ -91,6 +91,13 @@ class Endpoint:
     # models for; empty for an endpoint nothing is known about, where
     # replacing somebody's model id would be a guess.
     default_model: str = ""
+    # For a preset whose subscription has no usage API (its profile lists
+    # ``plans``): which plan this key is on, the day it started (where the
+    # 7-day windows begin; "" for rolling windows), and a factor scaling
+    # Mira's credit estimate to match the provider's console.
+    plan: str = ""
+    plan_started: str = ""
+    cost_scale: float = 1.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -141,10 +148,64 @@ def preset_options() -> list[dict[str, Any]]:
                 "base_url": profile.get("base_url") or "",
                 "api_key_env": profile.get("api_key_env") or "",
                 "api_style": profile.get("api_style") or "chat",
-                "reports_usage": bool(profile.get("usage_url")),
+                "reports_usage": reports_usage(profile),
+                "usage_estimated": estimates_usage(profile),
+                "plans": plan_options(profile),
             }
         )
     return options
+
+
+def reports_usage(profile: dict) -> bool:
+    """Whether the endpoint's card shows an allowance: asked for, or estimated."""
+    return bool(profile.get("usage_url")) or estimates_usage(profile)
+
+
+def estimates_usage(profile: dict) -> bool:
+    """True for a subscription with no usage API, whose meters Mira works out."""
+    return profile.get("usage_format") == "ledger" and bool(plans_of(profile))
+
+
+def plans_of(profile: dict) -> dict[str, dict]:
+    """The profile's plans, keyed by id, without its ``_comment`` keys."""
+    raw = profile.get("plans")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: plan
+        for key, plan in raw.items()
+        if not key.startswith("_")
+        and isinstance(plan, dict)
+        and isinstance(plan.get("windows"), list)
+    }
+
+
+def plan_options(profile: dict) -> list[dict[str, str]]:
+    """``[{id, label}]`` for the form's plan picker."""
+    return [
+        {"id": key, "label": str(plan.get("label") or key)}
+        for key, plan in plans_of(profile).items()
+    ]
+
+
+def parse_plan_start(text: str) -> float | None:
+    """A subscription start (``YYYY-MM-DD`` or ISO 8601) as an epoch, in UTC.
+
+    None for an empty or unreadable value; :func:`save` refuses the latter,
+    so a stored one always reads.
+    """
+    from datetime import UTC, datetime
+
+    value = (text or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
 
 
 def recommended_model(preset: str, purpose: str = "review") -> str:
@@ -159,7 +220,7 @@ def recommended_model(preset: str, purpose: str = "review") -> str:
     from mira.llm import registry
 
     fallback = ""
-    for model_id, info in registry.all_models().items():
+    for model_id, info in registry.entries():
         if info.get("endpoint") != preset:
             continue
         if purpose in (info.get("recommended_for") or []):
@@ -304,12 +365,32 @@ def save(endpoint: Endpoint, db: Any = None) -> Endpoint:
         raise EndpointError(f"Model prefix must be one of {', '.join(MODEL_PREFIXES)}")
     if endpoint.preset and endpoint.preset not in presets():
         raise EndpointError(f"Unknown preset {endpoint.preset!r}")
+    _check_plan(endpoint)
     endpoint.api_key_env = (endpoint.api_key_env or "").strip()
     if not endpoint.default_model:
         endpoint.default_model = recommended_model(endpoint.preset)
     endpoint.updated_at = time.time()
     store.set_setting(_PREFIX + endpoint.id, json.dumps(endpoint.to_dict()))
     return endpoint
+
+
+def _check_plan(endpoint: Endpoint) -> None:
+    """Validate the subscription settings against what the preset offers."""
+    endpoint.plan = (endpoint.plan or "").strip().lower()
+    endpoint.plan_started = (endpoint.plan_started or "").strip()
+    plans = plans_of(presets().get(endpoint.preset) or {}) if endpoint.preset else {}
+    if endpoint.plan and endpoint.plan not in plans:
+        offered = ", ".join(plans) or "none"
+        raise EndpointError(f"Plan must be one of: {offered}")
+    if endpoint.plan_started and parse_plan_start(endpoint.plan_started) is None:
+        raise EndpointError("The subscription start must be a date, as YYYY-MM-DD")
+    try:
+        scale = float(endpoint.cost_scale)
+    except (TypeError, ValueError):
+        raise EndpointError("The cost calibration must be a number") from None
+    if not 0 < scale <= 100:
+        raise EndpointError("The cost calibration must be above 0 and at most 100")
+    endpoint.cost_scale = scale
 
 
 def create(
@@ -320,6 +401,9 @@ def create(
     api_style: str = "",
     api_key_env: str = "",
     model_prefix: str = "",
+    plan: str = "",
+    plan_started: str = "",
+    cost_scale: float = 1.0,
     db: Any = None,
 ) -> Endpoint:
     """Add an endpoint, deriving its id from the label."""
@@ -336,6 +420,9 @@ def create(
         api_style=api_style or (profile or {}).get("api_style", "") or "chat",
         api_key_env=api_key_env,
         model_prefix=model_prefix,
+        plan=plan,
+        plan_started=plan_started,
+        cost_scale=cost_scale,
     )
     return save(endpoint, store)
 

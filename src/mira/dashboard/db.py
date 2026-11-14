@@ -396,6 +396,42 @@ CREATE TABLE IF NOT EXISTS pr_review_verdicts (
     updated_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
+
+-- One row per LLM call: which endpoint and model, what for, the tokens it
+-- spent by kind, and what that is estimated to have cost. Mira used to keep a
+-- single token total per review, which hid the two numbers a subscription is
+-- metered by: how much input came out of the provider's prompt cache, and
+-- what the call cost in plan credits. The cost view sums this table, and the
+-- allowance meter of a provider with no usage API (OpenDesign Cloud) is
+-- estimated from it. `endpoint` is the stored endpoint's id, 'config' for the
+-- one mira.yaml names, 'oauth:<provider>' or 'bedrock'; `provider` is the
+-- provider profile its prices were looked up under. Kept 90 days by default
+-- (MIRA_USAGE_RETENTION_DAYS); written in batches off the review's path.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL DEFAULT 0,
+    endpoint TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    credits REAL NOT NULL DEFAULT 0,
+    -- 0 when the registry had no price for the model: its cost is unknown,
+    -- not zero, and the cost view says so.
+    priced INTEGER NOT NULL DEFAULT 0,
+    trace_id TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_usage_created
+    ON llm_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_endpoint
+    ON llm_usage(endpoint, created_at);
 """
 
 _PG_SCHEMA = """
@@ -732,6 +768,42 @@ CREATE TABLE IF NOT EXISTS pr_review_verdicts (
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
+
+-- One row per LLM call: which endpoint and model, what for, the tokens it
+-- spent by kind, and what that is estimated to have cost. Mira used to keep a
+-- single token total per review, which hid the two numbers a subscription is
+-- metered by: how much input came out of the provider's prompt cache, and
+-- what the call cost in plan credits. The cost view sums this table, and the
+-- allowance meter of a provider with no usage API (OpenDesign Cloud) is
+-- estimated from it. `endpoint` is the stored endpoint's id, 'config' for the
+-- one mira.yaml names, 'oauth:<provider>' or 'bedrock'; `provider` is the
+-- provider profile its prices were looked up under. Kept 90 days by default
+-- (MIRA_USAGE_RETENTION_DAYS); written in batches off the review's path.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id BIGSERIAL PRIMARY KEY,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    endpoint TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    credits DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- 0 when the registry had no price for the model: its cost is unknown,
+    -- not zero, and the cost view says so.
+    priced INTEGER NOT NULL DEFAULT 0,
+    trace_id TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_usage_created
+    ON llm_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_endpoint
+    ON llm_usage(endpoint, created_at);
 """
 
 # pull_requests columns added for DORA / cycle time, as (name, DDL). Shared by
@@ -2689,6 +2761,155 @@ class AppDatabase:
                     "DELETE FROM app_logs WHERE id <= ?", (int(rows[0][0]),), conn=conn
                 )
         return deleted
+
+    # ── LLM usage ledger ──────────────────────────────────────────────
+
+    _LLM_USAGE_COLUMNS = (
+        "created_at, endpoint, provider, model, purpose, prompt_tokens, cached_tokens, "
+        "completion_tokens, reasoning_tokens, cost_usd, credits, priced, trace_id, repo, "
+        "pr_number"
+    )
+
+    def record_llm_usage(self, entries: list[dict[str, Any]]) -> int:
+        """Append a batch of ledger rows (see :mod:`mira.llm.ledger`).
+
+        Raises on failure, like ``record_app_logs``: the caller is the ledger's
+        writer thread, which counts the lost batch and carries on. On SQLite
+        it shares the log writer's connection and lock — both are background
+        writers committing on a timer, and neither belongs in a request's
+        transaction.
+        """
+        if not entries:
+            return 0
+        rows = [
+            (
+                float(e.get("created_at") or 0.0),
+                str(e.get("endpoint") or "")[:200],
+                str(e.get("provider") or "")[:100],
+                str(e.get("model") or "")[:200],
+                str(e.get("purpose") or "")[:40],
+                int(e.get("prompt_tokens") or 0),
+                int(e.get("cached_tokens") or 0),
+                int(e.get("completion_tokens") or 0),
+                int(e.get("reasoning_tokens") or 0),
+                float(e.get("cost_usd") or 0.0),
+                float(e.get("credits") or 0.0),
+                1 if e.get("priced") else 0,
+                str(e.get("trace_id") or "")[:64],
+                str(e.get("repo") or "")[:200],
+                int(e.get("pr_number") or 0),
+            )
+            for e in entries
+        ]
+        placeholders = ", ".join(["?"] * 15)
+        sql = f"INSERT INTO llm_usage ({self._LLM_USAGE_COLUMNS}) VALUES ({placeholders})"
+        if self._backend == "sqlite":
+            with self._sqlite_log_lock:
+                conn = self._log_writer_conn()
+                try:
+                    conn.executemany(sql, rows)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+        else:
+            with self._pg_cursor() as cur:
+                cur.executemany(sql.replace("?", "%s"), rows)
+            self._pg_commit()
+        return len(rows)
+
+    def prune_llm_usage(self, *, max_age_days: float = 90.0) -> int:
+        """Drop ledger rows older than ``max_age_days``."""
+        if max_age_days <= 0:
+            return 0
+        cutoff = time.time() - max_age_days * 86400
+        if self._backend != "sqlite":
+            return self._delete_returning_count(
+                "DELETE FROM llm_usage WHERE created_at < ?", (cutoff,)
+            )
+        with self._sqlite_log_lock:
+            return self._delete_returning_count(
+                "DELETE FROM llm_usage WHERE created_at < ?",
+                (cutoff,),
+                conn=self._log_writer_conn(),
+            )
+
+    def llm_usage_summary(
+        self, *, since: float, until: float | None = None, endpoint: str = ""
+    ) -> list[dict[str, Any]]:
+        """Ledger totals per (endpoint, provider, model, purpose) since ``since``.
+
+        One row per group with calls, every token kind, the estimated cost and
+        credits, how many calls had no price, and the first and last call.
+        """
+        clauses = ["created_at >= ?"]
+        params: list[Any] = [float(since)]
+        if until is not None:
+            clauses.append("created_at < ?")
+            params.append(float(until))
+        if endpoint:
+            clauses.append("endpoint = ?")
+            params.append(endpoint)
+        rows = self._ledger_rows(
+            "SELECT endpoint, provider, model, purpose, COUNT(*), "
+            "COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cached_tokens), 0), "
+            "COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(reasoning_tokens), 0), "
+            "COALESCE(SUM(cost_usd), 0), COALESCE(SUM(credits), 0), "
+            "COALESCE(SUM(CASE WHEN priced = 0 THEN 1 ELSE 0 END), 0), "
+            "MIN(created_at), MAX(created_at) "
+            f"FROM llm_usage WHERE {' AND '.join(clauses)} "
+            "GROUP BY endpoint, provider, model, purpose "
+            "ORDER BY endpoint, provider, model, purpose",
+            tuple(params),
+        )
+        return [
+            {
+                "endpoint": r[0],
+                "provider": r[1],
+                "model": r[2],
+                "purpose": r[3],
+                "calls": int(r[4] or 0),
+                "prompt_tokens": int(r[5] or 0),
+                "cached_tokens": int(r[6] or 0),
+                "completion_tokens": int(r[7] or 0),
+                "reasoning_tokens": int(r[8] or 0),
+                "cost_usd": float(r[9] or 0.0),
+                "credits": float(r[10] or 0.0),
+                "unpriced_calls": int(r[11] or 0),
+                "first_at": float(r[12] or 0.0),
+                "last_at": float(r[13] or 0.0),
+            }
+            for r in rows
+        ]
+
+    def llm_usage_credits(
+        self, endpoint: str, *, since: float, until: float | None = None
+    ) -> tuple[float, float]:
+        """``(credits, earliest call)`` one endpoint spent since ``since``.
+
+        The earliest call is 0 when there was none; a rolling window's reset
+        is when that call ages out of it.
+        """
+        sql = (
+            "SELECT COALESCE(SUM(credits), 0), MIN(created_at) FROM llm_usage "
+            "WHERE endpoint = ? AND created_at >= ?"
+        )
+        params: tuple = (endpoint, float(since))
+        if until is not None:
+            sql += " AND created_at < ?"
+            params = (*params, float(until))
+        rows = self._ledger_rows(sql, params)
+        if not rows:
+            return 0.0, 0.0
+        return float(rows[0][0] or 0.0), float(rows[0][1] or 0.0)
+
+    def _ledger_rows(self, sql: str, params: tuple) -> list[tuple]:
+        """A ledger read, through the reconnecting cursor on Postgres."""
+        if self._backend == "sqlite":
+            return self._rows(sql, params)
+        with self._pg_cursor() as cur:
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur.fetchall()
 
     def clear_app_logs(self) -> int:
         """Delete every captured line. Behind the dashboard's Clear button."""

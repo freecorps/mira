@@ -871,3 +871,28 @@ def test_postgres_triage_atomic_uses_a_dedicated_connection(store, monkeypatch):
     monkeypatch.setattr(pg_store.PgIndexStore, "_transaction_cursor", _record)
     store.record_triage_run(_triage_run())
     assert used == ["dedicated"]
+
+
+def test_review_events_carry_cost(store):
+    """Per-review cost columns round-trip and aggregate, as on SQLite."""
+    store.record_review(
+        pr_number=7,
+        pr_title="t",
+        pr_url="u",
+        comments_posted=0,
+        blockers=0,
+        warnings=0,
+        tokens_used=1100,
+        prompt_tokens=1000,
+        cached_tokens=900,
+        completion_tokens=100,
+        cost_usd=0.0123,
+    )
+    (event,) = store.list_review_events()
+    assert (event.prompt_tokens, event.cached_tokens, event.completion_tokens) == (1000, 900, 100)
+    assert event.cost_usd == pytest.approx(0.0123)
+    (for_pr,) = store.list_review_events_for_pr(7)
+    assert for_pr.cached_tokens == 900
+    stats = store.get_review_stats()
+    assert stats["total_cached_tokens"] == 900
+    assert stats["total_cost_usd"] == pytest.approx(0.0123)

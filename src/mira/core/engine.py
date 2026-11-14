@@ -649,12 +649,14 @@ class ReviewEngine:
             config = self.config.llm
         if config.max_tokens:
             return config.max_tokens
+        profile = getattr(self.llm, "profile", None)
+        endpoint = str(profile.get("name") or "") if isinstance(profile, dict) else ""
         return min(
-            registry.max_output_tokens(config.model, default=16384),
+            registry.max_output_tokens(config.model, default=16384, endpoint=endpoint or None),
             self.config.llm.max_context_tokens // 4,
         )
 
-    def _usage(self) -> dict[str, int]:
+    def _usage(self) -> dict[str, int | float]:
         """Tokens spent by every model this review called, not only the reviewer.
 
         The critique, the summary and the dependency pass run on the indexing
@@ -662,7 +664,18 @@ class ReviewEngine:
         alone left all of them out of the dashboard's token figure. A client
         serving two purposes is counted once.
         """
-        totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        totals: dict[str, int | float] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            # The part of the prompt served from the provider's cache, and
+            # what all of it is estimated to have cost (see llm.accounting).
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "cost_usd": 0.0,
+            "credits": 0.0,
+            "unpriced_calls": 0,
+        }
         seen: set[int] = set()
         for client in (self.llm, self.indexing_llm, self.security_llm):
             if id(client) in seen:
@@ -673,7 +686,7 @@ class ReviewEngine:
                 continue
             for key in totals:
                 value = usage.get(key, 0)
-                if isinstance(value, int):
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
                     totals[key] += value
         return totals
 
@@ -916,11 +929,14 @@ class ReviewEngine:
             # Inside the trace, so it closes the story `mira_get_trace` tells;
             # logged by the caller, it carried no trace id at all.
             logger.info(
-                "Review complete for %s (trace %s): %d comment(s), %d tokens, %.1fs",
+                "Review complete for %s (trace %s): %d comment(s), %d tokens "
+                "(%d cached), ~$%.4f, %.1fs",
                 pr_url,
                 trace_id,
                 len(result.comments),
                 result.token_usage.get("total_tokens", 0),
+                result.token_usage.get("cached_tokens", 0),
+                result.token_usage.get("cost_usd", 0.0),
                 time.monotonic() - started,
             )
             return result
@@ -1490,7 +1506,13 @@ class ReviewEngine:
                 suggestions=suggestion_count,
                 files_reviewed=result.reviewed_files,
                 lines_changed=_lines_changed,
-                tokens_used=result.token_usage.get("total_tokens", 0),
+                tokens_used=int(result.token_usage.get("total_tokens", 0)),
+                # Cost per review: what the ledger records call by call,
+                # summed for this one (cache hits included, estimated cost).
+                prompt_tokens=int(result.token_usage.get("prompt_tokens", 0)),
+                cached_tokens=int(result.token_usage.get("cached_tokens", 0)),
+                completion_tokens=int(result.token_usage.get("completion_tokens", 0)),
+                cost_usd=float(result.token_usage.get("cost_usd", 0.0)),
                 duration_ms=duration,
                 categories=categories,
                 author=pr_info.author,

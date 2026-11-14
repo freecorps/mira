@@ -52,6 +52,12 @@ class EndpointBody(BaseModel):
     api_key_env: str | None = None
     model_prefix: str | None = None
     default_model: str | None = None
+    # For a preset with no usage API (OpenDesign Cloud): the plan the key is
+    # on ("" for none), the day it started (YYYY-MM-DD; "" for rolling
+    # windows), and the factor scaling Mira's estimate to the console's.
+    plan: str | None = None
+    plan_started: str | None = None
+    cost_scale: float | None = None
     # Make this the endpoint bare model ids go to, in the same request that
     # creates it — the common case, and one round trip instead of two.
     make_default: bool = False
@@ -139,6 +145,9 @@ async def create_provider(body: EndpointBody, request: Request) -> dict:
             api_style=body.api_style or "",
             api_key_env=body.api_key_env or "",
             model_prefix=body.model_prefix or "",
+            plan=body.plan or "",
+            plan_started=body.plan_started or "",
+            cost_scale=body.cost_scale if body.cost_scale is not None else 1.0,
             db=_db(),
         )
         if body.api_key:
@@ -242,12 +251,21 @@ async def update_provider(endpoint_id: str, body: EndpointBody, request: Request
         endpoint.model_prefix = body.model_prefix
     if body.default_model is not None:
         endpoint.default_model = body.default_model
+    if body.plan is not None:
+        endpoint.plan = body.plan
+    if body.plan_started is not None:
+        endpoint.plan_started = body.plan_started
+    if body.cost_scale is not None:
+        endpoint.cost_scale = body.cost_scale
     if body.preset is not None and body.preset != endpoint.preset:
         endpoint.preset = body.preset
         # The old preset's model is no longer this endpoint's to fall back
         # to; `save` fills in the new preset's, if the registry knows one.
         if body.default_model is None:
             endpoint.default_model = ""
+        # A plan belongs to the preset it was chosen from.
+        if body.plan is None:
+            endpoint.plan = ""
     try:
         endpoints.save(endpoint, _db())
         if body.api_key is not None:
@@ -284,3 +302,22 @@ async def refresh_provider_usage(endpoint_id: str, request: Request) -> dict:
         raise HTTPException(status_code=404, detail=f"Unknown endpoint {endpoint_id!r}") from None
     except key_providers.UsageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/usage/costs")
+def usage_costs(request: Request, days: int = 30) -> dict:
+    """What each endpoint and model spent over the last ``days`` days.
+
+    From the usage ledger: calls, input, cached input and the hit rate,
+    output, estimated USD and plan credits, and a month projected from the
+    pace so far (see :mod:`mira.llm.costs`). Every figure is an estimate.
+    """
+    _require_admin(request)
+    if days not in (1, 7, 30, 90):
+        raise HTTPException(status_code=400, detail="days must be 1, 7, 30 or 90")
+    from mira.llm import costs
+
+    db = _db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="No dashboard database")
+    return costs.report(db, days=days, config=_llm_config())

@@ -619,6 +619,10 @@ def list_reviews(owner: str, repo: str, limit: int = 50) -> list[ReviewEventMode
                 duration_ms=e.duration_ms,
                 categories=e.categories,
                 created_at=e.created_at,
+                prompt_tokens=e.prompt_tokens,
+                cached_tokens=e.cached_tokens,
+                completion_tokens=e.completion_tokens,
+                cost_usd=e.cost_usd,
             )
             for e in events
         ]

@@ -225,6 +225,12 @@ class ReviewEventModel(BaseModel):
     duration_ms: int
     categories: str
     created_at: float
+    # What the review cost: prompt (cached part included), cached, output,
+    # and the estimated USD. Zero for reviews recorded before tracking.
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 class ActivityEventModel(ReviewEventModel):
@@ -1486,6 +1492,10 @@ def get_activity_detail(owner: str, repo: str, pr_number: int) -> ActivityDetail
                 duration_ms=e.duration_ms,
                 categories=e.categories,
                 created_at=e.created_at,
+                prompt_tokens=e.prompt_tokens,
+                cached_tokens=e.cached_tokens,
+                completion_tokens=e.completion_tokens,
+                cost_usd=e.cost_usd,
                 reviewed_paths=_paths(e.reviewed_paths),
                 comments=comments_by_review.get(e.id, []),
             )

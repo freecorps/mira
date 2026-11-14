@@ -51,6 +51,11 @@ DEFAULT_PROFILE: dict = {
     # endpoints, which have nothing to meter.
     "usage_url": "",
     "usage_format": "",
+    # With usage_format "ledger": the subscription's plans and their metered
+    # windows, for an endpoint that has no usage API and whose allowance Mira
+    # estimates from the tokens it spent (see ``mira.llm.key_providers``).
+    "plans": {},
+    "plan_reference_models": [],
     # Read replies as server-sent events, so a slow reply that is still
     # arriving is not mistaken for a stalled one (see LLMConfig.stream_*).
     "stream": False,

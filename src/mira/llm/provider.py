@@ -122,7 +122,7 @@ class LLMProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
         message = self._chat_message(data)
         content = message.get("content") or ""
         if not content.strip():
@@ -197,7 +197,7 @@ class LLMProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
 
         message = self._chat_message(data)
         finish_reason = _finish_reason(data)
@@ -276,7 +276,7 @@ class LLMProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
         message = self._chat_message(data)
         finish_reason = _finish_reason(data)
         return self._schema_reply(
@@ -314,7 +314,9 @@ class LLMProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             resp = await self._post(client, body)
-            if resp.status_code == 400 and "reasoning_content" in resp.text.lower():
+            if resp.status_code == 400 and any(
+                key in resp.text.lower() for key in _ECHOED_REASONING_KEYS
+            ):
                 logger.info(
                     "Model %s refused reasoning sent back in a tool loop; dropping it", api_model
                 )
@@ -326,7 +328,7 @@ class LLMProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
         message = self._chat_message(data)
         content = message.get("content")
         if not message.get("tool_calls") and not (isinstance(content, str) and content.strip()):
@@ -340,12 +342,17 @@ class LLMProvider(OpenAICompatibleProvider):
 
 
 _REASONING_KEYS = ("reasoning_content", "reasoning")
+# Everything an assistant turn can carry its reasoning in, the structured
+# ``reasoning_details`` list (OpenDesign, OpenRouter) as well as the text
+# fields a stream is assembled into. All of it stays off the wire for an
+# endpoint that is not sent its reasoning back.
+_ECHOED_REASONING_KEYS = (*_REASONING_KEYS, "reasoning_details")
 
 
 def _without_reasoning(message: Any) -> Any:
-    if not isinstance(message, dict) or not any(key in message for key in _REASONING_KEYS):
+    if not isinstance(message, dict) or not any(key in message for key in _ECHOED_REASONING_KEYS):
         return message
-    return {key: value for key, value in message.items() if key not in _REASONING_KEYS}
+    return {key: value for key, value in message.items() if key not in _ECHOED_REASONING_KEYS}
 
 
 class _StreamedResponse:

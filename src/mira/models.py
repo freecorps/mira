@@ -479,7 +479,7 @@ class ReviewResult:
     summary: str = ""
     reviewed_files: int = 0
     skipped_reason: str | None = None
-    token_usage: dict[str, int] = field(default_factory=dict)
+    token_usage: dict[str, int | float] = field(default_factory=dict)
     walkthrough: WalkthroughResult | None = None
     thread_decisions: list[ThreadDecision] = field(default_factory=list)
     # Surfaced in the walkthrough banner so @miracodeai review-rest can target the rest.

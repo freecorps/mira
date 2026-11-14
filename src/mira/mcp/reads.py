@@ -420,6 +420,8 @@ def _review_dict(event: Any) -> dict[str, Any]:
         "files_reviewed": event.files_reviewed,
         "lines_changed": event.lines_changed,
         "tokens_used": event.tokens_used,
+        "cached_tokens": getattr(event, "cached_tokens", 0),
+        "cost_usd": round(float(getattr(event, "cost_usd", 0.0) or 0.0), 6),
         "duration_ms": event.duration_ms,
         "categories": [c.strip() for c in (event.categories or "").split(",") if c.strip()],
         "reviewed_paths": _bounded(_json_list(event.reviewed_paths), "reviewed_paths", omitted),
