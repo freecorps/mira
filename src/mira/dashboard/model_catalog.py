@@ -103,12 +103,55 @@ async def _fetch_openai_style(config: LLMConfig, tools_only: bool) -> list[dict]
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(f"{config.base_url.rstrip('/')}/models", headers=headers)
     resp.raise_for_status()
+    preset = str(profile.get("name") or "")
     out = []
     for m in resp.json().get("data", []):
         if tools_only and "tools" not in (m.get("supported_parameters") or []):
             continue
-        out.append({"value": m["id"], "label": m.get("name") or m["id"]})
+        if m.get("enabled") is False:
+            continue  # listed, but the key cannot call it
+        option = {"value": m["id"], "label": m.get("name") or m["id"]}
+        limits = _catalog_limits(m)
+        if limits:
+            option.update(limits)
+            # A model the registry has no entry for on this endpoint is
+            # called with the budgets the endpoint itself published.
+            registry.remember_limits(
+                preset,
+                m["id"],
+                max_input=limits.get("max_input_tokens", 0),
+                max_output=limits.get("max_output_tokens", 0),
+            )
+        out.append(option)
     return out
+
+
+def _catalog_limits(model: dict) -> dict[str, int]:
+    """Input and output budgets a catalogue entry states, where it states them.
+
+    OpenDesign Cloud's ``metadata`` carries ``context_budget`` (the usable
+    input, well under the raw ``context_limit``) and ``output_budget``;
+    OpenRouter-style lists carry ``context_length`` and
+    ``top_provider.max_completion_tokens``.
+    """
+    raw_metadata, raw_top = model.get("metadata"), model.get("top_provider")
+    metadata: dict = raw_metadata if isinstance(raw_metadata, dict) else {}
+    top: dict = raw_top if isinstance(raw_top, dict) else {}
+
+    def first(*values: object) -> int:
+        for value in values:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                return int(value)
+        return 0
+
+    limits = {}
+    max_input = first(metadata.get("context_budget"), metadata.get("context_limit"))
+    max_output = first(metadata.get("output_budget"), top.get("max_completion_tokens"))
+    if max_input:
+        limits["max_input_tokens"] = max_input
+    if max_output:
+        limits["max_output_tokens"] = max_output
+    return limits
 
 
 def _fetch_bedrock_sync(config: LLMConfig) -> list[dict]:
@@ -437,7 +480,7 @@ def _registry_options(backend: str, purpose: str) -> list[dict]:
     between Bedrock and everything else as before.
     """
     options = []
-    for model_id, info in registry.all_models().items():
+    for model_id, info in registry.entries():
         endpoint = info.get("endpoint")
         if not endpoint:
             endpoint = "bedrock" if info.get("provider") == "bedrock" else "openrouter"

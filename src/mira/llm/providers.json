@@ -15,7 +15,9 @@
     "models_dev": "This endpoint's provider id on models.dev, whose per-model reasoning_options say which levels each model takes. The picker offers those levels and a requested one is snapped to the nearest the model has. Empty for an endpoint the catalogue does not list.",
     "session_header": "Optional header carrying a stable per-conversation id (one per client instance, so one per review pass), for endpoints that route and cache by it.",
     "usage_url": "Optional GET endpoint reporting the key's allowance. Its document is read by the parser named in usage_format.",
-    "usage_format": "Which parser reads usage_url's document (see mira.llm.key_providers). Currently: 'opencode-go'.",
+    "usage_format": "Which parser reads usage_url's document (see mira.llm.key_providers). Currently: 'opencode-go'; or 'ledger' for a subscription with no usage API, whose meters Mira estimates from the tokens it recorded spending (see plans).",
+    "plans": "With usage_format 'ledger': the subscription's plans, keyed by the id an endpoint's `plan` setting names. Each has a label and its metered windows: {minutes, credits, anchored}. `credits` is the window's allowance in plan credits (USD of usage value times the model's credit_multiplier in models.json); `anchored` windows restart every `minutes` from the subscription's start date when one is configured, and roll otherwise.",
+    "plan_reference_models": "With plans: models whose remaining allowance the card restates as USD of that model's usage (credits left divided by its credit_multiplier), for subscriptions that document their limits per model.",
     "stream": "true to read Chat Completions replies as server-sent events, so a reply still arriving is judged by llm.stream_idle_timeout rather than killed at llm.request_timeout. Off for an endpoint not known to stream tool calls.",
     "echo_reasoning": "true to send an assistant turn's reasoning_content back with the next request of a tool loop, which DeepSeek's thinking mode requires. A 400 naming the field turns it off for that model."
   },
@@ -56,6 +58,45 @@
     "session_header": "x-opencode-session",
     "usage_url": "https://opencode.ai/zen/go/v1/usage",
     "usage_format": "opencode-go"
+  },
+
+  "open-design": {
+    "models_dev": "",
+    "reasoning_param": "reasoning_effort",
+    "label": "OpenDesign Cloud",
+    "description": "OpenDesign's coding-plan subscription to DeepSeek, GLM, Kimi, Qwen, Claude, GPT and more behind one key, metered in plan credits over 5-hour and 7-day windows.",
+    "docs_url": "https://open-design.ai/pt-br/help/cloud-api/",
+    "base_url": "https://amr-link.open-design.ai/v1",
+    "api_key_env": "OPENDESIGN_API_KEY",
+    "api_style": "chat",
+    "model_prefix": "strip",
+    "stream": true,
+    "echo_reasoning": true,
+    "reasoning_effort_map": {},
+    "usage_format": "ledger",
+    "plan_reference_models": ["deepseek-v4.1-flash-eco", "deepseek-v4.1-flash"],
+    "plans": {
+      "_comment": "Allowances in plan credits, derived from the per-model limits OpenDesign's billing page lists: Go is $55 of Eco (x0.27) or $30 of Flash (x0.5) per 7 days, both 15 credits, and $18 / $10 per 5 hours, both 5 credits; Plus is $74 / $40, 20 credits. Pro and Max list $90 and $150 of Flash per 7 days.",
+      "go": {
+        "label": "Go",
+        "windows": [
+          { "minutes": 300, "credits": 5.0 },
+          { "minutes": 10080, "credits": 15.0, "anchored": true }
+        ]
+      },
+      "plus": {
+        "label": "Plus",
+        "windows": [{ "minutes": 10080, "credits": 20.0, "anchored": true }]
+      },
+      "pro": {
+        "label": "Pro",
+        "windows": [{ "minutes": 10080, "credits": 45.0, "anchored": true }]
+      },
+      "max": {
+        "label": "Max",
+        "windows": [{ "minutes": 10080, "credits": 75.0, "anchored": true }]
+      }
+    }
   },
 
   "opencode-zen": {

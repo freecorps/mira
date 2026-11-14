@@ -88,14 +88,31 @@ class FallbackChain:
         return sum(getattr(p, "total_completion_tokens", 0) for p in self.providers)
 
     @property
-    def usage(self) -> dict[str, int]:
+    def usage(self) -> dict[str, Any]:
+        """Every provider's usage, summed key by key.
+
+        The token counts come from each provider's attributes, the way they
+        always did; the rest — cached tokens, estimated cost, plan credits —
+        from whatever else each provider's ``usage`` reports.
+        """
         prompt = self.total_prompt_tokens
         completion = self.total_completion_tokens
-        return {
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": prompt + completion,
-        }
+        totals: dict[str, Any] = {}
+        for provider in self.providers:
+            usage = getattr(provider, "usage", None)
+            if not isinstance(usage, dict):
+                continue
+            for key, value in usage.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    totals[key] = totals.get(key, 0) + value
+        totals.update(
+            {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+            }
+        )
+        return totals
 
     def count_tokens(self, text: str) -> int:
         return self.primary.count_tokens(text)

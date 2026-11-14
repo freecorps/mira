@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import ClassVar, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 from pydantic import BaseModel
 from tenacity import (
@@ -16,7 +16,7 @@ from tenacity import (
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, ToolCallFormatError
-from mira.llm import structured
+from mira.llm import accounting, structured
 from mira.llm.base import (
     _SCHEMA_CORRECTION,
     _TOOL_CORRECTION,
@@ -167,6 +167,7 @@ class BedrockProvider:
         self._client = session.client("bedrock-runtime")
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.usage_tally = accounting.Tally()
         logger.info(
             "Bedrock provider initialized: region=%s, model=%s",
             config.region,
@@ -247,17 +248,20 @@ class BedrockProvider:
             self._handle_api_error(e, model)
             raise  # unreachable, but satisfies type checkers
 
-        # Track usage
-        usage = response.get("usage", {})
-        input_tokens = usage.get("inputTokens", 0)
-        output_tokens = usage.get("outputTokens", 0)
-        self.total_prompt_tokens += input_tokens
-        self.total_completion_tokens += output_tokens
+        # Track usage. Converse reports cache reads apart from inputTokens;
+        # the parser folds them back in so the prompt is the whole input.
+        usage = accounting.from_bedrock(response.get("usage"))
+        self.total_prompt_tokens += usage.prompt
+        self.total_completion_tokens += usage.completion
+        accounting.account(
+            self.usage_tally, config=self.config, provider="bedrock", model=model, usage=usage
+        )
         logger.info(
-            "Bedrock response: model=%s, input_tokens=%d, output_tokens=%d, stop=%s",
+            "Bedrock response: model=%s, input_tokens=%d (cached %d), output_tokens=%d, stop=%s",
             model,
-            input_tokens,
-            output_tokens,
+            usage.prompt,
+            usage.cached,
+            usage.completion,
             response.get("stopReason"),
         )
 
@@ -593,8 +597,9 @@ class BedrockProvider:
         return len(text) // 4
 
     @property
-    def usage(self) -> dict[str, int]:
+    def usage(self) -> dict[str, Any]:
         return {
+            **accounting.usage_dict(self.usage_tally),
             "prompt_tokens": self.total_prompt_tokens,
             "completion_tokens": self.total_completion_tokens,
             "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,

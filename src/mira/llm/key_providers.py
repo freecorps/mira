@@ -18,6 +18,15 @@ spending tokens on a completion.
 The snapshot is asked for on a page load only when the stored one is older
 than a few minutes, and a failed lookup is not retried for a minute — the
 page must not re-block on a dead endpoint every time it opens.
+
+A subscription with no usage API at all (OpenDesign Cloud: its usage lives
+only in its web console) gets meters all the same, **estimated**: its preset
+says ``usage_format: "ledger"`` and lists its plans' windows in credits, the
+endpoint says which plan the key is on, and the windows are worked out from
+the credits Mira's own usage ledger recorded spending against that endpoint
+(see :mod:`mira.llm.ledger`). Such a snapshot is marked ``source:
+"estimate"`` and carries the caveat the page prints beside it: Mira only
+sees the calls Mira made, so the console is the authority.
 """
 
 from __future__ import annotations
@@ -26,10 +35,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -146,6 +157,139 @@ def _iso_epoch(value: Any) -> float | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+# ── Estimated meters, from the usage ledger ─────────────────────────
+
+ESTIMATE_NOTE = (
+    "Estimated by Mira from the tokens it recorded spending on this endpoint — "
+    "check the provider's console for the real figure."
+)
+
+
+@dataclass(frozen=True)
+class PlanSettings:
+    """Which plan an endpoint's key is on, and how to read its windows."""
+
+    plan: str = ""
+    started: str = ""
+    scale: float = 1.0
+
+    @classmethod
+    def of_endpoint(cls, endpoint: Endpoint) -> PlanSettings:
+        return cls(endpoint.plan, endpoint.plan_started, endpoint.cost_scale or 1.0)
+
+    @classmethod
+    def of_config(cls, config: LLMConfig | None) -> PlanSettings:
+        if config is None:
+            return cls()
+        return cls(config.plan, config.plan_started, config.cost_scale or 1.0)
+
+
+def _window_start(minutes: int, anchored: bool, started: float | None, now: float) -> tuple:
+    """``(start, resets_at)`` of the window containing ``now``.
+
+    An anchored window restarts every ``minutes`` from the subscription's
+    start (OpenDesign's 7-day window starts on the day the plan did, not on
+    a Monday); without a start date — or for a window that rolls — it is
+    the last ``minutes`` up to now, which has no single reset.
+    """
+    length = minutes * 60.0
+    if anchored and started is not None and started <= now:
+        start = started + math.floor((now - started) / length) * length
+        return start, start + length
+    return now - length, None
+
+
+def ledger_snapshot(
+    endpoint_id: str,
+    profile: dict,
+    settings: PlanSettings,
+    db: Any = None,
+    *,
+    now: float | None = None,
+) -> UsageSnapshot | None:
+    """The plan's windows, estimated from what the ledger recorded.
+
+    None when the endpoint names no plan the preset knows, or there is no
+    database to read the ledger from — the card then says to pick a plan
+    rather than showing an empty meter that reads as "nothing spent".
+    """
+    plan = endpoints.plans_of(profile).get(settings.plan)
+    store = _db(db)
+    if plan is None or store is None or not hasattr(store, "llm_usage_credits"):
+        return None
+    now = now if now is not None else time.time()
+    started = endpoints.parse_plan_start(settings.started)
+    scale = settings.scale if settings.scale and settings.scale > 0 else 1.0
+    windows: list[UsageWindow] = []
+    details: list[dict[str, Any]] = []
+    for raw in plan.get("windows") or []:
+        try:
+            minutes = int(raw["minutes"])
+            allowance = float(raw["credits"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if minutes <= 0:
+            continue
+        start, resets = _window_start(minutes, bool(raw.get("anchored")), started, now)
+        spent, _earliest = store.llm_usage_credits(endpoint_id, since=start)
+        spent *= scale
+        percent = min(100.0, spent / allowance * 100.0) if allowance > 0 else 0.0
+        window = UsageWindow(used_percent=percent, window_minutes=minutes, resets_at=resets)
+        windows.append(window)
+        details.append(
+            {
+                "name": window.name,
+                "credits_spent": round(spent, 4),
+                "credits_allowed": allowance,
+                "credits_left": round(max(0.0, allowance - spent), 4),
+                "rolling": resets is None,
+            }
+        )
+    if not windows:
+        return None
+    tightest = min(details, key=lambda d: d["credits_left"])
+    return UsageSnapshot(
+        primary=windows[0],
+        secondary=windows[1] if len(windows) > 1 else None,
+        tertiary=windows[2] if len(windows) > 2 else None,
+        plan=str(plan.get("label") or settings.plan),
+        source="estimate",
+        fetched_at=now,
+        estimate={
+            "note": ESTIMATE_NOTE,
+            "scale": scale,
+            "windows": details,
+            "left_as": _left_as(profile, tightest["credits_left"]),
+        },
+    )
+
+
+def _left_as(profile: dict, credits_left: float) -> list[dict[str, Any]]:
+    """What is left in the tightest window, restated as USD of each reference model.
+
+    A plan that lists its limits per model ("$55 of Eco or $30 of Flash")
+    is one pool of credits spent at each model's multiplier, so the same
+    credits buy more of a cheaper-multiplier model.
+    """
+    from mira.llm import registry
+
+    out = []
+    name = str(profile.get("name") or "")
+    for model_id in profile.get("plan_reference_models") or []:
+        info = registry.get(str(model_id), name or None) or {}
+        rates = registry.price(str(model_id), name or None, at=time.time())
+        if rates is None or rates.credit_multiplier <= 0:
+            continue
+        out.append(
+            {
+                "model": str(model_id),
+                "label": str(info.get("label") or model_id),
+                "usd": round(credits_left / rates.credit_multiplier, 2),
+            }
+        )
+    return out
 
 
 # ── The config file's own endpoint ──────────────────────────────────
@@ -344,14 +488,31 @@ async def test_connection(profile: dict, api_key: str) -> dict[str, Any]:
 
 
 async def usage_for(
-    endpoint_id: str, profile: dict, api_key: str, db: Any = None, *, force: bool = False
+    endpoint_id: str,
+    profile: dict,
+    api_key: str,
+    db: Any = None,
+    *,
+    force: bool = False,
+    settings: PlanSettings | None = None,
 ) -> UsageSnapshot | None:
     """The key's allowance: the stored snapshot when fresh, else a fresh one.
 
     ``force`` asks the endpoint whatever is stored and raises when it does
     not answer; without it a failure is logged, remembered for a minute, and
     the stored snapshot (or none) stands in.
+
+    A preset with no usage API is estimated from the ledger instead, which
+    is a local query and is simply worked out again each time.
     """
+    if endpoints.estimates_usage(profile):
+        try:
+            return ledger_snapshot(endpoint_id, profile, settings or PlanSettings(), db)
+        except Exception as exc:  # noqa: BLE001 - a card must render without its meter
+            if force:
+                raise UsageError(f"Could not estimate usage from the ledger: {exc}") from exc
+            logger.warning("Could not estimate %s usage: %s", endpoint_id, exc)
+            return None
     if not api_key or not profile.get("usage_url"):
         return None
     # The failure memory and the lock share the snapshot's identity — this
@@ -403,10 +564,12 @@ def _card(
     is_default: bool,
     preset: str,
     usage: UsageSnapshot | None,
+    settings: PlanSettings | None = None,
 ) -> dict[str, Any]:
     """One endpoint's card. Never includes the key, or anything derived from
     it beyond the last four characters, which is what tells two keys apart."""
     style = api_style if api_style in _PROTOCOLS else "chat"
+    settings = settings or PlanSettings()
     return {
         "id": endpoint_id,
         "label": label,
@@ -425,7 +588,13 @@ def _card(
         "is_default": is_default,
         # A row in the database, as opposed to what the config file names.
         "editable": editable,
-        "reports_usage": bool(profile.get("usage_url")),
+        "reports_usage": endpoints.reports_usage(profile),
+        # No usage API: the meters are Mira's own estimate, from the ledger.
+        "usage_estimated": endpoints.estimates_usage(profile),
+        "plans": endpoints.plan_options(profile),
+        "plan": settings.plan,
+        "plan_started": settings.started,
+        "cost_scale": settings.scale,
         "protocol": {
             "api_style": style,
             "protocol": _PROTOCOLS[style],
@@ -443,7 +612,8 @@ async def endpoint_card(
     """The card for one stored endpoint, asking for its usage if it has any."""
     profile = endpoints.profile_for(endpoint)
     api_key = endpoints.key_for(endpoint, db)
-    usage = await usage_for(endpoint.id, profile, api_key, db, force=force_usage)
+    settings = PlanSettings.of_endpoint(endpoint)
+    usage = await usage_for(endpoint.id, profile, api_key, db, force=force_usage, settings=settings)
     return _card(
         endpoint_id=endpoint.id,
         label=endpoint.label,
@@ -457,6 +627,7 @@ async def endpoint_card(
         is_default=is_default,
         preset=endpoint.preset,
         usage=usage,
+        settings=settings,
     )
 
 
@@ -472,7 +643,8 @@ async def config_card(config: LLMConfig | None, *, is_default: bool, db: Any = N
         return {}
     api_key = config_key(config)
     env = config_key_env(config)
-    usage = await usage_for(CONFIG_ID, profile, api_key, db)
+    settings = PlanSettings.of_config(config)
+    usage = await usage_for(CONFIG_ID, profile, api_key, db, settings=settings)
     card = _card(
         endpoint_id=CONFIG_ID,
         label=profile.get("label") or "Endpoint from mira.yaml",
@@ -488,6 +660,7 @@ async def config_card(config: LLMConfig | None, *, is_default: bool, db: Any = N
         is_default=is_default,
         preset=profile.get("name") or "",
         usage=usage,
+        settings=settings,
     )
     card["source"] = "config"
     return card
@@ -521,7 +694,14 @@ async def refresh(endpoint_id: str, config: LLMConfig | None, db: Any = None) ->
         profile = config_profile(config)
         if not profile:
             raise KeyError(endpoint_id)
-        await usage_for(CONFIG_ID, profile, config_key(config), db, force=True)
+        await usage_for(
+            CONFIG_ID,
+            profile,
+            config_key(config),
+            db,
+            force=True,
+            settings=PlanSettings.of_config(config),
+        )
         return await config_card(config, is_default=not selected, db=db)
     endpoint = endpoints.get(endpoint_id, db)
     if endpoint is None:

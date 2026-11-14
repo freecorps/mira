@@ -108,10 +108,17 @@ class UsageSnapshot:
     credits: dict[str, Any] | None = None
     plan: str = ""
     limit_reached: bool = False
-    source: str = ""  # "headers" | "endpoint"
+    # "headers" | "endpoint" — the provider said so — or "estimate": Mira
+    # worked the windows out from the tokens it recorded spending, for a
+    # provider with no usage API (see ``mira.llm.key_providers``).
+    source: str = ""
     fetched_at: float = field(default_factory=time.time)
     exhausted_until: float = 0.0
     last_used_at: float = 0.0
+    # With source "estimate": how the windows were worked out — credits
+    # spent and allowed per window, what is left restated per model, and
+    # the caveat the page shows beside them. None for a reported snapshot.
+    estimate: dict[str, Any] | None = None
 
     def windows(self) -> list[UsageWindow]:
         """The metered windows that were reported, shortest first."""
@@ -169,6 +176,7 @@ class UsageSnapshot:
             "fetched_at": self.fetched_at,
             "exhausted_until": self.exhausted_until,
             "last_used_at": self.last_used_at,
+            "estimate": self.estimate,
         }
 
     @classmethod
@@ -176,6 +184,7 @@ class UsageSnapshot:
         if not isinstance(data, dict):
             return None
         credits = data.get("credits")
+        estimate = data.get("estimate")
         return cls(
             primary=UsageWindow.from_dict(data.get("primary")),
             secondary=UsageWindow.from_dict(data.get("secondary")),
@@ -187,6 +196,7 @@ class UsageSnapshot:
             fetched_at=_as_float(data.get("fetched_at")) or 0.0,
             exhausted_until=_as_float(data.get("exhausted_until")) or 0.0,
             last_used_at=_as_float(data.get("last_used_at")) or 0.0,
+            estimate=estimate if isinstance(estimate, dict) else None,
         )
 
 

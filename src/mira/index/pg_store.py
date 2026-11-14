@@ -23,6 +23,7 @@ from mira.feedback.provenance import finding_fingerprint, legacy_finding_id
 from mira.gate.persistence import GateStoreMixin
 from mira.index._store_shared import _StoreSharedMixin
 from mira.index.store import (
+    REVIEW_COST_COLUMNS,
     BlastRadiusEntry,
     DirectorySummary,
     ExternalRef,
@@ -122,6 +123,13 @@ CREATE TABLE IF NOT EXISTS review_events (
     author TEXT NOT NULL DEFAULT '',
     author_avatar_url TEXT NOT NULL DEFAULT '',
     reviewed_paths TEXT NOT NULL DEFAULT '',
+    -- Per-review totals of every model the review called: the input, the part
+    -- of it served from the prompt cache, the output, and the estimated cost.
+    -- `tokens_used` stays the plain prompt + completion total it always was.
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
@@ -870,6 +878,11 @@ def _get_conn(url: str, *, read_only: bool = False) -> Any:
                         f"ALTER TABLE review_events ADD COLUMN IF NOT EXISTS {col} "
                         "TEXT NOT NULL DEFAULT ''"
                     )
+                for col, ddl in REVIEW_COST_COLUMNS:
+                    cur.execute(
+                        f"ALTER TABLE review_events ADD COLUMN IF NOT EXISTS {col} "
+                        + ddl.replace("REAL", "DOUBLE PRECISION")
+                    )
                 cur.execute(
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS status "
                     "TEXT NOT NULL DEFAULT 'approved'"
@@ -1612,6 +1625,10 @@ class PgIndexStore(
         author: str = "",
         author_avatar_url: str = "",
         reviewed_paths: str = "",
+        prompt_tokens: int = 0,
+        cached_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_usd: float = 0.0,
     ) -> ReviewEvent:
         now = created_at if created_at is not None else time.time()
         with self._cursor() as cur:
@@ -1619,8 +1636,10 @@ class PgIndexStore(
                 "INSERT INTO review_events (owner, repo, pr_number, pr_title, pr_url, "
                 "comments_posted, blockers, warnings, suggestions, files_reviewed, "
                 "lines_changed, tokens_used, duration_ms, categories, author, "
-                "author_avatar_url, reviewed_paths, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "author_avatar_url, reviewed_paths, prompt_tokens, cached_tokens, "
+                "completion_tokens, cost_usd, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s) "
                 "RETURNING id",
                 (
                     self._owner,
@@ -1640,6 +1659,10 @@ class PgIndexStore(
                     author,
                     author_avatar_url,
                     reviewed_paths,
+                    prompt_tokens,
+                    cached_tokens,
+                    completion_tokens,
+                    cost_usd,
                     now,
                 ),
             )
@@ -1662,6 +1685,10 @@ class PgIndexStore(
             author=author,
             author_avatar_url=author_avatar_url,
             reviewed_paths=reviewed_paths,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=cost_usd,
         )
 
     def upsert_pr_fingerprint(self, fp: PRFingerprint) -> None:
@@ -1714,7 +1741,8 @@ class PgIndexStore(
         rows = self._fetchall(
             "SELECT id, pr_number, pr_title, pr_url, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, created_at, author, author_avatar_url, reviewed_paths "
+            "categories, created_at, author, author_avatar_url, reviewed_paths, "
+            "prompt_tokens, cached_tokens, completion_tokens, cost_usd "
             "FROM review_events WHERE owner=%s AND repo=%s "
             "ORDER BY created_at DESC LIMIT %s",
             (self._owner, self._repo, limit),
@@ -1738,6 +1766,10 @@ class PgIndexStore(
                 author=r[14],
                 author_avatar_url=r[15],
                 reviewed_paths=r[16],
+                prompt_tokens=r[17],
+                cached_tokens=r[18],
+                completion_tokens=r[19],
+                cost_usd=r[20],
             )
             for r in rows
         ]
@@ -1746,7 +1778,8 @@ class PgIndexStore(
         rows = self._fetchall(
             "SELECT id, pr_number, pr_title, pr_url, comments_posted, blockers, warnings, "
             "suggestions, files_reviewed, lines_changed, tokens_used, duration_ms, "
-            "categories, created_at, author, author_avatar_url, reviewed_paths "
+            "categories, created_at, author, author_avatar_url, reviewed_paths, "
+            "prompt_tokens, cached_tokens, completion_tokens, cost_usd "
             "FROM review_events WHERE owner=%s AND repo=%s AND pr_number=%s "
             "ORDER BY created_at DESC",
             (self._owner, self._repo, pr_number),
@@ -1770,6 +1803,10 @@ class PgIndexStore(
                 author=r[14],
                 author_avatar_url=r[15],
                 reviewed_paths=r[16],
+                prompt_tokens=r[17],
+                cached_tokens=r[18],
+                completion_tokens=r[19],
+                cost_usd=r[20],
             )
             for r in rows
         ]
@@ -1916,7 +1953,8 @@ class PgIndexStore(
             "SELECT COUNT(*), COALESCE(SUM(comments_posted),0), COALESCE(SUM(blockers),0), "
             "COALESCE(SUM(warnings),0), COALESCE(SUM(suggestions),0), "
             "COALESCE(SUM(files_reviewed),0), COALESCE(SUM(lines_changed),0), "
-            "COALESCE(SUM(tokens_used),0), COALESCE(AVG(duration_ms),0) "
+            "COALESCE(SUM(tokens_used),0), COALESCE(AVG(duration_ms),0), "
+            "COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cost_usd),0) "
             f"FROM review_events WHERE owner=%s AND repo=%s{since_clause}",
             tuple(params),
         )
@@ -1946,6 +1984,8 @@ class PgIndexStore(
             "total_lines_changed": row[6],
             "total_tokens": row[7],
             "avg_duration_ms": int(row[8]),
+            "total_cached_tokens": int(row[9] or 0),
+            "total_cost_usd": float(row[10] or 0.0),
             "categories": cat_counts,
         }
 

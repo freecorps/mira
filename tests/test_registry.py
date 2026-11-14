@@ -47,11 +47,13 @@ class TestCurrentGenerationModels:
         assert [m["value"] for m in indexing if m["recommended"]] == [
             "anthropic/claude-haiku-4-5",
             "us.anthropic.claude-haiku-4-5-v1:0",
+            "deepseek-v4.1-flash-eco",
             "glm-5.3-flash",
         ]
         assert [m["value"] for m in review if m["recommended"]] == [
             "anthropic/claude-sonnet-4-6",
             "us.anthropic.claude-sonnet-4-6-v1:0",
+            "deepseek-v4.1-flash-eco",
             "kimi-k2.7-code",
         ]
 

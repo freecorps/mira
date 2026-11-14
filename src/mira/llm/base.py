@@ -20,7 +20,7 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 from mira import __version__
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
-from mira.llm import endpoints, structured
+from mira.llm import accounting, endpoints, structured
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 from mira.llm.utils import (
@@ -95,7 +95,7 @@ class LLMProviderProtocol(Protocol):
     def count_tokens(self, text: str) -> int: ...
 
     @property
-    def usage(self) -> dict[str, int]: ...
+    def usage(self) -> dict[str, Any]: ...
 
 
 # ── Module-level helpers (shared by both providers) ─────────────────
@@ -374,15 +374,87 @@ def _drop_reasoning(body: dict) -> None:
     body.pop("reasoning_effort", None)
 
 
+def _merge_choices(choices: list) -> dict | None:
+    """One assistant turn out of a ``choices`` list, however it was split.
+
+    Mira never asks for ``n``, so a reply is one turn. Some gateways
+    (OpenDesign Cloud) still split that turn across several choices — the
+    text in ``choices[0]`` and the tool call in ``choices[1]`` — and reading
+    the first alone threw the tool call away. Several choices are folded
+    into one: contents and tool calls concatenated in order, reasoning
+    fields kept, and the finish reason the one that says the most
+    (``length`` over ``tool_calls`` over the last one given).
+    """
+    usable = [c for c in choices if isinstance(c, dict)]
+    if not usable:
+        return None
+    if len(usable) == 1:
+        return usable[0]
+    message: dict = {}
+    contents: list[str] = []
+    tool_calls: list = []
+    reasoning: dict[str, list[str]] = {}
+    reasons: list[str] = []
+    for choice in usable:
+        part = choice.get("message")
+        if isinstance(part, dict):
+            for key, value in part.items():
+                if key == "content":
+                    if isinstance(value, str) and value:
+                        contents.append(value)
+                elif key == "tool_calls":
+                    if isinstance(value, list):
+                        tool_calls.extend(value)
+                elif key in _REASONING_TEXT_KEYS and isinstance(value, str):
+                    if value:
+                        reasoning.setdefault(key, []).append(value)
+                elif key == "reasoning_details" and isinstance(value, list):
+                    message.setdefault("reasoning_details", []).extend(value)
+                elif key not in message:
+                    message[key] = value
+        if choice.get("finish_reason"):
+            reasons.append(str(choice["finish_reason"]))
+    message["content"] = "".join(contents) or None
+    for key, parts in reasoning.items():
+        message[key] = "".join(parts)
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    finish: str | None
+    if "length" in reasons:
+        finish = "length"
+    elif tool_calls and "tool_calls" in reasons:
+        finish = "tool_calls"
+    else:
+        finish = reasons[-1] if reasons else None
+    return {"index": 0, "message": message, "finish_reason": finish}
+
+
 def _finish_reason(data: object) -> str | None:
-    """``finish_reason`` of the first choice in a chat/completions payload."""
+    """``finish_reason`` of the reply in a chat/completions payload."""
     if not isinstance(data, dict):
         return None
     choices = data.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+    if not isinstance(choices, list) or not choices:
         return None
-    reason = choices[0].get("finish_reason")
+    merged = _merge_choices(choices)
+    reason = merged.get("finish_reason") if merged else None
     return str(reason) if reason else None
+
+
+def _spent_without_choices(data: dict) -> str:
+    """Why a 200 with no choices came back empty, when its usage can say.
+
+    OpenDesign answers 200, ``"choices": []`` and a usage block when the
+    model spent the whole output budget thinking: the tokens were billed,
+    and "no choices returned" made it read as a gateway fault.
+    """
+    usage = accounting.from_chat(data.get("usage"))
+    if not usage.completion:
+        return "no choices returned"
+    detail = f"no choices returned, though {usage.completion} completion tokens were spent"
+    if usage.reasoning:
+        detail += f", {usage.reasoning} of them on reasoning"
+    return detail + " (likely the output budget went to thinking)"
 
 
 def _empty_reply_detail(finish_reason: str | None, *, reasoning: bool) -> str:
@@ -404,14 +476,62 @@ def _empty_reply_detail(finish_reason: str | None, *, reasoning: bool) -> str:
     return parts[0] + (f" ({'; '.join(parts[1:])})" if len(parts) > 1 else "")
 
 
+# The fields a chat message carries reasoning text in, across the APIs in use.
+_REASONING_TEXT_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+
 def _carries_reasoning(message: object) -> bool:
-    """True when a chat message holds reasoning text (any of the field names in use)."""
+    """True when a chat message holds reasoning (any of the field names in use).
+
+    ``reasoning_details`` is the structured form OpenDesign and OpenRouter
+    return — a list of summary, text and encrypted parts — and counts when
+    it holds anything at all.
+    """
     if not isinstance(message, dict):
         return False
-    return any(
-        isinstance(message.get(key), str) and message[key].strip()
-        for key in ("reasoning_content", "reasoning", "thinking")
-    )
+    if any(
+        isinstance(message.get(key), str) and message[key].strip() for key in _REASONING_TEXT_KEYS
+    ):
+        return True
+    details = message.get("reasoning_details")
+    return isinstance(details, list) and any(isinstance(d, dict) and d for d in details)
+
+
+# Words in a refusal that mean the plan's allowance is spent, not that the
+# endpoint is busy. A quota does not come back in the seconds a retry waits,
+# so a call refused for one goes straight down the fallback chain instead.
+_QUOTA_WORDS = (
+    "quota",
+    "balance",
+    "credit",
+    "exhausted",
+    "insufficient",
+    "billing",
+    "subscription",
+    "usage limit",
+    "plan limit",
+    "spending limit",
+    "limit reached",
+)
+
+
+def _quota_exhausted(resp: httpx.Response) -> bool:
+    """Is this 402/403/429 a spent allowance rather than a transient refusal?
+
+    A bare "rate limit exceeded" on a 429 is the endpoint asking for a
+    pause, and keeps its retry. Anything naming a quota, a balance or
+    credits — or a 402/403 that mentions a limit at all — is the plan, and
+    retrying it only spends the review's time.
+    """
+    if resp.status_code not in (402, 403, 429):
+        return False
+    try:
+        text = resp.text.lower()
+    except Exception:
+        return False
+    if any(word in text for word in _QUOTA_WORDS):
+        return True
+    return resp.status_code in (402, 403) and "limit" in text
 
 
 def _tool_name(tools: list[dict]) -> str:
@@ -618,6 +738,9 @@ class OpenAICompatibleProvider:
         self.profile = endpoints.profile_for_config(config)
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Cached tokens, estimated cost and plan credits, per call into the
+        # usage ledger and summed here for the review's own record.
+        self.usage_tally = accounting.Tally()
         endpoint = self._endpoint_key()
         self._no_forced_tool_choice: set[str] = _refusals("forced_tool_choice", endpoint)
         self._no_reasoning: set[str] = _refusals("reasoning", endpoint)
@@ -788,7 +911,11 @@ class OpenAICompatibleProvider:
             return False
         cap = max(
             self.config.max_tokens,
-            registry.max_output_tokens(model, default=_OUTPUT_BUDGET_CEILING),
+            registry.max_output_tokens(
+                model,
+                default=_OUTPUT_BUDGET_CEILING,
+                endpoint=str(self.profile.get("name") or "") or None,
+            ),
         )
         if current >= cap:
             return False
@@ -818,21 +945,52 @@ class OpenAICompatibleProvider:
         body.pop("temperature", None)
         return True
 
-    def _account_usage(self, data: dict) -> None:
-        """Accumulate token counts. Default: chat/completions key names.
+    def _parse_usage(self, data: dict) -> accounting.TokenUsage:
+        """A payload's usage block. Default: chat/completions key names.
 
         Subclasses override when the API uses different keys
         (e.g. Responses API uses ``input_tokens`` / ``output_tokens``).
         """
-        usage = data.get("usage")
-        if usage:
-            self.total_prompt_tokens += usage.get("prompt_tokens", 0)
-            self.total_completion_tokens += usage.get("completion_tokens", 0)
+        return accounting.from_chat(data.get("usage") if isinstance(data, dict) else None)
 
-    @staticmethod
-    def _handle_error(resp: httpx.Response) -> None:
-        """Raise LLMError or NonRetriableLLMError on non-200 responses."""
+    def _account_usage(self, data: dict, model: str = "") -> None:
+        """Accumulate one call's tokens, and note it in the usage ledger.
+
+        ``model`` is the id as configured (before any prefix strip), which is
+        what the registry prices; it defaults to the client's own.
+        """
+        usage = self._parse_usage(data)
+        if not usage:
+            return
+        self.total_prompt_tokens += usage.prompt
+        self.total_completion_tokens += usage.completion
+        accounting.account(
+            self.usage_tally,
+            config=self.config,
+            provider=str(self.profile.get("name") or ""),
+            model=model or self.config.model,
+            usage=usage,
+        )
+
+    def _handle_error(self, resp: httpx.Response) -> None:
+        """Raise LLMError or NonRetriableLLMError on non-200 responses.
+
+        A refusal that says the plan's allowance is spent (see
+        :func:`_quota_exhausted`) is raised as not retriable whatever its
+        status, so the fallback chain takes the call at once, and logged as
+        what it is: the line an operator needs is "the quota ran out", not
+        a fourth "HTTP 429".
+        """
         if resp.status_code != 200:
+            if _quota_exhausted(resp):
+                logger.warning(
+                    "%s refused the call with HTTP %s: the plan's allowance looks spent "
+                    "(%s). Not retrying; the next model in the chain takes the call.",
+                    self.profile.get("label") or self._endpoint_key(),
+                    resp.status_code,
+                    _preview(resp.text, 300),
+                )
+                raise NonRetriableLLMError("api_error", status=resp.status_code, body=resp.text)
             if 400 <= resp.status_code < 500 and resp.status_code != 429:
                 raise NonRetriableLLMError("api_error", status=resp.status_code, body=resp.text)
             error = LLMError("api_error", status=resp.status_code, body=resp.text)
@@ -855,9 +1013,12 @@ class OpenAICompatibleProvider:
             )
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
-            detail = _preview(data.get("error")) if data.get("error") else "no choices returned"
+            detail = (
+                _preview(data.get("error")) if data.get("error") else _spent_without_choices(data)
+            )
             raise LLMError("malformed_response", detail=detail)
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        merged = _merge_choices(choices)
+        message = merged.get("message") if merged else None
         if not isinstance(message, dict):
             raise LLMError("malformed_response", detail="choice carried no message")
         return message
@@ -1463,8 +1624,10 @@ class OpenAICompatibleProvider:
         return len(text) // 4
 
     @property
-    def usage(self) -> dict[str, int]:
+    def usage(self) -> dict[str, Any]:
+        tally = self.usage_tally
         return {
+            **accounting.usage_dict(tally),
             "prompt_tokens": self.total_prompt_tokens,
             "completion_tokens": self.total_completion_tokens,
             "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,

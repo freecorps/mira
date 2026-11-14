@@ -16,6 +16,7 @@ import httpx
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, ToolCallFormatError
+from mira.llm import accounting
 from mira.llm.base import (
     OpenAICompatibleProvider,
     _as_json_object,
@@ -238,16 +239,13 @@ class ResponsesProvider(OpenAICompatibleProvider):
         """
         return await client.post(self._url, headers=self._build_headers(), json=body)
 
-    def _account_usage(self, data: dict) -> None:
-        """Accumulate token counts from Responses API usage.
+    def _parse_usage(self, data: dict) -> accounting.TokenUsage:
+        """Token counts from Responses API usage.
 
-        The Responses API uses ``input_tokens`` / ``output_tokens`` keys,
-        mapping to our ``total_prompt_tokens`` / ``total_completion_tokens``.
+        The Responses API uses ``input_tokens`` / ``output_tokens`` keys, with
+        the cached part of the input under ``input_tokens_details``.
         """
-        usage = data.get("usage")
-        if usage:
-            self.total_prompt_tokens += usage.get("input_tokens", 0)
-            self.total_completion_tokens += usage.get("output_tokens", 0)
+        return accounting.from_responses(data.get("usage") if isinstance(data, dict) else None)
 
     # ── Internal LLM calls (retry-decorated by base class) ──────────
 
@@ -277,7 +275,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
         return _output_text(data)
 
     async def _call_llm_with_tools(
@@ -336,7 +334,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
 
         # Check for tool calls in the response. A model may emit more than one;
         # the name match keeps us on the tool we actually asked for.
@@ -430,7 +428,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
         truncated = _responses_truncated(data)
         status = data.get("status")
         return self._schema_reply(
@@ -488,5 +486,5 @@ class ResponsesProvider(OpenAICompatibleProvider):
             self._handle_error(resp)
             data = resp.json()
 
-        self._account_usage(data)
+        self._account_usage(data, model)
         return _response_message(data)

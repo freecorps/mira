@@ -89,6 +89,7 @@ EXPECTED_ROUTES = {
     ("/api/providers/{endpoint_id}", "PUT"),
     ("/api/providers/{endpoint_id}", "DELETE"),
     ("/api/providers/{endpoint_id}/usage", "POST"),
+    ("/api/usage/costs", "GET"),
     # Phase 5 — assisted correction (all admin-only; the cancel route
     # additionally requires the cancel permission). There is deliberately no
     # route that *starts* a fix: that is a repository write permission, not a

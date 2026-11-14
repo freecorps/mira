@@ -460,11 +460,11 @@ class TestUsage:
     def test_usage_before_calls(self, config: LLMConfig):
         provider = ResponsesProvider(config)
         usage = provider.usage
-        assert usage == {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
+        assert usage["prompt_tokens"] == 0
+        assert usage["completion_tokens"] == 0
+        assert usage["total_tokens"] == 0
+        assert usage["cached_tokens"] == 0
+        assert usage["cost_usd"] == 0
 
     @pytest.mark.asyncio
     async def test_usage_accumulates(self, config: LLMConfig):

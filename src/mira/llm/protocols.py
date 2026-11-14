@@ -52,7 +52,7 @@ def native_protocol(config: Any, model: str = "") -> str | None:
     if not model:
         return None
     preset = _preset(config)
-    entry = registry.get(model)
+    entry = registry.get(model, preset or None)
     if entry and entry.get("api_style") and entry.get("endpoint") == preset:
         return str(entry["api_style"])
     provider_id = models_dev.endpoint_provider_id(config)
