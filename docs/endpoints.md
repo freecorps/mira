@@ -219,6 +219,13 @@ from the provider's own endpoint and refreshed on demand. OpenCode Go is the
 one today — 5-hour, weekly and monthly. See
 [opencode-go.md](opencode-go.md).
 
+A subscription with no usage API gets estimated meters instead: its preset
+lists its plans' windows in credits (`usage_format: "ledger"`), the endpoint
+names the plan its key is on, and Mira works the windows out from the credits
+its own usage ledger recorded against that endpoint. OpenDesign Cloud is the
+one today — see [open-design.md](open-design.md). Every endpoint, metered or
+not, appears in the cost view under the cards.
+
 ## Adding a preset
 
 A preset is an entry in `src/mira/llm/providers.json`: a label, a
