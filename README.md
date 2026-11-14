@@ -171,6 +171,14 @@ window running dry before a review does.
 
 → [docs/opencode-go.md](docs/opencode-go.md)
 
+[OpenDesign Cloud](https://open-design.ai/pt-br/help/cloud-api/) works the
+same way (`provider: "open-design"`, `OPENDESIGN_API_KEY`). It has no usage
+API, so its card shows meters Mira estimates from the credits it spent, and
+the cost view under the cards shows what every endpoint and model cost, cache
+hits included.
+
+→ [docs/open-design.md](docs/open-design.md)
+
 ## Review before you push
 
 The same review, against a change that is not a pull request yet:
