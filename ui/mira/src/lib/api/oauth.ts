@@ -20,12 +20,32 @@ export type UsageSnapshot = {
   } | null
   plan: string
   limit_reached: boolean
-  // "headers" (recorded off the last review call) or "endpoint" (asked for).
+  // "headers" (recorded off the last review call), "endpoint" (asked for),
+  // or "estimate" (worked out by Mira from its own usage ledger, for a
+  // subscription with no usage API).
   source: string
   fetched_at: number
   // Mira's own note: the backend refused this account until this time.
   exhausted_until: number
   last_used_at: number
+  // With source "estimate": how the windows were worked out.
+  estimate?: UsageEstimate | null
+}
+
+export type UsageEstimate = {
+  // The caveat to show beside the meters.
+  note: string
+  // The calibration factor applied to the recorded credits.
+  scale: number
+  windows: {
+    name: string
+    credits_spent: number
+    credits_allowed: number
+    credits_left: number
+    rolling: boolean
+  }[]
+  // What is left in the tightest window, as USD of each reference model.
+  left_as: { model: string; label: string; usd: number }[]
 }
 
 // One signed-in account. Never carries token material — the backend only

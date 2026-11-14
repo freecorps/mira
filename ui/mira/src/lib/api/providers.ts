@@ -26,11 +26,21 @@ export type ProviderEndpoint = {
   // shown but not editable here.
   editable: boolean
   reports_usage: boolean
+  // No usage API: the meters are Mira's own estimate, from the usage ledger.
+  usage_estimated: boolean
+  // The plans the preset meters ([] for none), the one this key is on, the
+  // day it started ("" = rolling windows), and the calibration factor.
+  plans: PlanOption[]
+  plan: string
+  plan_started: string
+  cost_scale: number
   protocol: OAuthProtocol
   usage: UsageSnapshot | null
   available: boolean
   source?: string
 }
+
+export type PlanOption = { id: string; label: string }
 
 // A starting point for a new endpoint: the URL to prefill and the variable
 // the key is conventionally read from.
@@ -43,6 +53,8 @@ export type EndpointPreset = {
   api_key_env: string
   api_style: string
   reports_usage: boolean
+  usage_estimated: boolean
+  plans: PlanOption[]
 }
 
 export type ProvidersResponse = {
@@ -66,7 +78,49 @@ export type EndpointInput = {
   api_key_env?: string
   model_prefix?: string
   default_model?: string
+  plan?: string
+  plan_started?: string
+  cost_scale?: number
   make_default?: boolean
+}
+
+// One endpoint and model in the cost view.
+export type CostRow = {
+  endpoint: string
+  endpoint_label: string
+  provider: string
+  model: string
+  model_label: string
+  calls: number
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+  reasoning_tokens: number
+  cost_usd: number
+  credits: number
+  unpriced_calls: number
+  cache_hit_rate: number
+  projected_month_usd: number
+  projected_month_credits: number
+  purposes: Record<string, number>
+}
+
+export type CostReport = {
+  days: number
+  since: number
+  span_days: number
+  rows: CostRow[]
+  total: Omit<
+    CostRow,
+    | "endpoint"
+    | "endpoint_label"
+    | "provider"
+    | "model"
+    | "model_label"
+    | "purposes"
+  >
+  ledger: { dropped: number; write_errors: number; queued: number }
+  note: string
 }
 
 export type EndpointTest = {
@@ -109,4 +163,7 @@ export const providersApi = {
     api_key_env?: string
     endpoint?: string
   }) => postJson<EndpointTest>("/api/providers/test", body),
+
+  getUsageCosts: (days: number) =>
+    fetchJson<CostReport>(`/api/usage/costs?days=${days}`),
 }
