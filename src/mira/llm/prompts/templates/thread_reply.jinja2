@@ -55,8 +55,9 @@ sentence of this prompt.
 ## Relevant code diff
 
 The file as the pull request now has it, numbered, around your comment and
-around any line the reply cites; what changed in it since you commented; and
-the pull request's hunk. Look there before saying code is not visible.
+around any line the reply cites; what changed since you commented, in every
+file of the pull request (the commented file first, with a list of all changed
+files); and the pull request's hunk.
 
 {{ code_block }}
 {%- endif %}
@@ -111,6 +112,11 @@ Worked examples, because this is where classification goes wrong:
 Set `learning` to null for every intent except disagreement. A learning
 proposal is only an input to a separate check; do not claim it is active or
 was recorded.
+
+Never ask the human to "show", "push", "paste" or "point at" code, and never
+say you cannot see it. A claimed fix is verified afterwards by a step that can
+read the whole repository, and a question is answered by one; your reply for
+`fixed` only acknowledges that you will check.
 
 Write the reply in the same language the human wrote in.
 Keep replies concise (1-2 short sentences). No emojis. No "as an AI".

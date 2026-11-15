@@ -982,7 +982,9 @@ class TestDryRun:
 
         # Read operations should be called
         provider.get_pr_info.assert_awaited_once()
-        provider.get_pr_diff.assert_awaited_once()
+        # Once for the review, once for thread verification, which reads the
+        # rest of the pull request for fixes that live outside a thread's file.
+        assert provider.get_pr_diff.await_count == 2
         provider.get_unresolved_bot_threads.assert_awaited_once()
         provider.get_file_content.assert_awaited()
 

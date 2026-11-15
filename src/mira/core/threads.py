@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from mira.core.change_context import mentions_in, render_changes
 from mira.llm.prompts.verify_fixes import (
     VerifyFixesResult,
     build_verify_fixes_prompt,
@@ -17,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 _MAX_FULL_FILE_LINES = 500
 _LARGE_FILE_CONTEXT_LINES = 50  # ±50 lines = 100-line window
+# The rest of the pull request's diff, for fixes that live outside the file a
+# thread is on. Bounded: this runs on every push with open threads.
+_MAX_OTHER_CHANGES_CHARS = 12_000
 
 
 def short_thread_description(body: str) -> str:
@@ -74,12 +78,42 @@ def _extract_sections(
     return "\n...\n".join(parts)
 
 
+async def _other_changes(
+    provider: BaseProvider, pr_info: PRInfo, threads: list[UnresolvedThread]
+) -> str:
+    """The pull request's changes outside the threads' files, most relevant first.
+
+    The verdicts used to see only the file each thread is on, so a fix in a
+    helper, a caller or another package left its thread open forever. Files
+    the threads name (by path, or by a symbol on their changed lines) come
+    first; every changed file is listed. "" when the diff cannot be read.
+    """
+    try:
+        diff_text = await provider.get_pr_diff(pr_info)
+    except Exception as exc:  # noqa: BLE001 — verify against the files alone
+        logger.debug("Could not read the diff of %s to verify fixes: %s", pr_info.url, exc)
+        return ""
+    if not isinstance(diff_text, str) or not diff_text.strip():
+        return ""
+    try:
+        return render_changes(
+            diff_text,
+            mentions=mentions_in(*(t.body for t in threads)),
+            budget=_MAX_OTHER_CHANGES_CHARS,
+            exclude_paths={t.path for t in threads},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not render the diff of %s to verify fixes: %s", pr_info.url, exc)
+        return ""
+
+
 async def verify_fixes(
     llm: LLMProvider,
     file_groups: list[tuple[str, str, list[UnresolvedThread]]],
+    other_changes: str = "",
 ) -> list[str]:
     """Ask the LLM which previously-filed review issues are now fixed."""
-    prompt = build_verify_fixes_prompt(file_groups)
+    prompt = build_verify_fixes_prompt(file_groups, other_changes=other_changes)
     logger.debug("Verify-fixes prompt:\n%s", prompt[1]["content"])
     result = await llm.generate_object(
         prompt, VerifyFixesResult, name="submit_fix_verdicts", temperature=0.0
@@ -143,7 +177,8 @@ async def resolve_verified_threads(
                 snippet = _extract_sections(lines, path_threads, _LARGE_FILE_CONTEXT_LINES)
                 file_groups.append((path, snippet, path_threads))
 
-    verified_ids = await verify_fixes(llm, file_groups)
+    other_changes = await _other_changes(provider, pr_info, threads)
+    verified_ids = await verify_fixes(llm, file_groups, other_changes)
     verified_set = set(verified_ids)
 
     decisions = [
