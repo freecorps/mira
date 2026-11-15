@@ -24,7 +24,7 @@ from mira.autofix.redact import redact
 from mira.config import ReleaseNotesConfig
 from mira.digests.models import Change
 from mira.digests.text import escape_html, excerpt, one_line, prose
-from mira.llm import untrusted
+from mira.llm import accounting, untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -271,14 +271,15 @@ async def build_release_notes(
                 f"Only the first {MAX_LLM_ENTRIES} entries were offered to the model."
             )
         try:
-            answer = await llm.generate_object(
-                build_messages(result.entries, max_chars=max_chars),
-                _LLMReleaseNotes,
-                name="submit_release_notes",
-                description="A narrative and a category for each unsorted entry.",
-                temperature=0.2,
-                max_tokens=2500,
-            )
+            with accounting.stage("release_notes"):
+                answer = await llm.generate_object(
+                    build_messages(result.entries, max_chars=max_chars),
+                    _LLMReleaseNotes,
+                    name="submit_release_notes",
+                    description="A narrative and a category for each unsorted entry.",
+                    temperature=0.2,
+                    max_tokens=2500,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Release notes model call failed: %s", exc)
         else:

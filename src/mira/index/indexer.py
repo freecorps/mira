@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from mira.config import MiraConfig, load_config
 from mira.index.manifests import is_manifest, parse_manifest
 from mira.index.store import DirectorySummary, ExternalRef, FileSummary, IndexStore, SymbolInfo
-from mira.llm import create_llm
+from mira.llm import accounting, create_llm
 from mira.platforms.fetch import RepoFetcher, make_fetcher
 
 logger = logging.getLogger(__name__)
@@ -113,14 +113,22 @@ _SKIP_PATTERNS = [
 ]
 
 _FILE_FETCH_SEMAPHORE = 10
-# Concurrent LLM summarization batches per repo. The indexing model
-# typically handles 6-8 comfortably on OpenRouter; bumping from 3 nearly
-# halves file-phase wall time without changing quality.
+# Concurrent LLM summarization batches per repo, at least. The indexing
+# model typically handles 6-8 comfortably on OpenRouter; bumping from 3
+# nearly halves file-phase wall time without changing quality. An endpoint
+# with a concurrency limit gets half its background lane when that is more
+# (see `_llm_concurrency`), so a larger plan indexes faster while reviews,
+# which share the lane, keep the other half.
 _LLM_SEMAPHORE = 8
+_LLM_SEMAPHORE_MAX = 32
 # Smaller batches → faster individual calls → better wave parallelism.
 # Empirically a 5-file batch with one large file bloated to 7k output
-# tokens and took 87s, dominating an entire indexing run. With 3-file
-# batches, the same content takes ~20-25s and the next wave starts sooner.
+# tokens and took 87s, dominating an entire indexing run — most of it
+# thinking. With reasoning off (summaries are a mechanical stage, see
+# mira.llm.reasoning) a call is bound by the summaries it writes, about 500
+# output tokens a file: three files took 16-20s on OpenDesign's Flash Eco
+# with no tail, and a bigger batch only makes each call longer. Throughput
+# comes from concurrency, not batch size.
 _BATCH_SIZE = 3
 # Files larger than this go into their own solo batch instead of being
 # packed with siblings. A single 8k-line file in a 3-file batch otherwise
@@ -133,6 +141,30 @@ _LARGE_FILE_BYTES = 5000
 # whole repo. Stored as no-summary entries so they still count for the
 # file index and any deterministic features (manifest parsing, etc.).
 _TRIVIAL_FILE_BYTES = 600
+
+
+def _llm_concurrency(llm: Any) -> int:
+    """Summarization batches one repository runs at once.
+
+    ``_LLM_SEMAPHORE``, or half the endpoint's background lane when it has a
+    concurrency limit and that is more (``mira.llm.concurrency``): on
+    OpenDesign Go that is still 8 of 10, on Max 24 of 50. The endpoint's
+    limiter bounds every request anyway; this only decides how much of it
+    one repository's indexing asks for.
+    """
+    from mira.llm import concurrency, endpoints
+
+    config = getattr(llm, "config", None)
+    if config is None:
+        return _LLM_SEMAPHORE
+    try:
+        sizing = concurrency.limit_for(config, endpoints.profile_for_config(config))
+    except Exception:  # noqa: BLE001 - a test double, a config with no endpoint
+        return _LLM_SEMAPHORE
+    if not sizing:
+        return _LLM_SEMAPHORE
+    limit, headroom = sizing
+    return max(_LLM_SEMAPHORE, min(_LLM_SEMAPHORE_MAX, (limit - headroom) // 2))
 
 
 def _build_batches(file_pairs: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
@@ -363,13 +395,14 @@ async def _summarize_batch(
             from mira.llm.registry import max_output_tokens
 
             cap = min(max_output_tokens(llm.config.model, default=16384), 32768)
-            result = await llm.generate_object(
-                messages,
-                _FileSummaries,
-                name="submit_file_summaries",
-                temperature=0.0,
-                max_tokens=cap,
-            )
+            with accounting.stage("file_summaries"):
+                result = await llm.generate_object(
+                    messages,
+                    _FileSummaries,
+                    name="submit_file_summaries",
+                    temperature=0.0,
+                    max_tokens=cap,
+                )
         except Exception as exc:
             logger.warning("LLM summarization failed for batch of %d files: %s", len(files), exc)
             return []
@@ -533,7 +566,7 @@ async def index_repo(
     # tasks and consume them as they complete; the inner semaphore bounds
     # actual parallelism. Cancellation still works between batch
     # completions.
-    llm_sem = asyncio.Semaphore(_LLM_SEMAPHORE)
+    llm_sem = asyncio.Semaphore(_llm_concurrency(llm))
     batches = _build_batches(file_pairs)
     tasks = [asyncio.create_task(_summarize_batch(batch, llm, llm_sem)) for batch in batches]
 
@@ -800,13 +833,14 @@ async def _summarize_directories(store: IndexStore, llm: Any, semaphore: asyncio
         ]
         async with semaphore:
             try:
-                result = await llm.generate_object(
-                    messages,
-                    _DirectorySummaries,
-                    name="submit_directory_summaries",
-                    temperature=0.0,
-                    max_tokens=4096,
-                )
+                with accounting.stage("directory_summaries"):
+                    result = await llm.generate_object(
+                        messages,
+                        _DirectorySummaries,
+                        name="submit_directory_summaries",
+                        temperature=0.0,
+                        max_tokens=4096,
+                    )
             except Exception as exc:
                 logger.warning("Directory batch summary failed: %s", exc)
                 return
@@ -935,7 +969,7 @@ async def index_diff(
         file_pairs.append((path, content))
 
     # Summarize changed files
-    llm_sem = asyncio.Semaphore(_LLM_SEMAPHORE)
+    llm_sem = asyncio.Semaphore(_llm_concurrency(llm))
     indexed_count = 0
 
     if file_pairs:
@@ -1015,12 +1049,13 @@ async def _summarize_directories_selective(
 
         async with semaphore:
             try:
-                result = await llm.generate_object(
-                    messages,
-                    _OneDirectorySummary,
-                    name="submit_directory_summary",
-                    temperature=0.0,
-                )
+                with accounting.stage("directory_summaries"):
+                    result = await llm.generate_object(
+                        messages,
+                        _OneDirectorySummary,
+                        name="submit_directory_summary",
+                        temperature=0.0,
+                    )
                 summary_text = result.summary.strip()
                 if summary_text:
                     store.upsert_directory(

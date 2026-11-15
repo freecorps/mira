@@ -39,6 +39,10 @@ DEFAULT_PROFILE: dict = {
     # How a Chat Completions request names its reasoning level: the OpenAI
     # field for the portable default; OpenRouter nests it (see providers.json).
     "reasoning_param": "reasoning_effort",
+    # The levels the endpoint acts on (a list, or model glob → list), when it
+    # accepts more than it honours. Empty: take the level as written, or as
+    # models.dev describes the model (see ``mira.llm.reasoning``).
+    "reasoning_levels": {},
     # This endpoint's provider id on models.dev, source of per-model
     # reasoning levels. Empty when the catalogue does not list it.
     "models_dev": "",

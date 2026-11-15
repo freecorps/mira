@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from mira.autofix.redact import redact
 from mira.digests.models import AreaDigest, Digest
 from mira.digests.text import excerpt, one_line, prose
-from mira.llm import untrusted
+from mira.llm import accounting, untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -161,14 +161,15 @@ async def summarize(llm: Any, digest: Digest, *, max_chars: int = 40_000) -> boo
     if truncated:
         digest.notes.append("Some changes were left out of the summary to fit the model budget.")
     try:
-        result = await llm.generate_object(
-            messages,
-            DigestSummary,
-            name="submit_digest",
-            description="The period overview and a summary per area.",
-            temperature=0.2,
-            max_tokens=3000,
-        )
+        with accounting.stage("digest"):
+            result = await llm.generate_object(
+                messages,
+                DigestSummary,
+                name="submit_digest",
+                description="The period overview and a summary per area.",
+                temperature=0.2,
+                max_tokens=3000,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Digest summary failed for %s: %s", digest.scope_name, exc)
         return False

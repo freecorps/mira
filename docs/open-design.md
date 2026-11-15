@@ -99,6 +99,66 @@ llm:
   concurrency_wait_seconds: 180
 ```
 
+## Thinking
+
+DeepSeek V4 on OpenDesign thinks unless it is told not to, and only one
+instruction works. Measured on `deepseek-v4.1-flash` and `-flash-eco`:
+
+| Sent | What the model did |
+| --- | --- |
+| no level | reasons until done or out of budget |
+| `reasoning_effort: low`, `minimal`, `high` | the same: the level is ignored |
+| `reasoning: {effort}`, `reasoning: {max_tokens}`, `reasoning: {enabled: false}` | ignored |
+| `thinking: {type: "disabled"}`, `enable_thinking: false`, `chat_template_kwargs` | ignored |
+| `reasoning_effort: none` | no thinking: answers in 6–18 s, no reasoning tokens |
+
+With thinking on, a "find the bugs" answer on a 24,000-character prompt took
+24,000 reasoning tokens and 123 s. That is fine for a review's judgement and
+wasteful for a file summary. The preset therefore declares what is honoured:
+
+```json
+"reasoning_levels": { "deepseek-*": ["none", "high"] }
+```
+
+and Mira maps every level onto those (`mira.llm.reasoning`):
+
+- **Judgement keeps its thinking.** The review passes, the system and
+  security passes, self-critique, the learning judge, thread replies and fix
+  verdicts run at the configured *Review Thinking Mode*. A configured `low` or
+  `medium` is sent as `high`, which is what the model does with it anyway. A
+  configured level is never mapped to `none`.
+- **Lookups and mechanical calls don't think.** A lookup hop
+  (`review.lookup_reasoning_effort: low`) is sent `none`. So is every
+  mechanical call (`llm.mechanical_reasoning: none`): file and directory
+  summaries, the walkthrough, the review's summary, the pull request's title
+  and description, the overlap check, peer-pattern extraction, release notes,
+  digests, dependency release summaries and CI log summaries. They get
+  `none` even on a purpose with no thinking configured (indexing), because
+  sending no level is not "off" here. `inherit` keeps them at the configured
+  level.
+- **A reply that was all thinking is asked again without it.** A structured
+  call that ends at the output limit with no content and no tool call — the
+  whole budget spent reasoning — is asked once more with `none` and logged,
+  instead of being re-rolled with a bigger budget for more of the same.
+
+File summaries on Flash Eco take about 16–20 s for a batch of three files with
+thinking off, bound by the ~500 tokens of summary they write per file, with
+no 100-second tail. Indexing runs half of a larger plan's background lane at
+once (8 on Go, 9 on Plus, 14 on Pro, 24 on Max). Other OpenDesign models are
+not in the table: they get the level as written until someone measures them
+and adds them.
+
+```yaml
+llm:
+  mechanical_reasoning: none     # inherit = the purpose's own level
+review:
+  lookup_reasoning_effort: low   # sent as none on OpenDesign's DeepSeek
+```
+
+The cost view's per-stage split (`GET /api/usage/costs`, `by_stage`) names
+each mechanical stage (`file_summaries`, `walkthrough`, `overlaps`, …), so the
+saving shows up as reasoning tokens that stop appearing.
+
 ## The estimated meter
 
 The preset's plans are data in `src/mira/llm/providers.json`, in plan credits:

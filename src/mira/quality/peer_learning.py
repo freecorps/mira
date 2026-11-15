@@ -170,12 +170,15 @@ async def synthesize_pattern(
         diff_block=untrusted.block("DIFF", diff, redactor=redact) if diff else "",
         existing=[{"id": c.id, "category": c.category, "rule_text": c.rule_text} for c in existing],
     )
+    from mira.llm import accounting
+
     try:
-        raw = await llm.complete_with_tools(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[SUBMIT_REVIEW_PATTERN_TOOL],
-            temperature=0.0,
-        )
+        with accounting.stage("review_pattern"):
+            raw = await llm.complete_with_tools(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[SUBMIT_REVIEW_PATTERN_TOOL],
+                temperature=0.0,
+            )
         data = json.loads(strip_think_blocks(strip_code_fences(raw))) if raw else {}
     except Exception as exc:  # noqa: BLE001
         logger.warning("Peer pattern synthesis failed for %s: %s", row.id, exc)

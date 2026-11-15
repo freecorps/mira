@@ -84,11 +84,18 @@ class ToolCallFormatError(LLMError):
     spends the whole budget thinking produces exactly this — an empty reply
     with a full ``reasoning_content`` — and a corrective prompt alone does not
     help it; the re-roll has to come with a bigger budget.
+
+    ``runaway`` narrows that to a reply that was nothing but thinking: cut
+    off, no content, no tool call. A bigger budget only buys more thinking
+    there, so the provider asks once more with reasoning off.
     """
 
-    def __init__(self, code: str, *, truncated: bool = False, **kwargs: object) -> None:
+    def __init__(
+        self, code: str, *, truncated: bool = False, runaway: bool = False, **kwargs: object
+    ) -> None:
         super().__init__(code, **kwargs)
         self.truncated = truncated
+        self.runaway = runaway
 
 
 class ResponseParseError(MiraError):

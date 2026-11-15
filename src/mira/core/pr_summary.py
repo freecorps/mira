@@ -46,7 +46,7 @@ from mira.autofix.redact import redact
 from mira.config import MiraConfig, PRSummaryConfig
 from mira.core.diff_parser import parse_diff
 from mira.core.file_filter import filter_files
-from mira.llm import untrusted
+from mira.llm import accounting, untrusted
 from mira.llm.prompts.review import build_walkthrough_prompt
 from mira.llm.response_parser import convert_to_walkthrough_result, parse_walkthrough_response
 from mira.models import FileDiff, PRInfo, WalkthroughResult
@@ -297,7 +297,8 @@ async def generate_walkthrough(
         pr_title=title,
         pr_description=strip_summary_section(pr_info.description),
     )
-    raw = await llm.walkthrough(messages)
+    with accounting.stage("pr_description"):
+        raw = await llm.walkthrough(messages)
     return convert_to_walkthrough_result(parse_walkthrough_response(raw))
 
 
@@ -347,13 +348,14 @@ async def generate_title(
         summary=_clean_generated(summary, names),
         description=strip_summary_section(pr_info.description),
     )
-    result = await llm.generate_object(
-        messages,
-        _GeneratedTitle,
-        name="submit_pr_title",
-        description="Submit the pull request title.",
-        temperature=0.2,
-    )
+    with accounting.stage("pr_title"):
+        result = await llm.generate_object(
+            messages,
+            _GeneratedTitle,
+            name="submit_pr_title",
+            description="Submit the pull request title.",
+            temperature=0.2,
+        )
     return sanitize_title(result.title, names)
 
 

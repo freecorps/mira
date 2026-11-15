@@ -64,6 +64,24 @@ def current_stage() -> str:
     return _stage.get()
 
 
+# What the ledger records a call under when no stage was set: the tool a
+# structured call submits through (``submit_fix_verdicts``). A call made
+# outside every tagged step — a thread reply, a fix verification, a chat
+# answer — then still says what it was, instead of reading as its purpose.
+# Ledger only: the reasoning level follows the stage, never this.
+_label: contextvars.ContextVar[str] = contextvars.ContextVar("mira_usage_label", default="")
+
+
+@contextlib.contextmanager
+def call_label(name: str) -> Iterator[None]:
+    """Record the calls in this block as ``name`` where no stage is set."""
+    token = _label.set(name)
+    try:
+        yield
+    finally:
+        _label.reset(token)
+
+
 @dataclass(frozen=True)
 class TokenUsage:
     """One call's tokens. ``cached`` and ``reasoning`` are parts of the totals."""
@@ -302,7 +320,7 @@ def record(entry: CallRecord) -> None:
     from mira.llm import ledger
 
     entry.trace_id = entry.trace_id or logs.current_trace_id()
-    entry.stage = entry.stage or current_stage()
+    entry.stage = entry.stage or current_stage() or _label.get()
     if not entry.repo:
         entry.repo = logs._trace_repo.get()
         entry.pr_number = logs._trace_pr.get()

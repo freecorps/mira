@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from mira.autofix.redact import redact
 from mira.dependency_updates.models import DependencyBump, DependencyUpdate, NoteItem
-from mira.llm import untrusted
+from mira.llm import accounting, untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -166,12 +166,13 @@ async def summarize(llm: object, updates: list[DependencyUpdate]) -> None:
     with_notes = [u for u in updates if u.releases]
     if not with_notes:
         return
-    result = await llm.generate_object(  # type: ignore[attr-defined]
-        build_messages(with_notes),
-        ReleaseSummary,
-        name="submit_release_summary",
-        description="Breaking changes, deprecations and notable changes per package.",
-        temperature=0.0,
-        max_tokens=3000,
-    )
+    with accounting.stage("release_summary"):
+        result = await llm.generate_object(  # type: ignore[attr-defined]
+            build_messages(with_notes),
+            ReleaseSummary,
+            name="submit_release_summary",
+            description="Breaking changes, deprecations and notable changes per package.",
+            temperature=0.0,
+            max_tokens=3000,
+        )
     apply_summary(with_notes, result)

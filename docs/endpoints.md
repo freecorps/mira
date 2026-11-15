@@ -126,6 +126,20 @@ setting serves a chain of models with different scales; each preset in
 and its models.dev id (`models_dev`). Set `MIRA_MODELS_DEV_URL=""` to keep
 an install off that catalogue.
 
+**Honoured levels and mechanical calls.** Some endpoints accept every level
+and act on few: OpenDesign's DeepSeek ignores everything but `none`. A preset
+lists what its endpoint honours (`reasoning_levels`, a list or model glob →
+list). A level lowered for a lookup hop or a mechanical call goes down to the
+nearest of those, and a configured level goes up to the nearest that still
+thinks, never to `none`. Mechanical calls are the summaries, walkthrough,
+titles, overlap checks, release notes and digests: one stage table in
+`mira.llm.reasoning`. They run at `llm.mechanical_reasoning` (`none` by
+default, `inherit` to keep the purpose's level). Where neither the preset nor
+models.dev says `none` exists, they are sent `low`, or nothing when no level
+is configured. A structured reply that was all thinking (cut off, no content,
+no tool call) is asked once more with thinking off. See
+[OpenDesign → Thinking](open-design.md#thinking).
+
 **Output budget.** The same page sets *Max output tokens*, the cap on every
 call — thinking included, which is why a reasoning model on the 4096
 default can answer with nothing. Pick a count, or *Unlimited* to send no
