@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from mira.config import MiraConfig
 from mira.core.noise_filter import _jaccard_similarity
+from mira.llm import accounting
 from mira.llm.base import LLMProviderProtocol
 from mira.llm.prompts.overlap import build_overlap_prompt
 from mira.models import OpenPRRef, OverlapFinding, PRFingerprint, PRInfo
@@ -169,7 +170,8 @@ async def detect_overlaps(
     # Stage 2 — one batched LLM judgment over the shortlist.
     messages = build_overlap_prompt(pr_info, current, survivors)
     try:
-        result = await llm.generate_object(messages, _OverlapVerdicts, name="submit_overlaps")
+        with accounting.stage("overlaps"):
+            result = await llm.generate_object(messages, _OverlapVerdicts, name="submit_overlaps")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Overlap LLM judgment failed, skipping: %s", exc)
         return []

@@ -26,6 +26,7 @@ from mira.llm.base import (
     _preview,
     _set_budget,
     _strip_model_prefix,
+    _thought,
     _tool_arguments,
     _tool_name,
 )
@@ -270,6 +271,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, body["model"]):
+                resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
                 resp = await self._post(client, body)
             self._handle_error(resp)
@@ -310,6 +313,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, api_model):
+                resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and body["tool_choice"] != "auto"
@@ -378,6 +383,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 reasoning=_responses_reasoning(data),
             ),
             truncated=truncated,
+            runaway=truncated and not text.strip() and _thought(body, _responses_reasoning(data)),
         )
 
     async def _call_llm_json_schema(
@@ -413,6 +419,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, api_model):
+                resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and _asked_for_reasoning(body)
@@ -442,6 +450,7 @@ class ResponsesProvider(OpenAICompatibleProvider):
                 else (str(status) if status and status != "completed" else None),
                 reasoning=_responses_reasoning(data),
             ),
+            thought=_thought(body, _responses_reasoning(data)),
         )
 
     async def _call_llm_agentic(

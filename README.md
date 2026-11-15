@@ -99,6 +99,9 @@ llm:
   # Output cap per call; 0 sends none and lets the model decide (best for
   # reasoning models, whose thinking counts against it).
   max_tokens: 0
+  # Summaries, walkthroughs, titles and other mechanical calls don't think;
+  # "inherit" gives them the purpose's own level.
+  mechanical_reasoning: none
 ```
 
 ```bash

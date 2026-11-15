@@ -127,6 +127,17 @@ class LLMConfig(BaseModel):
     # `llm_config_for`, the same way `model` is resolved from `review_model`).
     review_reasoning_effort: str | None = None
     reasoning_effort: str | None = None
+    # The reasoning level of mechanical calls — file and directory summaries,
+    # the walkthrough, the pull request's summary and title, the overlap
+    # check, release notes and digests (the stages in
+    # `mira.llm.reasoning.MECHANICAL_STAGES`) — whatever the purpose's own
+    # level. "none" turns thinking off where the endpoint is known to take it
+    # (on OpenDesign, DeepSeek V4 thinks unless told "none"); "inherit" keeps
+    # the configured level. Review judgement, self-critique, the learning
+    # judge and thread verdicts are never mechanical.
+    mechanical_reasoning: Literal[
+        "inherit", "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    ] = "none"
     temperature: float = 0.2
     # Output budget per call. 0 means unlimited: the request carries no
     # `max_tokens` at all and the model stops where it stops, which is the

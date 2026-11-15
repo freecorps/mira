@@ -29,6 +29,7 @@ from mira.llm.base import (
     _preview,
     _set_budget,
     _strip_model_prefix,
+    _thought,
     _tool_arguments,
     _tool_name,
 )
@@ -118,6 +119,8 @@ class LLMProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, body["model"]):
+                resp = await self._post(client, body)
             if self._refused_temperature(resp, body):
                 resp = await self._post(client, body)
             self._handle_error(resp)
@@ -171,6 +174,8 @@ class LLMProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, api_model):
+                resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and body["tool_choice"] != "auto"
@@ -222,13 +227,18 @@ class LLMProvider(OpenAICompatibleProvider):
             logger.warning("Model returned content instead of a tool call; parsed it as JSON")
             return as_json
 
+        truncated = finish_reason == "length"
         raise ToolCallFormatError(
             "bad_tool_arguments",
             tool=_tool_name(tools),
             preview=_preview(content)
             if content.strip()
             else _empty_reply_detail(finish_reason, reasoning=_carries_reasoning(message)),
-            truncated=finish_reason == "length",
+            truncated=truncated,
+            # Cut off with nothing written: the budget went to thinking.
+            runaway=truncated
+            and not content.strip()
+            and _thought(body, _carries_reasoning(message), data),
         )
 
     async def _call_llm_json_schema(
@@ -262,6 +272,8 @@ class LLMProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, api_model):
+                resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and _asked_for_reasoning(body)
@@ -286,6 +298,7 @@ class LLMProvider(OpenAICompatibleProvider):
             tools,
             truncated=finish_reason == "length",
             empty_detail=_empty_reply_detail(finish_reason, reasoning=_carries_reasoning(message)),
+            thought=_thought(body, _carries_reasoning(message), data),
         )
 
     async def _call_llm_agentic(

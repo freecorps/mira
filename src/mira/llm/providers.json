@@ -11,6 +11,7 @@
     "model_prefix": "'keep' sends the full vendor/model id (OpenRouter routes on it); 'strip' sends the bare model name.",
     "extra_headers": "Headers added to every request (attribution, client identification).",
     "reasoning_effort_map": "Renames for the unified reasoning.effort levels this endpoint spells differently.",
+    "reasoning_levels": "The reasoning levels the endpoint acts on, where it accepts others and ignores them: a list for every model, or an object from model globs (\"deepseek-*\") to lists. A lookup hop or a mechanical call that asked for less thinking is sent the nearest of these below its level (\"low\" becomes \"none\"); a configured level is sent the nearest above it other than \"none\", so a judgement call is never silently turned off. With \"none\" listed, a mechanical call sends it even when no level is configured, for a model that thinks unless told not to. Absent: models.dev's levels, else the level as written (see mira.llm.reasoning).",
     "reasoning_param": "How a Chat Completions request asks for a reasoning level: 'reasoning_effort' (the OpenAI field, what OpenAI-compatible endpoints take) or 'reasoning' (OpenRouter's nested {effort} object). The Responses API always uses the nested form.",
     "models_dev": "This endpoint's provider id on models.dev, whose per-model reasoning_options say which levels each model takes. The picker offers those levels and a requested one is snapped to the nearest the model has. Empty for an endpoint the catalogue does not list.",
     "session_header": "Optional header carrying a stable per-conversation id (one per client instance, so one per review pass), for endpoints that route and cache by it.",
@@ -78,6 +79,10 @@
     "max_concurrency": 10,
     "concurrency_headroom": 2,
     "reasoning_effort_map": {},
+    "reasoning_levels": {
+      "_comment": "Measured on deepseek-v4.1-flash and -flash-eco: low, minimal and high (and reasoning.effort, reasoning.max_tokens, thinking.type disabled, enable_thinking false) are all ignored and the model reasons until done or out of budget; reasoning_effort none turns thinking off. The other models are unmeasured and keep the level as written.",
+      "deepseek-*": ["none", "high"]
+    },
     "usage_format": "ledger",
     "plan_reference_models": ["deepseek-v4.1-flash-eco", "deepseek-v4.1-flash"],
     "plans": {

@@ -36,7 +36,7 @@ from mira.autofix.redact import redact
 from mira.checks import capabilities as caps
 from mira.checks.context import CheckContext, CheckOutcome
 from mira.checks.models import CheckFinding, Evidence, SkipReason, fingerprint
-from mira.llm import untrusted
+from mira.llm import accounting, untrusted
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.models import CIJobFailure
 
@@ -93,20 +93,21 @@ async def _summarize(ctx: CheckContext, failures: list[CIJobFailure]) -> str:
     )
     try:
         llm = ctx.llm_factory()
-        raw = await llm.complete(
-            [
-                {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{len(failures)} CI job(s) failed on this commit. Summarise "
-                        "what the output shows.\n\n" + blocks
-                    ),
-                },
-            ],
-            json_mode=False,
-            temperature=0.0,
-        )
+        with accounting.stage("ci_summary"):
+            raw = await llm.complete(
+                [
+                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{len(failures)} CI job(s) failed on this commit. Summarise "
+                            "what the output shows.\n\n" + blocks
+                        ),
+                    },
+                ],
+                json_mode=False,
+                temperature=0.0,
+            )
     except Exception as exc:  # noqa: BLE001 - a missing summary is not a failure
         logger.debug("CI summary unavailable for %s: %s", ctx.pr_url, exc)
         return ""

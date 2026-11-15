@@ -25,6 +25,7 @@ from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
 from mira.llm import accounting, concurrency, endpoints, structured
 from mira.llm import provider_profiles as profiles
+from mira.llm import reasoning as effort_rules
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 from mira.llm.utils import (
     loads_lenient,
@@ -341,30 +342,13 @@ def _refusals(kind: str, endpoint: str) -> set[str]:
 # ── Per-call reasoning level ────────────────────────────────────────
 
 # Reasoning levels from least to most thinking, for "never raise it" below.
-_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+# The rules live in :mod:`mira.llm.reasoning`; these names stay importable.
+_EFFORT_ORDER = effort_rules.EFFORT_ORDER
+lower_effort = effort_rules.lower_effort
 
 _effort_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mira_reasoning_override", default=None
 )
-
-
-def lower_effort(configured: str | None, override: str | None) -> str | None:
-    """The level a call is made at: ``override`` when it is lower than ``configured``.
-
-    An override never turns thinking on for a client that has it off, and
-    never raises the level; an unknown level on either side leaves the
-    configured one.
-    """
-    if not configured or configured == "off" or not override or override == "inherit":
-        return configured
-    try:
-        return (
-            override
-            if _EFFORT_ORDER.index(override) < _EFFORT_ORDER.index(configured)
-            else configured
-        )
-    except ValueError:
-        return configured
 
 
 @contextlib.contextmanager
@@ -425,6 +409,24 @@ def _asked_for_reasoning(body: dict) -> bool:
 def _drop_reasoning(body: dict) -> None:
     body.pop("reasoning", None)
     body.pop("reasoning_effort", None)
+
+
+def _thought(body: dict, carried: bool, data: object = None) -> bool:
+    """Did this call think? Reasoning came back, was billed, or a level was asked for.
+
+    ``carried`` is whether the reply held reasoning (the caller knows the
+    protocol's field). A level of ``none`` asks for no thinking at all.
+    """
+    if carried:
+        return True
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if accounting.from_chat(usage).reasoning > 0:
+        return True
+    level = body.get("reasoning_effort")
+    nested = body.get("reasoning")
+    if isinstance(nested, dict):
+        level = nested.get("effort", level)
+    return bool(level) and level != "none"
 
 
 def _merge_choices(choices: list) -> dict | None:
@@ -925,17 +927,20 @@ class OpenAICompatibleProvider:
         return dict(headers)
 
     def _apply_reasoning(self, body: dict) -> None:
-        """Enable extended thinking when a reasoning effort is configured.
+        """Put this call's reasoning level on the request, when it has one.
 
-        The level goes through the profile's rename map, then — when
-        models.dev has described this model — is snapped to the nearest
-        level the model actually takes, so "max" on a model that stops at
-        "high" is "high" rather than a 400 (see :mod:`mira.llm.models_dev`).
-        How it is named on the wire is the profile's call: the OpenAI
-        ``reasoning_effort`` field for OpenAI-compatible endpoints, the
-        nested ``reasoning.effort`` object for OpenRouter and for the
-        Responses API. Anthropic models reject a custom ``temperature``
-        while thinking is on, so it is dropped. No-op when reasoning is off.
+        The level is the configured one, lowered for a lookup hop or a
+        mechanical call and mapped onto the levels the endpoint honours (see
+        :mod:`mira.llm.reasoning`). It then goes through the profile's rename
+        map and — when models.dev has described this model and the preset
+        has not — is snapped to the nearest level the model actually takes,
+        so "max" on a model that stops at "high" is "high" rather than a 400
+        (see :mod:`mira.llm.models_dev`). How it is named on the wire is the
+        profile's call: the OpenAI ``reasoning_effort`` field for
+        OpenAI-compatible endpoints, the nested ``reasoning.effort`` object
+        for OpenRouter and for the Responses API. Anthropic models reject a
+        custom ``temperature`` while thinking is on, so it is dropped — except
+        at ``none``, where nothing thinks. No-op when the call has no level.
         """
         from mira.llm import models_dev
 
@@ -946,7 +951,11 @@ class OpenAICompatibleProvider:
         if model in self._no_reasoning:
             return
         effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
-        levels = models_dev.reasoning_levels(self.config, model)
+        levels = (
+            None
+            if effort_rules.honoured_levels(self.profile, model)
+            else models_dev.reasoning_levels(self.config, model)
+        )
         if levels:
             snapped = models_dev.snap_effort(levels, effort)
             if snapped != effort:
@@ -966,19 +975,43 @@ class OpenAICompatibleProvider:
             body["reasoning"] = {"effort": effort}
         else:
             body["reasoning_effort"] = effort
-        body.pop("temperature", None)
+        if effort != "none":
+            body.pop("temperature", None)
+
+    def _call_override(self) -> str | None:
+        """The lower level this call asks for: a lookup hop's, or a mechanical stage's.
+
+        The lower of the two when both apply: a mechanical call made inside
+        a lookup override still runs at the mechanical level.
+        """
+        return effort_rules.lowest(
+            current_effort_override(),
+            effort_rules.stage_level(
+                accounting.current_stage(), getattr(self.config, "mechanical_reasoning", None)
+            ),
+        )
+
+    def _effort_for(self, model: str, override: str | None) -> str | None:
+        """The level a call to ``model`` is made at under ``override`` (None: none)."""
+        from mira.llm import models_dev
+
+        return effort_rules.resolve(
+            self.config.reasoning_effort,
+            override,
+            honoured=effort_rules.honoured_levels(self.profile, model),
+            known=models_dev.reasoning_levels(self.config, model),
+        )
 
     def _requested_effort(self, model: str) -> str | None:
-        """The configured reasoning level, lowered by a :func:`reasoning_override`.
+        """The configured reasoning level, lowered for this call where it may be.
 
-        A model that refused the lowered level once (see
+        A model that refused a lowered level once (see
         :meth:`_override_refused`) is asked at the configured one from then on.
         """
-        configured = self.config.reasoning_effort
-        override = current_effort_override()
+        override = self._call_override()
         if override is None or model in self._no_effort_override:
-            return configured
-        return lower_effort(configured, override)
+            return self._effort_for(model, None)
+        return self._effort_for(model, override)
 
     def _override_refused(self, resp: Any, body: dict, api_model: str) -> bool:
         """Was a 400 about a lowered reasoning level? If so, ask at the configured one.
@@ -986,20 +1019,24 @@ class OpenAICompatibleProvider:
         Tried before any other recovery: the lowered level is the one thing
         this request does differently from every other the model answers.
         The level is remembered as refused for the model, so the loop's later
-        lookups do not pay the same round trip.
+        lookups — and later mechanical calls — do not pay the same round trip,
+        and a refusal of a level the configuration never asked for does not
+        take reasoning away from the model's judgement calls.
         """
         if resp.status_code != 400 or not _asked_for_reasoning(body):
             return False
-        override = current_effort_override()
+        override = self._call_override()
         if override is None or api_model in self._no_effort_override:
             return False
-        if lower_effort(self.config.reasoning_effort, override) == self.config.reasoning_effort:
+        configured = self._effort_for(api_model, None)
+        lowered = self._effort_for(api_model, override)
+        if lowered == configured:
             return False
         logger.info(
             "Model %s refused reasoning level %s; asking at the configured %s from now on",
             api_model,
-            override,
-            self.config.reasoning_effort,
+            lowered,
+            configured or "default",
         )
         self._no_effort_override.add(api_model)
         _drop_reasoning(body)
@@ -1007,14 +1044,15 @@ class OpenAICompatibleProvider:
         return True
 
     async def _prepare_reasoning(self) -> None:
-        """Have models.dev's levels in hand before a call that asks for thinking.
+        """Have models.dev's levels in hand before a call that may ask for a level.
 
         Lookups are synchronous and never fetch, so the fetch happens here,
-        where a call can afford to wait — and only when a level will be
-        sent, so a review with thinking off never touches the catalogue.
+        where a call can afford to wait — and only when a level may be sent,
+        so a review with thinking off and no mechanical call never touches
+        the catalogue.
         """
         effort = self.config.reasoning_effort
-        if not effort or effort == "off":
+        if (not effort or effort == "off") and self._call_override() != "none":
             return
         from mira.llm import models_dev
 
@@ -1261,13 +1299,16 @@ class OpenAICompatibleProvider:
         *,
         truncated: bool,
         empty_detail: str,
+        thought: bool = False,
     ) -> str:
         """Read a json_schema-mode reply as the tool's arguments, or raise.
 
         A reply that is not the object we asked for, when it was not cut off,
         is evidence the endpoint ignored the format — under real enforcement
         the model cannot write anything else — so the model is moved to tool
-        calling before the error goes up for the re-roll.
+        calling before the error goes up for the re-roll. An empty reply cut
+        off after thinking (``thought``) is a runaway: see
+        :class:`~mira.exceptions.ToolCallFormatError`.
         """
         if content.strip():
             try:
@@ -1282,6 +1323,7 @@ class OpenAICompatibleProvider:
             tool=_tool_name(tools),
             preview=empty_detail,
             truncated=truncated,
+            runaway=truncated and thought,
         )
 
     # ── Subclass hooks (abstract) ──────────────────────────────────
@@ -1411,6 +1453,11 @@ class OpenAICompatibleProvider:
         An endpoint that refuses the format costs no attempt — the same turn
         goes out as a tool call — and one that ignores it is moved to tool
         calling for the attempts after.
+
+        A reply that was nothing but thinking — cut off, no content, no call
+        (``runaway``) — is asked once more with reasoning off where that
+        changes the request, instead of with a bigger budget for more of the
+        same: 32,768 tokens of reasoning and no answer is a failed call.
         """
         attempts = 1 + self.config.tool_call_retries
         convo = messages
@@ -1418,29 +1465,15 @@ class OpenAICompatibleProvider:
         last_err: ToolCallFormatError | None = None
         schema = self._json_schema_for(tools)
         attempt = 0
+        thinking_off = False
 
         while attempt < attempts:
             use_schema = schema is not None and self._takes_json_schema(model)
             try:
-                if use_schema:
-                    assert schema is not None
-                    hint = {
-                        "role": "user",
-                        "content": _JSON_SCHEMA_PROMPT.format(tool=_tool_name(tools)),
-                    }
-                    payload = await self._call_llm_json_schema(
-                        model,
-                        [*convo, hint],
-                        tools,
-                        schema,
-                        temperature=temp,
-                        max_tokens=max_tokens,
+                with reasoning_override("none") if thinking_off else contextlib.nullcontext():
+                    payload = await self._attempt_structured(
+                        model, convo, tools, schema if use_schema else None, temp, max_tokens
                     )
-                else:
-                    payload = await self._call_llm_with_tools(
-                        model, convo, tools, temperature=temp, max_tokens=max_tokens
-                    )
-                payload = _settle(payload, tools)
                 if validate is not None:
                     validate(payload)
                 return payload
@@ -1468,6 +1501,17 @@ class OpenAICompatibleProvider:
                     attempts,
                     exc,
                 )
+                if exc.runaway and not thinking_off and self._can_stop_thinking(model):
+                    # More budget would buy more thinking. Once, with it off.
+                    thinking_off = True
+                    attempts = max(attempts, attempt + 1)
+                    logger.warning(
+                        "Model %s spent its whole output budget reasoning and wrote no "
+                        "answer; asking once more with reasoning off",
+                        model,
+                    )
+                    convo = messages
+                    continue
                 if exc.truncated:
                     self._raise_output_budget(model)
                     correction = _TRUNCATION_CORRECTION
@@ -1491,6 +1535,47 @@ class OpenAICompatibleProvider:
 
         assert last_err is not None  # the loop only exits here after a failure
         raise last_err
+
+    def _can_stop_thinking(self, model: str) -> bool:
+        """Would asking with reasoning off send ``model`` a different request?
+
+        Not when the call is already at ``none``, nor when nothing says the
+        endpoint can turn thinking off and no level is configured to lower.
+        """
+        api_model = _strip_model_prefix(model, self.profile)
+        if api_model in self._no_effort_override:
+            return False
+        now = self._requested_effort(api_model)
+        return now != "none" and self._effort_for(api_model, "none") != now
+
+    async def _attempt_structured(
+        self,
+        model: str,
+        convo: list[dict[str, str]],
+        tools: list[dict],
+        schema: dict | None,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> str:
+        """One structured attempt: constrained to ``schema`` when given, else a tool call."""
+        if schema is not None:
+            hint = {
+                "role": "user",
+                "content": _JSON_SCHEMA_PROMPT.format(tool=_tool_name(tools)),
+            }
+            payload = await self._call_llm_json_schema(
+                model,
+                [*convo, hint],
+                tools,
+                schema,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        else:
+            payload = await self._call_llm_with_tools(
+                model, convo, tools, temperature=temperature, max_tokens=max_tokens
+            )
+        return _settle(payload, tools)
 
     async def _json_mode_tool_fallback(
         self,
@@ -1624,8 +1709,22 @@ class OpenAICompatibleProvider:
         """The recovery ladder behind ``complete_with_tools`` and ``generate_object``.
 
         ``max_tokens`` is a floor for the output budget (see
-        :meth:`_structured_budget`), not a cap.
+        :meth:`_structured_budget`), not a cap. The calls are recorded under
+        the tool's name where no stage says what they were for.
         """
+        with accounting.call_label(_tool_name(tools)):
+            return await self._structured_ladder(
+                messages, tools, temperature=temperature, validate=validate, max_tokens=max_tokens
+            )
+
+    async def _structured_ladder(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        temperature: float | None = None,
+        validate: structured.Validator | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         await self._prepare_reasoning()
         try:
             return await self._tool_call_with_rerolls(
