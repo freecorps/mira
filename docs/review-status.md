@@ -115,6 +115,15 @@ redelivered webhook, or `opened` racing `synchronize`, is the same request and
 is not queued twice. During a restack each pull request is reviewed once, at
 its newest head.
 
+**A push waits for the branch to go quiet.** A review triggered by a push
+(`synchronize`) starts `push_quiet_seconds` (90 s) after it, not at once; a
+newer push in that time supersedes it and starts the wait again. A burst of
+fix-up pushes — one pull request was reviewed 14 times in two days, once per
+push — is reviewed once, at its last head. Only that pull request waits: the
+quiet period holds nothing else in its batch, and an opened pull request, an
+`@mira review` and a Re-run start as before. `push_quiet_seconds: 0` reviews
+every push as soon as `settle_seconds` allows.
+
 **Stack-aware.** Requests for one repository that arrive within
 `settle_seconds` (5 s) of each other form one batch, and the batch waits until
 the burst has gone quiet before any of it starts — but never longer than six
@@ -134,6 +143,18 @@ called, and the merge gate is re-evaluated for the new head. An explicit
 request (`@mira review`, Re-run) is always a real review.
 `carry_over_unchanged_rebase: false` turns this off.
 
+**A follow-up push is reviewed for what it changed.** Any pull request with a
+review on record is a follow-up round on its next push, and the round reads the
+diff since the last reviewed head. Before, only a pull request carrying one of
+Mira's threads counted as a follow-up, so one Mira had found clean was reviewed
+in full again on every push. Every review also records the patch id of each
+file it read, and a follow-up keeps only the files whose own change moved since
+then. After a force-push or a rebase, the commit-to-commit diff is the whole
+pull request again, or the old head is gone and there is no diff at all. The
+round then still reviews only the files that changed, where it used to review
+everything. Files a review left unread (a failed part, a size cap) keep the
+patch the last review read, so the next round reads them.
+
 **Memory.** A review keeps up to 150 MB of a repository's decoded source in
 memory for the agentic tools and the code graph, which is fine for one review
 and was most of what five concurrent reviews of one large repository cost.
@@ -147,6 +168,7 @@ review:
     max_concurrent_reviews: 2
     max_concurrent_per_installation: 0
     settle_seconds: 5
+    push_quiet_seconds: 90
     max_attempts: 3
     carry_over_unchanged_rebase: true
     reconcile_on_boot: true

@@ -26,22 +26,30 @@ Two things in how Mira reviewed made those easy to miss:
 
 ## Shuffled voting passes
 
-Each review part is read by `review.passes` independent agentic passes (3 by
-default), side by side:
+Each review part is read by `review.passes` independent agentic passes (2 by
+default; 3 until the cost work below), side by side:
 
 - **Pass 0** reads the part exactly as before — original file order, the
   configured `llm.temperature`. With `passes: 1` it is the only pass, and the
   review is the single-pass review it always was.
-- **Passes 1…n−1** read the part's files in another order, and each file's
-  hunks in another order too when its hunks do not touch (hunks that abut
-  read as one block and keep their order). The order comes from a seed derived
+- **Passes 1…n−1** read the part's files in another order and, on odd
+  passes, each file from its last hunk up. The order comes from a seed derived
   from the part's paths and the pass number, so replaying a review reads the
   same orders. Their temperature steps up evenly from `llm.temperature` to
   `llm.temperature + review.pass_temperature_spread` (0.3, capped at 1.0).
 
 Every pass is a full agentic pass: its own tool executor (`read_file`,
-`grep_repo`, `find_usages`, …), the same prompt, the same context, the same
-`submit_by` nudge.
+`grep_repo`, `find_usages`, …), the same context, the same `submit_by`
+nudge — and **the same prompt, byte for byte**. The order a later pass reads
+in is a short note after the diff ("## Reading order for this pass", a
+numbered list of the part's paths), not a re-shuffled prompt. The passes used
+to be sent the part re-shuffled: a different file list in the system prompt
+and a different diff in the user message, so a prompt cache could serve them
+nothing past the first lines of the system prompt, and every pass paid full
+input price for its first hop. Passes 1… are also held back (at most 20
+seconds) until pass 0's first reply starts arriving: a prefix cache can only
+serve what it has finished reading, and identical prompts sent side by side
+all miss it.
 
 ### The vote
 
@@ -52,8 +60,14 @@ once per cluster however often it repeats itself. Then:
 | Reported by | Kept? |
 |---|---|
 | ≥ `review.pass_vote_threshold` passes (2) | Yes. The finding carries `votes`/`vote_passes`, and its confidence becomes the mean of the passes that reported it. |
-| Fewer, and one of them is a **blocker** | Kept for self-critique, marked: the critic must grade it `proven`, or it is dropped. With self-critique off, or failing, it is dropped. |
+| Fewer, and one of them is at least `review.pass_vote_prove_min_severity` (a **warning**) | Kept for self-critique, marked: the critic must grade it `proven`, or it is dropped. With self-critique off, or failing, it is dropped. |
 | Fewer, otherwise | Dropped (recorded in the audit with its vote count). |
+
+With two passes and a threshold of two, a warning only one pass reported is
+no longer simply dropped — that rule made a two-pass review keep *fewer*
+warnings than a single pass. It has to be proven instead.
+`pass_vote_prove_min_severity: blocker` is the old rule, under which only a
+single-pass blocker got that chance.
 
 The threshold is clamped to the passes that actually landed: if one of three
 failed, the two left must agree; if only one landed, everything it found is
@@ -116,10 +130,11 @@ a timeout, a provider error, an unreadable answer — costs only its findings.
 
 Both are skipped on small changes:
 
-- below `review.multipass_min_changed_lines` (30) changed lines — added plus
+- below `review.multipass_min_changed_lines` (80) changed lines — added plus
   removed, over the reviewed files — on a first review;
-- below `review.multipass_min_changed_lines_incremental` (120) on a follow-up
-  round, which reviews only the new commits' diff.
+- below `review.multipass_min_changed_lines_incremental` (200) on a follow-up
+  round, which reviews only the files whose change moved since the last
+  review.
 
 Then every part gets one pass and there is no system pass: the old review,
 at the old price. The `multipass_plan` audit entry records the decision.
@@ -129,29 +144,58 @@ at the old price. The `multipass_plan` audit entry records the decision.
 Wall clock stays roughly flat: a part's passes run concurrently inside the
 part's slot of `review.max_concurrent_chunks`, and the system pass runs
 alongside the parts. Expect up to `max_concurrent_chunks × passes + 1`
-agentic loops in flight (16 with the defaults).
+agentic loops in flight (11 with the defaults), each holding one of the
+endpoint's concurrency slots only while a call is in flight.
 
 Tokens are not flat. Per review, above the thresholds:
 
 | Stage | Before | Now |
 |---|---|---|
-| Part reviews | 1 agentic loop per part | `passes` loops per part (3×) |
+| Part reviews | 1 agentic loop per part | `passes` loops per part (2×), later passes reading the first one's prompt from the cache |
 | System pass | — | 1 agentic loop over ≤ 40k tokens of the change |
 | Walkthrough, self-critique, summary, security pass | unchanged | unchanged |
 
 The part reviews are most of a review's tokens, so a default review above the
-thresholds costs roughly **2.5–3.5× the single-pass review** in tokens, and
-a review below them costs the same as before. On the review model this fork
+thresholds costs roughly **1.6–2.2× the single-pass review** in tokens (it
+was 2.5–3.5× with three shuffled passes), and a review below them costs the
+same as before. On the review model this fork
 runs (DeepSeek V4.1 Flash / muse-spark through OpenCode Go, cheap per call),
 that is the intended trade.
 
-Model calls are bounded. Each agentic loop makes at most 6 calls, and
+Model calls are bounded. Each agentic loop makes at most
+`review.agentic_max_hops` calls (5; it was 6), and
 `review.max_pass_runs` (30) bounds part × pass loops per review: a review
 with more parts than `max_pass_runs / passes` gets fewer passes per part (at
 least one). So a review's part and system loops make at most
-`6 × (min(parts × passes, max(parts, max_pass_runs)) + 1)` calls — 186 at
+`5 × (min(parts × passes, max(parts, max_pass_runs)) + 1)` calls — 155 at
 the defaults on a pull request of up to 30 parts — on top of the fixed walkthrough,
 critique and summary calls.
+
+### What a hop thinks
+
+Most hops of an agentic loop only decide what to read next. They run at
+`review.lookup_reasoning_effort` (`low`); the hop that submits the findings
+runs at the configured thinking mode, and so do self-critique, the summary
+and the walkthrough. A lookup hop that submits the review anyway is asked
+again at the configured level, and that answer stands, so findings are always
+written with the thinking the review was configured for. The level is never
+raised (`high` configured and `low` here sends `low`; thinking off stays
+off), and a model that refuses the lower level is asked at the configured
+one from then on. `inherit` thinks the same on every hop. In production at
+thinking `high`, 90% of output tokens were reasoning, and output was about
+two thirds of the bill.
+
+### Time
+
+A part's budget (`review.part_deadline_seconds`) starts when the part gets
+its slot of `review.max_concurrent_chunks`, not when it is queued: a part
+waiting behind five others used to start its passes with most of its budget
+gone. Waiting for one of the endpoint's concurrency slots (see
+[OpenDesign](open-design.md#concurrency)) does count, as model time does. A
+loop does not start a lookup hop it has no time to follow with a submission
+(judged by how long its last hop took): that turn becomes the last one. A
+pass the vote stops waiting for is cancelled with its in-flight call, and
+sends nothing after.
 
 `mira backtest`'s cost estimate counts the extra passes and the system pass
 (see below), so a plan shows the multiplier before anything is spent.
@@ -164,7 +208,8 @@ critique and summary calls.
   threshold, the kept findings with their vote counts, and the dropped ones
   with theirs; `agentic` entries carry their `pass`; `system_pass` with its
   status, time, files shown and omitted; `drafted` for chunk `system`; and a
-  `pass_vote` drop for a single-vote blocker the critic did not prove.
+  `pass_vote` drop for a single-vote warning or blocker the critic did not
+  prove.
 - **Findings**: `review_findings.votes` and `vote_passes` (0/0 for a single
   pass, the security pass or the system pass), migrated in place on SQLite
   and Postgres.
@@ -228,12 +273,15 @@ passes. It runs in the test suite and never calls a model.
 
 ```yaml
 review:
-  passes: 3                       # 1 = single pass (the old review)
+  passes: 2                       # 1 = single pass (the old review)
   pass_vote_threshold: 2          # passes that must agree; clamped to those that landed
+  pass_vote_prove_min_severity: warning  # below the vote: kept only if proven (blocker = old rule)
   pass_temperature_spread: 0.3    # pass temperatures step up to llm.temperature + this
   max_pass_runs: 30               # part × pass loops per review, at most
-  multipass_min_changed_lines: 30
-  multipass_min_changed_lines_incremental: 120
+  multipass_min_changed_lines: 80
+  multipass_min_changed_lines_incremental: 200
+  agentic_max_hops: 5             # model calls per agentic loop, the submitting one included
+  lookup_reasoning_effort: low    # inherit | minimal | low | medium | high
   system_pass: true
   system_pass_deadline_seconds: 480
   system_pass_tokens: 40000
