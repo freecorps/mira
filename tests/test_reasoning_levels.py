@@ -348,3 +348,12 @@ def test_indexing_takes_half_the_background_lane_of_a_large_plan() -> None:
     assert indexer._llm_concurrency(_Client(_open_design(plan="max"))) == 24
     assert indexer._llm_concurrency(_Client(_generic())) == 8
     assert indexer._llm_concurrency(object()) == 8
+
+
+def test_mechanical_reasoning_takes_only_none_or_inherit() -> None:
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    for level in ("low", "high"):
+        with _pytest.raises(ValidationError):
+            LLMConfig(mechanical_reasoning=level)

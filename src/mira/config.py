@@ -133,11 +133,11 @@ class LLMConfig(BaseModel):
     # `mira.llm.reasoning.MECHANICAL_STAGES`) — whatever the purpose's own
     # level. "none" turns thinking off where the endpoint is known to take it
     # (on OpenDesign, DeepSeek V4 thinks unless told "none"); "inherit" keeps
-    # the configured level. Review judgement, self-critique, the learning
-    # judge and thread verdicts are never mechanical.
-    mechanical_reasoning: Literal[
-        "inherit", "none", "minimal", "low", "medium", "high", "xhigh", "max"
-    ] = "none"
+    # the configured level. Only these two: an override only ever lowers, so
+    # another level could not raise a client configured without thinking.
+    # Review judgement, self-critique, the learning judge and thread verdicts
+    # are never mechanical.
+    mechanical_reasoning: Literal["inherit", "none"] = "none"
     temperature: float = 0.2
     # Output budget per call. 0 means unlimited: the request carries no
     # `max_tokens` at all and the model stops where it stops, which is the
