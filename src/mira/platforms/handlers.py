@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -16,7 +15,6 @@ from jinja2 import Environment, FileSystemLoader
 from mira.autofix.redact import redact
 from mira.config import load_config
 from mira.core import pr_summary
-from mira.core.diff_parser import parse_diff
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
 from mira.dashboard.models_config import llm_config_for
@@ -49,6 +47,15 @@ from mira.platforms.pr_chat import (
     run_pr_chat,
     wants_code_change,
 )
+from mira.platforms.thread_context import (
+    ThreadEvidence,
+    gather_thread_evidence,
+    lookup_llm_config,
+    numbered_windows,
+    pr_hunk,
+    referenced_lines,
+    thread_code_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,134 +86,13 @@ _PAUSE_KEYWORDS = {"pause"}
 
 _RESUME_KEYWORDS = {"resume"}
 
-_MAX_THREAD_CODE_CONTEXT = 6000
-# Lines of the file at the head shown around the finding, and around each line
-# the reply points at. A single diff hunk was all a reply used to get, and in
-# 28% of Mira's thread replies that hunk did not reach the code in question —
-# "the visible code stops before X" — so a fix the author pointed at could not
-# be seen and was argued with.
-_THREAD_WINDOW = 60
-_MAX_THREAD_FILE_CONTEXT = 12000
-_MAX_THREAD_CHANGE_CONTEXT = 5000
-_LINE_REFERENCE_RE = re.compile(
-    r"(?:\b(?:line|linha|lines|linhas|L)\s*|:)(\d{1,6})\b", re.IGNORECASE
-)
-
-
-def _numbered_windows(content: str, centres: list[int], radius: int) -> str:
-    lines = content.splitlines()
-    if not lines:
-        return ""
-    ranges: list[tuple[int, int]] = []
-    for centre in centres:
-        if centre <= 0:
-            continue
-        ranges.append((max(0, centre - 1 - radius), min(len(lines), centre + radius)))
-    if not ranges:
-        ranges = [(0, min(len(lines), 2 * radius))]
-    ranges.sort()
-    merged = [ranges[0]]
-    for lo, hi in ranges[1:]:
-        if lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-        else:
-            merged.append((lo, hi))
-    width = len(str(len(lines)))
-    return "\n...\n".join(
-        "\n".join(f"{i + 1:>{width}}| {lines[i]}" for i in range(lo, hi)) for lo, hi in merged
-    )
-
-
-def _referenced_lines(text: str, limit: int = 3) -> list[int]:
-    seen: list[int] = []
-    for match in _LINE_REFERENCE_RE.finditer(text or ""):
-        value = int(match.group(1))
-        if value > 0 and value not in seen:
-            seen.append(value)
-        if len(seen) >= limit:
-            break
-    return seen
-
-
-async def _pr_hunk(provider: Any, pr_info: Any, path: str, line: int) -> str:
-    if not hasattr(provider, "get_pr_diff"):
-        return ""
-    diff_text = await provider.get_pr_diff(pr_info)
-    if not isinstance(diff_text, str):
-        return ""
-    file = next((item for item in parse_diff(diff_text).files if item.path == path), None)
-    if file is None or not file.hunks:
-        return ""
-
-    def distance(item: Any) -> int:
-        last = item.target_start + max(item.target_length - 1, 0)
-        if item.target_start <= line <= last:
-            return 0
-        return min(abs(line - item.target_start), abs(line - last))
-
-    hunk = min(file.hunks, key=distance)
-    # Only a hunk at or near the line. The first hunk of the file used to be
-    # shown whatever the line, as though it were the code under discussion.
-    return hunk.content[:_MAX_THREAD_CODE_CONTEXT] if distance(hunk) <= 20 else ""
-
-
-async def _thread_code_context(
-    provider: Any,
-    pr_info: Any,
-    path: str,
-    line: int,
-    *,
-    reply: str = "",
-    finding_head_sha: str = "",
-) -> str:
-    """The code a thread reply is about, as the pull request now has it.
-
-    Three parts, each best-effort: the file at the head, numbered, around the
-    finding and around every line the reply cites; what changed in the file
-    since the finding was raised; and the pull request's hunk at the line.
-    """
-    if not path:
-        return ""
-    parts: list[str] = []
-    head = getattr(pr_info, "head_sha", "") or getattr(pr_info, "head_branch", "")
-    try:
-        if head and hasattr(provider, "get_file_content"):
-            content = await provider.get_file_content(pr_info, path, head)
-            if isinstance(content, str) and content:
-                window = _numbered_windows(
-                    content, [line, *_referenced_lines(reply)], _THREAD_WINDOW
-                )
-                parts.append(
-                    f"File at the pull request's head ({head[:12]}), numbered:\n"
-                    + window[:_MAX_THREAD_FILE_CONTEXT]
-                )
-    except Exception as exc:
-        logger.debug("Could not read %s at head for a thread reply: %s", path, exc)
-    try:
-        current = getattr(pr_info, "head_sha", "") or ""
-        if finding_head_sha and current and finding_head_sha != current:
-            compare = await provider.get_compare_diff(pr_info, finding_head_sha, current)
-            if isinstance(compare, str) and compare.strip():
-                changed = next(
-                    (f for f in parse_diff(compare).files if path in {f.path, f.old_path}), None
-                )
-                if changed is not None and changed.hunks:
-                    text = "\n".join(h.content for h in changed.hunks)
-                    parts.append(
-                        f"Changes to this file since the comment ({finding_head_sha[:12]}"
-                        f"..{current[:12]}):\n" + text[:_MAX_THREAD_CHANGE_CONTEXT]
-                    )
-                else:
-                    parts.append("This file has not changed since the comment was made.")
-    except Exception as exc:
-        logger.debug("Could not diff %s since its finding: %s", path, exc)
-    try:
-        hunk = await _pr_hunk(provider, pr_info, path, line)
-        if hunk:
-            parts.append("Pull request diff hunk at the comment's line:\n" + hunk)
-    except Exception as exc:
-        logger.debug("Could not load thread code context for %s: %s", path, exc)
-    return "\n\n".join(parts)
+# The code a thread reply is checked against, and the lookups that fill in
+# what it does not show, live in platforms/thread_context.py. The old names
+# stay importable.
+_numbered_windows = numbered_windows
+_referenced_lines = referenced_lines
+_pr_hunk = pr_hunk
+_thread_code_context = thread_code_context
 
 
 def _lookup_finding(
@@ -236,6 +122,15 @@ def _lookup_finding(
         return None
     finally:
         store.close()
+
+
+def _finding_text(finding: Any) -> str:
+    """A stored finding's title and body, or "" for none."""
+    if finding is None:
+        return ""
+    title = str(getattr(finding, "title", "") or "")
+    body = str(getattr(finding, "body", "") or "")
+    return f"{title}\n\n{body}".strip()
 
 
 def _thread_history_text(pr_info: Any, finding: Any, platform: str) -> str:
@@ -283,6 +178,7 @@ async def _recheck_finding(
     comment_line: int,
     code_context: str,
     history: str = "",
+    evidence: str = "",
 ) -> tuple[bool | None, str]:
     """Look at the code again after the author says they fixed something.
 
@@ -292,6 +188,11 @@ async def _recheck_finding(
     three different things happening to the thread — and collapsing the third
     into either of the others is how a thread gets closed on a fix nobody
     verified, or reopened on one that landed.
+
+    ``evidence`` is what the lookups at the head found
+    (:func:`~mira.platforms.thread_context.gather_thread_evidence`); the
+    verdict is still this one call, through the same submit tool, so a loop
+    that could not run leaves the check exactly as it was.
     """
     prompt = _THREAD_RECHECK_TEMPLATE.render(
         finding_block=untrusted.block("FINDING", original_suggestion or "(none)", redactor=redact),
@@ -300,6 +201,8 @@ async def _recheck_finding(
         history_block=untrusted.block("COMMENT", history, redactor=redact) if history else "",
         path_block=_path_block(comment_path),
         comment_line=_safe_line(comment_line),
+        # Rendered by thread_context: lookup results framed as untrusted.
+        evidence_block=evidence,
     )
     try:
         raw = await llm.complete_with_tools(
@@ -824,7 +727,8 @@ async def run_thread_reply(
     config = load_config()
     # The review model: a reply decides whether a finding closes and whether
     # anything is learned from it, which is not a job for the cheap model.
-    llm = create_llm(llm_config_for("review", config.llm))
+    review_llm_config = llm_config_for("review", config.llm)
+    llm = create_llm(review_llm_config)
     known = _lookup_finding(
         pr_info,
         original_body=original_suggestion,
@@ -854,6 +758,7 @@ async def run_thread_reply(
             reply=_reply,
         )
         return
+    history = _thread_history_text(pr_info, known, platform)
     code_context = await _thread_code_context(
         provider,
         pr_info,
@@ -861,8 +766,42 @@ async def run_thread_reply(
         comment_line,
         reply=human_reply,
         finding_head_sha=getattr(known, "head_sha", "") or "",
+        mention_text=f"{original_suggestion}\n{_finding_text(known)}\n{history}",
     )
-    history = _thread_history_text(pr_info, known, platform)
+
+    async def _evidence(purpose: str) -> ThreadEvidence:
+        # Looked up only where a verdict on the code follows: a recheck of
+        # "fixed", or the judge reading pushback. Never raises; an empty
+        # result leaves the verdict to the one call it always was.
+        lookup_llm = llm
+        lookup_config = lookup_llm_config(review_llm_config, config.chat.thread_lookup_effort)
+        if lookup_config is not review_llm_config:
+            try:
+                lookup_llm = create_llm(lookup_config)
+            except Exception as exc:  # noqa: BLE001 — look up on the review model
+                logger.debug("Could not make the lookup model: %s", exc)
+        found = await gather_thread_evidence(
+            provider,
+            pr_info,
+            llm=lookup_llm,
+            config=config,
+            purpose=purpose,
+            finding_text=original_suggestion or _finding_text(known),
+            reply=human_reply,
+            history=history,
+            path=comment_path,
+            line=_safe_line(comment_line),
+            code_context=code_context,
+        )
+        logger.info(
+            "Thread %s lookups on %s: %s, %d lookup(s)",
+            purpose,
+            pr_info.url,
+            found.route,
+            len(found.lookups),
+        )
+        return found
+
     prompt = _THREAD_REPLY_TEMPLATE.render(
         history_block=untrusted.block("COMMENT", history, redactor=redact) if history else "",
         reply_block=untrusted.block("REPLY", human_reply or "(empty)", redactor=redact),
@@ -969,6 +908,11 @@ async def run_thread_reply(
     if intent == "disagreement" and (
         config.learning.auto_accept or autolearn.corrects_false_positive(human_reply)
     ):
+        pushback_context = code_context
+        if not autolearn.corrects_false_positive(human_reply):
+            found = await _evidence("pushback")
+            if found.text:
+                pushback_context = f"{code_context}\n\n{found.text}" if code_context else found.text
         try:
             learning_outcome = await autolearn.learn_from_pushback(
                 provider,
@@ -977,7 +921,7 @@ async def run_thread_reply(
                 feedback_event,
                 human_reply=human_reply,
                 finding_text=original_suggestion,
-                code_context=code_context,
+                code_context=pushback_context,
                 config=config,
                 llm=llm,
                 platform=platform,
@@ -1013,6 +957,9 @@ async def run_thread_reply(
         # Look, rather than take their word for it. The reply the classifier
         # wrote is a holding sentence; what gets posted is the result of the
         # check, so the author learns whether the thread actually closed.
+        # The lookups first, so the check can see a fix in another file or
+        # past the window instead of asking the author to show it.
+        found = await _evidence("recheck")
         resolved, verdict = await _recheck_finding(
             llm,
             original_suggestion=original_suggestion,
@@ -1021,6 +968,7 @@ async def run_thread_reply(
             comment_line=comment_line,
             code_context=code_context,
             history=history,
+            evidence=found.text,
         )
         if verdict:
             reply_text = verdict

@@ -1675,6 +1675,18 @@ class ChatConfig(BaseModel):
                           this", "pode corrigir?") goes to ``@mira fix``
                           instead of being answered; off, it is answered
                           like any other question
+      thread_lookups    — before a reply on one of Mira's review threads is
+                          rechecked ("fixed", "corrigido") or judged, the
+                          same tools look up the code it is about at the
+                          head; off, the check sees the diff since the
+                          finding only. Needs ``agentic``
+      thread_max_hops   — model turns those lookups may take (2-8)
+      thread_deadline_seconds — wall clock for them; at the deadline the check
+                          goes ahead with what was found (15-300)
+      thread_lookup_effort — reasoning effort for the lookup turns when the
+                          review model reasons at a higher one; the verdict
+                          itself keeps the review model's. "" keeps it for
+                          the lookups too
     """
 
     agentic: bool = True
@@ -1685,6 +1697,10 @@ class ChatConfig(BaseModel):
     history_messages: int = Field(default=20, ge=0, le=100)
     history_chars: int = Field(default=12_000, ge=0, le=60_000)
     autofix_handoff: bool = True
+    thread_lookups: bool = True
+    thread_max_hops: int = Field(default=5, ge=2, le=8)
+    thread_deadline_seconds: float = Field(default=90.0, ge=15.0, le=300.0)
+    thread_lookup_effort: str = "low"
 
 
 class LicensesConfig(BaseModel):

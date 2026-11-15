@@ -456,6 +456,10 @@ async def test_a_reply_sees_the_file_at_head_around_the_line_it_cites(
         assert "250| line 250" in prompt
         assert " 10| line 10" in prompt
         assert "has not changed since the comment" in prompt
+        # The change in another file is shown, not filtered away: that is
+        # where a fix the author points at often lives.
+        assert "src/other.py (+1 -1) [shown]" in prompt
+        assert "+b" in prompt
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,55 @@ answers in one call over the diff and the conversation instead, carrying
 whatever its lookups had already found. If even that fails, it says it could
 not answer rather than staying silent.
 
+## Replies on Mira's review threads
+
+A reply on one of Mira's review comments is classified first — the finding is
+wrong, it is fixed, a question, agreement — and what happens next depends on
+which. Two of those answers are decided by the code rather than by the reply:
+
+- **"Fixed"** ("done", "corrigido", "it's in `store.ts` now"): Mira rechecks
+  the code, and only a recheck that finds the problem gone resolves the
+  thread, as fixed.
+- **Pushback** ("the caller already validates it"): a judge reads the code
+  before anything is learned from the reply.
+
+Both used to see the commented file only — a window around the finding and
+what changed *in that file* since. A fix in a helper, a caller, another
+package or a re-export was invisible, and Mira asked the author to "show" or
+"push" code that was already there. Now each check sees:
+
+- **The commented file at the head**, numbered, around the finding and around
+  every line the reply cites.
+- **What changed since the finding, in every file**: the commented file
+  first, then files the reply, the finding or the thread name (by path, by
+  filename, or by a symbol on their changed lines), then the rest — up to
+  16,000 characters of hunks, with a list of every changed file and its line
+  counts, each marked shown, shown in part or not shown.
+- **Lookups at the head.** Before the verdict, a short read-only tool loop —
+  the same tools as above — reads what that still does not show: the file the
+  reply names, the definition of the function, its callers, a search for the
+  literal. The verdict is then given in one call, through the same submit tool
+  as before, with the lookups in view.
+
+The lookups are bounded by turns (`chat.thread_max_hops`, default 5) and wall
+clock (`chat.thread_deadline_seconds`, default 90, snapshot included; past 60%
+the next turn is the last), and run at `chat.thread_lookup_effort` (default
+`low`) when the review model reasons at a higher effort — the verdict keeps
+the review model's. When they fail or time out, the check goes ahead with
+whatever they found, or with the diff alone, exactly as it did before; a
+reply is never left unanswered because a lookup failed. They run only for
+those two checks: a question goes to the chat above, and agreement needs no
+code.
+
+Mira is told never to ask the author to show, push or point at code. If the
+fix is genuinely not at the head, the reply says which file or symbol it
+looked for and where.
+
+When a review runs on a new push, Mira also checks its open threads for
+fixes (`review.auto_resolve_conversations`). That check now sees the rest of
+the pull request's diff, prioritised the same way, alongside each thread's
+file, so a thread whose fix landed in another file is resolved too.
+
 ## Asking Mira to change code
 
 A chat message that asks Mira to change code — "fix this", "can you fix it?",
@@ -81,6 +130,10 @@ chat:
   history_messages: 20     # 0 turns memory off
   history_chars: 12000
   autofix_handoff: true
+  thread_lookups: true          # look up the code before a recheck or a judge
+  thread_max_hops: 5            # 2-8
+  thread_deadline_seconds: 90   # 15-300
+  thread_lookup_effort: low     # "" keeps the review model's effort
 ```
 
 The tools reuse the review's settings: `review.repo_snapshot` (one archive
