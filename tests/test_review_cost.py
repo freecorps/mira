@@ -688,3 +688,61 @@ async def test_a_pass_left_out_at_the_soft_deadline_stops_calling_the_model() ->
     made = calls["slow"]
     await asyncio.sleep(0.3)
     assert calls["slow"] == made  # nothing after the cut
+
+
+def test_a_stored_endpoint_without_a_plan_does_not_take_the_config_plan() -> None:
+    from types import SimpleNamespace
+
+    from mira.llm import concurrency
+
+    profile = {
+        "max_concurrency": 10,
+        "concurrency_headroom": 0,
+        "plans": {"plus": {"concurrency": 20}},
+        "plan": "",
+        "endpoint_max_concurrency": 0,
+    }
+    config = SimpleNamespace(plan="plus", max_concurrent_requests=0)
+    assert concurrency.limit_for(config, profile) == (10, 0)
+    assert concurrency.limit_for(config, {**profile, "plan": "plus"}) == (20, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_resubmission_at_the_configured_level_counts_toward_the_hop_cap() -> None:
+    from unittest.mock import AsyncMock
+
+    submit = {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "s1",
+                "type": "function",
+                "function": {"name": "submit_review", "arguments": '{"comments": []}'},
+            }
+        ],
+    }
+    lookup = {
+        "content": "",
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    }
+    llm = AsyncMock()
+    # Hop 1 submits at the lookup level; asked again, the model looks something up.
+    llm.complete_agentic = AsyncMock(side_effect=[submit, lookup, submit, submit])
+
+    class _Executor:
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+
+        async def execute(self, name, args):
+            return "x"
+
+    await agentic_review_loop(
+        llm,
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "d"}],
+        _Executor(),
+        max_hops=2,
+        lookup_reasoning_effort="low",
+    )
+    # Two model calls spent the cap of two: no third hop.
+    assert llm.complete_agentic.await_count == 2

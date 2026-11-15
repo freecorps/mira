@@ -269,9 +269,9 @@ isn't actually present.
 {{ footguns }}
 
 {% endif %}
-{# The file list differs from part to part, so it sits late: what comes before
-   the first per-part section is one prefix every part shares, which the
-   endpoint's prompt cache can serve. #}
+{# The file list differs from part to part, so it sits late: it keeps the
+   shared preamble (the procedure and the pull request header) in the prefix a
+   prompt cache can serve, up to the first part-varying section. #}
 ## Valid File Paths
 
 Only use these file paths in your comments:

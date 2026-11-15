@@ -240,7 +240,10 @@ def limit_for(config: Any, profile: dict) -> tuple[int, int] | None:
     limit = _positive_int(getattr(config, "max_concurrent_requests", 0))
     if not limit:
         limit = _positive_int(profile.get("max_concurrency"))
-        plan_id = str(profile.get("plan") or getattr(config, "plan", "") or "").strip().lower()
+        # A stored endpoint's own plan governs, blank included: the
+        # mira.yaml plan describes the config endpoint, not this one.
+        raw_plan = profile["plan"] if "plan" in profile else getattr(config, "plan", "")
+        plan_id = str(raw_plan or "").strip().lower()
         plans = profile.get("plans")
         plan = plans.get(plan_id) if isinstance(plans, dict) and plan_id else None
         if isinstance(plan, dict) and _positive_int(plan.get("concurrency")):
