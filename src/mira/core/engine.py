@@ -3002,7 +3002,7 @@ class ReviewEngine:
                             idx + 1,
                             outcome.thinking_calls,
                             ", read without thinking" if outcome.degraded else "",
-                            f", lookups {outcome.followup}" if outcome.followup else "",
+                            f", {len(outcome.lookups)} lookup(s)" if outcome.lookups else "",
                             outcome.seconds,
                         )
                     parsed = _parse(raw_response)
@@ -3369,16 +3369,46 @@ class ReviewEngine:
 
             make_executor = None
             deadline_seconds = self.config.review.system_pass_deadline_seconds
+            has_tools = (
+                self.config.review.agentic_tools and self._agentic_source_fetcher is not None
+            )
+            if has_tools:
+                make_executor = _make_executor
+            loop: Callable[..., Awaitable[str]] = functools.partial(
+                agentic_review_loop,
+                max_hops=self.config.review.agentic_max_hops,
+                lookup_reasoning_effort=_lookup_effort(self.config),
+            )
             if staged:
-                # One call beside the parts, done when they are: no tool loop.
+                # Two calls at most, like a part, done when the parts are; and
+                # dropped rather than read without thinking if they fail.
                 left = review_budget.left(PARTS_FRACTION)
                 if left is not None:
                     seconds = max(1, int(left))
                     deadline_seconds = (
                         min(deadline_seconds, seconds) if deadline_seconds else seconds
                     )
-            elif self.config.review.agentic_tools and self._agentic_source_fetcher is not None:
-                make_executor = _make_executor
+                due = review_budget.deadline(PARTS_FRACTION)
+                system_outcome = PartOutcome()
+
+                async def _two_hops(model: Any, messages: list, executor: Any, **_kw: Any) -> str:
+                    try:
+                        return await review_part(
+                            model,
+                            messages,
+                            deadline_at=due,
+                            settings=StagedSettings.from_config(
+                                self.config.review, streams=_streams(model)
+                            ),
+                            executor=executor,
+                            outcome=system_outcome,
+                            degrade=False,
+                            stage="system",
+                        )
+                    finally:
+                        audit.append(system_outcome.audit("system"))
+
+                loop = _two_hops
 
             return await system_review_pass(
                 llm=self.llm,
@@ -3391,13 +3421,7 @@ class ReviewEngine:
                 pr_description=pr_description,
                 learned_checks=learned_checks or None,
                 make_executor=make_executor,
-                agentic_loop=None
-                if staged
-                else functools.partial(
-                    agentic_review_loop,
-                    max_hops=self.config.review.agentic_max_hops,
-                    lookup_reasoning_effort=_lookup_effort(self.config),
-                ),
+                agentic_loop=loop,
                 deadline_seconds=deadline_seconds,
                 audit=audit,
             )

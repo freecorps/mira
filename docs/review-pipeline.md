@@ -60,15 +60,24 @@ prepare ──► parts (+ whole-PR pass, security, dependencies) ──► veri
    no model call is spent on it, and it is bounded by
    `review.context_pack_seconds`: what is ready by then goes in.
 
-3. **One thinking call per part.** The model reviews the part with all of the
-   above and has no tools. Its answer is `submit_review` plus an optional
-   `need`: lookups (`read_file`, `find_usages`, `find_definition`,
-   `grep_repo`) that would settle a suspicion the context does not. When it
-   asks, the lookups run **side by side**, deterministically, and **one**
-   follow-up call gets the first reading and their results and submits the
-   final review. The follow-up repeats the first prompt byte for byte and adds
-   to its end, so the prompt cache serves what the first call paid for. **At
-   most two thinking calls per part**, whatever the model asks.
+3. **At most two thinking calls per part.** The first call has the part's
+   prompt — with everything above — and is *offered* the lookup tools
+   (`read_file`, `grep_repo`, `find_usages`, `find_definition`) beside
+   `submit_review`. It either submits straight away, or asks, in one turn,
+   for every lookup it still needs. Those run **side by side**,
+   deterministically, and the second call is offered `submit_review` alone:
+   it can only answer, and it carries the first call's reasoning over, so it
+   goes on from where the first stopped. No lookup runs on the last turn —
+   the old loop's last-turn nudge could be ignored and more lookups run.
+
+   Why offer tools at all, if the context is gathered first? Because on a
+   thinking model a tool call is where it stops thinking. Measured on DeepSeek
+   V4.1 Flash Eco through OpenDesign (where no reasoning level but `none` is
+   honoured): the hops of the old loop reasoned 1.8k tokens at the median
+   (p90 9.9k), while one call asked to review a whole module outright spent
+   all of a 16k-token budget reasoning and never answered — five times out of
+   six, with or without being told to think briefly. The lookups' results also
+   go to verification with the part's findings (below).
 
 4. **Never partial, never re-run.** A thinking call that times out
    (`review.call_timeout_seconds`), errors, runs out of output budget, or
@@ -86,18 +95,23 @@ prepare ──► parts (+ whole-PR pass, security, dependencies) ──► veri
    them can fail the review (a failure or a timeout costs only its findings,
    recorded as `stage_left_out` in the audit):
    - the **whole-PR pass** ([system pass](multipass-review.md#the-system-pass))
-     is one plain call over the PR map (every changed file, the callers of
-     changed symbols, as many hunks as fit) — no tool loop — and runs only
-     when the PR is split into two or more parts: one part already sees the
-     whole change;
+     reads the PR map (every changed file, the callers of changed symbols, as
+     many hunks as fit in `staged_system_pass_tokens`) with the same two calls
+     a part gets, and runs only when the PR is split into two or more parts:
+     one part already sees the whole change. If it fails it is dropped, not
+     read without thinking;
    - the security pass and the dependency-overlap pass.
 
 6. **Verify** — self-critique grades every candidate against the hunk and
-   the code around it (unchanged), now in batches of
-   `review.critique_batch_size` side by side, bounded by 90% of the budget. A
-   batch that does not finish keeps its drafts, as a failed critique always
-   has. This replaces the vote as the precision step: one pass by default
-   (`review.passes: 1`).
+   the code around it, **as soon as its part lands** (beside the parts still
+   running), in batches of `review.critique_batch_size` side by side,
+   bounded by 90% of the budget; the side passes' findings are graded after
+   them. A part's findings are graded with the lookups it made, shown once
+   per batch, and a finding filed below the confidence floor after them
+   (from `evidence_min_confidence`) goes to the critic instead of being
+   filtered out, posted only if graded `proven`. A batch that does not
+   finish keeps its drafts, as a failed critique always has. This replaces
+   the vote as the precision step: one pass by default (`review.passes: 1`).
 
 7. **Summary**, grouping, the comment cap, verification (`mira.verify`),
    walkthrough, check-run status — unchanged.
@@ -120,7 +134,7 @@ review. Every stage takes its deadline from what is left of it:
 |---|---|
 | Parts, whole-PR pass, security and dependency passes | 70% of the budget |
 | One thinking call | `call_timeout_seconds`, or what is left of the parts' time if less |
-| Follow-up | only if ≥ 30 s are left after the lookups |
+| Submitting turn | what is left of the parts' time, if at least 30 s; else the part is read without thinking with the lookups' results |
 | Degraded read | what is left, but never less than `degraded_call_seconds` |
 | Verification (self-critique batches) | 90% of the budget |
 
@@ -155,10 +169,10 @@ Ledger stages (`llm_usage.stage`):
 
 | Stage | Calls |
 |---|---|
-| `pass` | a part's thinking call |
-| `pass_followup` | its follow-up |
+| `pass` | a part's first thinking call |
+| `pass_followup` | its submitting turn, after the lookups |
 | `pass_degraded` | a part read without thinking |
-| `system` | the whole-PR pass |
+| `system`, `system_followup` | the whole-PR pass's two calls |
 | `security`, `dependency`, `critique`, `summary`, `walkthrough`, `threads` | as before |
 
 Audit entries in the review's audit trail:
@@ -166,9 +180,9 @@ Audit entries in the review's audit trail:
 - `context_pack` — per part: the functions whose callers were listed, the
   callees shown, the related tests, its size, how long it took and whether it
   ran out of time.
-- `staged_part` — per part: `thinking_calls` (0–2), `degraded`, `followup`
-  (`used`, `kept_first` when the follow-up failed, `skipped` when there was no
-  time), the `lookups` run, `hedged`, errors and seconds.
+- `staged_part` — per part (and `chunk: system` for the whole-PR pass):
+  `thinking_calls` (0–2), `degraded`, the `lookups` run, `hedged`, errors and
+  seconds.
 - `stage_left_out` — a side pass or a verification batch that failed or ran
   out of time.
 
@@ -181,7 +195,11 @@ review:
   call_timeout_seconds: 180     # one thinking call
   degraded_call_seconds: 60     # always granted to the no-thinking read
   degraded_reasoning_effort: none   # or `inherit`
-  followup_max_lookups: 6       # 0 = never a follow-up
+  max_lookups: 6                # one round per part; 0 = no tools, one call
+  evidence_min_confidence: 0.3  # below the floor after lookups: posted only if proven
+  staged_part_tokens: 16000     # diff tokens per part (the agentic pipeline: agent_token_budget)
+  staged_part_files: 10
+  staged_system_pass_tokens: 12000
   context_pack_tokens: 5000
   context_pack_seconds: 20
   hedge_after_seconds: 60       # 0 = no hedging

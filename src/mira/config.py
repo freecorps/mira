@@ -698,27 +698,21 @@ class ReviewConfig(BaseModel):
     # endpoint honours it; `off` on endpoints that only take a budget), or
     # `inherit` to make it on the review client as configured.
     degraded_reasoning_effort: Literal["none", "inherit"] = "none"
-    # Diff tokens and files per staged part. One thinking call reads a part,
-    # and on a thinking model its time grows with what it reads: a 12-file,
-    # 24k-token part was still thinking after 180 s on Flash Eco, while parts
-    # of at most 9k tokens answered in 30-90 s, side by side. The agentic
-    # pipeline keeps `agent_token_budget` / `agent_max_files`; the staged one
-    # takes the smaller of the two pairs.
-    staged_part_tokens: int = Field(default=9_000, ge=2_000)
-    staged_part_files: int = Field(default=6, ge=1)
-    # Lookups the staged reviewer may request in its answer (`need`). They run
-    # side by side, with no model call, and their results go to verification:
-    # self-critique grades each finding of the part with the code the
-    # reviewer asked for, and a finding filed below the confidence floor
-    # while waiting on them is posted only if that code proves it (at least
-    # `evidence_min_confidence`). 0: no lookups.
-    followup_max_lookups: int = Field(default=6, ge=0, le=20)
+    # Diff tokens and files per staged part; the agentic pipeline keeps
+    # `agent_token_budget` / `agent_max_files`, the staged one takes the
+    # smaller of the two pairs. Smaller parts do not think for less: with
+    # 9k-token parts a 94-file pull request became 34 parts, eight at a time,
+    # and most never got their turn before the budget ran out.
+    staged_part_tokens: int = Field(default=16_000, ge=2_000)
+    staged_part_files: int = Field(default=10, ge=1)
+    # Lookups a staged part's first thinking call may ask for, in one round:
+    # they run side by side and the second (last) call can only submit. Their
+    # results also go to verification with the part's findings, and a finding
+    # filed below the confidence floor after them goes to the critic instead
+    # of being filtered, posted only if the code proves it (from
+    # `evidence_min_confidence` up). 0: no lookups, one call per part.
+    max_lookups: int = Field(default=6, ge=0, le=20)
     evidence_min_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
-    # Also make a second thinking call per part with the lookups' results,
-    # when time allows. Off by default: on Flash Eco the follow-up reread the
-    # whole part and took 110-180 s, most of a review's budget, and was cut
-    # more often than it landed. Worth trying on a faster review model.
-    followup_call: bool = False
     # Tokens per part for the gathered context: callers of the changed
     # functions, the definitions they call, related tests.
     context_pack_tokens: int = Field(default=5_000, ge=0)

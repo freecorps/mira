@@ -1,11 +1,10 @@
-"""The staged review of one part: context first, then one thinking call.
+"""The staged review of one part: context first, then at most two thinking calls.
 
 The agentic loop this replaces let the model decide, one hop at a time, what
 to look up next. On a thinking model every hop re-read the whole growing
-conversation and reasoned over it again — about 2,900 reasoning tokens and a
-median 27 s per hop, sixty-odd calls on a large pull request — and the hops
-that decided "read this file next" thought as hard as the one that wrote the
-findings. Most of what they looked up is known before the model is called:
+conversation, sixty-odd calls on a large pull request and up to five per part
+and pass, with parts that ran out their 480 s and were read again. Most of
+what the hops looked up is known before the model is called:
 the functions a part changes, who calls them, what the functions they call
 do, the tests next to them.
 
@@ -15,11 +14,13 @@ So a part is reviewed in stages here:
    code graph over the reviewed commit — callers of the changed functions,
    definitions of what they call, related test files — bounded in time and
    size and ranked, so the most useful lookups land first.
-2. :func:`review_part` makes ONE thinking call over the part's prompt (which
-   carries the pack, the changed functions in full and the index context).
-   The model may name lookups it still needs in ``need``; they run side by
-   side (:func:`run_lookups`) and ONE follow-up call revises the review with
-   their results. Two thinking calls per part at most.
+2. :func:`review_part` makes the first thinking call over the part's prompt
+   (which carries the pack, the changed functions in full and the index
+   context), offering the lookup tools beside ``submit_review``. A thinking
+   model that calls a tool stops thinking to call it, so the model either
+   submits or asks, early, for what it still needs; those lookups run side by
+   side (:func:`run_lookups`) and the second call can only submit. Two
+   thinking calls per part at most, one round of lookups.
 3. A part never fails for lack of time and is never re-run from scratch: a
    thinking call that times out, errors, or answers with nothing usable is
    followed by one call without thinking over the same prompt, with the time
@@ -48,11 +49,7 @@ from typing import Any, TypeVar
 from mira.index.code_graph import added_lines, grammar_for_path
 from mira.llm import accounting, concurrency
 from mira.llm.response_parser import loads_lenient, parse_llm_response
-from mira.llm.tool_schemas import (
-    STAGED_LOOKUP_TOOLS,
-    SUBMIT_REVIEW_TOOL,
-    SUBMIT_STAGED_REVIEW_TOOL,
-)
+from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL
 from mira.models import FileChangeType, FileDiff
 
 logger = logging.getLogger(__name__)
@@ -66,15 +63,13 @@ CRITIQUE_FRACTION = 0.90
 # A thinking call is not started with less than this left: it would be cut
 # before it answered, and the degraded read is the better use of the time.
 _MIN_THINKING_SECONDS = 30.0
-# The follow-up is skipped unless this much time is left after the lookups.
-_MIN_FOLLOWUP_SECONDS = 30.0
 # Lookups for the follow-up run for at most this long, together.
 _LOOKUP_SECONDS = 20.0
 # Characters of one follow-up lookup's result, and of all of them.
 _LOOKUP_RESULT_CHARS = 6_000
 _LOOKUP_TOTAL_CHARS = 24_000
-# Room the follow-up call needs on top of the first prompt: the first
-# reading and the lookup results. Reserved when the prompt is sized.
+# Room the submitting turn needs on top of the first prompt: the lookups'
+# results and the first turn. Reserved when the prompt is sized.
 FOLLOWUP_RESERVE_TOKENS = 9_000
 
 # The context pack: changed functions whose callers are listed, callers per
@@ -171,20 +166,16 @@ class StagedSettings:
 
     call_timeout: float = 180.0
     degraded_seconds: float = 60.0
-    followup_max_lookups: int = 6
+    max_lookups: int = 6
     hedge_after: float = 60.0
-    # Make the second thinking call with the lookups' results; off hands them
-    # to verification as evidence instead (see review_part).
-    followup_call: bool = False
 
     @classmethod
     def from_config(cls, review: Any, *, streams: bool) -> StagedSettings:
         return cls(
             call_timeout=float(review.call_timeout_seconds),
             degraded_seconds=float(review.degraded_call_seconds),
-            followup_max_lookups=int(review.followup_max_lookups),
+            max_lookups=int(review.max_lookups),
             hedge_after=float(review.hedge_after_seconds) if streams else 0.0,
-            followup_call=bool(review.followup_call),
         )
 
 
@@ -254,118 +245,47 @@ def submission_problem(raw: object) -> str | None:
     return None
 
 
-def split_need(raw: str) -> tuple[str, list[dict]]:
-    """The review without its ``need`` field, and the lookups it asked for."""
-    data = loads_lenient(raw)
-    if not isinstance(data, dict):
-        return raw, []
-    need = data.pop("need", None)
-    lookups = [n for n in need if isinstance(n, dict)] if isinstance(need, list) else []
-    return json.dumps(data), lookups
-
-
-def _lookup_args(item: dict) -> tuple[str, dict] | None:
-    tool = str(item.get("tool") or "").strip()
-    if tool not in STAGED_LOOKUP_TOOLS:
-        return None
-    args: dict = {}
-    for key in ("symbol", "path", "pattern", "start_line", "end_line"):
-        value = item.get(key)
-        if value not in (None, ""):
-            args[key] = value
-    if tool == "read_file" and not args.get("path"):
-        return None
-    if tool in ("find_usages", "find_definition") and not args.get("symbol"):
-        return None
-    if tool == "grep_repo" and not args.get("pattern"):
-        return None
-    return tool, args
-
-
 def _label(tool: str, args: dict) -> str:
-    shown = ", ".join(f"{k}={v!r}" for k, v in args.items())
+    shown = ", ".join(f"{k}={v!r}" for k, v in args.items() if v not in (None, ""))
     return f"{tool}({shown})"
 
 
 async def run_lookups(
-    executor: Any, need: list[dict], max_lookups: int, seconds: float = _LOOKUP_SECONDS
+    executor: Any, calls: list[tuple[str, dict]], seconds: float = _LOOKUP_SECONDS
 ) -> list[tuple[str, str]]:
-    """The lookups a first reading asked for, run side by side; ``(label, result)`` each.
+    """``calls`` (tool, arguments) run side by side; ``(label, result)`` for each, in order.
 
-    Deduplicated, capped at ``max_lookups``, each result cut to a share of
-    the room. A lookup still running after ``seconds`` is left out.
+    Each result is cut to a share of the room, and a lookup still running
+    after ``seconds`` is reported as such rather than waited for.
     """
-    calls: list[tuple[str, dict]] = []
-    seen: set[str] = set()
-    for item in need:
-        parsed = _lookup_args(item)
-        if parsed is None:
-            continue
-        label = _label(*parsed)
-        if label in seen:
-            continue
-        seen.add(label)
-        calls.append(parsed)
-        if len(calls) >= max_lookups:
-            break
-    if not calls or executor is None:
+    if not calls:
         return []
+    if executor is None:
+        return [(_label(t, a), "[no repository to look this up in]") for t, a in calls]
     tasks = [asyncio.ensure_future(executor.execute(tool, args)) for tool, args in calls]
-    done, pending = await asyncio.wait(tasks, timeout=seconds)
+    done, pending = await asyncio.wait(tasks, timeout=max(0.5, seconds))
     for task in pending:
         task.cancel()
     out: list[tuple[str, str]] = []
     used = 0
     for (tool, args), task in zip(calls, tasks, strict=True):
+        label = _label(tool, args)
         if task not in done or task.cancelled() or task.exception() is not None:
-            out.append((_label(tool, args), "[this lookup did not finish in time]"))
+            out.append((label, "[this lookup did not finish in time]"))
             continue
         text = str(task.result())
         if len(text) > _LOOKUP_RESULT_CHARS:
             text = text[:_LOOKUP_RESULT_CHARS] + "\n… [cut]"
         if used + len(text) > _LOOKUP_TOTAL_CHARS:
-            out.append((_label(tool, args), "[left out: the lookups' room is spent]"))
+            out.append((label, "[left out: the lookups' room is spent]"))
             continue
         used += len(text)
-        out.append((_label(tool, args), text))
-    return out
-
-
-def _guidance(max_lookups: int, followup_call: bool) -> str:
-    then = (
-        "They run together and you get one more turn with their results to revise the review."
-        if followup_call
-        else "They run together before your findings are verified: a finding the code "
-        "they return proves is posted, one it disproves is not."
-    )
-    return (
-        "\n\n## Context and lookups\n\n"
-        "This review has no tools: what the repository can tell you about this change "
-        "was gathered before the call — the changed functions in full, the callers of "
-        "the functions this part changes, the definitions they call, the index's notes. "
-        "Review from it, and trace contracts across it.\n\n"
-        "File every finding you can support, and every issue you suspect but cannot "
-        "settle from what you were shown, each with the confidence you have now. For "
-        "the unsettled ones, list in `need` the lookups that would settle them — at "
-        f"most {max_lookups}: `read_file` with `path` (and `start_line`/`end_line` for "
-        "a range), `find_usages` or `find_definition` with `symbol`, `grep_repo` with "
-        f"`pattern`; each with the `reason` it would settle. {then} Leave `need` empty "
-        "when the context is enough — most parts need nothing more."
-    )
-
-
-def with_guidance(
-    messages: list[dict], max_lookups: int, followup_call: bool = False
-) -> list[dict]:
-    """``messages`` with the staged instructions after the system prompt."""
-    out = [dict(m) for m in messages]
-    if out and out[0].get("role") == "system" and max_lookups > 0:
-        out[0]["content"] = str(out[0].get("content") or "") + _guidance(max_lookups, followup_call)
+        out.append((label, text))
     return out
 
 
 def render_evidence(lookups: list[tuple[str, str]], max_chars: int = 8_000) -> str:
-    """The lookups a part asked for, as the critic reads them."""
+    """The lookups a part made, as the critic reads them."""
     blocks: list[str] = []
     used = 0
     for label, result in lookups:
@@ -378,36 +298,86 @@ def render_evidence(lookups: list[tuple[str, str]], max_chars: int = 8_000) -> s
     return "\n\n".join(blocks)
 
 
-def _append_to_last_user(messages: list[dict], text: str) -> list[dict]:
-    """``messages`` with ``text`` after the last user turn, keeping the prefix byte for byte.
+def _guidance(max_lookups: int) -> str:
+    return (
+        "\n\n## Context and lookups\n\n"
+        "What the repository can tell you about this change was gathered before this "
+        "call — the changed functions in full, the callers of the functions this part "
+        "changes, the definitions they call, the index's notes. Review from it, and "
+        "trace contracts across it.\n\n"
+        "When a suspected issue can only be settled by code you were not shown, call "
+        "the lookup tools for it — `read_file`, `grep_repo`, `find_usages`, "
+        "`find_definition`. You get **one** round: ask for everything you need in the "
+        f"same turn (at most {max_lookups} calls; they run together), and the next turn "
+        "can only submit. When the context is enough — most parts need nothing more — "
+        "call `submit_review` straight away."
+    )
 
-    The follow-up repeats the first call's prompt and adds to its end, so the
-    endpoint's prompt cache serves everything the first call paid for.
-    """
+
+def with_guidance(messages: list[dict], max_lookups: int) -> list[dict]:
+    """``messages`` with the staged instructions after the system prompt."""
+    out = [dict(m) for m in messages]
+    if out and out[0].get("role") == "system" and max_lookups > 0:
+        out[0]["content"] = str(out[0].get("content") or "") + _guidance(max_lookups)
+    return out
+
+
+_SUBMIT_NOW = (
+    "The lookups you asked for are above. This is your last turn: call `submit_review` "
+    "now with every finding you can support, or with an empty `comments` list."
+)
+
+
+def _digest(lookups: list[tuple[str, str]]) -> str:
+    """The lookups, for a degraded read that could not hold the conversation."""
+    if not lookups:
+        return ""
+    body = "\n\n".join(f"### {label}\n{result}" for label, result in lookups)
+    return (
+        "\n\n## Lookups already made for this review\n\n"
+        "The repository at this pull request's head:\n\n" + body[:_LOOKUP_TOTAL_CHARS]
+    )
+
+
+def _with_text(messages: list[dict], text: str) -> list[dict]:
+    """``messages`` with ``text`` after the last user turn."""
+    if not text:
+        return messages
     out = [dict(m) for m in messages]
     for message in reversed(out):
         if message.get("role") == "user" and isinstance(message.get("content"), str):
-            message["content"] = message["content"] + "\n\n" + text
+            message["content"] = message["content"] + text
             return out
     out.append({"role": "user", "content": text})
     return out
 
 
-def followup_message(first_reading: str, lookups: list[tuple[str, str]]) -> str:
-    parts = [
-        "## Your first reading of this part\n\n"
-        "You submitted this review and asked for lookups:\n\n"
-        f"```json\n{first_reading}\n```",
-        "## The lookups you asked for\n\nThe repository at this pull request's head:",
-    ]
-    parts.extend(f"### {label}\n{result}" for label, result in lookups)
-    parts.append(
-        "Submit the final review now, through `submit_review`: every finding you stand "
-        "by — those of the first reading, revised where a lookup changes them, and any a "
-        "lookup reveals. Leave out a first-reading finding only when a lookup disproves "
-        "it. No more lookups can be made."
-    )
-    return "\n\n".join(parts)
+def _submission_of(msg: object) -> tuple[str | None, list[dict]]:
+    """``(review JSON or None, lookup calls)`` from one agentic turn."""
+    from mira.core.passes import _review_json_in
+
+    if not isinstance(msg, dict):
+        return None, []
+    calls = msg.get("tool_calls") or []
+    lookups: list[dict] = []
+    if isinstance(calls, list):
+        for call in calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            if fn.get("name") == "submit_review":
+                args = fn.get("arguments")
+                raw = args if isinstance(args, str) else json.dumps(args or {})
+                if submission_problem(raw) is None:
+                    return raw, []
+            else:
+                lookups.append(call)
+    content = msg.get("content")
+    if isinstance(content, str) and content.strip():
+        written = _review_json_in(content)
+        if written is not None:
+            return written, []
+    return None, lookups
 
 
 @dataclass
@@ -419,15 +389,12 @@ class PartOutcome:
     degraded: bool = False
     hedged: bool = False
     lookups: list[str] = field(default_factory=list)
-    # The lookups' results, for verification when no follow-up call used them.
+    # The lookups' results, handed to verification with the part's findings.
     evidence: list[tuple[str, str]] = field(default_factory=list)
-    # "", "used", "kept_first" (follow-up failed or unusable), "skipped" (no
-    # time), "evidence" (handed to verification instead of a second call)
-    followup: str = ""
     errors: list[str] = field(default_factory=list)
     seconds: float = 0.0
 
-    def audit(self, chunk: int) -> dict:
+    def audit(self, chunk: int | str) -> dict:
         entry: dict = {
             "stage": "staged_part",
             "chunk": chunk,
@@ -437,8 +404,6 @@ class PartOutcome:
         }
         if self.lookups:
             entry["lookups"] = self.lookups
-        if self.followup:
-            entry["followup"] = self.followup
         if self.hedged:
             entry["hedged"] = True
         if self.errors:
@@ -456,122 +421,147 @@ async def review_part(
     degraded_llm: Any = None,
     temperature: float | None = None,
     outcome: PartOutcome | None = None,
+    degrade: bool = True,
+    stage: str = "pass",
 ) -> str:
     """One part, reviewed with at most two thinking calls; the ``submit_review`` JSON.
 
-    ``messages`` is the part's review prompt, context pack included.
-    ``deadline_at`` (monotonic) is when the part should be done; the
-    degraded read may run up to ``settings.degraded_seconds`` past it.
-    ``degraded_llm`` makes that read (the review client with thinking off);
-    None uses ``llm``. Raises only when the degraded read fails too.
+    The first call has the part's prompt (context pack included) and the
+    lookup tools. A thinking model that calls a tool stops thinking to call
+    it — in production the hops of the old loop reasoned 1.8k tokens at the
+    median, where one call asked to review a whole part outright ran past
+    16k on DeepSeek Flash Eco and was cut — so a model unsure of something
+    asks early instead of reasoning its way around it. Every lookup it asks
+    for runs side by side, and the second call is offered ``submit_review``
+    alone: it can only answer. Its reasoning is carried over, so it goes on
+    from where the first stopped.
+
+    ``deadline_at`` (monotonic) is when the part should be done. A call that
+    fails, times out or answers with nothing usable is followed by one read
+    without thinking (``degraded_llm``, or ``llm`` when None) over the same
+    prompt and the lookups made so far, given what is left and at least
+    ``settings.degraded_seconds``. Raises only when that read fails too —
+    or, with ``degrade=False`` (the whole-PR pass, which adds findings and
+    may be dropped), instead of making it.
     """
+    from mira.core.passes import assistant_turn
+    from mira.llm.agentic_tools import AGENTIC_TOOLS
+
     out = outcome if outcome is not None else PartOutcome()
     started = time.monotonic()
     sampling: dict = {} if temperature is None else {"temperature": temperature}
-    lookups_allowed = settings.followup_max_lookups if executor is not None else 0
-    tool = SUBMIT_STAGED_REVIEW_TOOL if lookups_allowed > 0 else SUBMIT_REVIEW_TOOL
-    staged_messages = with_guidance(messages, lookups_allowed, settings.followup_call)
+    offered = getattr(executor, "tools", None) if executor is not None else None
+    helpers = list(offered) if isinstance(offered, list) and offered else list(AGENTIC_TOOLS)
+    use_tools = executor is not None and settings.max_lookups > 0
+    convo = with_guidance(messages, settings.max_lookups if use_tools else 0)
+    min_thinking = min(_MIN_THINKING_SECONDS, settings.call_timeout)
 
     def _left() -> float:
         return float("inf") if deadline_at is None else deadline_at - time.monotonic()
 
-    async def _think(msgs: list[dict], tools: list[dict], seconds: float) -> str:
+    def _mark_hedged() -> None:
+        out.hedged = True
+
+    async def _hop(msgs: list[dict], tools: list[dict], seconds: float) -> object:
         out.thinking_calls += 1
         hedge_after = settings.hedge_after if settings.hedge_after < seconds else 0.0
 
-        async def _call() -> str:
+        async def _call() -> object:
+            if use_tools:
+                return await llm.complete_agentic(msgs, tools=tools, **sampling)
             return await llm.complete_with_tools(msgs, tools=tools, **sampling)
-
-        def _mark_hedged() -> None:
-            out.hedged = True
 
         return await asyncio.wait_for(hedged(_call, hedge_after, on_hedge=_mark_hedged), seconds)
 
-    first = ""
-    first_seconds = 0.0
-    budget = min(settings.call_timeout, _left())
-    # Floors no higher than the call bound itself, for a deployment that sets it low.
-    min_thinking = min(_MIN_THINKING_SECONDS, settings.call_timeout)
-    min_followup = min(_MIN_FOLLOWUP_SECONDS, settings.call_timeout)
-    if budget >= min_thinking:
+    review: str | None = None
+    seconds = min(settings.call_timeout, _left())
+    if seconds < min_thinking:
+        out.errors.append(f"no time for a thinking call ({max(0.0, _left()):.0f}s left)")
+    else:
         try:
-            with accounting.stage("pass"):
-                first = await _think(staged_messages, [tool], budget)
-            first_seconds = time.monotonic() - started
-            problem = submission_problem(split_need(first)[0] if first else first)
-            if problem is not None:
-                out.errors.append(f"first reading unusable: {problem}")
-                first = ""
+            with accounting.stage(stage):
+                first = await _hop(
+                    convo,
+                    [*helpers, SUBMIT_REVIEW_TOOL] if use_tools else [SUBMIT_REVIEW_TOOL],
+                    seconds,
+                )
+            if not use_tools:
+                if submission_problem(first) is None:
+                    review = str(first)
+                else:
+                    out.errors.append("first reading unusable")
+                lookup_calls: list[dict] = []
+            else:
+                review, lookup_calls = _submission_of(first)
+            if review is None and lookup_calls:
+                parsed: list[tuple[str, dict]] = []
+                for call in lookup_calls[: settings.max_lookups]:
+                    fn = call["function"]
+                    raw_args = fn.get("arguments") or "{}"
+                    args = raw_args if isinstance(raw_args, dict) else loads_lenient(raw_args)
+                    parsed.append(
+                        (str(fn.get("name") or ""), args if isinstance(args, dict) else {})
+                    )
+                results = await run_lookups(
+                    executor, parsed, min(_LOOKUP_SECONDS, max(1.0, _left()))
+                )
+                out.lookups = [label for label, _ in results]
+                out.evidence = results
+                assert isinstance(first, dict)
+                content = first.get("content") if isinstance(first.get("content"), str) else ""
+                turn = [
+                    *convo,
+                    assistant_turn(first, content or "", lookup_calls),
+                ]
+                for i, call in enumerate(lookup_calls):
+                    text = (
+                        results[i][1]
+                        if i < len(results)
+                        else f"[not run: one round of at most {settings.max_lookups} lookups]"
+                    )
+                    turn.append(
+                        {"role": "tool", "tool_call_id": call.get("id") or "", "content": text}
+                    )
+                turn.append({"role": "user", "content": _SUBMIT_NOW})
+                seconds = min(settings.call_timeout, _left())
+                if seconds >= min_thinking:
+                    with accounting.stage(f"{stage}_followup"):
+                        second = await _hop(turn, [SUBMIT_REVIEW_TOOL], seconds)
+                    review, _ignored = _submission_of(second)
+                    if review is None:
+                        out.errors.append("the submitting turn did not submit")
+                else:
+                    out.errors.append(
+                        f"no time for the submitting turn ({max(0.0, _left()):.0f}s left)"
+                    )
+            elif review is None:
+                out.errors.append("the first turn neither submitted nor looked anything up")
         except Exception as exc:  # noqa: BLE001 — degraded below
             if isinstance(exc, TimeoutError) and not str(exc):
-                exc = TimeoutError(f"thinking call ran past {budget:.0f}s")
+                exc = TimeoutError(f"thinking call ran past {seconds:.0f}s")
             out.errors.append(f"{type(exc).__name__}: {exc}"[:300])
             logger.warning(
                 "Staged part: thinking call failed (%s); reading it without thinking", exc
             )
-            first = ""
-    else:
-        out.errors.append(f"no time for a thinking call ({max(0.0, _left()):.0f}s left)")
+            review = None
 
-    if first:
-        review, need = split_need(first)
+    if review is not None:
         out.raw = review
-        if need and lookups_allowed > 0:
-            if not settings.followup_call:
-                # The default: no second reading. The lookups run side by side
-                # (seconds, no model call) and go to verification, which
-                # grades each finding with the code the reviewer asked for.
-                results = await run_lookups(
-                    executor, need, lookups_allowed, min(_LOOKUP_SECONDS, max(1.0, _left()))
-                )
-                out.lookups = [label for label, _ in results]
-                out.evidence = results
-                out.followup = "evidence" if results else ""
-            elif _left() < min_followup + _LOOKUP_SECONDS / 2:
-                out.followup = "skipped"
-            else:
-                results = await run_lookups(
-                    executor, need, lookups_allowed, min(_LOOKUP_SECONDS, _left() / 3)
-                )
-                out.lookups = [label for label, _ in results]
-                out.evidence = results
-                seconds = min(settings.call_timeout, _left())
-                # It rereads the part with more in it: a follow-up given less
-                # time than the first reading took is cut, its tokens spent.
-                if not results or seconds < max(min_followup, 0.8 * first_seconds):
-                    out.followup = "skipped"
-                else:
-                    try:
-                        with accounting.stage("pass_followup"):
-                            second = await _think(
-                                _append_to_last_user(messages, followup_message(review, results)),
-                                [SUBMIT_REVIEW_TOOL],
-                                seconds,
-                            )
-                        problem = submission_problem(second)
-                        if problem is None:
-                            out.raw = split_need(second)[0]
-                            out.followup = "used"
-                            out.evidence = []
-                        else:
-                            out.followup = "kept_first"
-                            out.errors.append(f"follow-up unusable: {problem}")
-                    except Exception as exc:  # noqa: BLE001 — the first reading stands
-                        out.followup = "kept_first"
-                        out.errors.append(f"follow-up {type(exc).__name__}: {exc}"[:300])
-                        logger.info(
-                            "Staged part: follow-up failed (%s); keeping the first reading", exc
-                        )
         out.seconds = time.monotonic() - started
-        return out.raw
+        return review
 
+    if not degrade:
+        out.seconds = time.monotonic() - started
+        raise RuntimeError("; ".join(out.errors) or "no usable review")
     # Degraded: one read without thinking, with what is left and at least the floor.
     out.degraded = True
     client = degraded_llm or llm
     seconds = max(settings.degraded_seconds, min(settings.call_timeout, _left()))
     try:
-        with accounting.stage("pass_degraded"):
-            raw = await asyncio.wait_for(client.review(messages, **sampling), seconds)
+        with accounting.stage(f"{stage}_degraded"):
+            raw = await asyncio.wait_for(
+                client.review(_with_text(messages, _digest(out.evidence)), **sampling), seconds
+            )
     except Exception as exc:
         out.seconds = time.monotonic() - started
         if isinstance(exc, TimeoutError) and not str(exc):
