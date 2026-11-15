@@ -175,10 +175,10 @@ class OAuthResponsesProvider(ResponsesProvider):
         here the spec gets to decide per model, since a backend that serves
         several generations at once accepts different top levels on each.
         """
-        effort = self.config.reasoning_effort
+        model = str(body.get("model") or "")
+        effort = self._requested_effort(model)
         if not effort or effort == "off":
             return
-        model = str(body.get("model") or "")
         if model in self._no_reasoning:
             return
         body["reasoning"] = {

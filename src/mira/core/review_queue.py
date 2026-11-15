@@ -225,6 +225,10 @@ class ReviewQueue:
             request,
             settle_seconds=q.settle_seconds,
             max_settle_seconds=max(q.settle_seconds * 6, 30.0),
+            # A push waits for the branch to go quiet: a newer push in that
+            # time supersedes it, so three fix-up pushes in a minute are one
+            # review rather than two cancelled ones and a third.
+            delay_seconds=q.push_quiet_seconds if request.reason == "synchronize" else 0.0,
             now=self._clock(),
         )
         for old in superseded:

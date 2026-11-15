@@ -19,14 +19,13 @@ counting those would send most restacked pull requests back to the model.
 from __future__ import annotations
 
 import hashlib
+import re
+
+_NEW_PATH = re.compile(r"^\"?a/.*?\"? \"?b/(.*?)\"?$")
 
 
-def diff_patch_id(diff_text: str) -> str:
-    """The patch id of a unified diff, or ``""`` for an empty one.
-
-    Files are hashed in path order, so a diff that lists the same files in a
-    different order has the same id.
-    """
+def _entries(diff_text: str) -> dict[str, list[str]]:
+    """Each file section's patch lines, keyed by its ``diff --git`` header."""
     files: dict[str, list[str]] = {}
     current: list[str] | None = None
     for line in (diff_text or "").splitlines():
@@ -43,6 +42,37 @@ def diff_patch_id(diff_text: str) -> str:
             continue
         if line.startswith(("+", "-")):
             current.append(line.rstrip())
+    return files
+
+
+def file_patch_ids(diff_text: str) -> dict[str, str]:
+    """The patch id of each file a unified diff changes, keyed by its new path.
+
+    What a follow-up review compares to learn which files the pull request
+    changes differently since the last review — the per-file form of
+    :func:`diff_patch_id`, which survives a force-push or a rebase where a
+    commit-to-commit diff does not.
+    """
+    out: dict[str, str] = {}
+    for header, entries in _entries(diff_text).items():
+        if not entries:
+            continue
+        match = _NEW_PATH.match(header)
+        path = match.group(1) if match else header
+        digest = hashlib.sha256()
+        for entry in entries:
+            digest.update(entry.encode("utf-8", "replace") + b"\n")
+        out[path] = digest.hexdigest()
+    return out
+
+
+def diff_patch_id(diff_text: str) -> str:
+    """The patch id of a unified diff, or ``""`` for an empty one.
+
+    Files are hashed in path order, so a diff that lists the same files in a
+    different order has the same id.
+    """
+    files = _entries(diff_text)
     if not any(files.values()):
         return ""
     digest = hashlib.sha256()

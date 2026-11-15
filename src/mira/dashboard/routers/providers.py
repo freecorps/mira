@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from mira.dashboard import api as _api
 from mira.dashboard.api import _require_admin, logger, router
@@ -58,6 +58,8 @@ class EndpointBody(BaseModel):
     plan: str | None = None
     plan_started: str | None = None
     cost_scale: float | None = None
+    # Requests the endpoint takes at once (0: from its plan or preset).
+    max_concurrency: int | None = Field(default=None, ge=0, le=1000)
     # Make this the endpoint bare model ids go to, in the same request that
     # creates it — the common case, and one round trip instead of two.
     make_default: bool = False
@@ -148,6 +150,7 @@ async def create_provider(body: EndpointBody, request: Request) -> dict:
             plan=body.plan or "",
             plan_started=body.plan_started or "",
             cost_scale=body.cost_scale if body.cost_scale is not None else 1.0,
+            max_concurrency=body.max_concurrency or 0,
             db=_db(),
         )
         if body.api_key:
@@ -257,6 +260,8 @@ async def update_provider(endpoint_id: str, body: EndpointBody, request: Request
         endpoint.plan_started = body.plan_started
     if body.cost_scale is not None:
         endpoint.cost_scale = body.cost_scale
+    if body.max_concurrency is not None:
+        endpoint.max_concurrency = body.max_concurrency
     if body.preset is not None and body.preset != endpoint.preset:
         endpoint.preset = body.preset
         # The old preset's model is no longer this endpoint's to fall back

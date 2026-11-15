@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import contextvars
 import functools
 import json
 import logging
@@ -20,7 +23,7 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 from mira import __version__
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError, ToolCallFormatError
-from mira.llm import accounting, endpoints, structured
+from mira.llm import accounting, concurrency, endpoints, structured
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 from mira.llm.utils import (
@@ -335,6 +338,56 @@ def _refusals(kind: str, endpoint: str) -> set[str]:
     return _REFUSALS.setdefault((kind, endpoint), set())
 
 
+# ── Per-call reasoning level ────────────────────────────────────────
+
+# Reasoning levels from least to most thinking, for "never raise it" below.
+_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+_effort_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mira_reasoning_override", default=None
+)
+
+
+def lower_effort(configured: str | None, override: str | None) -> str | None:
+    """The level a call is made at: ``override`` when it is lower than ``configured``.
+
+    An override never turns thinking on for a client that has it off, and
+    never raises the level; an unknown level on either side leaves the
+    configured one.
+    """
+    if not configured or configured == "off" or not override or override == "inherit":
+        return configured
+    try:
+        return (
+            override
+            if _EFFORT_ORDER.index(override) < _EFFORT_ORDER.index(configured)
+            else configured
+        )
+    except ValueError:
+        return configured
+
+
+@contextlib.contextmanager
+def reasoning_override(effort: str | None) -> Any:
+    """Make the calls in this block at ``effort`` where that is lower than configured.
+
+    The agentic review loop runs its lookup hops under it (see
+    ``review.lookup_reasoning_effort``): a hop that only decides which file to
+    read next does not need the thinking the hop that writes the findings
+    does. A context variable rather than an argument, so every provider and
+    test double keeps the signature it has.
+    """
+    token = _effort_override.set(effort if effort and effort != "inherit" else None)
+    try:
+        yield
+    finally:
+        _effort_override.reset(token)
+
+
+def current_effort_override() -> str | None:
+    return _effort_override.get()
+
+
 # Upper bound for the output budget a truncated re-roll may grow to when the
 # registry does not know the model. Every current model serves at least this
 # much, and it keeps a bad finish_reason from asking for a million tokens.
@@ -528,6 +581,10 @@ def _quota_exhausted(resp: httpx.Response) -> bool:
     try:
         text = resp.text.lower()
     except Exception:
+        return False
+    if concurrency.is_concurrency_refusal(resp.status_code, text):
+        # "Concurrency limit exceeded" names a limit, and is the opposite of a
+        # spent allowance: a slot frees up in seconds.
         return False
     if any(word in text for word in _QUOTA_WORDS):
         return True
@@ -747,6 +804,7 @@ class OpenAICompatibleProvider:
         self._no_temperature: set[str] = _refusals("temperature", endpoint)
         self._no_stream: set[str] = _refusals("stream", endpoint)
         self._no_echo_reasoning: set[str] = _refusals("echo_reasoning", endpoint)
+        self._no_effort_override: set[str] = _refusals("effort_override", endpoint)
         # Output budget per model, once a truncated reply has shown that
         # ``config.max_tokens`` is not enough for it. Kept for the life of
         # the client (one review pass) so every later call to that model
@@ -774,6 +832,73 @@ class OpenAICompatibleProvider:
         self._call_llm_with_tools = self._retry(self._call_llm_with_tools)
         self._call_llm_agentic = self._retry(self._call_llm_agentic)
         self._call_llm_json_schema = self._retry(self._call_llm_json_schema)
+        # Every request holds one of the endpoint's concurrency slots while it
+        # is in flight (see mira.llm.concurrency). Wrapped here, like the
+        # retry, so a subclass's own transport (the OAuth one) is gated too.
+        raw_post = getattr(self, "_post", None)
+        if callable(raw_post):
+            setattr(self, "_post", self._gate(raw_post))  # noqa: B010 — no base attribute
+
+    # ── Concurrency ────────────────────────────────────────────────
+
+    def _gate(self, post: Any) -> Any:
+        @functools.wraps(post)
+        async def gated(client: Any, body: dict) -> Any:
+            return await self._gated_post(post, client, body)
+
+        return gated
+
+    async def _gated_post(self, post: Any, client: Any, body: dict) -> Any:
+        """Send one request inside a slot of the endpoint's concurrency limit.
+
+        The slot is held for the request only — never across a retry's
+        backoff — so a request waiting out a 503 does not keep another from
+        going. A refusal for concurrency (OpenDesign's 400
+        ``tier_limit_exceeded``) gives the slot back, lowers the limiter's
+        ceiling for a while, and is sent again after the wait the refusal
+        names or a short backoff, for up to ``llm.concurrency_wait_seconds``.
+        Past that the refusal is returned, and ``_handle_error`` raises it
+        as the transient error it is. A wait for a slot is time the caller's
+        own deadline already counts.
+        """
+        sizing = concurrency.limit_for(self.config, self.profile)
+        slots = concurrency.limiter(self._endpoint_key(), *sizing) if sizing else None
+        background = concurrency.is_background(str(self.config.usage_purpose or ""))
+        give_up_at = time.monotonic() + float(self.config.concurrency_wait_seconds)
+        attempt = 0
+        while True:
+            if slots is not None:
+                await slots.acquire(background)
+            try:
+                resp = await post(client, body)
+            finally:
+                if slots is not None:
+                    slots.release()
+            status = getattr(resp, "status_code", 200)
+            if status == 200:
+                concurrency.first_response()
+                return resp
+            try:
+                text = resp.text
+            except Exception:
+                return resp
+            if not concurrency.is_concurrency_refusal(status, text):
+                return resp
+            attempt += 1
+            if slots is not None:
+                slots.throttle()
+            wait = concurrency.refusal_wait(text, attempt)
+            if time.monotonic() + wait > give_up_at:
+                return resp
+            logger.info(
+                "%s is at its concurrency limit (HTTP %s); sending the call again in %.0fs "
+                "(attempt %d)",
+                self.profile.get("label") or self._endpoint_key(),
+                status,
+                wait,
+                attempt + 1,
+            )
+            await asyncio.sleep(wait)
 
     # ── Shared helpers ─────────────────────────────────────────────
 
@@ -814,10 +939,10 @@ class OpenAICompatibleProvider:
         """
         from mira.llm import models_dev
 
-        effort = self.config.reasoning_effort
+        model = str(body.get("model") or "")
+        effort = self._requested_effort(model)
         if not effort or effort == "off":
             return
-        model = str(body.get("model") or "")
         if model in self._no_reasoning:
             return
         effort = self.profile.get("reasoning_effort_map", {}).get(effort, effort)
@@ -842,6 +967,44 @@ class OpenAICompatibleProvider:
         else:
             body["reasoning_effort"] = effort
         body.pop("temperature", None)
+
+    def _requested_effort(self, model: str) -> str | None:
+        """The configured reasoning level, lowered by a :func:`reasoning_override`.
+
+        A model that refused the lowered level once (see
+        :meth:`_override_refused`) is asked at the configured one from then on.
+        """
+        configured = self.config.reasoning_effort
+        override = current_effort_override()
+        if override is None or model in self._no_effort_override:
+            return configured
+        return lower_effort(configured, override)
+
+    def _override_refused(self, resp: Any, body: dict, api_model: str) -> bool:
+        """Was a 400 about a lowered reasoning level? If so, ask at the configured one.
+
+        Tried before any other recovery: the lowered level is the one thing
+        this request does differently from every other the model answers.
+        The level is remembered as refused for the model, so the loop's later
+        lookups do not pay the same round trip.
+        """
+        if resp.status_code != 400 or not _asked_for_reasoning(body):
+            return False
+        override = current_effort_override()
+        if override is None or api_model in self._no_effort_override:
+            return False
+        if lower_effort(self.config.reasoning_effort, override) == self.config.reasoning_effort:
+            return False
+        logger.info(
+            "Model %s refused reasoning level %s; asking at the configured %s from now on",
+            api_model,
+            override,
+            self.config.reasoning_effort,
+        )
+        self._no_effort_override.add(api_model)
+        _drop_reasoning(body)
+        self._apply_reasoning(body)
+        return True
 
     async def _prepare_reasoning(self) -> None:
         """Have models.dev's levels in hand before a call that asks for thinking.
@@ -982,6 +1145,25 @@ class OpenAICompatibleProvider:
         a fourth "HTTP 429".
         """
         if resp.status_code != 200:
+            try:
+                text = resp.text
+            except Exception:
+                text = ""
+            if concurrency.is_concurrency_refusal(resp.status_code, text):
+                # Too many requests in flight on this key — the limiter's
+                # waits ran out (see ``_gated_post``). A transient refusal,
+                # never a quota and never "this endpoint refuses the request":
+                # the retry policy sends it again after a pause.
+                logger.warning(
+                    "%s refused a call for concurrency (HTTP %s): %s",
+                    self.profile.get("label") or self._endpoint_key(),
+                    resp.status_code,
+                    _preview(text, 200),
+                )
+                error = LLMError("api_error", status=resp.status_code, body=text)
+                error.retry_after = concurrency.refusal_wait(text, 1)
+                error.concurrency_limited = True
+                raise error
             if _quota_exhausted(resp):
                 logger.warning(
                     "%s refused the call with HTTP %s: the plan's allowance looks spent "
@@ -1042,6 +1224,10 @@ class OpenAICompatibleProvider:
         carries the call, as it always did.
         """
         if not self.config.json_schema_mode or not self.supports_json_schema:
+            return None
+        if self.profile.get("json_schema") is False:
+            # Declared in providers.json: this endpoint does not take the
+            # format, so asking would only spend a refused request per call.
             return None
         parameters = _tool_parameters(tools)
         if parameters is None:

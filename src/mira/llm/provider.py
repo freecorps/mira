@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 import httpx
 
 from mira.exceptions import LLMError, ToolCallFormatError
+from mira.llm import concurrency
 from mira.llm.base import (
     OpenAICompatibleProvider,
     _as_json_object,
@@ -314,6 +315,8 @@ class LLMProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self._timeout()) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, api_model):
+                resp = await self._post(client, body)
             if resp.status_code == 400 and any(
                 key in resp.text.lower() for key in _ECHOED_REASONING_KEYS
             ):
@@ -405,6 +408,9 @@ async def _assemble_stream(lines: Any) -> dict:
     async for line in lines:
         if not line or not line.startswith("data:"):
             continue  # blank separators and ": keep-alive" comments
+        # The first event means the prompt has been read — and its prefix is
+        # in the endpoint's cache for whoever sends it next.
+        concurrency.first_response()
         payload = line[5:].strip()
         if payload == "[DONE]":
             break

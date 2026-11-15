@@ -132,13 +132,6 @@ How to work, so the call actually lands:
 3. Call it even when you found nothing: `comments: []`, `key_issues: []`, and a one-line `summary` saying the change looks correct. An empty reply is not "no findings" — it is a failure.
 4. Keep each `body` focused and each `suggestion` minimal. If the full answer would be long, file the highest-severity findings and stop rather than cutting the JSON short.
 
-## Valid File Paths
-
-Only use these file paths in your comments:
-{% for path in file_paths %}
-- `{{ path }}`
-{% endfor %}
-
 {% if pr_title %}
 ## Pull Request
 
@@ -276,6 +269,16 @@ isn't actually present.
 {{ footguns }}
 
 {% endif %}
+{# The file list differs from part to part, so it sits late: what comes before
+   the first per-part section is one prefix every part shares, which the
+   endpoint's prompt cache can serve. #}
+## Valid File Paths
+
+Only use these file paths in your comments:
+{% for path in file_paths %}
+- `{{ path }}`
+{% endfor %}
+
 ## Diffs to Review
 
 Review the file diffs provided in the user message below.

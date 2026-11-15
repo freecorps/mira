@@ -103,6 +103,10 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     -- as the base for an incremental diff so unchanged files aren't
     -- re-flagged after a new push.
     last_reviewed_sha TEXT NOT NULL DEFAULT '',
+    -- JSON {path: patch id} of the files that review read (core/patch_id.py).
+    -- A follow-up round reviews only the files whose patch id moved, which is
+    -- what keeps a force-pushed or rebased branch from a full re-review.
+    reviewed_patches TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
@@ -425,7 +429,10 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     priced INTEGER NOT NULL DEFAULT 0,
     trace_id TEXT NOT NULL DEFAULT '',
     repo TEXT NOT NULL DEFAULT '',
-    pr_number INTEGER NOT NULL DEFAULT 0
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    -- Which step of a review made the call: pass, system, security,
+    -- critique, summary, walkthrough, threads… ('' outside a review).
+    stage TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_usage_created
@@ -504,6 +511,7 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     skipped_paths TEXT NOT NULL DEFAULT '[]',
     chunk_index INTEGER NOT NULL DEFAULT 0,
     last_reviewed_sha TEXT NOT NULL DEFAULT '',
+    reviewed_patches TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
@@ -797,7 +805,10 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     priced INTEGER NOT NULL DEFAULT 0,
     trace_id TEXT NOT NULL DEFAULT '',
     repo TEXT NOT NULL DEFAULT '',
-    pr_number INTEGER NOT NULL DEFAULT 0
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    -- Which step of a review made the call: pass, system, security,
+    -- critique, summary, walkthrough, threads… ('' outside a review).
+    stage TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_usage_created
@@ -1122,6 +1133,17 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE pr_review_progress ADD COLUMN last_reviewed_sha TEXT NOT NULL DEFAULT ''"
             )
+        if "reviewed_patches" not in progress_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE pr_review_progress ADD COLUMN reviewed_patches TEXT NOT NULL DEFAULT ''"
+            )
+        usage_cols = {
+            r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(llm_usage)").fetchall()
+        }
+        if usage_cols and "stage" not in usage_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE llm_usage ADD COLUMN stage TEXT NOT NULL DEFAULT ''"
+            )
         # bare_approval (rubber-stamp flag) added to pr_reviewers post-launch.
         reviewer_cols = {
             r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(pr_reviewers)").fetchall()
@@ -1195,6 +1217,13 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
                     "last_reviewed_sha TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
+                    "reviewed_patches TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT ''"
                 )
                 cur.execute(
                     "ALTER TABLE pr_reviewers ADD COLUMN IF NOT EXISTS "
@@ -2767,7 +2796,7 @@ class AppDatabase:
     _LLM_USAGE_COLUMNS = (
         "created_at, endpoint, provider, model, purpose, prompt_tokens, cached_tokens, "
         "completion_tokens, reasoning_tokens, cost_usd, credits, priced, trace_id, repo, "
-        "pr_number"
+        "pr_number, stage"
     )
 
     def record_llm_usage(self, entries: list[dict[str, Any]]) -> int:
@@ -2798,10 +2827,11 @@ class AppDatabase:
                 str(e.get("trace_id") or "")[:64],
                 str(e.get("repo") or "")[:200],
                 int(e.get("pr_number") or 0),
+                str(e.get("stage") or "")[:40],
             )
             for e in entries
         ]
-        placeholders = ", ".join(["?"] * 15)
+        placeholders = ", ".join(["?"] * 16)
         sql = f"INSERT INTO llm_usage ({self._LLM_USAGE_COLUMNS}) VALUES ({placeholders})"
         if self._backend == "sqlite":
             with self._sqlite_log_lock:
@@ -2837,7 +2867,7 @@ class AppDatabase:
     def llm_usage_summary(
         self, *, since: float, until: float | None = None, endpoint: str = ""
     ) -> list[dict[str, Any]]:
-        """Ledger totals per (endpoint, provider, model, purpose) since ``since``.
+        """Ledger totals per (endpoint, provider, model, purpose, stage) since ``since``.
 
         One row per group with calls, every token kind, the estimated cost and
         credits, how many calls had no price, and the first and last call.
@@ -2851,15 +2881,15 @@ class AppDatabase:
             clauses.append("endpoint = ?")
             params.append(endpoint)
         rows = self._ledger_rows(
-            "SELECT endpoint, provider, model, purpose, COUNT(*), "
+            "SELECT endpoint, provider, model, purpose, stage, COUNT(*), "
             "COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cached_tokens), 0), "
             "COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(reasoning_tokens), 0), "
             "COALESCE(SUM(cost_usd), 0), COALESCE(SUM(credits), 0), "
             "COALESCE(SUM(CASE WHEN priced = 0 THEN 1 ELSE 0 END), 0), "
             "MIN(created_at), MAX(created_at) "
             f"FROM llm_usage WHERE {' AND '.join(clauses)} "
-            "GROUP BY endpoint, provider, model, purpose "
-            "ORDER BY endpoint, provider, model, purpose",
+            "GROUP BY endpoint, provider, model, purpose, stage "
+            "ORDER BY endpoint, provider, model, purpose, stage",
             tuple(params),
         )
         return [
@@ -2868,16 +2898,17 @@ class AppDatabase:
                 "provider": r[1],
                 "model": r[2],
                 "purpose": r[3],
-                "calls": int(r[4] or 0),
-                "prompt_tokens": int(r[5] or 0),
-                "cached_tokens": int(r[6] or 0),
-                "completion_tokens": int(r[7] or 0),
-                "reasoning_tokens": int(r[8] or 0),
-                "cost_usd": float(r[9] or 0.0),
-                "credits": float(r[10] or 0.0),
-                "unpriced_calls": int(r[11] or 0),
-                "first_at": float(r[12] or 0.0),
-                "last_at": float(r[13] or 0.0),
+                "stage": r[4] or "",
+                "calls": int(r[5] or 0),
+                "prompt_tokens": int(r[6] or 0),
+                "cached_tokens": int(r[7] or 0),
+                "completion_tokens": int(r[8] or 0),
+                "reasoning_tokens": int(r[9] or 0),
+                "cost_usd": float(r[10] or 0.0),
+                "credits": float(r[11] or 0.0),
+                "unpriced_calls": int(r[12] or 0),
+                "first_at": float(r[13] or 0.0),
+                "last_at": float(r[14] or 0.0),
             }
             for r in rows
         ]
@@ -3263,6 +3294,70 @@ class AppDatabase:
                 )
             self._pg_commit()
 
+    def get_reviewed_patches(
+        self, owner: str, repo: str, pr_number: int, platform: str = "github"
+    ) -> dict[str, str]:
+        """``{path: patch id}`` of the files the last review read; ``{}`` if unknown."""
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            row = self._sqlite_conn.execute(
+                "SELECT reviewed_patches FROM pr_review_progress "
+                "WHERE platform=? AND owner=? AND repo=? AND pr_number=?",
+                (platform, owner, repo, pr_number),
+            ).fetchone()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(
+                    "SELECT reviewed_patches FROM pr_review_progress "
+                    "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s",
+                    (platform, owner, repo, pr_number),
+                )
+                row = cur.fetchone()
+        if not row or not row[0]:
+            return {}
+        try:
+            data = json.loads(row[0])
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+
+    def set_reviewed_patches(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        patches: dict[str, str],
+        platform: str = "github",
+    ) -> None:
+        """Record which files a review read, by patch id (see ``core/patch_id.py``)."""
+        value = json.dumps(patches, sort_keys=True)
+        if self._backend == "sqlite":
+            assert self._sqlite_conn is not None
+            self._sqlite_conn.execute(
+                "INSERT INTO pr_review_progress "
+                "(platform, owner, repo, pr_number, reviewed_patches, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(platform, owner, repo, pr_number) DO UPDATE SET "
+                "reviewed_patches=excluded.reviewed_patches, "
+                "updated_at=excluded.updated_at",
+                (platform, owner, repo, pr_number, value, time.time()),
+            )
+            self._sqlite_conn.commit()
+        else:
+            with self._pg_cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pr_review_progress "
+                    "(platform, owner, repo, pr_number, reviewed_patches, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, NOW()) "
+                    "ON CONFLICT (platform, owner, repo, pr_number) DO UPDATE SET "
+                    "reviewed_patches=EXCLUDED.reviewed_patches, "
+                    "updated_at=NOW()",
+                    (platform, owner, repo, pr_number, value),
+                )
+            self._pg_commit()
+
     def delete_pr_review_progress(
         self, owner: str, repo: str, pr_number: int, platform: str = "github"
     ) -> None:
@@ -3330,6 +3425,7 @@ class AppDatabase:
         *,
         settle_seconds: float = 0.0,
         max_settle_seconds: float = 60.0,
+        delay_seconds: float = 0.0,
         now: float | None = None,
     ) -> tuple[ReviewRequest, list[ReviewRequest], bool]:
         """Persist a review request, coalescing it with the PR's earlier ones.
@@ -3347,6 +3443,11 @@ class AppDatabase:
         the burst has gone quiet (never longer than ``max_settle_seconds``
         from its first request) — a restack arrives one branch at a time, and
         ordering it needs all of it.
+
+        ``delay_seconds`` holds this request alone for longer: a push waits
+        for the pull request to go quiet, and a newer push in that time
+        supersedes it, so a burst of fix-up pushes is reviewed once. It does
+        not hold the rest of the batch.
         """
         now = time.time() if now is None else now
         active = [
@@ -3378,7 +3479,7 @@ class AppDatabase:
 
         request.state = "queued"
         request.attempts = 0
-        request.available_at = available_at
+        request.available_at = max(available_at, now + max(0.0, delay_seconds))
         request.created_at = now
         request.updated_at = now
         values = (

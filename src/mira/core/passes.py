@@ -78,6 +78,22 @@ def _review_json_in(content: str) -> str | None:
     return text if _submission_problem(text) is None else None
 
 
+def _submits(msg: object) -> bool:
+    """Does this agentic turn hand in the review (as a call, or written out)?"""
+    if not isinstance(msg, dict):
+        return False
+    calls = msg.get("tool_calls")
+    if isinstance(calls, list) and calls:
+        return any(
+            isinstance(call, dict)
+            and isinstance(call.get("function"), dict)
+            and call["function"].get("name") == "submit_review"
+            for call in calls
+        )
+    content = msg.get("content")
+    return isinstance(content, str) and _review_json_in(content) is not None
+
+
 def _lookup_digest(lookups: list[tuple[str, str]], notes: list[str]) -> str:
     """The loop's findings so far, as a message a fresh review call can read."""
     parts = [
@@ -192,6 +208,8 @@ async def agentic_review_loop(
     max_hops: int = _AGENTIC_MAX_HOPS,
     submit_by: float | None = None,
     temperature: float | None = None,
+    stop_by: float | None = None,
+    lookup_reasoning_effort: str | None = None,
 ) -> str:
     """Run an agentic tool-use loop until the LLM submits a review.
 
@@ -213,8 +231,21 @@ async def agentic_review_loop(
     ``temperature``, when set, samples every hop (and the digest review) at
     it instead of the configured one: the shuffled passes of
     core/multipass.py differ in temperature as well as in order.
+
+    ``stop_by`` (a ``time.monotonic()`` value) is when the caller stops
+    waiting for this loop. A hop that would not finish before it — judged by
+    how long the last one took — is not started as a lookup: the turn
+    becomes the last one instead. Past it, the loop raises ``TimeoutError``
+    rather than sending a call whose answer nobody will read.
+
+    ``lookup_reasoning_effort``, when set, is the reasoning level of every hop
+    but the last (see :func:`mira.llm.base.reasoning_override`; it never
+    raises the configured level). A hop at that level that submits the review
+    instead of looking something up is asked again at the configured level,
+    so the findings are always written with the thinking the review asked for.
     """
     from mira.llm.agentic_tools import AGENTIC_TOOLS
+    from mira.llm.base import reasoning_override
 
     # Passed only when set, so a provider (or a test double) that predates
     # the argument is called exactly as before.
@@ -255,20 +286,39 @@ async def agentic_review_loop(
             logger.warning("Review with the lookup digest failed: %s", exc)
             return ""
 
+    last_hop_seconds = 0.0
     for hop in range(max_hops):
+        hop_started = time.monotonic()
+        if stop_by is not None and hop > 0 and hop_started >= stop_by:
+            logger.info("Agentic loop out of time before hop %d; stopping", hop + 1)
+            raise TimeoutError("the agentic review loop ran out of time")
         # Past ``submit_by`` (a time.monotonic() value) the next turn is the
         # last: what the lookups found gets submitted instead of more lookups.
-        out_of_time = submit_by is not None and hop > 0 and time.monotonic() >= submit_by
+        # So is a turn after which there would be no time for another.
+        out_of_time = hop > 0 and (
+            (submit_by is not None and hop_started >= submit_by)
+            or (stop_by is not None and hop_started + 2 * last_hop_seconds >= stop_by)
+        )
         if out_of_time:
             logger.info("Agentic loop out of time at hop %d; asking for the review", hop + 1)
         final_hop = hop == max_hops - 1 or out_of_time
         if final_hop and hop > 0:
             convo.append({"role": "user", "content": _FINAL_HOP_NUDGE})
+        lookup = lookup_reasoning_effort if not final_hop else None
         try:
-            msg = await llm.complete_agentic(convo, tools=tools, **sampling)
+            with reasoning_override(lookup):
+                msg = await llm.complete_agentic(convo, tools=tools, **sampling)
+            if lookup and _submits(msg):
+                logger.info(
+                    "Agentic hop %d submitted at the lookup reasoning level; asking again "
+                    "at the configured one",
+                    hop + 1,
+                )
+                msg = await llm.complete_agentic(convo, tools=tools, **sampling)
         except Exception as exc:
             logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
             return await _finish()
+        last_hop_seconds = time.monotonic() - hop_started
 
         # Provider adapters are expected to return a normalized mapping, but a
         # malformed or partially mocked provider must degrade to the regular

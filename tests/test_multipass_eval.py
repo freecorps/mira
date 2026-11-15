@@ -95,6 +95,11 @@ def _base_config() -> MiraConfig:
         setattr(config.review, knob, False)
     config.review.code_graph.enabled = False
     config.review.dependency_updates.enabled = False
+    # Scripted for three passes, a 30-line threshold and the old vote; the
+    # defaults have since moved (see config.py).
+    config.review.passes = 3
+    config.review.multipass_min_changed_lines = 30
+    config.review.pass_vote_prove_min_severity = "blocker"
     return config
 
 

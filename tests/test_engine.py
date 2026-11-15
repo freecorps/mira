@@ -1573,13 +1573,14 @@ class TestIncrementalDiff:
 
     @pytest.mark.asyncio
     async def test_round_1_does_not_use_compare(self, monkeypatch):
-        """Round 1 must always do a full review — no incremental."""
+        """A first review — nothing on record for this PR — is a full review."""
         from mira.core.engine import ReviewEngine
 
         mock_provider = self._provider_with_threads_and_compare(threads=[])
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_reviewed_patches = MagicMock(return_value={})
         mock_db.get_repo = MagicMock(return_value=None)
         mock_db.set_last_reviewed_sha = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
@@ -1600,6 +1601,46 @@ class TestIncrementalDiff:
         await engine.review_pr("https://github.com/o/r/pull/1")
 
         mock_provider.get_compare_diff.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_push_after_a_clean_review_is_reviewed_incrementally(self, monkeypatch):
+        """No bot threads, but a review on record: the push is a follow-up round.
+
+        Round detection used to look only at Mira's threads, so a pull request
+        Mira found nothing in was reviewed in full again on every push.
+        """
+        from mira.core.engine import ReviewEngine
+
+        mock_provider = self._provider_with_threads_and_compare(threads=[])
+
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_reviewed_patches = MagicMock(return_value={})
+        mock_db.get_repo = MagicMock(return_value=None)
+        mock_db.set_last_reviewed_sha = MagicMock()
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        captured: dict = {}
+
+        async def fake_internal(self, diff_text, **kwargs):
+            from mira.models import ReviewResult
+
+            captured["diff_text"] = diff_text
+            captured["round"] = kwargs.get("review_round")
+            return ReviewResult(comments=[], summary="")
+
+        monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
+
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=AsyncMock(),
+            provider=mock_provider,
+            bot_name="mira",
+        )
+        await engine.review_pr("https://github.com/o/r/pull/1")
+
+        mock_provider.get_compare_diff.assert_awaited_once()
+        assert captured == {"diff_text": "INCR", "round": 2}
 
     @pytest.mark.asyncio
     async def test_records_head_sha_after_review(self, monkeypatch):
