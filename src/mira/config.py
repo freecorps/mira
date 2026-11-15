@@ -667,7 +667,74 @@ class ReviewConfig(BaseModel):
     agent_token_budget: int = Field(default=24_000, ge=4000)
     # Soft file-count target; a connected group that fits stays together.
     agent_max_files: int = Field(default=12, ge=1)
+    # How a review part is read (see docs/review-pipeline.md):
+    # - `staged` (default): the part's context — the changed functions in
+    #   full, their callers, the definitions they call, related tests — is
+    #   gathered before the model is called, then ONE thinking call reviews
+    #   it. The model may ask for more lookups in its answer; they run
+    #   together and one follow-up call revises the review. At most two
+    #   thinking calls per part, and a part that runs out of time is read once
+    #   more without thinking instead of being dropped or re-run.
+    # - `agentic`: the old tool loop (`agentic_max_hops` model calls that
+    #   each decide what to look up next), kept for experiments.
+    pipeline: Literal["staged", "agentic"] = "staged"
+    # Wall-clock target for one review, preparation to summary. Every stage
+    # takes its deadline from what is left: the parts (and the whole-PR and
+    # security passes beside them) until 70% of it, verification of the
+    # findings until 90%. A part that gets its turn late is read without
+    # thinking rather than cut, so a very large pull request can run past it
+    # by up to `degraded_call_seconds`. 0 turns it off (only the per-part and
+    # per-call bounds apply). Read by the staged pipeline.
+    time_budget_seconds: int = Field(default=300, ge=0)
+    # The longest one thinking call of a staged part may take. Streamed
+    # replies are cut when it passes, so this also caps the reasoning a
+    # runaway call can burn (≈90 tokens/s on DeepSeek Flash Eco).
+    call_timeout_seconds: int = Field(default=180, ge=10)
+    # Time always granted to the no-thinking read of a part whose thinking
+    # call failed or never got the time, even past the budget: a part is read
+    # or reported unread, never left out silently.
+    degraded_call_seconds: int = Field(default=60, ge=10)
+    # Reasoning level of that degraded read: `none` (thinking off where the
+    # endpoint honours it; `off` on endpoints that only take a budget), or
+    # `inherit` to make it on the review client as configured.
+    degraded_reasoning_effort: Literal["none", "inherit"] = "none"
+    # Diff tokens and files per staged part. One thinking call reads a part,
+    # and on a thinking model its time grows with what it reads: a 12-file,
+    # 24k-token part was still thinking after 180 s on Flash Eco, while parts
+    # of at most 9k tokens answered in 30-90 s, side by side. The agentic
+    # pipeline keeps `agent_token_budget` / `agent_max_files`; the staged one
+    # takes the smaller of the two pairs.
+    staged_part_tokens: int = Field(default=9_000, ge=2_000)
+    staged_part_files: int = Field(default=6, ge=1)
+    # Lookups the staged reviewer may request in its answer (`need`). They run
+    # side by side, with no model call, and their results go to verification:
+    # self-critique grades each finding of the part with the code the
+    # reviewer asked for, and a finding filed below the confidence floor
+    # while waiting on them is posted only if that code proves it (at least
+    # `evidence_min_confidence`). 0: no lookups.
+    followup_max_lookups: int = Field(default=6, ge=0, le=20)
+    evidence_min_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
+    # Also make a second thinking call per part with the lookups' results,
+    # when time allows. Off by default: on Flash Eco the follow-up reread the
+    # whole part and took 110-180 s, most of a review's budget, and was cut
+    # more often than it landed. Worth trying on a faster review model.
+    followup_call: bool = False
+    # Tokens per part for the gathered context: callers of the changed
+    # functions, the definitions they call, related tests.
+    context_pack_tokens: int = Field(default=5_000, ge=0)
+    # How long gathering that context may take per part; what is ready by
+    # then goes in.
+    context_pack_seconds: float = Field(default=20.0, gt=0, le=120)
+    # A thinking call whose reply has not started streaming after this many
+    # seconds is sent a second time and the first answer wins (the endpoint
+    # queued it, or the connection stalled). 0 turns hedging off. Streaming
+    # endpoints only: elsewhere there is no early sign of life to wait for.
+    hedge_after_seconds: float = Field(default=60.0, ge=0)
+    # Draft findings per verification call; larger sets are graded in
+    # batches side by side, so verification time does not grow with them.
+    critique_batch_size: int = Field(default=10, ge=1, le=100)
     # Retries per failed part, in addition to provider transport retries.
+    # The agentic pipeline only: a staged part degrades instead.
     chunk_retries: int = Field(default=1, ge=0, le=3)
     # Wall-clock budget for one review part, lookups and retries included; 0
     # turns it off. A part past it is left for `review-rest` rather than
@@ -714,7 +781,10 @@ class ReviewConfig(BaseModel):
     walkthrough_sequence_diagram: bool = True
     code_context: bool = True
     context_token_budget: int = 8_000
-    max_concurrent_chunks: int = Field(default=5, ge=1, le=20)
+    # Parts with the model at once. The endpoint's own concurrency limit
+    # (llm/concurrency.py) is what bounds requests in flight; a staged part
+    # holds its slot for one call at a time.
+    max_concurrent_chunks: int = Field(default=8, ge=1, le=20)
     # Review each chunk N times and keep only majority-vote findings.
     # 1 = off (single pass, exact current behavior). 3 is the sweet spot:
     # variance FPs flicker across runs, real findings recur. Runs fire in
@@ -735,11 +805,14 @@ class ReviewConfig(BaseModel):
     # read first, so this is mostly a recall feature. Costs up to `passes`×
     # the part reviews' tokens; wall clock stays roughly flat. 1 is the old
     # single-pass review (and `ensemble_runs` only applies then).
-    # Two by default: the third pass was a third of every multipass review's
-    # tokens for a third vote. With two, a finding both passes report is kept,
-    # and a warning or blocker only one reports goes to self-critique, which
-    # keeps it only when it grades it proven (`pass_vote_prove_min_severity`).
-    passes: int = Field(default=2, ge=1, le=5)
+    # One by default. In production the vote dropped 67% of what the passes
+    # found (every finding of 45 parts) while doubling the parts' tokens and
+    # holding each part to its slowest pass; precision now comes from
+    # verifying the candidates (self-critique). Two or more turns the vote
+    # back on for experiments: a finding both passes report is kept, and a
+    # warning or blocker only one reports goes to self-critique, which keeps
+    # it only when it grades it proven (`pass_vote_prove_min_severity`).
+    passes: int = Field(default=1, ge=1, le=5)
     # Passes that must report a finding for it to be kept, clamped to the
     # passes that actually landed (one landing keeps all it found).
     pass_vote_threshold: int = Field(default=2, ge=1, le=5)
@@ -774,12 +847,15 @@ class ReviewConfig(BaseModel):
     # on every hop, as before.
     lookup_reasoning_effort: Literal["inherit", "minimal", "low", "medium", "high"] = "low"
 
-    # One extra agentic pass over the whole pull request, asking only what the
+    # One extra pass over the whole pull request, asking only what the
     # change breaks elsewhere: lifecycle and cleanup, state machines,
     # concurrency, callers and contracts, cross-file invariants (see
     # core/system_pass.py). Its findings (`source_pass: system`) go through the
     # same filter, grouping, self-critique and cap as the rest. Skipped below
-    # the changed-line thresholds above.
+    # the changed-line thresholds above. Under the staged pipeline it is one
+    # bounded call (no tool loop) that runs beside the parts and ends with
+    # them, and only when the pull request is split into several parts — a
+    # single part already sees the whole change.
     system_pass: bool = True
     # Wall-clock budget of the system pass; past it the pass is dropped and
     # the review goes on without it. 0 turns the bound off.
@@ -789,6 +865,10 @@ class ReviewConfig(BaseModel):
     # the rest are listed and read with the tools). Held under the context
     # window either way.
     system_pass_tokens: int = Field(default=40_000, ge=2_000)
+    # The same, under the staged pipeline, where the pass is one thinking call
+    # with no tools: at 40k tokens it ran past three and a half minutes on
+    # Flash Eco and was dropped, its tokens spent.
+    staged_system_pass_tokens: int = Field(default=12_000, ge=2_000)
 
     # Run a second-pass LLM critique on each draft comment before posting.
     # The critic asks "is this analysis actually correct? Cite specific

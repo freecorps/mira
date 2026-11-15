@@ -1,9 +1,20 @@
 # Shuffled voting passes and the system pass
 
-**Status:** implemented
+**Status:** implemented; the vote is **off by default** (`review.passes: 1`)
 **Scope:** how Mira reads each review part several times and votes on what it
 found, the extra whole-PR pass that asks what the change breaks elsewhere,
 what they cost, and how to measure them against the other review bots.
+
+> **The default review is now the staged pipeline** — context gathered before
+> the call, one thinking call per part, at most one follow-up, a global time
+> budget — described in [the review pipeline](review-pipeline.md). In
+> production the vote dropped 67% of what the passes found (461 drafted, 154
+> kept; in 45 parts, everything) while doubling the parts' tokens, and the
+> agentic system pass failed 43 of 80 times on its deadline. Precision now
+> comes from verifying the candidates. Everything below still works with
+> `review.passes: 2` or more, and with `review.pipeline: agentic` for the tool
+> loop; under the staged pipeline the system pass is one bounded call with no
+> tools (see below).
 
 ## Why
 
@@ -26,8 +37,9 @@ Two things in how Mira reviewed made those easy to miss:
 
 ## Shuffled voting passes
 
-Each review part is read by `review.passes` independent agentic passes (2 by
-default; 3 until the cost work below), side by side:
+Each review part is read by `review.passes` independent passes (1 by default
+since the staged pipeline; 2 before it, 3 until the cost work below), side by
+side:
 
 - **Pass 0** reads the part exactly as before — original file order, the
   configured `llm.temperature`. With `passes: 1` it is the only pass, and the
@@ -125,6 +137,13 @@ go through the same noise filter, grouping, self-critique and comment cap as
 every other finding. It has its own deadline,
 `review.system_pass_deadline_seconds` (480), and anything that goes wrong —
 a timeout, a provider error, an unreadable answer — costs only its findings.
+
+Under the staged pipeline (the default, see [the review
+pipeline](review-pipeline.md)) the pass is **one call with no tools**, its
+input held to `review.staged_system_pass_tokens` (12,000), its deadline the
+parts' deadline in the review's budget, and it runs only when the pull
+request is split into two or more parts — a single part already reads the
+whole change, with the callers of what it changes.
 
 ## When they run
 
@@ -273,7 +292,7 @@ passes. It runs in the test suite and never calls a model.
 
 ```yaml
 review:
-  passes: 2                       # 1 = single pass (the old review)
+  passes: 1                       # 1 = single pass (the default); 2+ = the vote
   pass_vote_threshold: 2          # passes that must agree; clamped to those that landed
   pass_vote_prove_min_severity: warning  # below the vote: kept only if proven (blocker = old rule)
   pass_temperature_spread: 0.3    # pass temperatures step up to llm.temperature + this
@@ -285,4 +304,5 @@ review:
   system_pass: true
   system_pass_deadline_seconds: 480
   system_pass_tokens: 40000
+  staged_system_pass_tokens: 12000  # the staged pipeline's one call
 ```
