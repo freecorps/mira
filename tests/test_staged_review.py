@@ -25,42 +25,60 @@ from mira.core.staged_review import (
 )
 from mira.llm import concurrency
 from mira.llm.agentic_tools import AgenticToolExecutor
-from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_STAGED_REVIEW_TOOL
 
-SETTINGS = StagedSettings(call_timeout=5.0, degraded_seconds=2.0, followup_max_lookups=4)
-# The opt-in second thinking call (`review.followup_call`).
-FOLLOWUP = StagedSettings(
-    call_timeout=5.0, degraded_seconds=2.0, followup_max_lookups=4, followup_call=True
-)
+SETTINGS = StagedSettings(call_timeout=5.0, degraded_seconds=2.0, max_lookups=4)
 MESSAGES = [
     {"role": "system", "content": "You are a reviewer."},
     {"role": "user", "content": "### `src/a.py`\n+x = 1"},
 ]
 
 
-def review_json(*titles: str, need: list | None = None) -> str:
-    body: dict = {
-        "comments": [
-            {
-                "path": "src/a.py",
-                "line": 1,
-                "severity": "warning",
-                "category": "bug",
-                "title": title,
-                "body": f"{title}, shown by the diff.",
-                "confidence": 0.9,
-                "existing_code": "x = 1",
-            }
-            for title in titles
+def review_json(*titles: str) -> str:
+    return json.dumps(
+        {
+            "comments": [
+                {
+                    "path": "src/a.py",
+                    "line": 1,
+                    "severity": "warning",
+                    "category": "bug",
+                    "title": title,
+                    "body": f"{title}, shown by the diff.",
+                    "confidence": 0.9,
+                    "existing_code": "x = 1",
+                }
+                for title in titles
+            ],
+            "summary": "checked",
+        }
+    )
+
+
+def submit(*titles: str) -> dict:
+    """An agentic turn that submits the review."""
+    return {
+        "content": "",
+        "tool_calls": [
+            {"id": "s", "function": {"name": "submit_review", "arguments": review_json(*titles)}}
         ],
-        "summary": "checked",
     }
-    if need is not None:
-        body["need"] = need
-    return json.dumps(body)
+
+
+def lookups(*calls: tuple[str, dict]) -> dict:
+    """An agentic turn that asks for lookups."""
+    return {
+        "content": "",
+        "reasoning_content": "I should check the callers.",
+        "tool_calls": [
+            {"id": f"c{i}", "function": {"name": name, "arguments": json.dumps(args)}}
+            for i, (name, args) in enumerate(calls)
+        ],
+    }
 
 
 class FakeExecutor:
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+
     def __init__(self, delay: float = 0.0) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.delay = delay
@@ -78,12 +96,16 @@ class FakeExecutor:
         return f"result of {name} {args}"
 
 
+def _tool_names(call) -> list[str]:
+    return [t["function"]["name"] for t in call.kwargs["tools"]]
+
+
 # ── review_part ──
 
 
 async def test_one_thinking_call_when_the_context_is_enough():
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(return_value=review_json("Off by one", need=[]))
+    llm.complete_agentic = AsyncMock(return_value=submit("Off by one"))
     outcome = PartOutcome()
     raw = await review_part(
         llm,
@@ -94,57 +116,22 @@ async def test_one_thinking_call_when_the_context_is_enough():
         outcome=outcome,
     )
     assert json.loads(raw)["comments"][0]["title"] == "Off by one"
-    assert "need" not in json.loads(raw)
     assert outcome.thinking_calls == 1 and not outcome.degraded
-    _messages, kwargs = llm.complete_with_tools.call_args.args, llm.complete_with_tools.call_args
-    assert kwargs.kwargs["tools"] == [SUBMIT_STAGED_REVIEW_TOOL]
-    system = llm.complete_with_tools.call_args.args[0][0]["content"]
-    assert "## Context and lookups" in system and "`need`" in system
+    call = llm.complete_agentic.call_args
+    assert _tool_names(call) == ["read_file", "submit_review"]
+    system = call.args[0][0]["content"]
+    assert "## Context and lookups" in system and "**one** round" in system
 
 
-async def test_requested_lookups_run_together_and_one_follow_up_revises():
-    need = [
-        {"tool": "find_usages", "symbol": "load", "reason": "callers pass None?"},
-        {"tool": "read_file", "path": "src/b.py", "reason": "what b expects"},
-        {"tool": "find_usages", "symbol": "load", "reason": "duplicate"},
-        {"tool": "made_up", "reason": "ignored"},
-    ]
+async def test_one_round_of_lookups_runs_together_then_the_last_turn_can_only_submit():
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(
-        side_effect=[review_json("Maybe", need=need), review_json("Confirmed", "New one")]
+    llm.complete_agentic = AsyncMock(
+        side_effect=[
+            lookups(("find_usages", {"symbol": "load"}), ("read_file", {"path": "src/b.py"})),
+            submit("Confirmed", "New one"),
+        ]
     )
     executor = FakeExecutor(delay=0.05)
-    outcome = PartOutcome()
-    raw = await review_part(
-        llm,
-        MESSAGES,
-        deadline_at=time.monotonic() + 120,
-        settings=FOLLOWUP,
-        executor=executor,
-        outcome=outcome,
-    )
-    assert [c["title"] for c in json.loads(raw)["comments"]] == ["Confirmed", "New one"]
-    assert outcome.thinking_calls == 2 and outcome.followup == "used"
-    # Deduplicated, unknown tools dropped, run side by side.
-    assert [name for name, _ in executor.calls] == ["find_usages", "read_file"]
-    assert executor.peak == 2
-    first, second = (c.args[0] for c in llm.complete_with_tools.call_args_list)
-    # The follow-up repeats the first prompt and adds to its end: one cache prefix.
-    assert second[-1]["content"].startswith(MESSAGES[-1]["content"])
-    assert "## The lookups you asked for" in second[-1]["content"]
-    assert "result of find_usages" in second[-1]["content"]
-    assert llm.complete_with_tools.call_args_list[1].kwargs["tools"] == [SUBMIT_REVIEW_TOOL]
-    assert first[0]["content"].startswith(MESSAGES[0]["content"])
-
-
-async def test_by_default_lookups_go_to_verification_not_a_second_call():
-    need = [
-        {"tool": "find_usages", "symbol": "load", "reason": "callers pass None?"},
-        {"tool": "read_file", "path": "src/b.py", "reason": "what b expects"},
-    ]
-    llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(return_value=review_json("Maybe", need=need))
-    executor = FakeExecutor()
     outcome = PartOutcome()
     raw = await review_part(
         llm,
@@ -154,114 +141,101 @@ async def test_by_default_lookups_go_to_verification_not_a_second_call():
         executor=executor,
         outcome=outcome,
     )
-    assert llm.complete_with_tools.await_count == 1 and outcome.thinking_calls == 1
-    assert outcome.followup == "evidence"
+    assert [c["title"] for c in json.loads(raw)["comments"]] == ["Confirmed", "New one"]
+    assert outcome.thinking_calls == 2
+    assert [name for name, _ in executor.calls] == ["find_usages", "read_file"]
+    assert executor.peak == 2  # side by side
+    first, second = llm.complete_agentic.call_args_list
+    assert _tool_names(second) == ["submit_review"]
+    convo = second.args[0]
+    # The first prompt byte for byte, then the turn, its reasoning, the results.
+    assert convo[: len(MESSAGES)][1] == first.args[0][1]
+    assistant = next(m for m in convo if m["role"] == "assistant")
+    assert assistant["reasoning_content"] == "I should check the callers."
+    tool_msgs = [m for m in convo if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == ["c0", "c1"]
+    assert "result of find_usages" in tool_msgs[0]["content"]
+    assert convo[-1]["role"] == "user" and "last turn" in convo[-1]["content"]
     assert [label for label, _ in outcome.evidence] == [
         "find_usages(symbol='load')",
         "read_file(path='src/b.py')",
     ]
-    assert [c["title"] for c in json.loads(raw)["comments"]] == ["Maybe"]
-    system = llm.complete_with_tools.call_args.args[0][0]["content"]
-    assert "before your findings are verified" in system
 
 
-async def test_never_more_than_two_thinking_calls():
-    need = [{"tool": "find_definition", "symbol": "load", "reason": "what it returns"}]
+async def test_never_more_than_two_thinking_calls_or_one_round_of_lookups():
     llm = MagicMock()
-    # The follow-up asks for more lookups again: they are not run.
-    llm.complete_with_tools = AsyncMock(
-        side_effect=[review_json("A", need=need), review_json("B", need=need), "never"]
+    # The last turn asks for more lookups instead of submitting: none run.
+    llm.complete_agentic = AsyncMock(
+        side_effect=[
+            lookups(*[("grep_repo", {"pattern": f"p{i}"}) for i in range(6)]),
+            lookups(("read_file", {"path": "x"})),
+            submit("never"),
+        ]
     )
+    degraded = MagicMock()
+    degraded.review = AsyncMock(return_value=review_json("Read without thinking"))
     executor = FakeExecutor()
     outcome = PartOutcome()
     raw = await review_part(
         llm,
         MESSAGES,
         deadline_at=time.monotonic() + 120,
-        settings=FOLLOWUP,
+        settings=SETTINGS,
         executor=executor,
+        degraded_llm=degraded,
         outcome=outcome,
     )
-    assert llm.complete_with_tools.await_count == 2
-    assert outcome.thinking_calls == 2
-    assert len(executor.calls) == 1
-    assert "need" not in json.loads(raw)
+    assert llm.complete_agentic.await_count == 2 and outcome.thinking_calls == 2
+    assert len(executor.calls) == 4  # capped at max_lookups, one round
+    over = [m for m in llm.complete_agentic.call_args_list[1].args[0] if m["role"] == "tool"]
+    assert len(over) == 6 and "not run" in over[-1]["content"]
+    assert outcome.degraded
+    # The degraded read carries what the lookups found.
+    assert "## Lookups already made" in degraded.review.call_args.args[0][-1]["content"]
+    assert json.loads(raw)["comments"][0]["title"] == "Read without thinking"
 
 
-async def test_follow_up_failure_keeps_the_first_reading():
-    need = [{"tool": "grep_repo", "pattern": "load\\(", "reason": "callers"}]
+async def test_a_review_written_as_text_is_taken():
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(
-        side_effect=[review_json("First", need=need), RuntimeError("boom")]
-    )
-    outcome = PartOutcome()
+    llm.complete_agentic = AsyncMock(return_value={"content": review_json("In prose")})
     raw = await review_part(
-        llm,
-        MESSAGES,
-        deadline_at=time.monotonic() + 120,
-        settings=FOLLOWUP,
-        executor=FakeExecutor(),
-        outcome=outcome,
+        llm, MESSAGES, deadline_at=None, settings=SETTINGS, executor=FakeExecutor()
     )
-    assert [c["title"] for c in json.loads(raw)["comments"]] == ["First"]
-    assert outcome.followup == "kept_first" and not outcome.degraded
+    assert json.loads(raw)["comments"][0]["title"] == "In prose"
 
 
-async def test_no_follow_up_without_time_for_it():
-    need = [{"tool": "grep_repo", "pattern": "x", "reason": "r"}]
-    llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(return_value=review_json("First", need=need))
-    executor = FakeExecutor()
-    outcome = PartOutcome()
-    await review_part(
-        llm,
-        MESSAGES,
-        deadline_at=time.monotonic() + 8,
-        settings=FOLLOWUP,
-        executor=executor,
-        outcome=outcome,
-    )
-    assert outcome.followup == "skipped" and executor.calls == []
-    assert llm.complete_with_tools.await_count == 1
+async def test_a_thinking_call_that_times_out_is_read_once_without_thinking(monkeypatch):
+    import mira.core.staged_review as module
 
-
-async def test_a_thinking_call_that_times_out_is_read_once_without_thinking():
     async def slow(*_a, **_kw):
         await asyncio.sleep(10)
 
+    monkeypatch.setattr(module, "_MIN_THINKING_SECONDS", 0.1)
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(side_effect=slow)
+    llm.complete_agentic = AsyncMock(side_effect=slow)
     degraded = MagicMock()
     degraded.review = AsyncMock(return_value=review_json("Seen without thinking"))
     outcome = PartOutcome()
-    settings = StagedSettings(call_timeout=0.2, degraded_seconds=2.0, followup_max_lookups=4)
-    # The thinking call is not even started under the floor; lower it for the test.
-    import mira.core.staged_review as module
-
-    original = module._MIN_THINKING_SECONDS
-    module._MIN_THINKING_SECONDS = 0.1
-    try:
-        raw = await review_part(
-            llm,
-            MESSAGES,
-            deadline_at=time.monotonic() + 60,
-            settings=settings,
-            executor=FakeExecutor(),
-            degraded_llm=degraded,
-            outcome=outcome,
-        )
-    finally:
-        module._MIN_THINKING_SECONDS = original
+    settings = StagedSettings(call_timeout=0.2, degraded_seconds=2.0, max_lookups=4)
+    raw = await review_part(
+        llm,
+        MESSAGES,
+        deadline_at=time.monotonic() + 60,
+        settings=settings,
+        executor=FakeExecutor(),
+        degraded_llm=degraded,
+        outcome=outcome,
+    )
     assert json.loads(raw)["comments"][0]["title"] == "Seen without thinking"
     assert outcome.degraded and outcome.thinking_calls == 1
-    assert llm.complete_with_tools.await_count == 1  # never re-run from scratch
-    # The degraded read gets the plain prompt (no lookup instructions, no `need`).
+    assert llm.complete_agentic.await_count == 1  # never re-run from scratch
+    # The degraded read gets the plain prompt (no lookup instructions).
     assert degraded.review.call_args.args[0] == MESSAGES
 
 
 async def test_past_the_deadline_the_part_is_still_read_without_thinking():
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(return_value=review_json("never"))
+    llm.complete_agentic = AsyncMock(return_value=submit("never"))
     degraded = MagicMock()
     degraded.review = AsyncMock(return_value=review_json("Read late"))
     outcome = PartOutcome()
@@ -270,18 +244,22 @@ async def test_past_the_deadline_the_part_is_still_read_without_thinking():
         MESSAGES,
         deadline_at=time.monotonic() - 5,
         settings=SETTINGS,
+        executor=FakeExecutor(),
         degraded_llm=degraded,
         outcome=outcome,
     )
     assert json.loads(raw)["comments"][0]["title"] == "Read late"
     assert outcome.thinking_calls == 0 and outcome.degraded
-    llm.complete_with_tools.assert_not_awaited()
+    llm.complete_agentic.assert_not_awaited()
 
 
-@pytest.mark.parametrize("answer", ["", "not json at all", RuntimeError("length")])
+@pytest.mark.parametrize(
+    "answer",
+    [{"content": "I think it is fine."}, {"content": "", "tool_calls": []}, RuntimeError("length")],
+)
 async def test_an_unusable_or_failed_answer_degrades(answer):
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(
+    llm.complete_agentic = AsyncMock(
         side_effect=answer if isinstance(answer, Exception) else [answer]
     )
     degraded = MagicMock()
@@ -292,6 +270,7 @@ async def test_an_unusable_or_failed_answer_degrades(answer):
         MESSAGES,
         deadline_at=time.monotonic() + 60,
         settings=SETTINGS,
+        executor=FakeExecutor(),
         degraded_llm=degraded,
         outcome=outcome,
     )
@@ -301,7 +280,7 @@ async def test_an_unusable_or_failed_answer_degrades(answer):
 
 async def test_a_failed_degraded_read_raises():
     llm = MagicMock()
-    llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("offline"))
+    llm.complete_agentic = AsyncMock(side_effect=RuntimeError("offline"))
     degraded = MagicMock()
     degraded.review = AsyncMock(side_effect=RuntimeError("still offline"))
     with pytest.raises(RuntimeError, match="still offline"):
@@ -310,23 +289,38 @@ async def test_a_failed_degraded_read_raises():
             MESSAGES,
             deadline_at=time.monotonic() + 60,
             settings=SETTINGS,
+            executor=FakeExecutor(),
             degraded_llm=degraded,
         )
 
 
-async def test_without_an_executor_there_is_no_need_field():
+async def test_without_degrading_a_failure_raises_instead_of_a_third_call():
+    llm = MagicMock()
+    llm.complete_agentic = AsyncMock(side_effect=RuntimeError("offline"))
+    llm.review = AsyncMock(return_value=review_json("never"))
+    with pytest.raises(RuntimeError):
+        await review_part(
+            llm,
+            MESSAGES,
+            deadline_at=time.monotonic() + 60,
+            settings=SETTINGS,
+            executor=FakeExecutor(),
+            degrade=False,
+        )
+    llm.review.assert_not_awaited()
+
+
+async def test_without_an_executor_it_is_one_structured_call():
     llm = MagicMock()
     llm.complete_with_tools = AsyncMock(return_value=review_json())
     await review_part(llm, MESSAGES, deadline_at=None, settings=SETTINGS)
-    assert llm.complete_with_tools.call_args.kwargs["tools"] == [SUBMIT_REVIEW_TOOL]
+    assert _tool_names(llm.complete_with_tools.call_args) == ["submit_review"]
     assert "## Context and lookups" not in llm.complete_with_tools.call_args.args[0][0]["content"]
 
 
 async def test_lookups_still_running_are_left_out():
     executor = FakeExecutor(delay=5)
-    results = await run_lookups(
-        executor, [{"tool": "find_usages", "symbol": "x", "reason": "r"}], 4, seconds=0.05
-    )
+    results = await run_lookups(executor, [("find_usages", {"symbol": "x"})], seconds=0.05)
     assert results == [("find_usages(symbol='x')", "[this lookup did not finish in time]")]
 
 
@@ -721,11 +715,11 @@ def test_defaults_are_the_staged_single_pass_pipeline():
     review = MiraConfig().review
     assert review.pipeline == "staged" and review.passes == 1
     assert review.time_budget_seconds == 300
-    assert review.followup_max_lookups > 0 and review.followup_call is False
+    assert review.max_lookups > 0
 
 
 def _engine_with_lookups(confidence: float, verdict: str):
-    """A one-part staged review whose draft asked for a lookup, and a critic giving ``verdict``."""
+    """A one-part staged review that looked something up, and a critic giving ``verdict``."""
     from mira.models import PRInfo
     from mira.platforms.fetch import RepoSnapshot
 
@@ -736,13 +730,23 @@ def _engine_with_lookups(confidence: float, verdict: str):
         if name == "submit_critique":
             critic_prompts.append(messages[0]["content"])
             return json.dumps({"verdicts": [{"index": 0, "evidence": verdict, "reason": "r"}]})
-        body = json.loads(review_json("Caller passes None"))
-        body["comments"][0]["confidence"] = confidence
-        body["comments"][0]["existing_code"] = "value_0 = 0"
-        body["need"] = [{"tool": "find_usages", "symbol": "load", "reason": "None?"}]
-        return json.dumps(body)
+        raise AssertionError(f"unexpected structured call {name}")
+
+    body = json.loads(review_json("Caller passes None"))
+    body["comments"][0]["confidence"] = confidence
+    body["comments"][0]["existing_code"] = "value_0 = 0"
+    turns = [
+        lookups(("find_usages", {"symbol": "load"})),
+        {
+            "content": "",
+            "tool_calls": [
+                {"id": "s", "function": {"name": "submit_review", "arguments": json.dumps(body)}}
+            ],
+        },
+    ]
 
     model = _model(answer)
+    model.complete_agentic = AsyncMock(side_effect=turns)
     config = _engine_config(self_critique=True, code_context=True)
     source = "".join(f"value_{i} = {i}\n" for i in range(3))
     provider = MagicMock()
@@ -758,11 +762,10 @@ def _engine_with_lookups(confidence: float, verdict: str):
 
 
 @pytest.mark.parametrize(("verdict", "posted"), [("proven", True), ("plausible", False)])
-async def test_an_unsure_finding_waits_for_its_lookups_and_is_posted_only_if_proven(
+async def test_an_unsure_finding_after_lookups_is_posted_only_if_proven(
     monkeypatch, verdict, posted
 ):
     executor = FakeExecutor()
-    executor.tools = []
     monkeypatch.setattr("mira.llm.agentic_tools.AgenticToolExecutor", lambda **kw: executor)
     engine, scope, critic_prompts = _engine_with_lookups(0.4, verdict)
     result = await engine.review_diff(_diff(["src/a.py"]), repo_scope=scope)

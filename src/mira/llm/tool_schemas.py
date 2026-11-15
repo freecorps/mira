@@ -5,8 +5,6 @@ walkthrough passes. Distinct from ``agentic_tools`` (the read_file/grep
 tools the model calls while reasoning) — these are the shapes it returns.
 """
 
-import copy
-
 SUBMIT_REVIEW_TOOL = {
     "type": "function",
     "function": {
@@ -107,46 +105,6 @@ SUBMIT_REVIEW_TOOL = {
             },
             "required": ["comments", "summary"],
         },
-    },
-}
-
-# The staged review's answer (core/staged_review.py): ``submit_review`` plus
-# the lookups the reviewer still needs. The context a part needs is gathered
-# before the call; ``need`` is the one way left to ask for more, and every
-# lookup in it runs at once, for one follow-up call at most.
-STAGED_LOOKUP_TOOLS = ("read_file", "find_usages", "find_definition", "grep_repo")
-
-SUBMIT_STAGED_REVIEW_TOOL = copy.deepcopy(SUBMIT_REVIEW_TOOL)
-SUBMIT_STAGED_REVIEW_TOOL["function"]["parameters"]["properties"]["need"] = {
-    "type": "array",
-    "description": (
-        "Lookups that would settle a suspected issue the provided context does not. "
-        "Empty when the context is enough."
-    ),
-    "items": {
-        "type": "object",
-        "properties": {
-            "tool": {"type": "string", "enum": list(STAGED_LOOKUP_TOOLS)},
-            "symbol": {
-                "type": ["string", "null"],
-                "description": "find_usages / find_definition: the function, method or class.",
-            },
-            "path": {
-                "type": ["string", "null"],
-                "description": "read_file: the file; find_usages: an optional scope.",
-            },
-            "pattern": {
-                "type": ["string", "null"],
-                "description": "grep_repo: the regular expression.",
-            },
-            "start_line": {"type": ["integer", "null"]},
-            "end_line": {"type": ["integer", "null"]},
-            "reason": {
-                "type": "string",
-                "description": "The suspected issue this lookup would confirm or rule out.",
-            },
-        },
-        "required": ["tool", "reason"],
     },
 }
 
