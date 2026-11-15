@@ -36,7 +36,7 @@ from mira.core.multipass import (
     vote_audit,
     with_reading_order,
 )
-from mira.core.noise_filter import drop_already_posted, filter_noise
+from mira.core.noise_filter import confidence_floor, drop_already_posted, filter_noise
 from mira.core.passes import (
     agentic_review_loop,
     dependency_review_pass,
@@ -53,6 +53,18 @@ from mira.core.review_instructions import (
     load_repo_instructions,
     provider_reader,
 )
+from mira.core.staged_review import (
+    CRITIQUE_FRACTION,
+    FOLLOWUP_RESERVE_TOKENS,
+    PARTS_FRACTION,
+    PartOutcome,
+    ReviewBudget,
+    StagedSettings,
+    build_context_pack,
+    render_evidence,
+    review_part,
+    within,
+)
 from mira.core.system_pass import system_review_pass
 from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.core.verdict import decide_verdict
@@ -68,7 +80,13 @@ from mira.feedback.provenance import finding_fingerprint, new_finding_id
 from mira.feedback.retrieval import render_rule, split_rules
 from mira.gate.policy import resolve_policy
 from mira.index._store_shared import IndexMatch
-from mira.index.code_graph import BlastRadius, CodeGraph, build_blast_radius, render_blast_radius
+from mira.index.code_graph import (
+    BlastRadius,
+    CodeGraph,
+    added_lines,
+    build_blast_radius,
+    render_blast_radius,
+)
 from mira.index.context import SnapshotSourceFetcher, build_code_context, snapshot_budget
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
@@ -111,11 +129,23 @@ ReviewPartResult = tuple[list[ReviewComment], list[KeyIssue], str]
 # Room an agentic part keeps free for its tool output (the executor caps it at
 # 50 KB per part), so optional context never crowds the loop out of its window.
 _AGENTIC_OUTPUT_TOKENS = 13_000
+# What a staged part's hard bound allows past its deadline and its degraded
+# read's floor: the context pack and the parse, never a model call.
+_STAGED_GRACE_SECONDS = 15.0
 # How long a part's passes after the first wait for pass 0's first reply to
 # start arriving, which is when its prompt is in the endpoint's cache (see
 # core/multipass.py). The first streamed event follows the prompt's prefill
 # by moments; the cap bounds what a slow or non-streaming endpoint costs.
 _PASS_STAGGER_SECONDS = 20.0
+
+
+def _streams(llm: Any) -> bool:
+    """Whether ``llm`` reads its replies as a stream (so a silent call can be hedged)."""
+    providers = getattr(llm, "providers", None)
+    if isinstance(providers, list) and providers:
+        llm = providers[0]
+    profile = getattr(llm, "profile", None)
+    return bool(profile.get("stream")) if isinstance(profile, dict) else False
 
 
 def _lookup_effort(config: MiraConfig) -> str | None:
@@ -590,6 +620,9 @@ class ReviewEngine:
         self.llm = llm
         self.indexing_llm = indexing_llm or llm
         self.security_llm = security_llm or llm
+        # The review client with thinking off, for a staged part that ran out
+        # of time (see `_degraded_llm`). Built on first use.
+        self._degraded_client: LLMProviderProtocol | None = None
         self.provider = provider
         self.bot_name = bot_name
         self.dry_run = dry_run
@@ -688,6 +721,43 @@ class ReviewEngine:
             self.config.llm.max_context_tokens // 4,
         )
 
+    def _degraded_llm(self) -> LLMProviderProtocol:
+        """The review model with thinking off, for a staged part's degraded read.
+
+        A separate client built from the review client's own configuration,
+        so nothing it does changes the thinking calls. `none` is what an
+        OpenAI-compatible endpoint takes to switch thinking off (DeepSeek on
+        OpenDesign honours nothing else); a provider that only knows a
+        thinking budget (Bedrock) is asked with thinking `off`. With
+        `review.degraded_reasoning_effort: inherit`, or a client with no
+        configuration to copy (a test double), the review client itself.
+        """
+        if self._degraded_client is not None:
+            return self._degraded_client
+        client: LLMProviderProtocol = self.llm
+        if self.config.review.degraded_reasoning_effort == "none":
+            from mira.config import LLMConfig
+            from mira.llm import create_llm
+            from mira.llm.base import OpenAICompatibleProvider
+
+            primary = self.llm
+            providers = getattr(primary, "providers", None)
+            if isinstance(providers, list) and providers:
+                primary = providers[0]
+            config = getattr(primary, "config", None)
+            effort = config.reasoning_effort if isinstance(config, LLMConfig) else None
+            if isinstance(config, LLMConfig) and effort and effort not in ("off", "none"):
+                off = "none" if isinstance(primary, OpenAICompatibleProvider) else "off"
+                try:
+                    client = create_llm(
+                        config.model_copy(update={"reasoning_effort": off, "fallbacks": []})
+                    )
+                except Exception as exc:  # noqa: BLE001 — the review client still reads it
+                    logger.info("No thinking-off client for degraded reads: %s", exc)
+                    client = self.llm
+        self._degraded_client = client
+        return client
+
     def _usage(self) -> dict[str, int | float]:
         """Tokens spent by every model this review called, not only the reviewer.
 
@@ -709,8 +779,8 @@ class ReviewEngine:
             "unpriced_calls": 0,
         }
         seen: set[int] = set()
-        for client in (self.llm, self.indexing_llm, self.security_llm):
-            if id(client) in seen:
+        for client in (self.llm, self.indexing_llm, self.security_llm, self._degraded_client):
+            if client is None or id(client) in seen:
                 continue
             seen.add(id(client))
             usage = getattr(client, "usage", None)
@@ -2137,6 +2207,13 @@ class ReviewEngine:
         """The pipeline behind :meth:`_review_diff_internal`, which owns its cleanup."""
         stage_started = time.monotonic()
         timings: dict[str, float] = {}
+        # The staged pipeline's clock (docs/review-pipeline.md): every stage
+        # after preparation takes its deadline from what is left of it.
+        staged = self.config.review.pipeline == "staged"
+        review_budget = ReviewBudget(
+            started=stage_started,
+            total=float(self.config.review.time_budget_seconds) if staged else 0.0,
+        )
 
         def _mark(stage: str) -> None:
             nonlocal stage_started
@@ -2592,12 +2669,19 @@ class ReviewEngine:
         context_budget = (
             self.config.llm.max_context_tokens - overhead - self._output_reserve() - 6000
         )
+        part_tokens = self.config.review.agent_token_budget
+        part_files = self.config.review.agent_max_files
+        if staged:
+            # One thinking call reads a staged part, and how long it thinks
+            # grows with what it reads: smaller parts, side by side.
+            part_tokens = min(part_tokens, self.config.review.staged_part_tokens)
+            part_files = min(part_files, self.config.review.staged_part_files)
         chunks = chunk_files(
             expanded,
-            max_tokens=min(self.config.review.agent_token_budget, context_budget),
+            max_tokens=min(part_tokens, context_budget),
             provider=self.llm,
             dependencies=dependencies,
-            max_files=max(1, min(self.config.review.agent_max_files, self.config.filter.max_files)),
+            max_files=max(1, min(part_files, self.config.filter.max_files)),
         )
 
         base_existing = list(existing_comments) if existing_comments else []
@@ -2637,6 +2721,9 @@ class ReviewEngine:
             min_lines,
         )
         run_system_pass = self.config.review.system_pass and changed_lines >= min_lines
+        if staged and len(chunks) < 2:
+            # One part already reads the whole change, with its callers.
+            run_system_pass = False
         audit.append(
             {
                 "stage": "multipass_plan",
@@ -2696,6 +2783,37 @@ class ReviewEngine:
             first = run.landed[0].result
             assert first is not None
             return voted.kept, first[1], first[2]
+
+        def _make_executor() -> Any:
+            from mira.llm.agentic_tools import AgenticToolExecutor
+
+            return AgenticToolExecutor(
+                source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                repo_tree=list(self._agentic_repo_tree),
+                graph_tools=review_graph is not None,
+                code_graph=review_graph,
+                index_search=self._index_search(),
+            )
+
+        def _attach_evidence(comments: list[ReviewComment], evidence: str) -> None:
+            """Hand a part's lookups to verification with its findings.
+
+            A finding filed below the confidence floor while its lookups were
+            pending would be dropped by the noise filter before anyone read
+            them; it goes to the critic instead, to be posted only if the code
+            proves it (``require_proven``, at the floor's confidence).
+            """
+            pending_min = self.config.review.evidence_min_confidence
+            for c in comments:
+                c.evidence = evidence
+                floor = confidence_floor(self.config.filter, review_round, c.category)
+                if self.config.review.self_critique and pending_min <= c.confidence < floor:
+                    c.require_proven = True
+                    c.confidence = floor
+
+        # Every reviewed file's added lines, so the context pack can mark a
+        # call site this pull request already rewrites.
+        changed_lines_by_path = {f.path: added_lines(f) for f in filtered} if staged else {}
 
         async def _review_chunk(
             idx: int,
@@ -2768,8 +2886,13 @@ class ReviewEngine:
                 raise ValueError("Review prompt exceeds the configured context window")
             # The changed functions in full, in whatever room the prompt has
             # left: optional, so it only ever takes space nothing else needs.
-            # Leave the agentic loop room for its tool output, too.
-            tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
+            # Leave the agentic loop room for its tool output, too — or the
+            # staged follow-up room for the lookups it may ask for.
+            tool_room = (
+                (FOLLOWUP_RESERVE_TOKENS if staged else _AGENTIC_OUTPUT_TOKENS)
+                if self._agentic_source_fetcher
+                else 0
+            )
             room = min(enclosing_budget, prompt_limit - _size(messages) - 1000 - tool_room)
             enclosing = ""
             if room > 500 and source is not None:
@@ -2789,6 +2912,33 @@ class ReviewEngine:
                         enclosing += callers
                         messages = _messages(chunk_history, part, enclosing)
 
+            use_agentic = (
+                self.config.review.agentic_tools and self._agentic_source_fetcher is not None
+            )
+            # One executor per part under the staged pipeline: the context
+            # pack and the follow-up's lookups share its reads and its cache.
+            part_executor = _make_executor() if staged and use_agentic else None
+            # Staged: the callers of the changed functions, the definitions
+            # they call and the tests beside them, gathered before the call
+            # (core/staged_review.py) in whatever room is left.
+            if part_executor is not None:
+                room = min(
+                    self.config.review.context_pack_tokens,
+                    prompt_limit - _size(messages) - 1000 - tool_room,
+                )
+                if room > 300:
+                    pack = await build_context_pack(
+                        chunk.files,
+                        part_executor,
+                        char_budget=room * 4,
+                        seconds=self.config.review.context_pack_seconds,
+                        changed_lines=changed_lines_by_path,
+                    )
+                    audit.append(pack.audit(idx))
+                    if pack.text:
+                        enclosing += pack.text
+                        messages = _messages(chunk_history, part, enclosing)
+
             def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
                 parsed = parse_llm_response(raw)
                 return (
@@ -2804,9 +2954,6 @@ class ReviewEngine:
                     parsed.summary or "",
                 )
 
-            use_agentic = (
-                self.config.review.agentic_tools and self._agentic_source_fetcher is not None
-            )
             chunk_key = "\n".join(f.path for f in chunk.files)
 
             async def _one_pass(
@@ -2828,16 +2975,42 @@ class ReviewEngine:
                     part_passes,
                 )
                 raw_response = ""
+                if staged:
+                    outcome = PartOutcome()
+                    try:
+                        raw_response = await review_part(
+                            self.llm,
+                            pass_messages,
+                            deadline_at=(
+                                _soft_deadline(deadline_at) if part_passes > 1 else deadline_at
+                            ),
+                            settings=StagedSettings.from_config(
+                                self.config.review, streams=_streams(self.llm)
+                            ),
+                            executor=part_executor,
+                            degraded_llm=self._degraded_llm(),
+                            temperature=temperature,
+                            outcome=outcome,
+                        )
+                    finally:
+                        staged_entry = outcome.audit(idx)
+                        if part_passes > 1:
+                            staged_entry["pass"] = pass_idx
+                        audit.append(staged_entry)
+                        logger.info(
+                            "Review part %d: %d thinking call(s)%s%s in %.1fs",
+                            idx + 1,
+                            outcome.thinking_calls,
+                            ", read without thinking" if outcome.degraded else "",
+                            f", lookups {outcome.followup}" if outcome.followup else "",
+                            outcome.seconds,
+                        )
+                    parsed = _parse(raw_response)
+                    if outcome.evidence:
+                        _attach_evidence(parsed[0], render_evidence(outcome.evidence))
+                    return parsed
                 if use_agentic:
-                    from mira.llm.agentic_tools import AgenticToolExecutor
-
-                    executor = AgenticToolExecutor(
-                        source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
-                        repo_tree=list(self._agentic_repo_tree),
-                        graph_tools=review_graph is not None,
-                        code_graph=review_graph,
-                        index_search=self._index_search(),
-                    )
+                    executor = _make_executor()
                     budget = self.config.review.part_deadline_seconds
                     # Measured from the part's own start, which a pass held
                     # back for the prompt cache did not move: the passes of a
@@ -2944,27 +3117,137 @@ class ReviewEngine:
                     hi = mid - 1
             return value[:lo]
 
+        # Self-critique, shared by the parts (staged: each part's findings are
+        # verified as soon as it lands, beside the parts still running) and
+        # by the pass over the side passes' findings after them.
+        # A dependency finding can land on a manifest that lost the size cull
+        # and so isn't in `filtered`. The critic grades on the hunk covering a
+        # comment; with no hunk it reads as "unsupported" and drops the
+        # finding. Add those manifests back as evidence only.
+        _selected = {f.path for f in filtered}
+        critique_files = filtered + [f for f in manifest_candidates if f.path not in _selected]
+        critique_rules = [*custom_rules, *repo_instructions.as_rules(selected_paths)] or None
+        critic_llm = (
+            self.llm if self.config.review.critique_model == "review" else self.indexing_llm
+        )
+        # Findings a part already had verified (by id), so the pass after the
+        # parts does not grade them twice.
+        verified_ids: set[int] = set()
+
+        async def _grade(batch: list[ReviewComment]) -> list[ReviewComment]:
+            return await self_critique(
+                self.llm,
+                batch,
+                learned_rules=learned_rules or None,
+                # The repository's instructions for the reviewed files are
+                # team preferences too: a finding enforcing one is not a nit.
+                custom_rules=critique_rules,
+                indexing_llm=self.indexing_llm,
+                diff_files=critique_files,
+                audit=audit,
+                source_fetcher=source,
+                plausible_min_confidence=self.config.review.critique_plausible_min_confidence,
+                critic_llm=critic_llm,
+            )
+
+        async def _verify(comments: list[ReviewComment]) -> list[ReviewComment]:
+            """Grade ``comments`` in batches side by side, within the budget.
+
+            A batch that does not finish by the verification deadline keeps
+            its drafts, as a failed critique always has.
+            """
+            if not comments:
+                return comments
+            size = self.config.review.critique_batch_size
+            batches = [comments[i : i + size] for i in range(0, len(comments), size)]
+            left = review_budget.left(CRITIQUE_FRACTION)
+            seconds = (
+                max(left, float(self.config.review.degraded_call_seconds))
+                if left is not None
+                else None
+            )
+            graded = await _asyncio.gather(
+                *(
+                    within(_grade(batch), seconds, batch, "Self-critique batch", audit)
+                    for batch in batches
+                )
+            )
+            return [c for batch in graded for c in batch]
+
+        async def _verify_part(idx: int, comments: list[ReviewComment]) -> list[ReviewComment]:
+            """A staged part's findings, filtered and verified the moment the part lands."""
+            drafted = [classify_severity(c) for c in comments]
+            kept = filter_noise(
+                drafted,
+                self.config.filter,
+                review_round=review_round,
+                group_findings=self.config.review.group_findings,
+                apply_cap=False,
+            )
+            _audit_stage(audit, "noise_filter", drafted, kept)
+            if existing_comments:
+                before = kept
+                kept = drop_already_posted(kept, existing_comments)
+                _audit_stage(audit, "already_posted", before, kept)
+            try:
+                with accounting.stage("critique"):
+                    kept = await _verify(kept)
+            except Exception as exc:  # noqa: BLE001 — the drafts stand, as before
+                logger.warning(
+                    "Self-critique of part %d failed, keeping its drafts: %s", idx + 1, exc
+                )
+            verified_ids.update(id(c) for c in kept)
+            return kept
+
         async def _run_part(idx: int, chunk: ReviewChunk, context: str) -> ReviewPartResult:
             """One part, with its retries; a part that never lands costs its files.
 
             A part is bounded by ``part_deadline_seconds``, and a part that
             failed by timing out is not reviewed again from scratch: the
             model that just took minutes to not answer will take them again.
+            A failed attempt that is not retried ends the part — it used to
+            fall through to the next attempt, so a part that timed out was
+            read again from the start after the others finished, and counted
+            as unread even when that second read landed.
+
+            Under the staged pipeline the part's deadline is also the
+            review's parts deadline, wherever the part got its turn, and the
+            part is never retried: :func:`review_part` degrades instead.
             """
-            budget = self.config.review.part_deadline_seconds
-            for attempt in range(self.config.review.chunk_retries + 1):
+            budget_seconds = self.config.review.part_deadline_seconds
+            retries = 0 if staged else self.config.review.chunk_retries
+            for attempt in range(retries + 1):
                 try:
                     # The slot first, then the clock: a part queued behind
                     # `max_concurrent_chunks` others used to spend its budget
                     # waiting, and start its passes with none of it left.
                     async with semaphore:
-                        deadline_at = time.monotonic() + budget if budget else None
+                        now = time.monotonic()
+                        deadline_at = now + budget_seconds if budget_seconds else None
+                        limit: float | None = budget_seconds or None
+                        if staged:
+                            parts_due = review_budget.deadline(PARTS_FRACTION)
+                            if parts_due is not None:
+                                deadline_at = min(deadline_at or parts_due, parts_due)
+                            # The degraded read may run past the deadline by its
+                            # floor; the hard bound only catches a hang.
+                            limit = (
+                                max(0.0, deadline_at - now)
+                                + self.config.review.degraded_call_seconds
+                                + _STAGED_GRACE_SECONDS
+                                if deadline_at is not None
+                                else None
+                            )
                         review = _review_chunk(idx, chunk, context, deadline_at)
-                        return await (asyncio.wait_for(review, budget) if budget else review)
+                        result = await (asyncio.wait_for(review, limit) if limit else review)
+                    if staged and self.config.review.self_critique and result[0]:
+                        # Outside the part's slot: grading is the critic's call.
+                        result = (await _verify_part(idx, result[0]), result[1], result[2])
+                    return result
                 except Exception as exc:
                     if isinstance(exc, TimeoutError) and not str(exc):
-                        exc = TimeoutError(f"review part ran past its {budget}s deadline")
-                    if attempt < self.config.review.chunk_retries and not _timed_out(exc):
+                        exc = TimeoutError(f"review part ran past its {budget_seconds}s deadline")
+                    if attempt < retries and not _timed_out(exc):
                         logger.warning("Retrying review part %d: %s", idx + 1, exc)
                         audit.append({"stage": "chunk_retry", "chunk": idx, "attempt": attempt + 1})
                         continue
@@ -2972,6 +3255,7 @@ class ReviewEngine:
                     audit.append({"stage": "chunk_failed", "chunk": idx, "error": str(exc)})
                     chunk_failures.append(exc)
                     unread_paths.update(f.path for f in chunk.files)
+                    break
             return [], [], ""
 
         def _group_context(
@@ -3067,6 +3351,10 @@ class ReviewEngine:
             tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
             # The system prompt and learned checks take a few thousand tokens.
             budget = min(self.config.review.system_pass_tokens, prompt_limit - tool_room - 6000)
+            if staged:
+                # One thinking call reads it: the map, the callers and the
+                # top hunks, not as much diff as the window holds.
+                budget = min(budget, self.config.review.staged_system_pass_tokens)
             reviewed = {f.path for f in filtered}
 
             async def _callers(char_budget: int) -> str:
@@ -3080,17 +3368,17 @@ class ReviewEngine:
                 )
 
             make_executor = None
-            if self.config.review.agentic_tools and self._agentic_source_fetcher is not None:
-                from mira.llm.agentic_tools import AgenticToolExecutor
-
-                def make_executor() -> AgenticToolExecutor:
-                    return AgenticToolExecutor(
-                        source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
-                        repo_tree=list(self._agentic_repo_tree),
-                        graph_tools=review_graph is not None,
-                        code_graph=review_graph,
-                        index_search=self._index_search(),
+            deadline_seconds = self.config.review.system_pass_deadline_seconds
+            if staged:
+                # One call beside the parts, done when they are: no tool loop.
+                left = review_budget.left(PARTS_FRACTION)
+                if left is not None:
+                    seconds = max(1, int(left))
+                    deadline_seconds = (
+                        min(deadline_seconds, seconds) if deadline_seconds else seconds
                     )
+            elif self.config.review.agentic_tools and self._agentic_source_fetcher is not None:
+                make_executor = _make_executor
 
             return await system_review_pass(
                 llm=self.llm,
@@ -3103,12 +3391,14 @@ class ReviewEngine:
                 pr_description=pr_description,
                 learned_checks=learned_checks or None,
                 make_executor=make_executor,
-                agentic_loop=functools.partial(
+                agentic_loop=None
+                if staged
+                else functools.partial(
                     agentic_review_loop,
                     max_hops=self.config.review.agentic_max_hops,
                     lookup_reasoning_effort=_lookup_effort(self.config),
                 ),
-                deadline_seconds=self.config.review.system_pass_deadline_seconds,
+                deadline_seconds=deadline_seconds,
                 audit=audit,
             )
 
@@ -3118,15 +3408,29 @@ class ReviewEngine:
             if run_system_pass
             else _asyncio.sleep(0, result=[])
         )
+        # Beside the parts, and done when they are: a pass that adds findings
+        # must not be what holds the review past its budget.
+        side_seconds = review_budget.left(PARTS_FRACTION)
+        if side_seconds is not None:
+            side_seconds = max(side_seconds, float(self.config.review.degraded_call_seconds))
+
+        def _side(work: Coroutine[Any, Any, list], what: str) -> Awaitable[list]:
+            # Staged only: the agentic pipeline keeps its old behaviour, where
+            # a pass that raises takes the review down with it.
+            return within(work, side_seconds, [], what, audit) if staged else work
+
         security_task = _asyncio.create_task(
             accounting.staged(
                 "security",
-                security_review_pass(
-                    self.llm,
-                    filtered,
-                    _security_relevant_files(filtered),
-                    pr_title,
-                    security_llm=self.security_llm,
+                _side(
+                    security_review_pass(
+                        self.llm,
+                        filtered,
+                        _security_relevant_files(filtered),
+                        pr_title,
+                        security_llm=self.security_llm,
+                    ),
+                    "Security pass",
                 ),
             )
             if self.config.review.security_pass
@@ -3159,12 +3463,15 @@ class ReviewEngine:
         dependency_task = _asyncio.create_task(
             accounting.staged(
                 "dependency",
-                dependency_review_pass(
-                    self.llm,
-                    manifest_files,
-                    existing_packages,
-                    pr_title,
-                    indexing_llm=self.indexing_llm,
+                _side(
+                    dependency_review_pass(
+                        self.llm,
+                        manifest_files,
+                        existing_packages,
+                        pr_title,
+                        indexing_llm=self.indexing_llm,
+                    ),
+                    "Dependency pass",
                 ),
             )
             if manifest_files
@@ -3271,34 +3578,18 @@ class ReviewEngine:
         # the team's documented preferences so the critic doesn't strip
         # findings that enforce them as "style nits".
         if final_comments and self.config.review.self_critique:
-            # A dependency finding can land on a manifest that lost the size
-            # cull and so isn't in `filtered`. The critic grades on the hunk
-            # covering a comment; with no hunk it reads as "unsupported" and
-            # drops the finding. Add those manifests back as evidence only.
-            _selected = {f.path for f in filtered}
-            critique_files = filtered + [f for f in manifest_candidates if f.path not in _selected]
             try:
                 with accounting.stage("critique"):
-                    final_comments = await self_critique(
-                        self.llm,
-                        final_comments,
-                        learned_rules=learned_rules or None,
-                        # The repository's instructions for the reviewed files are
-                        # team preferences too: a finding enforcing one is not a nit.
-                        custom_rules=(
-                            [*custom_rules, *repo_instructions.as_rules(selected_paths)] or None
-                        ),
-                        indexing_llm=self.indexing_llm,
-                        diff_files=critique_files,
-                        audit=audit,
-                        source_fetcher=source,
-                        plausible_min_confidence=self.config.review.critique_plausible_min_confidence,
-                        critic_llm=(
-                            self.llm
-                            if self.config.review.critique_model == "review"
-                            else self.indexing_llm
-                        ),
-                    )
+                    if not staged:
+                        final_comments = await _grade(final_comments)
+                    else:
+                        # Each part's findings were verified as the part landed;
+                        # what is left is the side passes' (security, system…).
+                        pending = [c for c in final_comments if id(c) not in verified_ids]
+                        graded = {id(c) for c in await _verify(pending)}
+                        final_comments = [
+                            c for c in final_comments if id(c) in verified_ids or id(c) in graded
+                        ]
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
         # A blocker too few passes voted for stands only on a `proven` grade;
@@ -3308,8 +3599,10 @@ class ReviewEngine:
             audit.append(
                 _audit_drop(
                     c,
-                    "pass_vote",
-                    f"{c.severity.name.lower()} reported by {c.votes} pass(es), not proven",
+                    "pass_vote" if c.votes else "unproven",
+                    f"{c.severity.name.lower()} reported by {c.votes} pass(es), not proven"
+                    if c.votes
+                    else "filed below the confidence floor pending its lookups, not proven",
                 )
             )
         _mark("critique")

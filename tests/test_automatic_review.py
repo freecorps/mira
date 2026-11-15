@@ -30,8 +30,9 @@ def diff(paths, lines=1):
     )
 
 
-def engine_config():
+def engine_config(pipeline: str = "staged"):
     cfg = MiraConfig()
+    cfg.review.pipeline = pipeline
     cfg.review.walkthrough = False
     cfg.review.security_pass = False
     cfg.review.dependency_overlap = False
@@ -232,7 +233,10 @@ async def test_failed_part_retries_without_repeating_successful_parts(monkeypatc
         return '{"comments": []}'
 
     model.review.side_effect = review
-    result = await ReviewEngine(config=engine_config(), llm=model).review_diff(diff(list(calls)))
+    # Retries are the agentic pipeline's; a staged part degrades instead.
+    result = await ReviewEngine(config=engine_config("agentic"), llm=model).review_diff(
+        diff(list(calls))
+    )
     assert calls == {"src/a.py": 1, "src/b.py": 2}
     assert result.reviewed_files == 2 and not result.skipped_paths
     assert any(e["stage"] == "chunk_retry" for e in result.audit)
@@ -336,7 +340,7 @@ async def test_all_parts_failing_raises():
     model = llm()
     model.review.side_effect = RuntimeError("provider offline")
     with pytest.raises(RuntimeError, match="provider offline"):
-        await ReviewEngine(config=engine_config(), llm=model).review_diff(diff(["a.py"]))
+        await ReviewEngine(config=engine_config("agentic"), llm=model).review_diff(diff(["a.py"]))
     assert model.review.await_count == 2
 
 
@@ -536,7 +540,7 @@ async def test_agentic_context_and_dependency_reads_share_revision(monkeypatch, 
         return '{"comments": []}'
 
     monkeypatch.setattr(module, "agentic_review_loop", agentic_read)
-    config = engine_config()
+    config = engine_config("agentic")
     config.review.code_context = True
     scope = PRInfo("title", "", "main", "feature", "url", 1, "test", "repo", head_sha=head_sha)
     engine = ReviewEngine(config=config, llm=llm(), provider=provider)

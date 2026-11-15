@@ -78,6 +78,9 @@ def engine_config(**review) -> MiraConfig:
     # The mechanics these tests pin down were written for three passes, a
     # 30-line threshold and the old vote; the defaults moved (see config.py).
     cfg.review.passes = 3
+    # The voting and agentic mechanics, as the agentic pipeline runs them;
+    # the staged pipeline has its own tests (tests/test_staged_review.py).
+    cfg.review.pipeline = "agentic"
     cfg.review.multipass_min_changed_lines = 30
     cfg.review.pass_vote_prove_min_severity = "blocker"
     cfg.review.walkthrough = False

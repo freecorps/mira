@@ -757,6 +757,12 @@ async def self_critique(
         return comments
 
     surroundings = await asyncio.gather(*(_surrounding_code(c, source_fetcher) for c in comments))
+    # The staged reviewer's lookups (core/staged_review.py), shown once per
+    # batch and named by each draft that came with them.
+    evidence_ids: dict[str, str] = {}
+    for c in comments:
+        if c.evidence and c.evidence not in evidence_ids:
+            evidence_ids[c.evidence] = f"E{len(evidence_ids) + 1}"
     draft_lines = []
     for i, c in enumerate(comments):
         cited = (c.existing_code or "").strip()
@@ -778,6 +784,10 @@ async def self_critique(
             entry += f"    Diff hunk (new-file line numbers on the left):\n{hunk}\n"
         if surroundings[i]:
             entry += f"    The file around it, after the change:\n{surroundings[i]}\n"
+        if c.evidence:
+            entry += f"    Lookups the reviewer asked for: {evidence_ids[c.evidence]} (below)\n"
+        if c.require_proven and not c.votes:
+            entry += "    The reviewer was unsure of this one: grade it proven only if the code shows it.\n"
         draft_lines.append(entry)
 
     rules_block = ""
@@ -793,8 +803,17 @@ async def self_critique(
             + "\n\n"
         )
 
+    evidence_block = ""
+    if evidence_ids:
+        evidence_block = "\n## Lookups the reviewer asked for (the repository at the head)\n\n" + (
+            "\n\n".join(f"### {eid}\n{text}" for text, eid in evidence_ids.items())
+        )
     critic_prompt = (
-        _CRITIC_PREAMBLE + rules_block + "## Draft comments\n\n" + "\n".join(draft_lines)
+        _CRITIC_PREAMBLE
+        + rules_block
+        + "## Draft comments\n\n"
+        + "\n".join(draft_lines)
+        + evidence_block
     )
 
     critic_llm = critic_llm or indexing_llm or _indexing_llm(llm)

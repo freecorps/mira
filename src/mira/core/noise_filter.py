@@ -98,6 +98,19 @@ def _deduplicate(
     return kept
 
 
+def confidence_floor(config: FilterConfig, review_round: int = 1, category: str = "") -> float:
+    """The confidence a finding needs to pass :func:`filter_noise` in this round."""
+    floor = config.confidence_threshold
+    if review_round >= 2:
+        # Tighten without dropping real catches: confident bugs are scored
+        # 0.85+ by the LLM, so 0.8 still lets them through while filtering
+        # the marginal/hedged ones.
+        floor = max(floor, 0.8)
+    if review_round >= 3:
+        floor = max(floor, 0.85)
+    return max(floor, config.category_confidence_thresholds.get(category, 0.0))
+
+
 def filter_noise(
     comments: list[ReviewComment],
     config: FilterConfig,
@@ -130,22 +143,12 @@ def filter_noise(
     "round 1 sets the bar; later rounds only flag new high-confidence
     findings, typically bugs the team introduced while applying fixes."
     """
-    confidence_floor = config.confidence_threshold
     min_severity = Severity.from_str(config.min_severity)
-
     if review_round >= 2:
-        # Tighten without dropping real catches: confident bugs are scored
-        # 0.85+ by the LLM, so 0.8 still lets them through while filtering
-        # the marginal/hedged ones.
-        confidence_floor = max(confidence_floor, 0.8)
         min_severity = max(min_severity, Severity.WARNING)
-    if review_round >= 3:
-        confidence_floor = max(confidence_floor, 0.85)
-
-    category_floors = config.category_confidence_thresholds
 
     def _floor(c: ReviewComment) -> float:
-        return max(confidence_floor, category_floors.get(c.category, 0.0))
+        return confidence_floor(config, review_round, c.category)
 
     result = [c for c in comments if c.confidence >= _floor(c)]
     result = [c for c in result if c.severity >= min_severity]

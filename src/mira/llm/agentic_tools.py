@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING
 
 from mira.index.code_graph import (
     CodeGraph,
+    Definition,
+    Reference,
     graph_searchable,
     match_path,
     name_pattern,
@@ -644,6 +646,38 @@ class AgenticToolExecutor:
         parsed = [(p, c) for p, c in candidates if p in graph]
         complete = not capped and not timed_out and not getattr(snapshot, "partial", False)
         return parsed, complete
+
+    async def references(self, name: str) -> tuple[list[Reference], bool] | None:
+        """Call sites of ``name`` from the code graph, and whether the search was whole.
+
+        The same search ``find_usages`` runs, as data rather than text, for
+        the staged review's context pack (core/staged_review.py). None
+        without the repository snapshot.
+        """
+        if not self.repo_tree:
+            return None
+        found = await self._graph_candidates(name, None)
+        if found is None:
+            return None
+        _candidates, complete = found
+        return self._graph().references_to(name), complete
+
+    async def definitions(self, name: str) -> list[Definition] | None:
+        """Definitions of ``name`` from the code graph, source before tests; None without a snapshot."""
+        if not self.repo_tree:
+            return None
+        lowered = name.lower().replace("_", "")
+
+        def _rank(path: str) -> tuple:
+            stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower().replace("_", "")
+            return (lowered not in stem, *_grep_order(path))
+
+        found = await self._graph_candidates(name, None, rank=_rank)
+        if found is None:
+            return None
+        defs = self._graph().definitions_of(name)
+        defs.sort(key=lambda d: (_grep_order(d.path), d.start_line))
+        return defs
 
     async def _text_fallback(self, name: str, scope: str | None, why: str) -> str:
         # The same scope rules as the graph search: `src/api` is a directory,

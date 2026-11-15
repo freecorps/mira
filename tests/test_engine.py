@@ -2133,6 +2133,9 @@ class TestManifestFileSelection:
         config.review.self_critique = False
         config.review.security_pass = True
         config.review.auto_complete = False
+        # The staged pipeline contains a side pass's failure (see
+        # test_staged_review.py); the agentic one still fails the review.
+        config.review.pipeline = "agentic"
         engine = ReviewEngine(
             config=config, llm=MagicMock(count_tokens=lambda text: 100), provider=None
         )

@@ -165,6 +165,10 @@ class ReviewComment:
     # "" when no critique ran. Verification reads it: a finding the critic only
     # found plausible and a test then failed to reproduce is dropped, not kept.
     critique_grade: str = ""
+    # The lookups the staged reviewer asked for while filing this finding's
+    # part, with their results (core/staged_review.py): what self-critique
+    # grades it with, beside the hunk and the code around it. Never posted.
+    evidence: str = ""
     # What running a reproduction test said about this finding (mira.verify),
     # or None when none was run.
     verification: FindingVerification | None = None
