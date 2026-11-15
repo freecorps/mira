@@ -52,9 +52,12 @@ from typing import Any
 # Reasoning levels from least to most thinking.
 EFFORT_ORDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-# Values ``llm.mechanical_reasoning`` takes: a level, or "inherit" to leave
-# mechanical calls at the client's configured one.
-MECHANICAL_VALUES: tuple[str, ...] = ("inherit", *EFFORT_ORDER)
+# Values ``llm.mechanical_reasoning`` takes: "none" turns thinking off for
+# mechanical calls, "inherit" leaves them at the client's configured level.
+# Other levels are not offered: an override only ever lowers, so a mechanical
+# level above "none" could never turn thinking on for a client configured
+# without it, and would read as a setting that does nothing.
+MECHANICAL_VALUES: tuple[str, ...] = ("inherit", "none")
 
 # The stages whose calls are mechanical: they summarise or rephrase what they
 # are shown and decide nothing a review's correctness rests on. The review

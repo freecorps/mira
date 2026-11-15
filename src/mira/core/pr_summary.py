@@ -297,7 +297,7 @@ async def generate_walkthrough(
         pr_title=title,
         pr_description=strip_summary_section(pr_info.description),
     )
-    with accounting.stage("pr_description"):
+    with accounting.stage("walkthrough"):
         raw = await llm.walkthrough(messages)
     return convert_to_walkthrough_result(parse_walkthrough_response(raw))
 
