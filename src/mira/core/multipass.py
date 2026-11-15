@@ -6,9 +6,12 @@ pull requests Mira also reviewed, the bots that found what Mira did not (403
 Bugbot threads, 297 of them fixed) run several passes with the diff order
 randomised and keep what recurs. This module is that, for one review part:
 
-- :func:`shuffle_files` gives each pass after the first the part's files — and
-  the hunks inside a file, when that is safe — in another order, from a seed
-  derived from the part and the pass, so a replay reads the same order.
+- :func:`reading_order_note` gives each pass after the first the part's files
+  in another order — and, on odd passes, each file's hunks from the last up —
+  from a seed derived from the part and the pass, so a replay reads the same
+  order. The order is a short note after the diff, not a re-shuffled prompt:
+  every pass sends the same prompt, so the prompt cache serves passes 1… the
+  prefix pass 0 paid for (:func:`run_passes` starts them once it has).
 - :func:`run_passes` runs the passes side by side and degrades: a pass that
   fails or is still running at the soft deadline is left out of the vote,
   and only no pass at all landing fails the part.
@@ -24,6 +27,7 @@ temperature, so ``review.passes: 1`` is exactly the single-pass review.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import logging
@@ -36,6 +40,7 @@ from typing import Any, Generic, TypeVar
 from mira.core.ensemble import cluster_representative, cluster_runs, cluster_votes
 from mira.core.grouping import prune_group
 from mira.core.noise_filter import _jaccard_similarity
+from mira.llm import concurrency
 from mira.models import FileDiff, ReviewComment, Severity
 
 logger = logging.getLogger(__name__)
@@ -97,6 +102,48 @@ def shuffle_files(files: list[FileDiff], seed: int) -> list[FileDiff]:
     return out
 
 
+def reading_order_note(files: list[FileDiff], seed: int, pass_index: int) -> str:
+    """The order a pass after the first reads its part in, as a note after the diff.
+
+    The passes used to be sent the part re-shuffled — a different system
+    prompt (the file list) and a different user message — so they shared
+    nothing a prompt cache could serve past the first lines, and every pass
+    paid full price for its first hop. The prompt is now the same for every
+    pass, byte for byte, and the order is this short note at its end: the
+    same files in another seeded order, and on odd passes each file read from
+    its last hunk up. Empty for pass 0, and for a part with nothing to reorder.
+    """
+    if pass_index <= 0:
+        return ""
+    order = [f.path for f in shuffle_files(files, seed)]
+    backwards = pass_index % 2 == 1 and any(len(f.hunks) > 1 for f in files)
+    lines: list[str] = []
+    if len(order) > 1:
+        lines.append(
+            "Read the files above in this order, giving each the same care, rather than "
+            "in the order they were given:"
+        )
+        lines.extend(f"{n}. `{path}`" for n, path in enumerate(order, 1))
+    if backwards:
+        lines.append("Within each file, start with its last hunk and work up to the first.")
+    if not lines:
+        return ""
+    return "\n\n## Reading order for this pass\n\n" + "\n".join(lines)
+
+
+def with_reading_order(messages: list[dict[str, str]], note: str) -> list[dict[str, str]]:
+    """``messages`` with ``note`` appended to the last user message (unchanged if empty)."""
+    if not note:
+        return messages
+    out = [dict(m) for m in messages]
+    for message in reversed(out):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            message["content"] = message["content"] + note
+            return out
+    out.append({"role": "user", "content": note.lstrip()})
+    return out
+
+
 def pass_temperature(base: float, spread: float, pass_index: int, passes: int) -> float | None:
     """Sampling temperature for one pass, or None for the configured default.
 
@@ -144,18 +191,46 @@ async def run_passes(
     passes: int,
     *,
     soft_deadline: float | None = None,
+    stagger_seconds: float = 0.0,
 ) -> PassRun[T]:
     """Run ``passes`` passes concurrently and collect what lands.
 
     ``soft_deadline`` is a ``time.monotonic()`` value. Once it passes, the
     passes still running are cancelled and left out — as long as at least one
     landed; with none landed yet, the first to land is waited for (the part's
-    own hard deadline still bounds that). A failed pass is left out too. Only
-    when every pass failed does this raise, with the first pass's error, so
-    the part's retry rules apply as they did to a single pass.
+    own hard deadline still bounds that). A cancelled pass stops at once: its
+    in-flight model call is cancelled with it, and no further hop is sent. A
+    failed pass is left out too. Only when every pass failed does this raise,
+    with the first pass's error, so the part's retry rules apply as they did
+    to a single pass.
+
+    ``stagger_seconds`` holds passes 1… until pass 0's first reply starts
+    arriving (at most that long). The passes send the same prompt, and a
+    prompt cache can only serve a prefix it has finished reading: sent side
+    by side, every pass paid full price for the same tokens.
     """
     started = time.monotonic()
-    tasks: dict[asyncio.Task[T], int] = {asyncio.create_task(run_one(i)): i for i in range(passes)}
+    warm = asyncio.Event()
+
+    async def _first() -> T:
+        with concurrency.watch_first_response(warm):
+            try:
+                return await run_one(0)
+            finally:
+                warm.set()
+
+    async def _later(index: int) -> T:
+        if not warm.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(warm.wait(), stagger_seconds)
+        return await run_one(index)
+
+    def _start(index: int) -> Coroutine[Any, Any, T]:
+        if stagger_seconds <= 0 or passes <= 1:
+            return run_one(index)
+        return _first() if index == 0 else _later(index)
+
+    tasks: dict[asyncio.Task[T], int] = {asyncio.create_task(_start(i)): i for i in range(passes)}
     finished: dict[int, PassOutcome[T]] = {}
 
     def _collect(done: set[asyncio.Task[T]]) -> None:
@@ -219,13 +294,18 @@ class VoteResult:
     single_vote_blockers: int = 0
 
 
-def vote(runs: list[list[ReviewComment]], threshold: int) -> VoteResult:
+def vote(
+    runs: list[list[ReviewComment]],
+    threshold: int,
+    prove_min_severity: Severity = Severity.BLOCKER,
+) -> VoteResult:
     """Keep findings reported by at least ``threshold`` of ``runs``.
 
     ``threshold`` is clamped to the passes that landed, so two passes out of
     three landing with threshold 2 need both to agree, and one landing keeps
     everything it found (the single-pass review). Each kept finding carries
-    ``votes``/``vote_passes``. A blocker under the threshold is kept with
+    ``votes``/``vote_passes``. A finding under the threshold at
+    ``prove_min_severity`` or above (a blocker, by default) is kept with
     ``require_proven`` set — see the module docstring.
     """
     passes = len(runs)
@@ -239,9 +319,9 @@ def vote(runs: list[list[ReviewComment]], threshold: int) -> VoteResult:
         votes = cluster_votes(cluster)
         if votes >= needed:
             rep = cluster_representative(cluster)
-        elif any(c.severity >= Severity.BLOCKER for _, c in cluster):
-            blockers = [(i, c) for i, c in cluster if c.severity >= Severity.BLOCKER]
-            rep = cluster_representative(blockers)
+        elif any(c.severity >= prove_min_severity for _, c in cluster):
+            serious = [(i, c) for i, c in cluster if c.severity >= prove_min_severity]
+            rep = cluster_representative(serious)
             rep.require_proven = True
             single_blockers += 1
         else:

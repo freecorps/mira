@@ -19,7 +19,10 @@
     "plans": "With usage_format 'ledger': the subscription's plans, keyed by the id an endpoint's `plan` setting names. Each has a label and its metered windows: {minutes, credits, anchored}. `credits` is the window's allowance in plan credits (USD of usage value times the model's credit_multiplier in models.json); `anchored` windows restart every `minutes` from the subscription's start date when one is configured, and roll otherwise.",
     "plan_reference_models": "With plans: models whose remaining allowance the card restates as USD of that model's usage (credits left divided by its credit_multiplier), for subscriptions that document their limits per model.",
     "stream": "true to read Chat Completions replies as server-sent events, so a reply still arriving is judged by llm.stream_idle_timeout rather than killed at llm.request_timeout. Off for an endpoint not known to stream tool calls.",
-    "echo_reasoning": "true to send an assistant turn's reasoning_content back with the next request of a tool loop, which DeepSeek's thinking mode requires. A 400 naming the field turns it off for that model."
+    "echo_reasoning": "true to send an assistant turn's reasoning_content back with the next request of a tool loop, which DeepSeek's thinking mode requires. A 400 naming the field turns it off for that model.",
+    "json_schema": "false when the endpoint does not take `response_format: json_schema`: structured output then goes straight to tool calling instead of spending a refused request per call.",
+    "max_concurrency": "Requests the endpoint takes at once per key, process-wide (see mira.llm.concurrency). A plan's own `concurrency` wins over it, a stored endpoint's `max_concurrency` and llm.max_concurrent_requests over both. Absent: no limit.",
+    "concurrency_headroom": "Slots of that limit background work (reviews, indexing, the security pass) leaves free for chat and thread replies. 2 by default, at most a quarter of the limit."
   },
 
   "openrouter": {
@@ -72,13 +75,16 @@
     "model_prefix": "strip",
     "stream": true,
     "echo_reasoning": true,
+    "max_concurrency": 10,
+    "concurrency_headroom": 2,
     "reasoning_effort_map": {},
     "usage_format": "ledger",
     "plan_reference_models": ["deepseek-v4.1-flash-eco", "deepseek-v4.1-flash"],
     "plans": {
-      "_comment": "Allowances in plan credits, derived from the per-model limits OpenDesign's billing page lists: Go is $55 of Eco (x0.27) or $30 of Flash (x0.5) per 7 days, both 15 credits, and $18 / $10 per 5 hours, both 5 credits; Plus is $74 / $40, 20 credits. Pro and Max list $90 and $150 of Flash per 7 days.",
+      "_comment": "Allowances in plan credits, derived from the per-model limits OpenDesign's billing page lists: Go is $55 of Eco (x0.27) or $30 of Flash (x0.5) per 7 days, both 15 credits, and $18 / $10 per 5 hours, both 5 credits; Plus is $74 / $40, 20 credits. Pro and Max list $90 and $150 of Flash per 7 days. `concurrency` is the plan's limit on requests in flight per key (a 400 tier_limit_exceeded past it).",
       "go": {
         "label": "Go",
+        "concurrency": 10,
         "windows": [
           { "minutes": 300, "credits": 5.0 },
           { "minutes": 10080, "credits": 15.0, "anchored": true }
@@ -86,14 +92,17 @@
       },
       "plus": {
         "label": "Plus",
+        "concurrency": 20,
         "windows": [{ "minutes": 10080, "credits": 20.0, "anchored": true }]
       },
       "pro": {
         "label": "Pro",
+        "concurrency": 30,
         "windows": [{ "minutes": 10080, "credits": 45.0, "anchored": true }]
       },
       "max": {
         "label": "Max",
+        "concurrency": 50,
         "windows": [{ "minutes": 10080, "credits": 75.0, "anchored": true }]
       }
     }

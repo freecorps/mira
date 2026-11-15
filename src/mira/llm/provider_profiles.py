@@ -62,6 +62,13 @@ DEFAULT_PROFILE: dict = {
     # Send an assistant turn's reasoning back with the next request of a tool
     # loop. DeepSeek's thinking mode requires it; other APIs may refuse it.
     "echo_reasoning": False,
+    # Whether the endpoint takes ``response_format: json_schema``. False sends
+    # structured output straight to tool calling.
+    "json_schema": True,
+    # Requests in flight per key (0: no limit), and the slots of it background
+    # work leaves to chat replies (see ``mira.llm.concurrency``).
+    "max_concurrency": 0,
+    "concurrency_headroom": 2,
 }
 
 

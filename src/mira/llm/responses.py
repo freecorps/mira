@@ -470,6 +470,8 @@ class ResponsesProvider(OpenAICompatibleProvider):
 
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             resp = await self._post(client, body)
+            if self._override_refused(resp, body, _strip_model_prefix(model, self.profile)):
+                resp = await self._post(client, body)
             if (
                 resp.status_code == 400
                 and _asked_for_reasoning(body)

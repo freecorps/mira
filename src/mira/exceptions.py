@@ -50,6 +50,9 @@ class LLMError(MiraError):
         # Seconds the server asked us to wait (Retry-After), when it said so.
         # The retry wait strategy honours it in place of the backoff curve.
         self.retry_after: float | None = None
+        # The endpoint refused the call for too many requests in flight: a
+        # transient refusal that says nothing about the request itself.
+        self.concurrency_limited = False
         super().__init__(self._full)
 
     @property

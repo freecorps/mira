@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import re
 import time
@@ -29,10 +30,11 @@ from mira.core.multipass import (
     pass_seed,
     pass_temperature,
     passes_per_part,
+    reading_order_note,
     run_passes,
-    shuffle_files,
     vote,
     vote_audit,
+    with_reading_order,
 )
 from mira.core.noise_filter import drop_already_posted, filter_noise
 from mira.core.passes import (
@@ -42,6 +44,7 @@ from mira.core.passes import (
     security_review_pass,
     self_critique,
 )
+from mira.core.patch_id import file_patch_ids
 from mira.core.pr_summary import strip_summary_section
 from mira.core.priority import rank_files
 from mira.core.review_instructions import (
@@ -69,6 +72,7 @@ from mira.index.code_graph import BlastRadius, CodeGraph, build_blast_radius, re
 from mira.index.context import SnapshotSourceFetcher, build_code_context, snapshot_budget
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
+from mira.llm import accounting, concurrency
 from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
@@ -107,6 +111,17 @@ ReviewPartResult = tuple[list[ReviewComment], list[KeyIssue], str]
 # Room an agentic part keeps free for its tool output (the executor caps it at
 # 50 KB per part), so optional context never crowds the loop out of its window.
 _AGENTIC_OUTPUT_TOKENS = 13_000
+# How long a part's passes after the first wait for pass 0's first reply to
+# start arriving, which is when its prompt is in the endpoint's cache (see
+# core/multipass.py). The first streamed event follows the prompt's prefill
+# by moments; the cap bounds what a slow or non-streaming endpoint costs.
+_PASS_STAGGER_SECONDS = 20.0
+
+
+def _lookup_effort(config: MiraConfig) -> str | None:
+    """``review.lookup_reasoning_effort`` as the agentic loop takes it."""
+    effort = config.review.lookup_reasoning_effort
+    return None if effort == "inherit" else effort
 
 
 def _build_review_finding(
@@ -479,6 +494,23 @@ def _drop_unanchorable_comments(
 
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git \"?a/.*?\"? \"?b/(.*?)\"?$")
+
+
+def _patches_read(
+    full_diff_text: str, previous: dict[str, str], result: ReviewResult
+) -> dict[str, str]:
+    """``{path: patch id}`` to record as read by this review.
+
+    Every file of the pull request at its current patch — what was not in
+    this round's diff is unchanged since the last one read it — except the
+    files this review left unread (a failed part, a size cap), which keep the
+    patch the last review read, or none: the next round reviews them.
+    """
+    unread = set(result.skipped_paths or [])
+    current = file_patch_ids(full_diff_text)
+    out = {path: pid for path, pid in current.items() if path not in unread}
+    out.update({path: previous[path] for path in unread if path in previous and path in current})
+    return out
 
 
 def _restrict_diff_to_paths(diff_text: str, paths: set[str]) -> str:
@@ -922,7 +954,9 @@ class ReviewEngine:
         pull request into one filter on the dashboard's Logs page rather than a
         timestamp hunt through the output of every review running at once.
         """
-        with log_context() as trace_id:
+        # Background work for the endpoint's concurrency limit: a chat reply
+        # arriving mid-review keeps the slots reviews leave free.
+        with log_context() as trace_id, concurrency.background_lane():
             logger.info("Review starting for %s (trace %s)", pr_url, trace_id)
             started = time.monotonic()
             result = await self._review_pr_traced(pr_url)
@@ -1005,7 +1039,7 @@ class ReviewEngine:
         # it answered; now it runs alongside the diff fetch, the snapshot and
         # the context build, and the review waits for it only where it needs
         # the answer — right before the review prompt is written.
-        thread_task = _asyncio.create_task(_resolve_threads())
+        thread_task = _asyncio.create_task(accounting.staged("threads", _resolve_threads()))
         try:
             diff_text, all_bot_threads = await _asyncio.gather(
                 self.provider.get_pr_diff(pr_info),
@@ -1095,22 +1129,77 @@ class ReviewEngine:
         # Overlap detection keeps the full diff — its fingerprint must cover the
         # whole PR, not just the latest commits.
         full_diff_text = diff_text
-        if review_round >= 2 and pr_info.head_sha:
+        last_sha = ""
+        reviewed_patches: dict[str, str] = {}
+        if pr_info.head_sha and not is_review_rest and not self.full_review:
             try:
                 from mira.dashboard.api import _app_db
 
-                last_sha = _app_db.get_last_reviewed_sha(
+                recorded_sha = _app_db.get_last_reviewed_sha(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
                     platform=pr_info.platform,
                 )
+                last_sha = recorded_sha if isinstance(recorded_sha, str) else ""
+                recorded = _app_db.get_reviewed_patches(
+                    pr_info.owner,
+                    pr_info.repo,
+                    pr_info.number,
+                    platform=pr_info.platform,
+                )
+                reviewed_patches = recorded if isinstance(recorded, dict) else {}
+            except Exception as exc:
+                logger.debug("Could not read the last review of this PR: %s", exc)
+        if review_round == 1 and last_sha and last_sha != pr_info.head_sha:
+            # A review is on record for an earlier head. Bot threads were the
+            # only sign of a follow-up before, so a pull request Mira found
+            # clean was reviewed in full again on every push.
+            review_round = 2
+        # Files whose own change is what the last review read (same patch id):
+        # nothing in them to review again, however the branch got here.
+        changed_paths: set[str] | None = None
+        if reviewed_patches:
+            current_patches = file_patch_ids(full_diff_text)
+            changed_paths = {
+                p for p, pid in current_patches.items() if reviewed_patches.get(p) != pid
+            }
+        if review_round >= 2 and pr_info.head_sha:
+            try:
                 if last_sha and last_sha != pr_info.head_sha:
-                    incremental = await self.provider.get_compare_diff(
-                        pr_info,
-                        last_sha,
-                        pr_info.head_sha,
-                    )
+                    try:
+                        incremental = await self.provider.get_compare_diff(
+                            pr_info,
+                            last_sha,
+                            pr_info.head_sha,
+                        )
+                    except Exception as exc:
+                        if changed_paths is None:
+                            raise
+                        # The last reviewed commit is gone (a force-push) or
+                        # the compare failed: the files whose patch moved are
+                        # still known, so review those rather than everything.
+                        logger.info(
+                            "Round %d: compare from %s failed (%s); reviewing the %d file(s) "
+                            "whose change moved since the last review",
+                            review_round,
+                            last_sha[:8],
+                            exc,
+                            len(changed_paths),
+                        )
+                        incremental = full_diff_text
+                    if incremental.strip() and changed_paths is not None:
+                        narrowed = _restrict_diff_to_paths(incremental, changed_paths)
+                        if len(narrowed) != len(incremental):
+                            logger.info(
+                                "Round %d: %d file(s) changed since the last review by patch id; "
+                                "kept those of the compare diff (%d -> %d chars)",
+                                review_round,
+                                len(changed_paths),
+                                len(incremental),
+                                len(narrowed),
+                            )
+                        incremental = narrowed
                     if incremental.strip():
                         # A merge commit's compare diff includes everything the
                         # base branch brought in — not this PR's code. Review
@@ -1138,7 +1227,8 @@ class ReviewEngine:
                         diff_text = incremental
                     else:
                         logger.info(
-                            "Round %d: no new commits since %s on PR %s, skipping review",
+                            "Round %d: no new commits since %s on PR %s (or none that change "
+                            "the PR's own diff), skipping review",
                             review_round,
                             last_sha[:8],
                             pr_info.url,
@@ -1617,6 +1707,13 @@ class ReviewEngine:
                     pr_info.head_sha,
                     platform=pr_info.platform,
                 )
+                _app_db.set_reviewed_patches(
+                    pr_info.owner,
+                    pr_info.repo,
+                    pr_info.number,
+                    _patches_read(full_diff_text, reviewed_patches, result),
+                    platform=pr_info.platform,
+                )
             except Exception as exc:
                 logger.debug("Failed to record last reviewed SHA: %s", exc)
 
@@ -1962,9 +2059,10 @@ class ReviewEngine:
         self._pr_info = repo_scope
         # The whole diff is all there is here; verification reads it from this.
         self.last_full_diff = diff_text
-        return await self._review_diff_internal(
-            diff_text, pr_title=title, pr_description=description
-        )
+        with concurrency.background_lane():
+            return await self._review_diff_internal(
+                diff_text, pr_title=title, pr_description=description
+            )
 
     async def _review_diff_internal(
         self,
@@ -2309,7 +2407,9 @@ class ReviewEngine:
                 return ""
 
         # Fire walkthrough early so review_pr can post it before chunk review finishes.
-        walkthrough_task = _asyncio.create_task(_generate_walkthrough())
+        walkthrough_task = _asyncio.create_task(
+            accounting.staged("walkthrough", _generate_walkthrough())
+        )
 
         # `_walkthrough_notify_task` exposed on self so review_pr can await it
         # before its own final write — otherwise the in-progress update can land
@@ -2548,6 +2648,15 @@ class ReviewEngine:
             }
         )
 
+        def _soft_deadline(deadline_at: float | None) -> float | None:
+            """When a part's passes stop being waited for: 90% into its budget.
+
+            The last tenth is left to the vote: a pass that lands after it
+            would only race the hard deadline for the part.
+            """
+            budget = self.config.review.part_deadline_seconds
+            return deadline_at - budget * 0.1 if deadline_at is not None and budget else None
+
         async def _voted_passes(
             idx: int,
             one_pass: Callable[
@@ -2560,19 +2669,23 @@ class ReviewEngine:
             Passes still running shortly before the part's deadline are left
             out of the vote rather than taking the whole part down with them.
             """
-            budget = self.config.review.part_deadline_seconds
-            # The last tenth of the budget is left to the vote: a pass that
-            # lands after it would only race the hard deadline for the part.
-            soft = deadline_at - budget * 0.1 if deadline_at is not None and budget else None
-            run = await run_passes(one_pass, part_passes, soft_deadline=soft)
+            soft = _soft_deadline(deadline_at)
+            run = await run_passes(
+                one_pass, part_passes, soft_deadline=soft, stagger_seconds=_PASS_STAGGER_SECONDS
+            )
             runs = [o.result[0] for o in run.landed if o.result is not None]
             threshold = self.config.review.pass_vote_threshold
-            voted = vote(runs, threshold)
+            prove_min = (
+                Severity.WARNING
+                if self.config.review.pass_vote_prove_min_severity == "warning"
+                else Severity.BLOCKER
+            )
+            voted = vote(runs, threshold, prove_min)
             drafted = sum(len(r) for r in runs)
             audit.append(vote_audit(idx, run, threshold, voted, drafted))
             logger.info(
                 "Review part %d: %d of %d pass(es) landed, %d finding(s) -> %d kept by vote "
-                "(%d single-vote blocker(s) left to the critic)",
+                "(%d single-vote finding(s) left to the critic)",
                 idx + 1,
                 len(runs),
                 part_passes,
@@ -2590,221 +2703,236 @@ class ReviewEngine:
             group_notes: str = "",
             deadline_at: float | None = None,
         ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-            async with semaphore:
-                logger.info(
-                    "Reviewing chunk %d/%d (%d files)",
-                    idx + 1,
-                    len(chunks),
-                    len(chunk.files),
+            logger.info(
+                "Reviewing chunk %d/%d (%d files)",
+                idx + 1,
+                len(chunks),
+                len(chunk.files),
+            )
+            chunk_history = {
+                f.path: file_history[f.path] for f in chunk.files if f.path in file_history
+            }
+
+            part_instructions = repo_instructions.render(f.path for f in chunk.files)
+
+            def _messages(
+                history: dict,
+                part: str = "",
+                enclosing: str = "",
+                files: list | None = None,
+            ) -> list[dict[str, str]]:
+                shared = "\n\n".join(p for p in (code_context_block, part) if p)
+                return build_review_prompt(
+                    files=chunk.files if files is None else files,
+                    config=self.config,
+                    pr_title=pr_title,
+                    pr_description=pr_description,
+                    existing_comments=base_existing or None,
+                    code_context=shared + enclosing + group_notes,
+                    learned_rules=learned_rules or None,
+                    learned_checks=learned_checks or None,
+                    custom_rules=custom_rules or None,
+                    file_history=history or None,
+                    review_round=review_round,
+                    resolved_threads=resolved_threads,
+                    team_conventions=team_conventions,
+                    dependency_updates=dependency_context,
+                    repo_instructions=part_instructions,
                 )
-                chunk_history = {
-                    f.path: file_history[f.path] for f in chunk.files if f.path in file_history
-                }
 
-                part_instructions = repo_instructions.render(f.path for f in chunk.files)
+            def _size(msgs: list[dict[str, str]]) -> int:
+                return sum(self.llm.count_tokens(m["content"]) for m in msgs)
 
-                def _messages(
-                    history: dict,
-                    part: str = "",
-                    enclosing: str = "",
-                    files: list | None = None,
-                ) -> list[dict[str, str]]:
-                    shared = "\n\n".join(p for p in (code_context_block, part) if p)
-                    return build_review_prompt(
-                        files=chunk.files if files is None else files,
-                        config=self.config,
-                        pr_title=pr_title,
-                        pr_description=pr_description,
-                        existing_comments=base_existing or None,
-                        code_context=shared + enclosing + group_notes,
-                        learned_rules=learned_rules or None,
-                        learned_checks=learned_checks or None,
-                        custom_rules=custom_rules or None,
-                        file_history=history or None,
-                        review_round=review_round,
-                        resolved_threads=resolved_threads,
-                        team_conventions=team_conventions,
-                        dependency_updates=dependency_context,
-                        repo_instructions=part_instructions,
-                    )
-
-                def _size(msgs: list[dict[str, str]]) -> int:
-                    return sum(self.llm.count_tokens(m["content"]) for m in msgs)
-
-                part = await _part_context(chunk.files)
-                if verify_session is not None:
-                    # Tool output on this part's changed lines; dropped with the
-                    # part context below when the prompt has no room for it.
-                    tool_output = await verify_session.prompt_block([f.path for f in chunk.files])
-                    part = "\n\n".join(p for p in (tool_output, part) if p)
+            part = await _part_context(chunk.files)
+            if verify_session is not None:
+                # Tool output on this part's changed lines; dropped with the
+                # part context below when the prompt has no room for it.
+                tool_output = await verify_session.prompt_block([f.path for f in chunk.files])
+                part = "\n\n".join(p for p in (tool_output, part) if p)
+            messages = _messages(chunk_history, part)
+            prompt_limit = self.config.llm.max_context_tokens - self._output_reserve()
+            if _size(messages) > prompt_limit:
+                # Optional commit history must not displace owned diff hunks.
+                chunk_history = {}
                 messages = _messages(chunk_history, part)
-                prompt_limit = self.config.llm.max_context_tokens - self._output_reserve()
-                if _size(messages) > prompt_limit:
-                    # Optional commit history must not displace owned diff hunks.
-                    chunk_history = {}
-                    messages = _messages(chunk_history, part)
-                if _size(messages) > prompt_limit:
-                    # Nor may the part's code context.
-                    part = ""
-                    messages = _messages(chunk_history)
-                if _size(messages) > prompt_limit and part_instructions:
-                    # Nor, last of all, the repository's instructions.
-                    logger.warning("Review part %d left out its review instructions", idx + 1)
-                    part_instructions = ""
-                    messages = _messages(chunk_history)
-                if _size(messages) > prompt_limit:
-                    raise ValueError("Review prompt exceeds the configured context window")
-                # The changed functions in full, in whatever room the prompt has
-                # left: optional, so it only ever takes space nothing else needs.
-                # Leave the agentic loop room for its tool output, too.
-                tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
-                room = min(enclosing_budget, prompt_limit - _size(messages) - 1000 - tool_room)
-                enclosing = ""
-                if room > 500 and source is not None:
-                    enclosing = await build_enclosing_context(chunk.files, source, room * 4)
-                    if enclosing:
-                        messages = _messages(chunk_history, part, enclosing)
-                # Callers of the symbols this part changes, likewise optional.
-                if blast_radius_task is not None:
-                    room = min(
-                        graph_config.callers_tokens,
-                        prompt_limit - _size(messages) - 1000 - tool_room,
-                    )
-                    if room > 200:
-                        radius = await blast_radius_task
-                        callers = render_blast_radius(
-                            radius, [f.path for f in chunk.files], room * 4
-                        )
-                        if callers:
-                            enclosing += callers
-                            messages = _messages(chunk_history, part, enclosing)
-
-                def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-                    parsed = parse_llm_response(raw)
-                    return (
-                        convert_to_review_comments(
-                            parsed,
-                            {f.path for f in chunk.files},
-                            diff_files=chunk.files,
-                        ),
-                        [
-                            KeyIssue(issue=ki.issue, path=ki.path, line=ki.line)
-                            for ki in parsed.key_issues
-                        ],
-                        parsed.summary or "",
-                    )
-
-                use_agentic = (
-                    self.config.review.agentic_tools and self._agentic_source_fetcher is not None
+            if _size(messages) > prompt_limit:
+                # Nor may the part's code context.
+                part = ""
+                messages = _messages(chunk_history)
+            if _size(messages) > prompt_limit and part_instructions:
+                # Nor, last of all, the repository's instructions.
+                logger.warning("Review part %d left out its review instructions", idx + 1)
+                part_instructions = ""
+                messages = _messages(chunk_history)
+            if _size(messages) > prompt_limit:
+                raise ValueError("Review prompt exceeds the configured context window")
+            # The changed functions in full, in whatever room the prompt has
+            # left: optional, so it only ever takes space nothing else needs.
+            # Leave the agentic loop room for its tool output, too.
+            tool_room = _AGENTIC_OUTPUT_TOKENS if self._agentic_source_fetcher else 0
+            room = min(enclosing_budget, prompt_limit - _size(messages) - 1000 - tool_room)
+            enclosing = ""
+            if room > 500 and source is not None:
+                enclosing = await build_enclosing_context(chunk.files, source, room * 4)
+                if enclosing:
+                    messages = _messages(chunk_history, part, enclosing)
+            # Callers of the symbols this part changes, likewise optional.
+            if blast_radius_task is not None:
+                room = min(
+                    graph_config.callers_tokens,
+                    prompt_limit - _size(messages) - 1000 - tool_room,
                 )
-                chunk_key = "\n".join(f.path for f in chunk.files)
+                if room > 200:
+                    radius = await blast_radius_task
+                    callers = render_blast_radius(radius, [f.path for f in chunk.files], room * 4)
+                    if callers:
+                        enclosing += callers
+                        messages = _messages(chunk_history, part, enclosing)
 
-                async def _one_pass(
-                    pass_idx: int,
-                ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
-                    """One reading of the part; pass 0 is the original order."""
-                    started = time.monotonic()
-                    pass_messages = messages
-                    if pass_idx:
-                        order = shuffle_files(chunk.files, pass_seed(chunk_key, pass_idx))
-                        pass_messages = _messages(chunk_history, part, enclosing, files=order)
-                    temperature = pass_temperature(
-                        self.config.llm.temperature,
-                        self.config.review.pass_temperature_spread,
-                        pass_idx,
-                        part_passes,
+            def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+                parsed = parse_llm_response(raw)
+                return (
+                    convert_to_review_comments(
+                        parsed,
+                        {f.path for f in chunk.files},
+                        diff_files=chunk.files,
+                    ),
+                    [
+                        KeyIssue(issue=ki.issue, path=ki.path, line=ki.line)
+                        for ki in parsed.key_issues
+                    ],
+                    parsed.summary or "",
+                )
+
+            use_agentic = (
+                self.config.review.agentic_tools and self._agentic_source_fetcher is not None
+            )
+            chunk_key = "\n".join(f.path for f in chunk.files)
+
+            async def _one_pass(
+                pass_idx: int,
+            ) -> tuple[list[ReviewComment], list[KeyIssue], str]:
+                """One reading of the part; pass 0 is the original order."""
+                started = time.monotonic()
+                # Every pass sends the part's prompt byte for byte, so the
+                # prompt cache serves passes 1… what pass 0 paid for; the
+                # order a later pass reads in is a note at the end.
+                pass_messages = with_reading_order(
+                    messages,
+                    reading_order_note(chunk.files, pass_seed(chunk_key, pass_idx), pass_idx),
+                )
+                temperature = pass_temperature(
+                    self.config.llm.temperature,
+                    self.config.review.pass_temperature_spread,
+                    pass_idx,
+                    part_passes,
+                )
+                raw_response = ""
+                if use_agentic:
+                    from mira.llm.agentic_tools import AgenticToolExecutor
+
+                    executor = AgenticToolExecutor(
+                        source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                        repo_tree=list(self._agentic_repo_tree),
+                        graph_tools=review_graph is not None,
+                        code_graph=review_graph,
+                        index_search=self._index_search(),
                     )
-                    raw_response = ""
-                    if use_agentic:
-                        from mira.llm.agentic_tools import AgenticToolExecutor
-
-                        executor = AgenticToolExecutor(
-                            source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
-                            repo_tree=list(self._agentic_repo_tree),
-                            graph_tools=review_graph is not None,
-                            code_graph=review_graph,
-                            index_search=self._index_search(),
-                        )
-                        budget = self.config.review.part_deadline_seconds
-                        raw_response = await agentic_review_loop(
-                            self.llm,
-                            pass_messages,
-                            executor,
-                            submit_by=time.monotonic() + budget * 0.6 if budget else None,
-                            temperature=temperature,
-                        )
-                        entry: dict = {"stage": "agentic", "chunk": idx, "calls": executor.call_log}
-                        if part_passes > 1:
-                            entry["pass"] = pass_idx
-                        audit.append(entry)
-                    if not raw_response:
-                        raw_response = await (
-                            self.llm.review(pass_messages)
-                            if temperature is None
-                            else self.llm.review(pass_messages, temperature=temperature)
-                        )
-                    parsed = _parse(raw_response)
+                    budget = self.config.review.part_deadline_seconds
+                    # Measured from the part's own start, which a pass held
+                    # back for the prompt cache did not move: the passes of a
+                    # part share one budget. A pass stops where the part stops
+                    # waiting for it — the vote's cut-off with several passes,
+                    # the part's deadline with one.
+                    submit_by = (
+                        deadline_at - budget * 0.4
+                        if deadline_at is not None and budget
+                        else time.monotonic() + budget * 0.6
+                        if budget
+                        else None
+                    )
+                    raw_response = await agentic_review_loop(
+                        self.llm,
+                        pass_messages,
+                        executor,
+                        max_hops=self.config.review.agentic_max_hops,
+                        submit_by=submit_by,
+                        temperature=temperature,
+                        stop_by=_soft_deadline(deadline_at) if part_passes > 1 else deadline_at,
+                        lookup_reasoning_effort=_lookup_effort(self.config),
+                    )
+                    entry: dict = {"stage": "agentic", "chunk": idx, "calls": executor.call_log}
                     if part_passes > 1:
-                        logger.info(
-                            "Review part %d pass %d/%d: %d finding(s) in %.1fs",
-                            idx + 1,
-                            pass_idx + 1,
-                            part_passes,
-                            len(parsed[0]),
-                            time.monotonic() - started,
-                        )
-                    return parsed
-
-                if part_passes > 1:
-                    return await _voted_passes(idx, _one_pass, deadline_at)
-                comments, key_issues, summary_text = await _one_pass(0)
-
-                # Ensemble: fire the extra runs in parallel and keep
-                # majority-vote findings. The agentic loop (if any) only
-                # runs once; extras sample the plain review path.
-                n_runs = self.config.review.ensemble_runs
-                if n_runs > 1:
-                    extra_raws = await _asyncio.gather(
-                        *[
-                            self.llm.review(
-                                messages,
-                                temperature=self.config.review.ensemble_temperature,
-                            )
-                            for _ in range(n_runs - 1)
-                        ],
-                        return_exceptions=True,
+                        entry["pass"] = pass_idx
+                    audit.append(entry)
+                if not raw_response:
+                    raw_response = await (
+                        self.llm.review(pass_messages)
+                        if temperature is None
+                        else self.llm.review(pass_messages, temperature=temperature)
                     )
-                    runs = [comments]
-                    for raw in extra_raws:
-                        if isinstance(raw, BaseException):
-                            logger.warning("Ensemble run failed: %s", raw)
-                            continue
-                        try:
-                            extra_comments, _, _ = _parse(raw)
-                            runs.append(extra_comments)
-                        except ResponseParseError as exc:
-                            logger.warning("Ensemble run failed to parse: %s", exc)
-                    if len(runs) > 1:
-                        before = sum(len(r) for r in runs)
-                        comments = merge_ensemble_runs(runs)
-                        audit.append(
-                            {
-                                "stage": "ensemble_vote",
-                                "chunk": idx,
-                                "runs": len(runs),
-                                "drafted": before,
-                                "kept": len(comments),
-                            }
-                        )
-                        logger.info(
-                            "Ensemble chunk %d: %d comments across %d runs -> %d consensus",
-                            idx + 1,
-                            before,
-                            len(runs),
-                            len(comments),
-                        )
+                parsed = _parse(raw_response)
+                if part_passes > 1:
+                    logger.info(
+                        "Review part %d pass %d/%d: %d finding(s) in %.1fs",
+                        idx + 1,
+                        pass_idx + 1,
+                        part_passes,
+                        len(parsed[0]),
+                        time.monotonic() - started,
+                    )
+                return parsed
 
-                return comments, key_issues, summary_text
+            if part_passes > 1:
+                return await _voted_passes(idx, _one_pass, deadline_at)
+            comments, key_issues, summary_text = await _one_pass(0)
+
+            # Ensemble: fire the extra runs in parallel and keep
+            # majority-vote findings. The agentic loop (if any) only
+            # runs once; extras sample the plain review path.
+            n_runs = self.config.review.ensemble_runs
+            if n_runs > 1:
+                extra_raws = await _asyncio.gather(
+                    *[
+                        self.llm.review(
+                            messages,
+                            temperature=self.config.review.ensemble_temperature,
+                        )
+                        for _ in range(n_runs - 1)
+                    ],
+                    return_exceptions=True,
+                )
+                runs = [comments]
+                for raw in extra_raws:
+                    if isinstance(raw, BaseException):
+                        logger.warning("Ensemble run failed: %s", raw)
+                        continue
+                    try:
+                        extra_comments, _, _ = _parse(raw)
+                        runs.append(extra_comments)
+                    except ResponseParseError as exc:
+                        logger.warning("Ensemble run failed to parse: %s", exc)
+                if len(runs) > 1:
+                    before = sum(len(r) for r in runs)
+                    comments = merge_ensemble_runs(runs)
+                    audit.append(
+                        {
+                            "stage": "ensemble_vote",
+                            "chunk": idx,
+                            "runs": len(runs),
+                            "drafted": before,
+                            "kept": len(comments),
+                        }
+                    )
+                    logger.info(
+                        "Ensemble chunk %d: %d comments across %d runs -> %d consensus",
+                        idx + 1,
+                        before,
+                        len(runs),
+                        len(comments),
+                    )
+
+            return comments, key_issues, summary_text
 
         def _bounded_group_text(value: str) -> str:
             lo, hi = 0, len(value)
@@ -2826,9 +2954,13 @@ class ReviewEngine:
             budget = self.config.review.part_deadline_seconds
             for attempt in range(self.config.review.chunk_retries + 1):
                 try:
-                    deadline_at = time.monotonic() + budget if budget else None
-                    review = _review_chunk(idx, chunk, context, deadline_at)
-                    return await (asyncio.wait_for(review, budget) if budget else review)
+                    # The slot first, then the clock: a part queued behind
+                    # `max_concurrent_chunks` others used to spend its budget
+                    # waiting, and start its passes with none of it left.
+                    async with semaphore:
+                        deadline_at = time.monotonic() + budget if budget else None
+                        review = _review_chunk(idx, chunk, context, deadline_at)
+                        return await (asyncio.wait_for(review, budget) if budget else review)
                 except Exception as exc:
                     if isinstance(exc, TimeoutError) and not str(exc):
                         exc = TimeoutError(f"review part ran past its {budget}s deadline")
@@ -2971,22 +3103,31 @@ class ReviewEngine:
                 pr_description=pr_description,
                 learned_checks=learned_checks or None,
                 make_executor=make_executor,
-                agentic_loop=agentic_review_loop,
+                agentic_loop=functools.partial(
+                    agentic_review_loop,
+                    max_hops=self.config.review.agentic_max_hops,
+                    lookup_reasoning_effort=_lookup_effort(self.config),
+                ),
                 deadline_seconds=self.config.review.system_pass_deadline_seconds,
                 audit=audit,
             )
 
-        review_task = _asyncio.create_task(_run_review_groups())
+        review_task = _asyncio.create_task(accounting.staged("pass", _run_review_groups()))
         system_task = _asyncio.create_task(
-            _system_pass() if run_system_pass else _asyncio.sleep(0, result=[])
+            accounting.staged("system", _system_pass())
+            if run_system_pass
+            else _asyncio.sleep(0, result=[])
         )
         security_task = _asyncio.create_task(
-            security_review_pass(
-                self.llm,
-                filtered,
-                _security_relevant_files(filtered),
-                pr_title,
-                security_llm=self.security_llm,
+            accounting.staged(
+                "security",
+                security_review_pass(
+                    self.llm,
+                    filtered,
+                    _security_relevant_files(filtered),
+                    pr_title,
+                    security_llm=self.security_llm,
+                ),
             )
             if self.config.review.security_pass
             else _asyncio.sleep(0, result=[])
@@ -3016,12 +3157,15 @@ class ReviewEngine:
                     logger.debug("Manifest package lookup failed: %s", exc)
                 pr_source_fetcher = source
         dependency_task = _asyncio.create_task(
-            dependency_review_pass(
-                self.llm,
-                manifest_files,
-                existing_packages,
-                pr_title,
-                indexing_llm=self.indexing_llm,
+            accounting.staged(
+                "dependency",
+                dependency_review_pass(
+                    self.llm,
+                    manifest_files,
+                    existing_packages,
+                    pr_title,
+                    indexing_llm=self.indexing_llm,
+                ),
             )
             if manifest_files
             else _asyncio.sleep(0, result=[])
@@ -3134,26 +3278,27 @@ class ReviewEngine:
             _selected = {f.path for f in filtered}
             critique_files = filtered + [f for f in manifest_candidates if f.path not in _selected]
             try:
-                final_comments = await self_critique(
-                    self.llm,
-                    final_comments,
-                    learned_rules=learned_rules or None,
-                    # The repository's instructions for the reviewed files are
-                    # team preferences too: a finding enforcing one is not a nit.
-                    custom_rules=(
-                        [*custom_rules, *repo_instructions.as_rules(selected_paths)] or None
-                    ),
-                    indexing_llm=self.indexing_llm,
-                    diff_files=critique_files,
-                    audit=audit,
-                    source_fetcher=source,
-                    plausible_min_confidence=self.config.review.critique_plausible_min_confidence,
-                    critic_llm=(
-                        self.llm
-                        if self.config.review.critique_model == "review"
-                        else self.indexing_llm
-                    ),
-                )
+                with accounting.stage("critique"):
+                    final_comments = await self_critique(
+                        self.llm,
+                        final_comments,
+                        learned_rules=learned_rules or None,
+                        # The repository's instructions for the reviewed files are
+                        # team preferences too: a finding enforcing one is not a nit.
+                        custom_rules=(
+                            [*custom_rules, *repo_instructions.as_rules(selected_paths)] or None
+                        ),
+                        indexing_llm=self.indexing_llm,
+                        diff_files=critique_files,
+                        audit=audit,
+                        source_fetcher=source,
+                        plausible_min_confidence=self.config.review.critique_plausible_min_confidence,
+                        critic_llm=(
+                            self.llm
+                            if self.config.review.critique_model == "review"
+                            else self.indexing_llm
+                        ),
+                    )
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
         # A blocker too few passes voted for stands only on a `proven` grade;
@@ -3161,7 +3306,11 @@ class ReviewEngine:
         final_comments, unproven = drop_unproven(final_comments)
         for c in unproven:
             audit.append(
-                _audit_drop(c, "pass_vote", f"blocker reported by {c.votes} pass(es), not proven")
+                _audit_drop(
+                    c,
+                    "pass_vote",
+                    f"{c.severity.name.lower()} reported by {c.votes} pass(es), not proven",
+                )
             )
         _mark("critique")
 
@@ -3206,17 +3355,18 @@ class ReviewEngine:
             # Regenerate from the FINAL filed outputs so summary prose can't
             # claim issues that were dropped by the filter/critique passes.
             try:
-                summary = await regenerate_summary(
-                    self.llm,
-                    # Overflow too: it is listed in the walkthrough, so the
-                    # summary may speak of it without claiming a dropped issue.
-                    [*final_comments, *overflow_comments],
-                    all_key_issues,
-                    pr_title,
-                    pr_description,
-                    fallback=original_summary,
-                    indexing_llm=self.indexing_llm,
-                )
+                with accounting.stage("summary"):
+                    summary = await regenerate_summary(
+                        self.llm,
+                        # Overflow too: it is listed in the walkthrough, so the
+                        # summary may speak of it without claiming a dropped issue.
+                        [*final_comments, *overflow_comments],
+                        all_key_issues,
+                        pr_title,
+                        pr_description,
+                        fallback=original_summary,
+                        indexing_llm=self.indexing_llm,
+                    )
             except Exception as exc:
                 logger.warning("Summary regeneration failed, using original: %s", exc)
                 summary = original_summary or "No issues found."

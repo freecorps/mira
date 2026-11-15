@@ -89,7 +89,14 @@ class FakeGitHub:
 
 
 def _config(**queue: Any) -> MiraConfig:
-    settings = {"max_concurrent_reviews": 2, "settle_seconds": 0.0, "reconcile_on_boot": True}
+    settings = {
+        "max_concurrent_reviews": 2,
+        "settle_seconds": 0.0,
+        # Most of these tests push and expect the review at once; the push
+        # debounce has tests of its own.
+        "push_quiet_seconds": 0.0,
+        "reconcile_on_boot": True,
+    }
     settings.update(queue)
     return MiraConfig(review=ReviewConfig(queue=ReviewQueueConfig(**settings)))
 
@@ -358,6 +365,40 @@ async def test_two_pushes_before_the_review_starts_run_one_review_on_the_newer_h
     assert platform.checks[(7, "second")] == ("success", "No findings")
 
 
+async def test_a_push_waits_for_the_branch_to_go_quiet(db: AppDatabase) -> None:
+    clock = Clock()
+    platform = FakeGitHub()
+    queue = _queue(db, platform, clock, push_quiet_seconds=90.0)
+    queue.enqueue(_request(7, "first"))
+    await _tick(queue)
+    assert platform.started == []
+
+    clock.now += 60
+    queue.enqueue(_request(7, "second"))
+    clock.now += 60
+    await _tick(queue)
+    # Sixty seconds after the second push: still inside its quiet period,
+    # which the push restarted.
+    assert platform.started == []
+
+    clock.now += 31
+    await _drain(queue, db)
+    assert platform.started == [(7, "second")]
+    assert platform.checks[(7, "first")] == ("neutral", "Superseded by a newer push")
+
+
+async def test_the_quiet_period_holds_only_pushes(db: AppDatabase) -> None:
+    clock = Clock()
+    platform = FakeGitHub()
+    queue = _queue(db, platform, clock, push_quiet_seconds=90.0)
+    queue.enqueue(_request(7, "opened", reason="opened"))
+    queue.enqueue(_request(8, "pushed"))
+    await _tick(queue)
+    # A newly opened pull request is reviewed at once, and the push to
+    # another one in the same repository does not hold it back.
+    assert platform.started == [(7, "opened")]
+
+
 async def test_a_push_during_a_review_cancels_it_and_reviews_the_newer_head(
     db: AppDatabase,
 ) -> None:
@@ -580,7 +621,7 @@ async def test_nothing_is_published_with_the_status_off(db: AppDatabase) -> None
     config = MiraConfig(
         review=ReviewConfig(
             status=ReviewStatusConfig(enabled=False),
-            queue=ReviewQueueConfig(settle_seconds=5.0),
+            queue=ReviewQueueConfig(settle_seconds=5.0, push_quiet_seconds=0.0),
         )
     )
     queue = ReviewQueue(db, {"github": platform}, config=lambda: config, clock=clock)

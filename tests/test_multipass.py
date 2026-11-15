@@ -75,6 +75,11 @@ def diff(paths, lines=12):
 
 def engine_config(**review) -> MiraConfig:
     cfg = MiraConfig()
+    # The mechanics these tests pin down were written for three passes, a
+    # 30-line threshold and the old vote; the defaults moved (see config.py).
+    cfg.review.passes = 3
+    cfg.review.multipass_min_changed_lines = 30
+    cfg.review.pass_vote_prove_min_severity = "blocker"
     cfg.review.walkthrough = False
     cfg.review.security_pass = False
     cfg.review.dependency_overlap = False
@@ -397,9 +402,14 @@ async def test_engine_votes_across_shuffled_passes():
     seen_orders: list[list[str]] = []
     temperatures: list[float | None] = []
 
+    prompts: list[str] = []
+
     async def review(messages, temperature=None):
         content = messages[-1]["content"]
-        seen_orders.append(sorted(paths, key=lambda p: content.index(f"### `{p}`")))
+        diff_part, _, note = content.partition("## Reading order for this pass")
+        prompts.append(messages[0]["content"] + diff_part.rstrip())
+        key = (lambda p: note.index(f"`{p}`")) if note else (lambda p: content.index(f"### `{p}`"))
+        seen_orders.append(sorted(paths, key=key))
         temperatures.append(temperature)
         recurring = comment_json("src/a.py", 4, "Value read before it is assigned")
         if temperature is None:
@@ -417,10 +427,13 @@ async def test_engine_votes_across_shuffled_passes():
 
     assert model.review.await_count == 3
     assert sorted(t or 0 for t in temperatures) == pytest.approx([0, 0.35, 0.5])
-    # Pass 0 reads the part as chunked; the others in their own seeded orders.
+    # Pass 0 reads the part as chunked; the others in their own seeded orders,
+    # told in a note after a prompt that is the same for every pass — the
+    # prefix the endpoint's cache serves the later passes.
     by_temperature = dict(zip(temperatures, seen_orders, strict=True))
     assert by_temperature[None] == paths
     assert by_temperature[0.35] != paths and by_temperature[0.5] != paths
+    assert len(set(prompts)) == 1
     titles = {c.title: c for c in result.comments}
     # Reported by all three passes: kept, with its votes on the finding.
     assert titles["Value read before it is assigned"].votes == 3

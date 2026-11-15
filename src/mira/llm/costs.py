@@ -19,6 +19,29 @@ _DAY = 86400.0
 _MIN_SPAN_DAYS = 1.0
 
 
+# The figures a breakdown row sums straight from the ledger (credits are
+# summed scaled by each endpoint's calibration, apart).
+_SUMMED = (
+    "calls",
+    "prompt_tokens",
+    "cached_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "cost_usd",
+    "unpriced_calls",
+)
+
+
+def _blank_totals() -> dict[str, Any]:
+    return dict.fromkeys(_SUMMED, 0) | {"cost_usd": 0.0, "credits": 0.0}
+
+
+def _add(slot: dict[str, Any], row: dict[str, Any], scale: float) -> None:
+    for field in _SUMMED:
+        slot[field] += row[field]
+    slot["credits"] += row["credits"] * scale
+
+
 def _labels(db: Any, config: Any) -> dict[str, tuple[str, float]]:
     """``{endpoint id: (label, cost scale)}`` for every endpoint the ledger names."""
     from mira.llm import endpoints, key_providers
@@ -59,9 +82,23 @@ def report(db: Any, *, days: int, config: Any = None, now: float | None = None) 
     labels = _labels(db, config)
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    # The same calls cut by what they were for, and by which step of a review
+    # made them, so a week can be compared with the last one stage by stage.
+    by_purpose: dict[str, dict[str, Any]] = {}
+    by_stage: dict[tuple[str, str], dict[str, Any]] = {}
     for row in raw:
+        purpose = row["purpose"] or "other"
+        stage = row.get("stage") or ""
         key = (row["endpoint"], row["model"])
         label, scale = _endpoint_label(row["endpoint"], labels)
+        _add(by_purpose.setdefault(purpose, {"purpose": purpose, **_blank_totals()}), row, scale)
+        _add(
+            by_stage.setdefault(
+                (purpose, stage), {"purpose": purpose, "stage": stage or purpose, **_blank_totals()}
+            ),
+            row,
+            scale,
+        )
         entry = grouped.get(key)
         if entry is None:
             info = registry.get(row["model"], row["provider"] or None) or {}
@@ -94,7 +131,6 @@ def report(db: Any, *, days: int, config: Any = None, now: float | None = None) 
         ):
             entry[field] += row[field]
         entry["credits"] += row["credits"] * scale
-        purpose = row["purpose"] or "other"
         entry["purposes"][purpose] = entry["purposes"].get(purpose, 0) + row["calls"]
         entry["first_at"] = min(entry["first_at"], row["first_at"])
         entry["last_at"] = max(entry["last_at"], row["last_at"])
@@ -130,12 +166,27 @@ def report(db: Any, *, days: int, config: Any = None, now: float | None = None) 
             total[field] += row[field]
     total = finish({**total, "purposes": {}})
     total.pop("purposes", None)
+
+    def split(table: dict[Any, dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        for slot in table.values():
+            prompt = slot["prompt_tokens"]
+            slot["cache_hit_rate"] = round(slot["cached_tokens"] / prompt, 4) if prompt else 0.0
+            slot["cost_usd"] = round(slot["cost_usd"], 6)
+            slot["credits"] = round(slot["credits"], 6)
+            share = slot["cost_usd"] / total["cost_usd"] if total["cost_usd"] else 0.0
+            slot["cost_share"] = round(share, 4)
+            out.append(slot)
+        return sorted(out, key=lambda s: (-s["cost_usd"], -s["calls"]))
+
     return {
         "days": days,
         "since": since,
         "span_days": round(span_days, 2),
         "rows": rows,
         "total": total,
+        "by_purpose": split(by_purpose),
+        "by_stage": split(by_stage),
         "ledger": ledger.stats(),
         "note": (
             "Estimated from the registry's per-model prices, cached input at the "

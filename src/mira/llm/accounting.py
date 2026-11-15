@@ -21,12 +21,47 @@ no usage, and a ledger that cannot be written to is a ledger with a gap.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import time
+from collections.abc import Awaitable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Which step of a review the calls in this context belong to — ``pass``,
+# ``system``, ``security``, ``critique``, ``summary``, ``walkthrough``,
+# ``threads`` and so on — recorded beside each call so the cost view can say
+# where a review's tokens went, not only that they were "review" tokens.
+_stage: contextvars.ContextVar[str] = contextvars.ContextVar("mira_usage_stage", default="")
+
+
+@contextlib.contextmanager
+def stage(name: str) -> Iterator[None]:
+    """Tag the calls made in this block (and the tasks it starts) with ``name``."""
+    token = _stage.set(name)
+    try:
+        yield
+    finally:
+        _stage.reset(token)
+
+
+async def staged(name: str, awaitable: Awaitable[_T]) -> _T:
+    """Await ``awaitable`` with its calls tagged ``name``.
+
+    For a coroutine handed to ``asyncio.create_task``: the tag is set inside
+    the task, where the calls are made.
+    """
+    with stage(name):
+        return await awaitable
+
+
+def current_stage() -> str:
+    return _stage.get()
 
 
 @dataclass(frozen=True)
@@ -168,6 +203,7 @@ class CallRecord:
     trace_id: str = ""
     repo: str = ""
     pr_number: int = 0
+    stage: str = ""
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -186,6 +222,7 @@ class CallRecord:
             "trace_id": self.trace_id,
             "repo": self.repo,
             "pr_number": self.pr_number,
+            "stage": self.stage,
         }
 
 
@@ -265,6 +302,7 @@ def record(entry: CallRecord) -> None:
     from mira.llm import ledger
 
     entry.trace_id = entry.trace_id or logs.current_trace_id()
+    entry.stage = entry.stage or current_stage()
     if not entry.repo:
         entry.repo = logs._trace_repo.get()
         entry.pr_number = logs._trace_pr.get()

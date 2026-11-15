@@ -98,6 +98,11 @@ class Endpoint:
     plan: str = ""
     plan_started: str = ""
     cost_scale: float = 1.0
+    # Requests this endpoint takes at once, across the whole process. 0
+    # derives it from the plan (``plans.<id>.concurrency`` in providers.json)
+    # or the preset (see mira.llm.concurrency); no figure at all means no
+    # limit.
+    max_concurrency: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -256,6 +261,9 @@ def profile_for(endpoint: Endpoint) -> dict:
     # did, and an endpoint with no preset has nothing to report.
     profile["endpoint_id"] = endpoint.id
     profile["label"] = endpoint.label or base.get("label") or endpoint.id
+    # What the concurrency limiter sizes this endpoint's slots from.
+    profile["plan"] = endpoint.plan
+    profile["endpoint_max_concurrency"] = max(0, int(endpoint.max_concurrency or 0))
     return profile
 
 
@@ -404,6 +412,7 @@ def create(
     plan: str = "",
     plan_started: str = "",
     cost_scale: float = 1.0,
+    max_concurrency: int = 0,
     db: Any = None,
 ) -> Endpoint:
     """Add an endpoint, deriving its id from the label."""
@@ -423,6 +432,7 @@ def create(
         plan=plan,
         plan_started=plan_started,
         cost_scale=cost_scale,
+        max_concurrency=max(0, int(max_concurrency or 0)),
     )
     return save(endpoint, store)
 

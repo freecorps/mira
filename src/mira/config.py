@@ -186,6 +186,16 @@ class LLMConfig(BaseModel):
     stream_total_timeout: int = Field(default=600, ge=1)
     retry_min_wait: int = Field(default=2, ge=0)
     retry_max_wait: int = Field(default=30, ge=0)
+    # Requests in flight at once on this endpoint, across every review,
+    # index batch and chat reply in the process. 0 takes it from the
+    # endpoint: its stored `max_concurrency`, else its plan's concurrency in
+    # providers.json (OpenDesign: Go 10, Plus 20, Pro 30, Max 50), else no
+    # limit. Background work keeps a couple of slots free for chat replies.
+    max_concurrent_requests: int = Field(default=0, ge=0, le=1000)
+    # How long one request may keep waiting out "concurrency limit exceeded"
+    # refusals (a slot taken by another process on the same key) before it
+    # is handed to the retry policy as a transient error.
+    concurrency_wait_seconds: int = Field(default=180, ge=0, le=3600)
     # Extra attempts spent re-rolling a model that answered a tool call with
     # unparsable arguments (or with prose instead of a call). Separate from
     # `max_retries`, which covers transport/API failures: a broken tool call
@@ -588,6 +598,12 @@ class ReviewQueueConfig(BaseModel):
     # delivers one webhook per branch over a few seconds; waiting for the last
     # one is what lets the queue order the chain from its base up.
     settle_seconds: float = Field(default=5.0, ge=0.0, le=120.0)
+    # How long a review triggered by a push waits for the branch to go quiet.
+    # A newer push in that time supersedes it (and restarts the wait), so a
+    # burst of fix-up pushes is reviewed once, at its last head. One pull
+    # request was reviewed 14 times in two days, one review per push. 0
+    # reviews every push as soon as `settle_seconds` allows.
+    push_quiet_seconds: float = Field(default=90.0, ge=0.0, le=1800.0)
     # Starts a request gets before it is given up on. A review is only started
     # again after the process died under it, and one that keeps taking the
     # process down with it must not do so forever.
@@ -708,10 +724,19 @@ class ReviewConfig(BaseModel):
     # read first, so this is mostly a recall feature. Costs up to `passes`×
     # the part reviews' tokens; wall clock stays roughly flat. 1 is the old
     # single-pass review (and `ensemble_runs` only applies then).
-    passes: int = Field(default=3, ge=1, le=5)
+    # Two by default: the third pass was a third of every multipass review's
+    # tokens for a third vote. With two, a finding both passes report is kept,
+    # and a warning or blocker only one reports goes to self-critique, which
+    # keeps it only when it grades it proven (`pass_vote_prove_min_severity`).
+    passes: int = Field(default=2, ge=1, le=5)
     # Passes that must report a finding for it to be kept, clamped to the
     # passes that actually landed (one landing keeps all it found).
     pass_vote_threshold: int = Field(default=2, ge=1, le=5)
+    # The lowest severity a finding too few passes reported may still be
+    # kept at — when self-critique grades it `proven`. `warning` (the
+    # default) gives single-pass warnings and blockers that chance; `blocker`
+    # is the old rule, which dropped every single-pass warning outright.
+    pass_vote_prove_min_severity: Literal["warning", "blocker"] = "warning"
     # Pass 0 keeps `llm.temperature`; the others step up evenly to
     # `llm.temperature + pass_temperature_spread` (at most 1.0).
     pass_temperature_spread: float = Field(default=0.3, ge=0.0, le=1.0)
@@ -722,10 +747,21 @@ class ReviewConfig(BaseModel):
     # Below this many changed lines (added + removed, reviewed files only)
     # every part gets one pass and the system pass is skipped: a small change
     # gains little from a second reading at full price.
-    multipass_min_changed_lines: int = Field(default=30, ge=0)
+    multipass_min_changed_lines: int = Field(default=80, ge=0)
     # The same, for follow-up rounds (which review only the new commits'
-    # diff): a fix-up push rarely needs three readings.
-    multipass_min_changed_lines_incremental: int = Field(default=120, ge=0)
+    # diff): a fix-up push rarely needs a second reading.
+    multipass_min_changed_lines_incremental: int = Field(default=200, ge=0)
+    # Model calls one agentic review loop may make, the submitting one
+    # included. Each hop re-sends the whole conversation, and the last hops
+    # of a long loop were the ones still running when a part's time ran out.
+    agentic_max_hops: int = Field(default=5, ge=2, le=12)
+    # Reasoning level for the hops of an agentic review loop that only look
+    # things up (read a file, grep, find callers). The hop that submits the
+    # findings, self-critique and every other call keep the configured
+    # thinking mode; a lookup hop that tries to submit is asked again at the
+    # configured level. Never raises the level. `inherit` thinks the same
+    # on every hop, as before.
+    lookup_reasoning_effort: Literal["inherit", "minimal", "low", "medium", "high"] = "low"
 
     # One extra agentic pass over the whole pull request, asking only what the
     # change breaks elsewhere: lifecycle and cleanup, state machines,
