@@ -309,20 +309,24 @@ never held back.
 
 ### Several readings, and one of the whole change
 
-Each review part is read by three agentic passes side by side, each with the
-files (and hunks) in another seeded order and a slightly higher temperature; a
-finding is kept when two passes report it, and a blocker only one pass saw is
-kept only if self-critique grades it proven. One more pass reads the whole pull
-request and asks what the change breaks elsewhere — cleanup and lifecycle,
-state transitions, races, callers of changed contracts. Both are skipped on
-small changes, and roughly triple the tokens of the part reviews above that.
+Each review part is read by two agentic passes side by side, the second with
+the files in another seeded order and a slightly higher temperature, from the
+same prompt so it reads the first pass's tokens from the prompt cache; a
+finding is kept when both passes report it, and a warning or blocker only one
+pass saw is kept only if self-critique grades it proven. One more pass reads
+the whole pull request and asks what the change breaks elsewhere — cleanup and
+lifecycle, state transitions, races, callers of changed contracts. Both are
+skipped on small changes, and roughly double the tokens of the part reviews
+above that. Lookup hops think at a lower reasoning level than the hop that
+submits the findings.
 
 ```yaml
 review:
-  passes: 3                 # 1 = a single reading per part
+  passes: 2                 # 1 = a single reading per part
   pass_vote_threshold: 2
   system_pass: true
-  multipass_min_changed_lines: 30
+  multipass_min_changed_lines: 80
+  lookup_reasoning_effort: low   # inherit = the same thinking on every hop
 ```
 
 → [Voting passes and the system pass](docs/multipass-review.md)

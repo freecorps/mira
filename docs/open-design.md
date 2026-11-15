@@ -60,6 +60,45 @@ each model's usable input and output budgets (`context_budget`,
 `output_budget`), and Mira uses them for any model its registry has no entry
 for on this endpoint.
 
+## Concurrency
+
+Each plan caps the requests a key has in flight: 10 on Go, 20 on Plus, 30 on
+Pro and 50 on Max. Past it OpenDesign answers `400`
+`{"code": "tier_limit_exceeded", "message": "… membership concurrency limit
+exceeded: 21/20 resets …"}`. A review does not count its own requests —
+passes × parts × concurrent reviews, plus the security pass, indexing and
+chat replies — and in two days of production 1,566 requests were refused
+that way, each one a pass, a part or an index batch dying after it had
+already spent tokens. Worse, a `400` read as "this request is wrong", so a
+structured call went down the tool-calling and JSON-mode ladder on it.
+
+So every request to the endpoint now holds one of its slots while it is in
+flight, process-wide (`mira.llm.concurrency`):
+
+- **The limit** is the plan's (`plans.<id>.concurrency` in `providers.json`),
+  or the preset's 10 when no plan is set. An endpoint's own
+  `max_concurrency` (the endpoint API) overrides it, and
+  `llm.max_concurrent_requests` overrides both.
+- **Headroom.** Reviews, indexing and the security pass may hold the limit
+  minus 2 (`concurrency_headroom`, at most a quarter of the limit), so a chat
+  or thread reply never waits behind a large review.
+- **A refusal is a wait, not a failure.** A `tier_limit_exceeded` (or any
+  "concurrency limit" refusal) that still happens — the key is also used
+  from an IDE, or by another Mira process — gives its slot back, lowers the
+  ceiling to what is in flight for a minute, and sends the same request again
+  after the reset time the refusal names (when it is under 30 seconds away)
+  or a 2–30 second backoff, for up to `llm.concurrency_wait_seconds` (180).
+  Past that it is a transient error for the retry policy. It is never
+  read as a spent quota, and never as the endpoint refusing a request format.
+- A wait for a slot counts against the review part's deadline like any model
+  time.
+
+```yaml
+llm:
+  max_concurrent_requests: 0     # 0 = from the endpoint's plan
+  concurrency_wait_seconds: 180
+```
+
 ## The estimated meter
 
 The preset's plans are data in `src/mira/llm/providers.json`, in plan credits:
@@ -113,6 +152,14 @@ input and the cache-hit rate, output, estimated USD and credits, and a month
 projected from the pace so far. Each review's record carries its own prompt,
 cached, completion and cost totals.
 
+The same report has `by_purpose` and `by_stage`: the calls, tokens, cache
+hit rate, cost and share of the cost per purpose, and per step of a review —
+`pass` (the part reviews), `system`, `security`, `dependency`, `critique`,
+`summary`, `walkthrough` and `threads` (thread verification). Each ledger row
+records its `stage` (a new column, migrated in place on SQLite and Postgres);
+calls made outside a review are listed under their purpose. Compare one week
+with the next by stage to see where a change moved the bill.
+
 Cached tokens are billed at the model's `cache_read_cost_per_1m` in
 `models.json`. On DeepSeek that is about a fiftieth of the input rate, which
 is why a review's cost depends so much on its cache-hit rate. Rows are kept
@@ -141,6 +188,14 @@ ledger off.
   call at once. A plain "rate limit exceeded" 429 is still retried.
 - **Forced `tool_choice` works, but slowly** (around 25 seconds).
   `response_format: json_object` and a custom `temperature` are accepted.
-- No rate-limit headers were seen, and 14 concurrent requests all
-  succeeded. The documented concurrency per workspace is 10 on Go, 20 on
-  Plus, 30 on Pro and 50 on Max.
+- **`response_format: json_schema` is taken.** Two days of production logged
+  373 "rejected json_schema output with HTTP 400 … for this call", and a
+  falling cascade after them (352 tool-calling rejections, 334 failed JSON-mode
+  rescues). None of those 400s named the format — a refusal that does is
+  remembered for the process — and most structured calls went through. They
+  were the concurrency refusal above, read as "this request is wrong" at each
+  step of the ladder. With concurrency refusals now waited out, the ladder no
+  longer sees them. An endpoint that really refuses the format can say so in
+  its preset (`"json_schema": false`) and skip the refused request per call.
+- No rate-limit headers were seen. Concurrency is capped per plan; see
+  [Concurrency](#concurrency).
