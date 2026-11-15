@@ -287,7 +287,12 @@ async def agentic_review_loop(
             return ""
 
     last_hop_seconds = 0.0
-    for hop in range(max_hops):
+    # ``max_hops`` caps model calls, not turns: a submission at the lookup
+    # level that is asked again at the configured one spends two of them.
+    calls = 0
+    hop = -1
+    while calls < max_hops:
+        hop += 1
         hop_started = time.monotonic()
         if stop_by is not None and hop > 0 and hop_started >= stop_by:
             logger.info("Agentic loop out of time before hop %d; stopping", hop + 1)
@@ -301,14 +306,16 @@ async def agentic_review_loop(
         )
         if out_of_time:
             logger.info("Agentic loop out of time at hop %d; asking for the review", hop + 1)
-        final_hop = hop == max_hops - 1 or out_of_time
+        final_hop = calls >= max_hops - 1 or out_of_time
         if final_hop and hop > 0:
             convo.append({"role": "user", "content": _FINAL_HOP_NUDGE})
         lookup = lookup_reasoning_effort if not final_hop else None
         try:
+            calls += 1
             with reasoning_override(lookup):
                 msg = await llm.complete_agentic(convo, tools=tools, **sampling)
             if lookup and _submits(msg):
+                calls += 1
                 logger.info(
                     "Agentic hop %d submitted at the lookup reasoning level; asking again "
                     "at the configured one",
