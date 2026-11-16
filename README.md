@@ -317,8 +317,9 @@ sites of the functions it changes, the definitions its changed lines call and
 the tests named after its files — gathered from the code graph before the
 model is called. The first thinking call may ask, in one round, for more
 lookups (they run side by side); the second can only submit. A part that runs
-out of time is read once without thinking, never re-run and never left out,
-and every stage takes its deadline from one budget. One more pass reads the
+out of time is read once without thinking and is never re-run; only if that
+read fails too are its files listed as unread. Every stage takes its deadline
+from one budget. One more pass reads the
 whole pull request and asks what the change breaks elsewhere — cleanup and
 lifecycle, state transitions, races, callers of changed contracts — when it is
 split into several parts.

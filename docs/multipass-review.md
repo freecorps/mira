@@ -13,8 +13,8 @@ what they cost, and how to measure them against the other review bots.
 > agentic system pass failed 43 of 80 times on its deadline. Precision now
 > comes from verifying the candidates. Everything below still works with
 > `review.passes: 2` or more, and with `review.pipeline: agentic` for the tool
-> loop; under the staged pipeline the system pass is one bounded call with no
-> tools (see below).
+> loop; under the staged pipeline the system pass makes the same two calls a
+> part gets, bounded by the review's budget (see below).
 
 ## Why
 
@@ -139,11 +139,12 @@ every other finding. It has its own deadline,
 a timeout, a provider error, an unreadable answer — costs only its findings.
 
 Under the staged pipeline (the default, see [the review
-pipeline](review-pipeline.md)) the pass is **one call with no tools**, its
-input held to `review.staged_system_pass_tokens` (12,000), its deadline the
-parts' deadline in the review's budget, and it runs only when the pull
-request is split into two or more parts — a single part already reads the
-whole change, with the callers of what it changes.
+pipeline](review-pipeline.md)) the pass makes **the same two calls a part
+gets** — one offered the lookup tools, one that can only submit — its input
+held to `review.staged_system_pass_tokens` (12,000), its deadline the parts'
+deadline in the review's budget, and it runs only when the pull request is
+split into two or more parts — a single part already reads the whole change,
+with the callers of what it changes. If it fails it is dropped, not retried.
 
 ## When they run
 
@@ -304,5 +305,5 @@ review:
   system_pass: true
   system_pass_deadline_seconds: 480
   system_pass_tokens: 40000
-  staged_system_pass_tokens: 12000  # the staged pipeline's one call
+  staged_system_pass_tokens: 12000  # the staged pipeline's input for its two calls
 ```
