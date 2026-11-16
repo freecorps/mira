@@ -151,17 +151,28 @@ spent on reasoning without an answer.
 
 ## Choosing models
 
-The thinking stage is the review part. Everything around it can run on a
-cheaper or faster model:
+The thinking stage is the review part; everything around it can run on a
+cheaper model. The defaults assume the review model stays where production
+has it, **DeepSeek V4.1 Flash Eco**, and the measurements below say what that
+costs and what another model buys.
 
-| Setting (dashboard: Settings → Models) | Used for | Recommendation on OpenDesign |
-|---|---|---|
-| Review model | the part reviews, the whole-PR pass, self-critique | `deepseek-v4.1-flash` — about 2× Eco's streaming speed (≈180 vs ≈90 tok/s), and the review stage is where the time goes |
-| Indexing model | indexing, summaries, the dependency pass | `deepseek-v4.1-flash-eco` (0.27× credits) |
-| Security model | the security pass | the review model, or Eco to save credits |
+| Setting (dashboard: Settings → Models) | Used for |
+|---|---|
+| Review model | the part reviews, the whole-PR pass, self-critique |
+| Indexing model | indexing, summaries, the dependency pass |
+| Security model | the security pass |
 
-`review.critique_model: indexing` moves verification to the indexing model.
-Nothing in this change alters stored settings.
+**An option, not the default:** `deepseek-v4.1-flash` as the review model
+(Eco kept for indexing). It is the same model at about twice Eco's streaming
+speed (≈180 vs ≈90 tok/s on OpenDesign), so far fewer parts run out of time
+and are read without thinking — in the A/B below it kept today's recall
+(18/51 against 11–13/51 on Eco) in 240 s at the median, at about today's plan
+credits (Flash is billed 0.5× per token, Eco 0.27×). Nothing in this change
+alters stored settings.
+
+On Eco, a larger budget is not the lever: at `time_budget_seconds: 480` /
+`call_timeout_seconds: 300` fewer parts degraded (30 of 59 instead of 48) but
+recall did not improve (11/51) and the median review took 434 s.
 
 ## What gets recorded
 
@@ -214,10 +225,30 @@ staged one, `part_deadline_seconds` still caps a part, inside the budget.
 
 ## Measuring it
 
-The A/B in the pull request that introduced this pipeline replayed ten merged
-pull requests from three repositories, each at the commit Mira had reviewed,
-under the old pipeline (main's code, unchanged) and the new one, with the same
-model and settings, and scored both against the threads opened on that commit
-that the author then resolved by changing the code. `mira backtest
---config A.yaml --config-b B.yaml` (with `review.pipeline: agentic` in one)
-runs the same comparison on merged diffs; see [backtest](backtest.md).
+Ten merged pull requests from three repositories (`freecorps/mira`,
+`freecorps/ember`, `freecorps/mail`; 13–94 files), each replayed at the commit
+Mira had reviewed, under the agentic pipeline (main's code, unchanged) and the
+staged one, same settings (thinking `high`, `max_tokens` 32,768, ten requests
+in flight per process, two reviews at a time). Ground truth: the 51 review
+threads opened on that commit — by Mira or Cursor Bugbot — that the author
+resolved by changing the code; a finding counts when it lands in the same
+file within ten lines.
+
+| | agentic, Eco | **staged, Eco (default)** | staged, Eco, 480 s budget | staged, Flash review |
+|---|---|---|---|---|
+| Wall time p50 / p90 / max | 533 / 1,270 / 1,271 s | **304 / 325 / 368 s** | 434 / 479 / 501 s | 240 / 304 / 312 s |
+| Partial reviews (files unread) | 3 of 10 (12, 14, 27 files) | **0** | 0 | 0 |
+| Parts read without thinking | — | 48 of 59 | 30 of 59 | 19 of 59 |
+| Model calls (+ cut by a timeout) | 524 (+33) | **207 (+63)** | 227 (+33) | 244 (+14) |
+| Prompt / cached / completion tokens | 18.3M / 13.1M / 2.06M | **3.96M / 1.16M / 0.60M** | 4.25M / 3.51M / 1.04M | 4.37M / 0.50M / 1.24M |
+| Reasoning tokens | 1.88M | **0.46M** | 0.90M | 1.10M |
+| Plan credits (metered) | 1.11 | **0.42** | 0.40 | 1.32 |
+| Ground-truth threads found | 18 / 51 | **13 / 51** | 11 / 51 | 18 / 51 |
+
+A call cut by its timeout reports no usage, so every credit figure leaves
+those out: 6,995 s of cut calls under the agentic pipeline, 7,126 s under the
+staged one on Eco at 300 s, 1,530 s on Flash. With 51 threads, a difference
+of two or three is within run-to-run noise; the Eco rows sit below the
+agentic pipeline on every run. `mira backtest --config A.yaml --config-b
+B.yaml` (with `review.pipeline: agentic` in one) runs the same comparison on
+merged diffs; see [backtest](backtest.md).
