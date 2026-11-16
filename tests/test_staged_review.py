@@ -820,3 +820,18 @@ async def test_a_part_is_verified_as_soon_as_it_lands(monkeypatch):
     assert sorted(c.path for c in result.comments) == ["src/fast.py", "src/slow.py"]
     # One grading per part, the fast one before the slow part finished; none after.
     assert graded_before_slow == [True, False]
+
+
+async def test_lookups_cut_by_the_deadline_are_stopped_before_it_returns():
+    stopped = asyncio.Event()
+
+    class Slow:
+        async def execute(self, name: str, args: dict) -> str:
+            try:
+                await asyncio.sleep(10)
+            finally:
+                stopped.set()
+            return "never"
+
+    await run_lookups(Slow(), [("read_file", {"path": "a"})], seconds=0.05)
+    assert stopped.is_set()

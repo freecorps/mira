@@ -266,6 +266,10 @@ async def run_lookups(
     done, pending = await asyncio.wait(tasks, timeout=max(0.5, seconds))
     for task in pending:
         task.cancel()
+    if pending:
+        # Stopped, not just asked to stop: no lookup still reads the snapshot
+        # while the submitting turn goes out, and none fails unretrieved.
+        await asyncio.gather(*pending, return_exceptions=True)
     out: list[tuple[str, str]] = []
     used = 0
     for (tool, args), task in zip(calls, tasks, strict=True):
