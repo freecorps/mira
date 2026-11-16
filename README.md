@@ -310,29 +310,30 @@ review:
 `cap_exempt_severity: blocker` lets warnings share the limit too; blockers are
 never held back.
 
-### Several readings, and one of the whole change
+### Context first, two thinking calls per part, one time budget
 
-Each review part is read by two agentic passes side by side, the second with
-the files in another seeded order and a slightly higher temperature, from the
-same prompt so it reads the first pass's tokens from the prompt cache; a
-finding is kept when both passes report it, and a warning or blocker only one
-pass saw is kept only if self-critique grades it proven. One more pass reads
-the whole pull request and asks what the change breaks elsewhere — cleanup and
-lifecycle, state transitions, races, callers of changed contracts. Both are
-skipped on small changes, and roughly double the tokens of the part reviews
-above that. Lookup hops think at a lower reasoning level than the hop that
-submits the findings.
+Each review part's prompt carries the changed functions in full, the call
+sites of the functions it changes, the definitions its changed lines call and
+the tests named after its files — gathered from the code graph before the
+model is called. The first thinking call may ask, in one round, for more
+lookups (they run side by side); the second can only submit. A part that runs
+out of time is read once without thinking, never re-run and never left out,
+and every stage takes its deadline from one budget. One more pass reads the
+whole pull request and asks what the change breaks elsewhere — cleanup and
+lifecycle, state transitions, races, callers of changed contracts — when it is
+split into several parts.
 
 ```yaml
 review:
-  passes: 2                 # 1 = a single reading per part
-  pass_vote_threshold: 2
-  system_pass: true
-  multipass_min_changed_lines: 80
-  lookup_reasoning_effort: low   # inherit = the same thinking on every hop
+  pipeline: staged            # agentic = the old tool loop
+  time_budget_seconds: 300    # parts by 70% of it, verification by 90%
+  call_timeout_seconds: 180   # one thinking call
+  max_lookups: 6              # one round per part; 0 = one call per part
+  passes: 1                   # 2+ = shuffled voting passes
 ```
 
-→ [Voting passes and the system pass](docs/multipass-review.md)
+→ [The review pipeline](docs/review-pipeline.md) ·
+[Voting passes and the system pass](docs/multipass-review.md)
 
 ### Review instructions per directory
 
